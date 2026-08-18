@@ -211,13 +211,14 @@ once. The safe manual-run recipe is in `90-warden-roller.yaml`'s header and in
 PRODUCTION.md.
 
 Exit 0 is a converged fleet (nothing to do counts, and so does a clean
-`--dry-run`); 1 is not converged in any of its five forms — halted on a tenant,
-stopped before applying anything because a tenant carries today's render and is
-not serving it, a tenant DOWN with no workload and no cancellation on record,
-never started, or a `--dry-run` that found work; 2 is everything it could
+`--dry-run`); 1 is a tenant wanting a person while the fleet keeps converging
+around it — halted on the tenant it took, a tenant DOWN with no workload and no
+cancellation on record, one whose sealed credential is gone, never started, or a
+`--dry-run` that found work; 2 is everything it could
 converge converged with something left that no run ever will (foreign drift, or
 an identity Secret whose label does not validate); 3 is a tenant rolled with more
-queued behind it, which is every tick of a normal bump; 64 is a bad argument
+queued behind it, which is every tick of a normal bump; 4 is a casualty that
+froze the fleet, which is the one code worth paging on; 64 is a bad argument
 list. Anything but 0 marks the Job failed on purpose, so 3 marks it failed too.
 PRODUCTION.md, "Rolling the daemon image", has the full table and what to do
 about each, and "Alerting on this, without alerting on normal" has the query.

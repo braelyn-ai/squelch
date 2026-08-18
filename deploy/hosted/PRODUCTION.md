@@ -499,9 +499,10 @@ The run's answer is its exit code, which is also the Job's status:
 | Exit | Means | What to do |
 |---|---|---|
 | 0 | The fleet is on today's render and serving it. A run with nothing to do is this, and so is `--dry-run` over a fleet that needs nothing. | Nothing. |
-| 1 | Not converged, in one of six ways. The summary line says which. | Suspend the CronJob while you work; at most the one named tenant was written. Then, by case — see the six paragraphs below. |
+| 1 | A tenant wants a person, and the fleet is still converging around it. The summary line says which. | At most the one named tenant was written. Then, by case — see the paragraphs below. Several of these are permanent until you act, so this code can repeat every tick indefinitely. |
 | 2 | Everything this run could converge did, and something is left that no run will ever fix: a tenant skipped for foreign drift, or an identity Secret whose label does not validate. | For foreign drift: `squelch-control drift <label>`, then `reconcile <label>` when you are ready for that mailbox to be down for a pod cycle. For an unreadable label: see below. Nothing fixes itself. |
 | 3 | The fleet is behind and the run is working through it. Usually "it rolled a tenant and more are queued"; also the tick that spent its one attempt on a tenant that turned out to be foreign or cancelled mid-flight. **Normal.** | Nothing. The next tick takes the next one. If N stops falling across runs, read the stall note in `90-warden-roller.yaml`. A foreign skip raised during a run like this surfaces as a 2 once the queue drains. |
+| 4 | **FROZEN.** A casualty stopped the run before it wrote anything: a tenant carries today's render and is not serving it. No tenant converged, and none will on any tick until this is dealt with. | Suspend the CronJob and look at that pod. This is the roller saying the release is bad. **This is the code to page on.** |
 | 64 | The Job's argument list is wrong. | Fix `args:` in `90-warden-roller.yaml`. Nothing was read and nothing was applied. |
 
 The six shapes of a 1, and what each wants:
@@ -511,7 +512,8 @@ The six shapes of a 1, and what each wants:
   `kubectl -n tenants describe pod -l app.kubernetes.io/instance=<label>`. It is
   the only tenant this run wrote to, and it goes back on the queue for the next
   tick; everything else in the fleet is exactly as the last run left it.
-- **Casualty** (`HALTED before applying anything`) — below.
+- **Casualty** (`HALTED before applying anything`) — no longer a 1. It is exit
+  **4**, because it is the only outcome that stops the rest of the fleet; below.
 - **A tenant DOWN with no workload** — below.
 - **A tenant that can never be rendered** (`a workload whose sealed credential
   Secret is gone`) — its `<label>-credential` Secret is missing, so the warden
@@ -549,16 +551,35 @@ in its history by design**: nine tenants behind is nine failed Jobs and then a
 green one, every image bump. An alert on `kube_job_status_failed{namespace="warden"}`
 alone will page on every ordinary rollout and be ignored inside a week.
 
-Alert on the exit code instead, which kube-state-metrics exposes per pod:
+Alert on the exit code instead, which kube-state-metrics exposes per pod.
+**Page on 4 and nothing else:**
 
 ```promql
-kube_pod_container_status_last_terminated_exitcode{namespace="warden",container="roll"} == 1
+kube_pod_container_status_last_terminated_exitcode{namespace="warden",container="roll"} == 4
 ```
 
-Codes 2 and 3 are worth a dashboard panel and not a page: 3 clears itself, and 2
-wants a person this week rather than tonight. A 3 whose `still behind` count
-does not fall across consecutive runs is the stall signature, and that one is
-worth paging on.
+That is the frozen fleet: nothing converged, and nothing will until a person
+acts. Everything else belongs on a board.
+
+The split matters more than it looks, because codes 1, 2 and 3 can all be
+**permanent**. A stranded mailbox raises 1 every fifteen minutes until somebody
+reconciles it; an unreadable label raises 2 forever; a stalled queue raises 3
+forever. Each of those is a state an operator can reasonably look at, decide to
+live with for a week, and stop reading. If the casualty shared a code with any
+of them, the one signal meaning *the fleet has stopped converging entirely*
+would be muted by a tenant nobody is worried about, and the next release would
+reach nobody, silently.
+
+So: **4 pages.** 1 goes on a board and gets triaged — treat a *new* label
+appearing in it as worth a look, and expect the old ones to persist. 2 is a
+weekly cleanup. 3 is healthy unless its `still behind` count stops falling
+across consecutive runs, which is the stall signature and worth its own alert:
+
+```promql
+min_over_time(
+  kube_pod_container_status_last_terminated_exitcode{namespace="warden",container="roll"}[2h]
+) == 3
+```
 
 ```sh
 kubectl -n warden get cronjob squelch-warden-roll         # last schedule, ACTIVE, suspended or not

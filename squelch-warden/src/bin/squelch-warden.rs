@@ -53,10 +53,10 @@ usage:
 
 `roll` rolls AT MOST ONE tenant per run: the next tick takes the next one, so a
 fleet with N tenants behind needs N runs. It exits 0 converged (nothing to do
-counts), 1 not converged (it halted, it never started, a tenant is down or
-cannot be rendered, or a dry run found work), 2 nothing left it can fix on its
-own (foreign drift, an unreadable label), 3 the fleet is behind and the run is
-working through it.
+counts), 1 a tenant wants a person (it halted, it never started, a tenant is
+down or cannot be rendered, or a dry run found work), 2 nothing left it can fix
+on its own (foreign drift, an unreadable label), 3 the fleet is behind and the
+run is working through it, 4 a casualty froze the fleet and nothing converged.
 ";
 
 // `roll`'s exit status is the CronJob's entire interface to a run: the pod's
@@ -65,17 +65,24 @@ working through it.
 /// The fleet is on today's render and every tenant is serving it. A run with
 /// nothing to do is this; a run that would have had something to do is not.
 const EXIT_CONVERGED: u8 = 0;
-/// The fleet is NOT converged, in any of the five ways that can be true: the
-/// roll halted on the tenant it took, it stopped on a casualty of an earlier
-/// run, it never started at all (a refused config, an API server it could not
-/// reach), it found a tenant with no workload and no cancellation on record, or
-/// it found one whose sealed credential is gone and which therefore cannot be
-/// rendered at all. A dry run that would roll anything is here too - it has just
-/// reported that the fleet is behind, and reporting that as converged is the
-/// one answer that would make `--dry-run` worse than useless.
+/// A TENANT wants a person, and the fleet is still converging around it: the
+/// roll halted on the tenant it took, it never started at all (a refused
+/// config, an API server it could not reach), it found a tenant with no
+/// workload and no cancellation on record, or it found one whose sealed
+/// credential is gone and which therefore cannot be rendered at all. A dry run
+/// that would roll anything is here too - it has just reported that the fleet
+/// is behind, and reporting that as converged is the one answer that would make
+/// `--dry-run` worse than useless.
 ///
-/// All of them want the same thing, which is a person reading the log before
-/// anything else is applied, so all of them are one code.
+/// What is NOT here, and used to be, is the casualty: see [`EXIT_FROZEN`]. The
+/// difference is whether the rest of the fleet is still moving, and it is the
+/// difference between a code an operator may reasonably decide to live with for
+/// a week and one that must never be muted.
+///
+/// Several of these are PERMANENT until somebody acts - a stranded mailbox and
+/// a tenant whose credential is gone both persist across every tick - so a
+/// fleet holding one raises this code every fifteen minutes forever. That is
+/// exactly why the casualty is no longer among them.
 const EXIT_NOT_CONVERGED: u8 = 1;
 /// Everything this run could converge did, and at least one tenant is left that
 /// this timer will NEVER converge, however many times it runs: another field
@@ -114,8 +121,25 @@ const EXIT_SKIPPED: u8 = 2;
 /// design. `deploy/hosted/PRODUCTION.md` says what that looks like and how an
 /// alert should tell it from the real thing.
 const EXIT_PROGRESSING: u8 = 3;
+/// A CASUALTY stopped the run before it wrote anything, and the fleet is
+/// FROZEN: no tenant converged, and none will on any tick until this one is
+/// dealt with. A tenant carries today's render and is not serving it, so the
+/// render itself is the suspect, and handing it to the next mailbox is the one
+/// thing this timer must not do.
+///
+/// Its own code because it is the only outcome that stops OTHER tenants. Every
+/// other failure is one tenant's problem while the walk continues, and
+/// [`EXIT_NOT_CONVERGED`] can be raised forever by a single stranded mailbox an
+/// operator has already looked at and decided to live with. An alert that
+/// cannot tell those apart is an alert somebody mutes - and muting this one
+/// means the fleet quietly stops converging and the next release reaches
+/// nobody.
+///
+/// So: page on this, dashboard the rest. `deploy/hosted/PRODUCTION.md`,
+/// "Alerting on this, without alerting on normal", has the query.
+const EXIT_FROZEN: u8 = 4;
 /// The argument list was none of the three this binary accepts (`EX_USAGE`).
-/// Deliberately outside the 0-3 range: a mistyped CronJob argument must not
+/// Deliberately outside the 0-4 range: a mistyped CronJob argument must not
 /// read as a verdict on the fleet.
 const EXIT_USAGE: u8 = 64;
 
@@ -158,7 +182,13 @@ fn command(args: &[String]) -> Option<Command> {
 /// made no progress, which is the whole idea.
 fn verdict(rolled: &Rolled, dry_run: bool) -> u8 {
     let would_roll = dry_run && !rolled.rolled.is_empty();
-    if rolled.halted_on.is_some()
+    // FIRST, and it outranks the halt it always accompanies: a casualty sets
+    // `halted_on` too, and the whole point of the code is that it is not the
+    // same news. A dry run reaches it on the same terms, because the read pass
+    // stops on a casualty whether or not anything was going to be written.
+    if rolled.casualty.is_some() {
+        EXIT_FROZEN
+    } else if rolled.halted_on.is_some()
         || !rolled.stranded.is_empty()
         || !rolled.unrenderable.is_empty()
         || would_roll
@@ -602,13 +632,56 @@ mod tests {
             casualty: Some("carol".into()),
             ..Rolled::default()
         };
-        assert_eq!(verdict(&halted, false), EXIT_NOT_CONVERGED);
+        // A casualty, so FROZEN rather than the ordinary tenant-level alarm:
+        // this run converged nobody and neither will the next one.
+        assert_eq!(verdict(&halted, false), EXIT_FROZEN);
 
         let out = summarize(&halted, false);
         assert!(out.contains("2 more"), "{out}");
         // Not the ordinary promise: the next tick meets the same casualty.
         assert!(!out.contains("the next at the next tick"), "{out}");
         assert!(out.contains("HALTED before applying anything"), "{out}");
+    }
+
+    /// The casualty outranks everything, including the halt it always sets and
+    /// the tenant-level faults it may be standing next to.
+    ///
+    /// It is the only outcome that stops OTHER tenants converging, and the
+    /// codes it outranks are ones an operator may have already triaged and
+    /// decided to live with. Folding it back in with them is how a frozen fleet
+    /// gets muted by a stranded mailbox somebody is not worried about.
+    #[test]
+    fn a_casualty_outranks_every_other_verdict() {
+        let casualty = Rolled {
+            checked: 3,
+            halted_on: Some("carol".into()),
+            casualty: Some("carol".into()),
+            ..Rolled::default()
+        };
+        assert_eq!(verdict(&casualty, false), EXIT_FROZEN);
+        // A dry run stops on a casualty on the same terms, so it says so with
+        // the same code: the read pass runs either way.
+        assert_eq!(verdict(&casualty, true), EXIT_FROZEN);
+
+        // Standing next to every other kind of bad news, it still wins.
+        let crowded = Rolled {
+            stranded: vec!["alice".into()],
+            unrenderable: vec!["bob".into()],
+            skipped_foreign: vec!["dave".into()],
+            unreadable: 1,
+            remaining: 2,
+            ..casualty.clone()
+        };
+        assert_eq!(verdict(&crowded, false), EXIT_FROZEN);
+
+        // And without the casualty, that same run is the ordinary alarm - which
+        // is the pair of readings the split exists to keep apart.
+        let thawed = Rolled {
+            casualty: None,
+            halted_on: None,
+            ..crowded
+        };
+        assert_eq!(verdict(&thawed, false), EXIT_NOT_CONVERGED);
     }
 
     /// A run that rolled a tenant and has more queued is PROGRESSING: not
