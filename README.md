@@ -14,7 +14,7 @@ squelch reads your Gmail (read-only), decides what actually deserves attention, 
 [Quickstart](#quickstart) ·
 [How it works](#how-it-works) ·
 [Agent door](#the-agent-door) ·
-[Passband](#passband-the-macos-client) ·
+[Passband](#passband-the-client) ·
 [Security](#security-posture) ·
 [Docs](#docs)
 
@@ -33,7 +33,8 @@ The name comes from the radio control that mutes everything below a signal thres
 | ⚖️ **Deterministic first, models second** | Seal detection, then your sender rules, then heuristics. LLMs only refine. |
 | 💬 **Natural-language sender rules** | "only tell me about school closures" is a rule. Your words are passed to the model verbatim, in either polarity. |
 | 📅 **Bills, deadlines, shipments** | Extracted during triage and queryable as first-class tools. |
-| 🖥️ **Native clients** | Passband, a native macOS app over the human door, plus a ratatui TUI for setup and debugging. |
+| 🖥️ **Native clients** | Passband for macOS and iOS over the human door, a no-JavaScript console your own daemon serves at `/console`, and a ratatui TUI for the box itself. |
+| 🤖 **An assistant inside the app** | Passband carries its own agent — your key on self-host, a daemon-held one on hosted. It reads through the human door, so sealed mail is absent from it too, and it parks on a tap before anything writes. |
 | 📬 **Opt-in read receipts** | Per-send open tracking whose records live in your daemon, not on shared infrastructure. |
 | 🐳 **Self-host in one compose file** | Prebuilt multi-arch images on GHCR. No Rust toolchain on the box. |
 
@@ -47,21 +48,27 @@ flowchart LR
     T --> M["/mcp<br/>agent door"]
     T --> C["/client<br/>human door"]
     M --> A["your agent"]
-    C --> P["Passband · TUI"]
+    C --> P["Passband (macOS · iOS)<br/>/console · TUI"]
 ```
 
 - **Sync**: polls Gmail every 45s with a read-only token. Sent mail seeds a "people I know" contact list, the strongest cheap triage signal.
 - **Triage**: seal detection runs before anything else, so auth mail never reaches any LLM. Everything else gets a real model verdict: heuristics (bills, known contacts, alerts, newsletters, cold sales) write provisional seed values at ingest, then Stage-1 (default `claude-opus-5` at low effort) scores importance, tier, deadline, category, and a one-liner with a per-property "why". Those heuristics never stand as the answer unless the API is unreachable, and they never fire a notification on their own; what they do instead is act as a witness, because a model verdict that contradicts them is one of the strongest signals that a row needs a second look.
 - **Escalation**: a router, not the model's own confidence, decides what gets that second look. It reads the settled verdict plus facts the model cannot see: what the deterministic detectors found, whether you have corrected this sender before, and where the score fell against the surface line. Stage-2 runs the *same* model at `xhigh` effort with more context (why it was flagged, the sender's track record, the rest of the thread) — escalation buys thinking and information, not a bigger brain. Your squelch/surface rules still settle visibility outright, applied over the verdict rather than instead of it.
-- **Re-triage**: relevance expires. Alongside each verdict the model lists dates to look again ("this reservation is dead the morning after"), anything with a deadline schedules itself regardless, and anything sitting unactioned in the standing band gets swept. Verdicts you have corrected by hand are never re-evaluated.
+- **Re-triage**: relevance expires. Alongside each verdict the model lists dates to look again ("this reservation is dead the morning after"), anything with a deadline schedules itself regardless, and anything sitting unactioned in the standing band gets swept. Verdicts you have corrected by hand are never re-evaluated. Every model pass also has an age horizon (7 days for Stage-1, 14 for Stage-2) so a fresh install cannot spend a day's cap on a decade of backlog, and a re-triage you ask for by hand outranks that horizon for 24 hours and jumps the queue ahead of the backlog: asking is the one thing the cutoff exists to wait for.
 - Each stage has its own daily budget caps and cost ledger; no API key or an exhausted budget just means rows keep their heuristic values.
 - **Two doors**: agents connect to `/mcp` and get ranked summaries, and they cannot send, archive, delete, or see auth-related mail. Your own clients connect to `/client` with a bearer token and get search, threads, sender rules, the sitrep lifecycle, and gated actions (archive, label, send) backed by a separate write-scoped credential that only the action handlers can load.
 
 ## Quickstart
 
-One-click start with our hosted service: [passband.app](https://passband.app)
+Let us run it for you: [passband.app](https://passband.app)
 
-Download the client and follow the instructions.
+Our hosted version is currently in alpha. Please join the waitlist.
+
+The Mac client is the download on that page, or `brew install --cask
+braelyn-ai/tap/passband`. It is signed, notarized, and updates itself, so the download
+is the last one you have to think about; the iOS client ships through TestFlight. The
+same client talks to a hosted daemon and a self-hosted one — it only ever knows a URL
+and a token.
 
 ## Self-Hosting
 
@@ -165,6 +172,14 @@ To reach it from another machine on a tailnet: `tailscale serve --bg 8848`, set 
 
 ### 5. Browse locally
 
+Your daemon serves its own console at `http://127.0.0.1:8848/console`: server-rendered
+HTML with no JavaScript and no external asset, for seeing what this mailbox is doing
+and managing the devices allowed to reach it. Signing in is the same `squelchd pair`
+code an app claims, so the browser is simply one more paired device and
+`squelchd token revoke <id>` ends its session like any other.
+
+For a terminal on the box itself:
+
 ```sh
 cargo run --bin squelch-tui    # ranked digest, squelch line, sender rule tuning
 ```
@@ -185,11 +200,17 @@ Seven tools, no mailbox writes, sealed mail structurally absent:
 
 Sender rules are the one thing an agent can write, and they only shape triage inside squelch's own database. Nothing an agent does can touch your actual mailbox.
 
-## Passband, the macOS client
+## Passband, the client
 
 [Download here](https://passband.app)
 
-Passband is the native macOS client over the human door: the sitrep, threaded reading, compose with live markdown that sends as proper multipart HTML, contacts autocomplete, per-send read-receipt opt-in, sender rule tuning, sealed-mail reveal with an audit trail, and budget/usage dashboards.
+Passband is the native client over the human door: the sitrep, threaded reading with a rail and a minimap, compose with live markdown that sends as proper multipart HTML, contacts autocomplete, inline images with the system's own Quick Look panel for everything else, per-send read-receipt opt-in, sender rule tuning, sealed-mail reveal with an audit trail, and budget/usage dashboards. Released builds update themselves over an EdDSA-signed appcast, and a new version arrives as a card inside the app with one button on it rather than a second window asking the same question twice.
+
+One daemon is one mailbox, so several mailboxes are several daemons: the app keeps an index of them, switches with ⌘1–⌘9, and keeps a background ear on the ones you are not looking at, which is what lets an auth code from an account you left in a background tab still reach you.
+
+It also carries its own agent. On self-host you bring your own Anthropic key and the app calls the provider directly; on hosted, the daemon relays the same request with a credential the app never sees. Either way the assistant reads through the human door, so sealed mail is structurally absent from it, and every mutating tool parks on a confirm card before it runs.
+
+**iOS** is the same client in four tabs (sitrep, records, mail, search) plus the agent, built from the same source tree as a second XcodeGen target, and shipped through TestFlight.
 
 ```sh
 cd passband
@@ -198,7 +219,7 @@ cd passband
 ./build.sh release  # optimized
 ```
 
-No Xcode needed for a local build, `swiftc` does the work.
+No Xcode needed for a Mac build, `swiftc` does the work. The iOS target does need it: run `xcodegen generate` (which is also what teaches the project about a newly added `.swift` file) and build `PassbandiOS` from Xcode, or `./release-ios.sh` for a TestFlight build.
 
 <details>
 <summary><b>Code signing notes</b> (why local builds want a Developer ID cert)</summary>
@@ -210,23 +231,13 @@ Local builds sign with whatever `Developer ID Application` certificate is in the
 </details>
 
 <details>
-<summary><b>Releases</b> (sign, notarize, staple)</summary>
+<summary><b>Releases</b> (a tag, and CI does the rest)</summary>
 
-`./build-release.sh` produces a bundle that opens by double-click on any Mac: Developer ID signature, hardened runtime, Apple notarization, stapled ticket. Ad-hoc builds from `build.sh` do not, Gatekeeper blocks them everywhere but the machine that built them.
+A Mac release is a tag. Bump `passband/VERSION` and its mirror in `project.yml`, commit, then push `passband-mac-X.Y.Z`: the workflow refuses a tag the two files do not agree on, then builds, signs with the Developer ID, notarizes, staples, publishes the GitHub release, regenerates the signed Sparkle appcast, and bumps the Homebrew cask. iOS is the same shape under `passband-ios-*`, and the daemon owns `daemon-*`; the three namespaces never overlap.
 
-```sh
-./build-release.sh              # sign, notarize, staple, package
-./build-release.sh --no-notary  # sign only; fast, still Gatekeeper-warned
-```
+`./release.sh` (`--dry` to rehearse) cuts the identical release from this machine when CI cannot, and `./build-release.sh` is just its signing step: Developer ID signature, hardened runtime, notarization, stapled ticket. Ad-hoc builds from `build.sh` get none of that, and Gatekeeper blocks them everywhere but the machine that built them.
 
-It picks up whatever `Developer ID Application` certificate is in the keychain; set `SIGN_ID` to choose explicitly. Notarization needs an **app-specific password** (generated at [appleid.apple.com](https://appleid.apple.com) under Sign-In and Security, *not* your Apple ID password), stored once:
-
-```sh
-xcrun notarytool store-credentials squelch-notary \
-  --apple-id <your apple id> --team-id <your team id>
-```
-
-Override the profile name with `NOTARY_PROFILE=`. Apple's turnaround is typically 2–15 minutes; on rejection the script fetches and prints the reason.
+The prerequisites, the five repo secrets, and what to do about a bad release that already shipped: [`passband/RELEASING.md`](passband/RELEASING.md) for this app, [`docs/RELEASING.md`](docs/RELEASING.md) for all four surfaces at once.
 
 </details>
 
@@ -236,19 +247,23 @@ Override the profile name with `NOTARY_PROFILE=`. Apple's turnaround is typicall
 |---|---|
 | `squelch-core` | types, SQLite store, seal detection, two-stage triage (rules + LLM), Gmail sync, OAuth |
 | [`squelch-mcp`](squelch-mcp/README.md) | the agent door (rmcp server, stdio or HTTP) |
-| [`squelch-api`](squelch-api/README.md) | the human door (axum, bearer auth, actions, audit log) |
+| [`squelch-api`](squelch-api/README.md) | the human door (axum, bearer auth, actions, audit log) and the `/console` pages |
 | `squelch-httpauth` | shared HTTP auth layer used by both doors |
-| [`squelchd`](squelchd/README.md) | the daemon binary: `auth`, `run`, `serve` |
+| `squelch-ratelimit` | the per-IP token buckets the public-facing services share |
+| [`squelchd`](squelchd/README.md) | the daemon binary: `auth`, `run`, `serve`, `pair`, `token` |
 | [`squelch-tui`](squelch-tui/README.md) | local ratatui viewer for setup and debugging |
-| `passband` | Passband, the native macOS client over the human door |
-| [`squelch-relay`](squelch-relay/README.md) | blind APNs ping relay for the future iOS app |
+| `passband` | Passband, the native client: a macOS target and an iOS one over one source tree |
+| [`squelch-relay`](squelch-relay/README.md) | blind APNs ping relay for the iOS app |
 | [`squelch-broker`](squelch-broker/README.md) | consent relay — built but not deployed; see [docs/BROKER.md](docs/BROKER.md) |
+| [`squelch-control`](squelch-control/README.md) | hosted only: waitlist, invite codes, signup, and the console's Google hop |
+| [`squelch-warden`](squelch-warden/README.md) | hosted only: the in-cluster provisioner that runs one daemon per tenant |
 
 ## Security posture
 
 - The sync credential is requested as `gmail.readonly`, and what holds the line is structural: sync and triage can only load the Read slot, ever. The write credential (`gmail.modify` + `gmail.send`) lives in a separate slot that is only reachable from the human door's action handlers, which require an explicit confirm flag, run an outbound secret scan on sends, and audit every attempt. (Google unions granted scopes across one project's consents, so the token in the Read slot may *carry* more than readonly after `auth --write` — which door can load which slot is the enforcement, not the token's scope list.)
 - Auth emails (2FA codes, password resets, login alerts) are sealed at ingest and never appear in any MCP response, any LLM call, or any list endpoint. Revealing one takes an explicit authenticated request and writes an audit row.
 - Email content is treated as untrusted input everywhere. Tokens never appear in logs.
+- The console introduces no new credential type: its session cookie *is* an ordinary device token, HttpOnly and verified by the same check the bearer path runs, so a browser is one more paired device and `squelchd token revoke <id>` ends its session like any other. The pages ship no JavaScript and no external asset, and say so to the browser with a `default-src 'none'` CSP.
 - Read tracking on mail you send is off by default and opt-in per send; the record lives in your daemon, never on shared infrastructure. Self-hosted deployments serve the pixel themselves and need no relay.
 
 The full model is in [docs/SECURITY.md](docs/SECURITY.md).
@@ -264,6 +279,8 @@ The full model is in [docs/SECURITY.md](docs/SECURITY.md).
 | [SHIPMENTS.md](docs/SHIPMENTS.md) | package tracking: BYOK carrier polling and how a package is identified |
 | [TRACKING.md](docs/TRACKING.md) | opt-in read receipts, self-hosted pixel |
 | [BROKER.md](docs/BROKER.md) | why the consent broker is a dead end, and what replaced it |
+| [RELEASING.md](docs/RELEASING.md) | the four release surfaces, their tags, and what each one gates on |
+| [HOSTED.md](docs/HOSTED.md) | the hosted tier: what was decided, why, and what self-host keeps |
 
 ## License
 

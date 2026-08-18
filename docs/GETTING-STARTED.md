@@ -200,9 +200,27 @@ refusing strangers.
 The first sync takes a while and the mailbox fills in progressively, so an
 initially sparse client is normal rather than broken.
 
+If your NAS wants a real health check rather than a TCP probe, set
+`SQUELCH_METRICS_BIND` (say `0.0.0.0:9464`, published like the main port) and probe
+`GET /healthz` on it: `200` once the sync engine is actually running, `503` until
+then. The doors bind before startup finishes, deliberately, so that a first-run
+model download cannot make them unreachable — which is exactly why "the port
+accepts" is a different question from "it is serving". That listener also carries
+`GET /metrics`, and it is unauthenticated, so keep it on a private interface.
+
 ## 5. Point Passband at it
 
-Build the client from `passband/`:
+Install the Mac app. The released build is signed, notarized, and updates itself,
+which a local build is not and does not:
+
+```sh
+brew install --cask braelyn-ai/tap/passband
+# or download the zip from https://passband.app
+```
+
+Building from source is for working on the app rather than running it, and it is
+what the code-signing notes in the [root README](../README.md#passband-the-client)
+are about:
 
 ```sh
 cd passband

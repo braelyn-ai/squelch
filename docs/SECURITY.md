@@ -2,8 +2,8 @@
 
 One section per surface: the **invariant**, the **enforcement point** (`file:symbol`
 — the line that actually holds it), and **what a maintainer must not break**.
-Verified against the tree on 2026-07-30; stale source comments are flagged, not
-trusted.
+Verified against the tree on 2026-07-30; §6 was written against it on 2026-08-18.
+Stale source comments are flagged, not trusted.
 
 ## 1. HTML sanitization at ingest
 
@@ -470,3 +470,49 @@ pre-echo status quo. The read-back is also capped at **5s**
 already made two serial Gmail calls, so bookkeeping may not spend the rest of that
 budget. Keep the echo's failures audited and swallowed; keep it out of core's write
 surface (the fetch lives in `squelch-api/src/gmail_write.rs`, core takes bytes).
+
+## 6. The embedded assistant
+
+**Invariant.** The agent inside Passband reads only what the human door serves, so
+sealed mail is absent from it for the same reason it is absent from the door; and it
+cannot touch the mailbox without a human tap that has already happened by the time
+the call goes out.
+
+**Enforcement.**
+- **Reads inherit §4.** Every tool call in
+  `passband/Sources/Passband/Assistant/AgentTools.swift` goes through `APIClient`,
+  i.e. `/client/*`. The assistant cannot read a 2FA code because the door it knocks
+  on has none — nothing is filtered here, and nothing needs to be. It holds no
+  sealed tool: `/client/sealed` and the reveal route are not in its inventory.
+- **Three tiers, and only one of them stops.** Fourteen tools: reads are never
+  gated; safe writes touch this database only (status, sender rules, drafts) and are
+  reversible in the app; the four that touch Gmail (archive, label, send,
+  unsubscribe) route through `AgentTools.confirmed(_:_:)`, where only `.approved`
+  reaches `perform`. That single funnel is the entire reason the `confirm: true`
+  those calls carry is a true statement rather than a default.
+- **The daemon does not take the client's word for it.** Every mutating `/client/*`
+  route demands the flag itself and audits the attempt, and a send still meets the
+  outbound secret guard (§5). A client that lied would be recorded doing it.
+- **A half-arrived instruction is not an instruction.**
+  `passband/Sources/Passband/Assistant/Assistant.swift` executes a `tool_use` only
+  after its message has closed, so a partially streamed tool input never runs.
+- **The key.** Self-host is BYOK and the key is read only inside
+  `LLMProxy` (`passband/Sources/Passband/Model/Keychain.swift`) at call time —
+  never a parameter, a return value, or an error string — over sessions that refuse
+  every redirect, because URLSession carries `x-api-key` verbatim across a hop.
+  Hosted holds no key in the app at all: `POST /client/assistant/messages`
+  (`squelch-api/src/assistant.rs`) relays with a daemon-held credential and streams
+  the bytes back, human door only, and 404s when no gateway is configured. The
+  conversation body is treated like mail content and logged in neither direction.
+
+**What a maintainer must not break.**
+- **Prompt injection is the standing threat, and the gate is the answer to it.**
+  Mail bodies reach this model as data, so assume the text is adversarial and
+  assume it will eventually ask for an action. Everything that touches the mailbox
+  must keep going through `confirmed`; a new ungated write is how this section stops
+  being true.
+- Do not hand the assistant a sealed route, and do not "helpfully" widen a tool's
+  read to a store call that bypasses the door.
+- Do not log the relay body, in either direction, at any level.
+- A decline is a legitimate answer with `is_error` false. Do not turn it into a
+  failure the model feels invited to retry.

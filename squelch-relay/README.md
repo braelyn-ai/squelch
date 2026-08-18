@@ -4,10 +4,16 @@
 APNs pusher (`squelch_core::push`) that registers devices on the human door and
 POSTs `/v1/push` for each new event; it is off unless `SQUELCH_RELAY_URL` is set.
 Deployment is a root `Dockerfile` + `railway.toml` (Railway), so the service can
-go up whenever the iOS app needs it. Still nothing in production, and the iOS app
-does not exist yet.
+go up whenever the phone needs it. Still nothing in production, and no `.p8`
+minted.
 
-A tiny, blind APNs relay. It exists so that a future squelch iOS app can receive
+The iOS app now exists — Passband ships to TestFlight from the same source tree
+as the Mac app — but it is not yet the caller this was built for: it registers
+for no push, carries no notification service extension, and so nothing on the
+phone has ever asked this relay for anything. What remains is on the app's side,
+not here.
+
+A tiny, blind APNs relay. It exists so that the Passband iOS app can receive
 push notifications without any user's mail content — or any user's daemon — ever
 touching shared infrastructure beyond a single opaque ping.
 
@@ -26,8 +32,8 @@ events table (SQLite, monotonic id)    <- one source of truth, in squelchd
      └── APNs pusher (this relay)       -> iOS
 ```
 
-The client story is all-Swift: `squelch-client-swift` on macOS today, an iOS
-app later, sharing models and API-client code. On the Mac the app stays
+The client story is all-Swift: `passband`, one source tree with a macOS target
+and an iOS one, sharing models and API-client code. On the Mac the app stays
 resident (window hides on close, the process lingers), holds one SSE connection
 to the human door, and posts through `UNUserNotificationCenter` — no relay
 involved. iOS has no resident-process option: a native app that isn't
@@ -105,7 +111,7 @@ tokens, or payloads.
 SQUELCH_RELAY_APNS_KEY_PATH=/etc/squelch/AuthKey_ABC123.p8 \
 SQUELCH_RELAY_APNS_KEY_ID=ABC123XYZ9 \
 SQUELCH_RELAY_APNS_TEAM_ID=TEAM123456 \
-SQUELCH_RELAY_APNS_TOPICS=dev.squelch.ios \
+SQUELCH_RELAY_APNS_TOPICS=app.passband.client.ios \
 SQUELCH_RELAY_AUTH_TOKEN=$(openssl rand -hex 32) \
   squelch-relay
 ```
@@ -167,7 +173,7 @@ probe and must answer even while a client is being throttled.
   "device_tokens": ["<hex>", "..."],
   "event_id": 4711,
   "collapse_id": "thread-99",
-  "topic": "dev.squelch.ios",
+  "topic": "app.passband.client.ios",
   "environment": "production"
 }
 ```
@@ -242,8 +248,9 @@ need no setup. It is not an Apple credential and never was.
 
 ## Daemon and client integration (lives in the main repo, not here)
 
-In dependency order. **Steps 1-4 are done**; step 4's iOS half (the app, the NSE,
-and the shared rendering package) is what remains.
+In dependency order. **Steps 1-4 are done**; what remains is step 4's phone half
+— push registration in the iOS app, the NSE, and the shared rendering package.
+The app itself exists now; it simply does not speak APNs yet.
 
 1. **Done.** `events` table + triage emission rules + in-process broadcast
    (`squelch-core`). Emission rules decided up front: never on initial
@@ -259,7 +266,7 @@ and the shared rendering package) is what remains.
    through `UNUserNotificationCenter`, notification click focuses the app and
    deep-links to the thread. Residency: last-window-closed does not terminate,
    optional menu bar extra, `SMAppService` login item. The app is already a
-   real bundle (`dev.squelch.client`) so notification authorization just works;
+   real bundle (`app.passband.client`) so notification authorization just works;
    note that re-signing ad-hoc can reset the user's notification permission
    grant.
 4. iOS era. **Daemon half done:** `POST /client/devices` +
@@ -274,7 +281,8 @@ and the shared rendering package) is what remains.
    registered the cursor advances without any request at all. Configured
    entirely by `SQUELCH_RELAY_URL` / `SQUELCH_RELAY_TOKEN` (+ optional
    `SQUELCH_RELAY_TOPIC` / `SQUELCH_RELAY_APNS_ENV`) — no relay URL, no task.
-   **Remaining:** the iOS app itself, the NSE, and the shared rendering package.
+   **Remaining:** device registration and the NSE in the iOS app, plus the
+   shared rendering package. Everything the daemon owes this path is written.
 
 **Per-channel cursors, not a global "delivered" flag** — the Mac's SSE consumer
 and each phone track their own `after=<id>` independently. A single-consumer
