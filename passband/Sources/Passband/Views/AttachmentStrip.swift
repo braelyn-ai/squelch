@@ -109,7 +109,13 @@ struct AttachmentStrip: View {
             // photo attached" is answered by the photo, and the card below is
             // then just where its name and its download live.
             ForEach(inlineImages) { att in
-                InlineImage(attachment: att, onOpen: { openPreview(att) })
+                // Through the SAME gate as the card below. A picture that
+                // decoded is not a picture that may be handed to Quick Look:
+                // `image/png` bytes named `logo.svg` render fine in the column
+                // and would open as an svg, which is a browser engine.
+                InlineImage(
+                    attachment: att,
+                    onOpen: AttachmentKinds.isPreviewable(att) ? { openPreview(att) } : nil)
                     #if os(macOS)
                         .previewSource(att.id, into: $sourceFrames)
                     #endif
@@ -334,7 +340,8 @@ private struct ThumbTile: View {
 /// the two platforms disagree only about what a TAP opens, never about this.
 private struct InlineImage: View {
     let attachment: Attachment
-    let onOpen: () -> Void
+    /// nil when the click is withheld — see `AttachmentKinds.isPreviewable`.
+    let onOpen: (() -> Void)?
 
     @State private var resolved: AttachmentThumbs.Tile?
     @State private var hovering = false
@@ -365,10 +372,13 @@ private struct InlineImage: View {
                             .strokeBorder(Palette.hairline, lineWidth: 1)
                     )
                     .contentShape(Rectangle())
-                    .onTapGesture(perform: onOpen)
-                    .onHover { hovering = $0 }
+                    .onTapGesture { onOpen?() }
+                    .onHover { hovering = onOpen != nil && $0 }
                     .opacity(hovering ? 0.93 : 1)
-                    .help("\(attachment.filename) — click to open")
+                    .help(
+                        onOpen == nil
+                            ? attachment.filename : "\(attachment.filename) — click to open"
+                    )
                     .accessibilityLabel(attachment.filename)
             // A decode we already know fails is NOT a hole in the column: the
             // card below still names the file and still downloads it.

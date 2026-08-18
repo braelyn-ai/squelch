@@ -50,6 +50,15 @@ run_suite attachment-kinds \
   Sources/Passband/Lib/AttachmentKinds.swift \
   Tests/AttachmentKindsTests.swift
 
+# Where a stranger's filename lands on disk, and which renderer draws it. The
+# staging rules are the last thing standing between an attachment named
+# `invoice.html` and WebKit, so they are asserted rather than read.
+run_suite staged-attachment \
+  Sources/Passband/Model/WireTypes.swift \
+  Sources/Passband/Lib/AttachmentKinds.swift \
+  Sources/Passband/Lib/StagedAttachment.swift \
+  Tests/StagedAttachmentTests.swift
+
 run_suite email-images \
   Sources/Passband/Lib/ImageProxy.swift \
   Tests/EmailImagesTests.swift

@@ -40,6 +40,11 @@ final class AppDelegate: NSObject, UIApplicationDelegate {
         _ application: UIApplication,
         didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]? = nil
     ) -> Bool {
+        // The same launch sweep the Mac does, and for the same reason: staged
+        // attachment bytes are torn down when the sheet closes, and a phone that
+        // was jetsammed mid-preview closed nothing. Without this the decrypted
+        // plaintext accumulates in the container across launches.
+        StagedAttachment.purgeRoot()
         MainActor.assumeIsolated {
             Notifier.shared.install()
             Analytics.start()

@@ -64,6 +64,13 @@
 
         private var pendingIndex = 0
         private var fetching: Set<Int> = []
+        /// Who was typing before the preview opened. This view takes first
+        /// responder to drive the panel and has to give it back, or the composer
+        /// the human was mid-sentence in never gets its caret returned.
+        private weak var previousResponder: NSResponder?
+        /// Set across the reload that only asks the panel HOW MANY items there
+        /// are. See `present(_:on:)`.
+        private var counting = false
 
         // Top-left origin, matching SwiftUI, so a measured rect needs no flip.
         override var isFlipped: Bool { true }
@@ -80,6 +87,26 @@
         func setAttachments(_ attachments: [Attachment]) {
             guard attachments.map(\.id) != items.map(\.attachment.id) else { return }
             items = attachments.map(QuickLookItem.init)
+            pendingIndex = min(pendingIndex, max(items.count - 1, 0))
+            // A panel showing THIS strip is now holding a list that changed
+            // under it — a poller refresh landed while it was open. Left alone
+            // it keeps asking for an index that may no longer exist and draws
+            // nothing; there is no notification it reads on its own.
+            guard let panel = livePanel() else { return }
+            guard !items.isEmpty else {
+                panel.orderOut(nil)
+                return
+            }
+            present(min(panel.currentPreviewItemIndex, items.count - 1), on: panel)
+        }
+
+        /// The shared panel, but only when it is up and driven by THIS strip.
+        private func livePanel() -> QLPreviewPanel? {
+            guard QLPreviewPanel.sharedPreviewPanelExists(),
+                let panel = QLPreviewPanel.shared(),
+                panel.isVisible, panel.dataSource === self
+            else { return nil }
+            return panel
         }
 
         // MARK: - opening
@@ -94,16 +121,30 @@
             // read has one and the empty state is never drawn at all.
             stage(index)
             // Then this, because the panel reads the responder chain the moment
-            // it is asked to appear.
+            // it is asked to appear — and remember who had it, because a preview
+            // is a detour and the caret goes back where it was.
+            if let window, window.firstResponder !== self {
+                // Inherit the chain rather than pointing at another strip's
+                // invisible host: an attachment opened in one message and then
+                // in another must still give the caret back to whatever the
+                // human was actually typing in.
+                previousResponder =
+                    (window.firstResponder as? QuickLookHostView)?.previousResponder
+                    ?? window.firstResponder
+            }
             window?.makeFirstResponder(self)
 
             guard let panel = QLPreviewPanel.shared() else { return }
             if panel.isVisible {
                 // Already up on some other strip's attachment: hand it over
                 // rather than opening a second one. There is only ever one panel.
+                // If it switches, `beginPreviewPanelControl` has already put the
+                // index here; if it was ALREADY ours, nothing was called and
+                // this is what moves it.
                 panel.updateController()
-                panel.reloadData()
-                panel.currentPreviewItemIndex = index
+                if livePanel() != nil, items.indices.contains(index) {
+                    panel.currentPreviewItemIndex = index
+                }
             } else {
                 // Calls back into beginPreviewPanelControl, which is where the
                 // data source and the starting index get set.
@@ -123,24 +164,56 @@
             MainActor.assumeIsolated {
                 panel.dataSource = self
                 panel.delegate = self
-                panel.reloadData()
-                panel.currentPreviewItemIndex = pendingIndex
+                present(pendingIndex, on: panel)
             }
         }
 
         override func endPreviewPanelControl(_ panel: QLPreviewPanel!) {
             MainActor.assumeIsolated {
+                // Give the caret back whatever happened; `restoreResponder` is a
+                // no-op unless this view still holds it.
+                restoreResponder()
+                // The rest only if the panel is still OURS. AppKit does not
+                // document whether a handover between two strips ends the old
+                // controller before or after it begins the new one, and an end
+                // that ran second would wipe the data source the other strip had
+                // just installed and drop the pin it had just taken.
+                guard panel.dataSource === self else { return }
                 panel.dataSource = nil
                 panel.delegate = nil
                 unpin()
             }
         }
 
+        /// Point the panel at `index` and make it re-read the list.
+        ///
+        /// TWO RELOADS, with the index between them. `reloadData` asks the data
+        /// source for the item it is about to show AND its neighbours, measured
+        /// from `currentPreviewItemIndex` — which on a panel opening for the
+        /// first time still reads 0. Reloading once and then moving the index
+        /// therefore downloads the first two attachments in the strip before it
+        /// touches the eighth one somebody clicked. Setting the index first is
+        /// not an option either: out of range raises, and the panel does not
+        /// know the count until it has reloaded once.
+        ///
+        /// So: reload for the COUNT with staging suspended, move the index,
+        /// reload for the ITEMS. Correct whether the panel answers a reload
+        /// synchronously or defers it — by the time a deferred callback lands,
+        /// the index it measures from is already the right one.
+        private func present(_ index: Int, on panel: QLPreviewPanel) {
+            guard items.indices.contains(index) else { return }
+            counting = true
+            panel.reloadData()
+            panel.currentPreviewItemIndex = index
+            counting = false
+            panel.reloadData()
+        }
+
         // MARK: - staging
 
         /// Put one item's file in place, fetching it only if the cache has none.
         private func stage(_ index: Int) {
-            guard items.indices.contains(index) else { return }
+            guard !counting, items.indices.contains(index) else { return }
             let item = items[index]
             let id = item.attachment.id
 
@@ -186,6 +259,16 @@
             AttachmentFiles.shared.pinned = nil
         }
 
+        /// Hand first responder back to whoever had it before the preview. Only
+        /// when this view still holds it: another strip taking the panel makes
+        /// ITSELF first responder, and stealing it back would fight over the
+        /// caret rather than return it.
+        private func restoreResponder() {
+            defer { previousResponder = nil }
+            guard let window, window.firstResponder === self else { return }
+            window.makeFirstResponder(previousResponder)
+        }
+
         // MARK: - teardown
 
         override func viewDidMoveToWindow() {
@@ -205,6 +288,7 @@
             panel.delegate = nil
             if panel.isVisible { panel.orderOut(nil) }
             unpin()
+            restoreResponder()
         }
     }
 
@@ -238,6 +322,11 @@
         ) -> NSRect {
             guard let item = item as? QuickLookItem,
                 let frame = sourceFrames[item.attachment.id],
+                // An inline image whose decode failed draws an EmptyView and
+                // still reports its geometry, so its rect is a 0x0 one at some
+                // arbitrary spot. That is not a card to zoom out of; it is the
+                // same "we cannot place this" the fade is for.
+                !frame.isEmpty,
                 let window
             else { return .zero }
             return window.convertToScreen(convert(frame, to: nil))

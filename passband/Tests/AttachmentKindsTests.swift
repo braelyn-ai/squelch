@@ -4,12 +4,19 @@
 // neon sign rendered as a 38pt chip under a message that said "see photo
 // attached". Both answers are asserted here rather than left to a view.
 //
-// The other half is the browser-engine refusal. svg, html, xhtml and webarchives
+// The second half is the browser-engine refusal. svg, html, xhtml and webarchives
 // all render through WebKit, and Quick Look will draw every one of them on ask —
 // so now that previewing is "whatever the OS has a generator for", the ONLY thing
 // standing between a stranger's attachment and a script engine is
 // `isScriptable`. It is asserted from both directions: the spellings that must be
 // caught, and the near-misses that must not be.
+//
+// And it is asserted TWICE, because the mime is not what Quick Look reads. The
+// panel picks its renderer from the file extension, so an attachment named
+// `invoice.html` and declared `application/octet-stream` — which is exactly what
+// the daemon serves it as — clears every mime rule in the file and lands in
+// WebKit anyway. `hasScriptableExtension` is the half that closes that, and it
+// has its own near-misses (`.htmlx`, `.svgx`) to keep it from over-refusing.
 
 import Foundation
 
@@ -23,6 +30,7 @@ struct AttachmentKindsTests {
         photosAreInlineAndPreviewable()
         svgIsNeverRenderable()
         scriptableNeverOpens()
+        aScriptableNameNeverOpens()
         nonImagesStayFiled()
         sizeCeilings()
         undownloadableIsInert()
@@ -129,6 +137,38 @@ struct AttachmentKindsTests {
         }
     }
 
+    /// THE HALF THAT ACTUALLY HOLDS. Quick Look picks its renderer from the
+    /// EXTENSION, so refusing by mime alone refuses nothing: the daemon serves
+    /// everything that is not a photo or a PDF as `application/octet-stream`,
+    /// and a sender is free to call the thing `invoice.html` anyway.
+    private static func aScriptableNameNeverOpens() {
+        for name in [
+            "invoice.html", "invoice.HTM", "page.xhtml", "logo.svg", "logo.svgz",
+            "feed.xml", "mail.webarchive", "mail.mht", "index.shtml", ".html",
+        ] {
+            equal(AttachmentKinds.hasScriptableExtension(name), true, "\(name) names a browser type")
+            // Declared as the generic blob the daemon actually serves. The mime
+            // rule waves this through; the name is what stops it.
+            let blob = att(mime: "application/octet-stream", size: 4_000, filename: name)
+            equal(AttachmentKinds.isScriptable(blob.mime), false, "\(name)'s mime looks inert")
+            equal(AttachmentKinds.isPreviewable(blob), false, "\(name) still does not open")
+        }
+        // The near-misses, which must keep opening.
+        for name in [
+            "IMG_3480.jpeg", "invoice.pdf", "report.docx", "sheet.xlsx", "notes.txt",
+            "README", "a.htmlx", "photo.svgx", "server.xmlrpc",
+        ] {
+            equal(AttachmentKinds.hasScriptableExtension(name), false, "\(name) is not a browser type")
+            let a = att(mime: "application/octet-stream", size: 4_000, filename: name)
+            equal(AttachmentKinds.isPreviewable(a), true, "\(name) opens")
+        }
+        // A real png that a sender named `.svg`: it decodes, so it renders in
+        // the column — and it still may not be handed to a browser engine.
+        let liar = att(mime: "image/png", size: 40_000, filename: "logo.svg")
+        equal(AttachmentKinds.isInline(liar), true, "png bytes render inline whatever the name")
+        equal(AttachmentKinds.isPreviewable(liar), false, "but the name keeps them out of WebKit")
+    }
+
     private static func sizeCeilings() {
         equal(
             AttachmentKinds.isThumbnailable("image/jpeg", AttachmentKinds.thumbMaxBytes), true,
@@ -159,9 +199,11 @@ struct AttachmentKindsTests {
 
     // MARK: - helpers
 
-    private static func att(mime: String, size: Int, downloadable: Bool = true) -> Attachment {
+    private static func att(
+        mime: String, size: Int, downloadable: Bool = true, filename: String = "IMG_3480.jpeg"
+    ) -> Attachment {
         Attachment(
-            id: 1, filename: "IMG_3480.jpeg", mime: mime, size: size, downloadable: downloadable)
+            id: 1, filename: filename, mime: mime, size: size, downloadable: downloadable)
     }
 
     static func equal<T: Equatable>(
