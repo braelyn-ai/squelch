@@ -217,6 +217,16 @@ pub trait Cluster: Send + Sync {
 
     async fn get_deployment(&self, name: &str) -> Result<Option<Deployment>, ClusterError>;
 
+    /// The tenant's Service, if one exists.
+    ///
+    /// ONE caller, and it is a bridge rather than a rule:
+    /// [`crate::provision::Warden::torn_down_before_the_marker`], which has to
+    /// decide what a workload-less tenant carrying NO cancellation marker is,
+    /// on a cluster whose cancelled tenants predate the marker. Intent is read
+    /// from [`crate::objects::CANCELLED_AT_ANNOTATION`] everywhere else, and
+    /// this read goes away with the last unmarked tenant.
+    async fn get_service(&self, name: &str) -> Result<Option<Service>, ClusterError>;
+
     /// Write or remove ONE annotation on a Secret, leaving every other field on
     /// that object exactly as it is. `None` removes it.
     ///
@@ -529,6 +539,10 @@ impl Cluster for KubeCluster {
 
     async fn get_deployment(&self, name: &str) -> Result<Option<Deployment>, ClusterError> {
         optional(self.api::<Deployment>().get(name).await, "get deployment")
+    }
+
+    async fn get_service(&self, name: &str) -> Result<Option<Service>, ClusterError> {
+        optional(self.api::<Service>().get(name).await, "get service")
     }
 
     async fn annotate_secret(

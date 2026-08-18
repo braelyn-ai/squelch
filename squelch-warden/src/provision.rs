@@ -348,6 +348,19 @@ pub enum WardenError {
     /// [`Warden::reconcile`].
     #[error("nothing to reconcile")]
     NotReconcilable,
+    /// The account behind this tenant is CLOSED
+    /// ([`objects::CANCELLED_AT_ANNOTATION`]), so nothing here may put a
+    /// workload up, roll one, or hand out a key to one.
+    ///
+    /// Its own variant rather than a second meaning for
+    /// [`WardenError::NotReconcilable`], because the two want different things
+    /// done about them and one of them is not about shape at all: a cancelled
+    /// account has an EXIT, and it is [`Warden::set_credentials`] - the account
+    /// holder re-consenting. Same 409 on the wire, so the control plane's
+    /// existing handling is unchanged; the word is what changes, in the log and
+    /// in the body.
+    #[error("account cancelled")]
+    Cancelled,
     #[error("{reason}")]
     Cluster { reason: &'static str },
 }
@@ -364,6 +377,18 @@ impl WardenError {
 /// the refusal and the caller that reads it have to agree on the spelling, and a
 /// roll that misread it would halt the fleet on a tenant it merely skipped.
 const RECREATE_REFUSED: &str = "recreate_refused";
+
+/// A tenant with a workload and no sealed credential behind it: a state this
+/// warden never writes, and one it cannot render its way out of.
+///
+/// One constant for the same reason [`RECREATE_REFUSED`] is one: three writers
+/// refuse with it ([`Warden::set_llm_key`], [`Warden::drift`],
+/// [`Warden::reconcile_inner`]) and [`Warden::inspect`] reads it to tell a
+/// tenant that will NEVER be readable from a cluster that has stopped
+/// answering. Those two want opposite things from a fleet roll - one tenant
+/// named for a person, or the whole run stopped - and a misspelling here would
+/// silently pick the wrong one.
+const CREDENTIAL_MISSING: &str = "credential_missing";
 
 /// Log the shape of the failure here and return the machine reason for the
 /// wire.
@@ -540,25 +565,9 @@ impl Warden {
         // re-consenting" has somewhere to go and "somebody is claiming a
         // running mailbox" does not: the mailbox is running on a credential its
         // owner already cancelled, and replacing it is the repair.
-        if !reopening && self.status_of(&name).await? == TenantStatus::Active {
+        let status = self.status_of(&name).await?;
+        if !reopening && status == TenantStatus::Active {
             return Err(WardenError::Conflict);
-        }
-
-        // This is the reopen path, so the cancellation is over, and the marker
-        // comes off BEFORE anything is applied. The order is the same one
-        // `delete` uses in reverse and for the same reason: what a half-finished
-        // call leaves behind has to be readable. Cleared first, a reopen that
-        // dies partway leaves a tenant with no marker and no workload, which is
-        // an unfinished job - true, and the state `Warden::reconcile` will
-        // finish. Cleared last, it would leave a running mailbox still filed as
-        // a cancelled account, which every reader here refuses to touch and no
-        // roll would ever converge again.
-        if reopening {
-            self.cluster
-                .annotate_secret(&name.identity_secret(), objects::CANCELLED_AT_ANNOTATION, None)
-                .await
-                .map_err(|e| fail(name.as_str(), "cancel_marker_failed", &e))?;
-            tracing::info!(tenant = %name, "reopening a cancelled account");
         }
 
         // Verbatim. The warden does not parse, re-serialize or pretty-print
@@ -624,11 +633,54 @@ impl Warden {
         )
         .await?;
 
+        // REPLACING a workload, so the pod that answers `ready_pod` may be the
+        // one this apply just condemned: the strategy is `Recreate`, and the
+        // old pod is Ready and matching this tenant's selector for as long as
+        // it takes to terminate. `squelchd pair` execed into that pod writes a
+        // live pairing code into a container the kubelet is killing, and the
+        // handoff is gone with it. Waiting for the ROLLOUT first is what makes
+        // the next line's answer the new pod; see [`Cluster::rollout_complete`].
+        //
+        // Only when there was something to replace. A signup's first phase two
+        // has no old pod to be confused with, and making every new tenant wait
+        // out `minReadySeconds` as well would spend a good part of the deadline
+        // on a race that cannot happen to it.
+        if matches!(status, TenantStatus::Active | TenantStatus::Failed) {
+            self.cluster
+                .rollout_complete(name.as_str(), self.config.ready_timeout)
+                .await
+                .map_err(|e| fail(name.as_str(), "not_ready", &e))?;
+        }
         let pod = self
             .cluster
             .ready_pod(&objects::pod_selector(&name), self.config.ready_timeout)
             .await
             .map_err(|e| fail(name.as_str(), "not_ready", &e))?;
+
+        // The reopen is DONE, so the marker comes off - and it comes off here,
+        // after the workload this call promised is up, rather than on the way
+        // in. What a half-finished call leaves behind has to be readable, and
+        // the two orders leave opposite things:
+        //
+        // Cleared last, a reopen that dies partway leaves the marker on, over a
+        // tenant whose objects are somewhere between the two states. Every
+        // reader refuses it, which is correct - the account is still closed
+        // until this call says otherwise - and the retry is this same call,
+        // which is exempt from the 409 above for exactly that reason. Nothing
+        // is stuck.
+        //
+        // Cleared FIRST, the same failure leaves a mailbox that is up and
+        // serving on the credential its owner cancelled, with nothing on record
+        // saying anybody cancelled it: `reconcile` converges it, the roll rolls
+        // it, and the closed account is now an ordinary active tenant. That is
+        // the one direction this marker may never fail in.
+        if reopening {
+            self.cluster
+                .annotate_secret(&name.identity_secret(), objects::CANCELLED_AT_ANNOTATION, None)
+                .await
+                .map_err(|e| fail(name.as_str(), "cancel_marker_failed", &e))?;
+            tracing::info!(tenant = %name, "reopened a cancelled account");
+        }
 
         let pairing = self.mint_pairing(&name, &pod).await?;
         tracing::info!(tenant = %name, "tenant provisioned");
@@ -686,8 +738,27 @@ impl Warden {
         let assistant_api_key = raw_assistant_api_key
             .map(validate::validate_llm_api_key)
             .transpose()?;
-        if self.identity(&name).await?.is_none() {
+        let Some(identity) = self.identity(&name).await? else {
             return Err(WardenError::NotFound);
+        };
+        // Intent before shape, the same order `reconcile` and the roll use. Two
+        // things happen below and a closed account may have neither: a live
+        // gateway credential is stored against it, and - if a teardown stopped
+        // partway and left the Deployment standing - that Deployment is
+        // re-rendered and re-applied, which rolls the pod of a mailbox its owner
+        // closed. `delete` removes the LLM Secret precisely because the key is a
+        // credential rather than tenant data, so writing one back here would
+        // undo the teardown's one irreversible step.
+        //
+        // Reopening is `set_credentials`, and the control plane mints a fresh
+        // key for a reopened account anyway; a key stored against a cancelled
+        // one would be a revoked token waiting to roll a pod.
+        if is_cancelled(&identity) {
+            tracing::warn!(
+                tenant = %name,
+                "refusing to store an llm key for a cancelled account"
+            );
+            return Err(WardenError::Cancelled);
         }
 
         // The union with what is already stored: the apply below force-owns
@@ -744,10 +815,10 @@ impl Warden {
                 // a hash of nothing.
                 tracing::error!(
                     tenant = %name,
-                    reason = "credential_missing",
+                    reason = CREDENTIAL_MISSING,
                     "a workload exists but its credential Secret does not"
                 );
-                return Err(WardenError::cluster("credential_missing"));
+                return Err(WardenError::cluster(CREDENTIAL_MISSING));
             };
             self.apply(
                 &name,
@@ -774,18 +845,48 @@ impl Warden {
     /// Re-mint a pairing code for a later device. Nothing else about the tenant
     /// is touched, and the previous code is superseded, which is the daemon's
     /// documented behaviour: one live pairing code per account.
+    ///
+    /// A CANCELLED account is refused, and this is the route where that matters
+    /// most. A pairing code is full access to a mailbox, so the one thing a
+    /// closed account may never produce is a fresh one - and a teardown that
+    /// stopped partway leaves exactly the tenant this route would otherwise
+    /// serve: the marker written, the Deployment still up, a pod still Ready.
+    /// The shape says "here is a running tenant"; only
+    /// [`objects::CANCELLED_AT_ANNOTATION`] says whose it still is.
     pub async fn repair(&self, raw_label: &str) -> Result<Pairing, WardenError> {
         let name = TenantName::parse(raw_label)?;
-        if self.identity(&name).await?.is_none() {
+        let Some(identity) = self.identity(&name).await? else {
             return Err(WardenError::NotFound);
+        };
+        if is_cancelled(&identity) {
+            tracing::warn!(
+                tenant = %name,
+                "refusing to mint a pairing code for a cancelled account; \
+                 reopening one is a re-consent"
+            );
+            return Err(WardenError::Cancelled);
         }
+        // The pod that is going to SURVIVE. This route applies nothing, but
+        // something else may be mid-apply on this tenant right now - a roll, or
+        // an operator's reconcile - and under `Recreate` the pod being replaced
+        // stays Ready and stays in this selector until it terminates. A code
+        // minted in that one is a code that dies with it. Waiting the rollout
+        // out costs a call on a settled tenant and answers at once
+        // ([`Cluster::rollout_complete`] reads four integers), and a tenant with
+        // no Deployment at all fails here immediately rather than spending the
+        // whole deadline waiting for a pod nothing is going to create.
+        //
+        // A known tenant with nothing running is not a 404 (the tenant exists)
+        // and not a 409 (nothing conflicts); it is this cluster being unable to
+        // do the thing right now.
+        self.cluster
+            .rollout_complete(name.as_str(), self.config.ready_timeout)
+            .await
+            .map_err(|e| fail(name.as_str(), "no_ready_pod", &e))?;
         let pod = self
             .cluster
             .ready_pod(&objects::pod_selector(&name), self.config.ready_timeout)
             .await
-            // A known tenant with nothing running is not a 404 (the tenant
-            // exists) and not a 409 (nothing conflicts); it is this cluster
-            // being unable to do the thing right now.
             .map_err(|e| fail(name.as_str(), "no_ready_pod", &e))?;
         self.mint_pairing(&name, &pod).await
     }
@@ -822,15 +923,25 @@ impl Warden {
         if self.identity(&name).await?.is_none() {
             return Err(WardenError::NotFound);
         }
-        // Two reads of the same object rather than one shared one:
-        // `status_of` is the single definition of what the four words mean,
-        // and a diagnostic route can afford the second GET.
-        let status = self.status_of(&name).await?;
-        let live = self
-            .cluster
-            .get_deployment(name.as_str())
-            .await
-            .map_err(|e| fail(name.as_str(), "cluster_unavailable", &e))?;
+        let (live, status) = self.workload(&name).await?;
+        self.drift_of(&name, status, live).await
+    }
+
+    /// [`Warden::drift`]'s body, over a Deployment and a status word the caller
+    /// has already read.
+    ///
+    /// Split out for [`Warden::inspect`], which reads both to reach its own
+    /// verdict and would otherwise pay for them twice - and it walks the WHOLE
+    /// FLEET every tick, where the public route runs once for one label. Passing
+    /// the reads in also means one tenant's verdict is decided from ONE view of
+    /// it: a Deployment deleted between two reads cannot leave the status word
+    /// and the report disagreeing about whether there is a workload.
+    async fn drift_of(
+        &self,
+        name: &TenantName,
+        status: TenantStatus,
+        live: Option<Deployment>,
+    ) -> Result<DriftReport, WardenError> {
         let Some(live) = live else {
             return Ok(DriftReport {
                 status: status.as_str(),
@@ -853,16 +964,16 @@ impl Warden {
             // render to compare the live object with.
             tracing::error!(
                 tenant = %name,
-                reason = "credential_missing",
+                reason = CREDENTIAL_MISSING,
                 "a workload exists but its credential Secret does not"
             );
-            return Err(WardenError::cluster("credential_missing"));
+            return Err(WardenError::cluster(CREDENTIAL_MISSING));
         };
-        let llm_hash = self.llm_hash(&name).await?;
+        let llm_hash = self.llm_hash(name).await?;
 
         let rendered = objects::deployment(
             &self.config,
-            &name,
+            name,
             &objects::credential_hash(&ciphertext),
             llm_hash.as_deref(),
         );
@@ -954,8 +1065,8 @@ impl Warden {
     /// never had a workload, and bringing one up is a signup to finish with
     /// [`Warden::set_credentials`], not a shape to converge.
     ///
-    /// A CANCELLED tenant is [`WardenError::NotReconcilable`] whatever its
-    /// status word and whatever objects are still standing, because
+    /// A CANCELLED tenant is [`WardenError::Cancelled`] whatever its status word
+    /// and whatever objects are still standing, because
     /// [`objects::CANCELLED_AT_ANNOTATION`] is the account holder's decision
     /// written down and no shape repair overrides one. That covers the state
     /// this route used to guess at - a teardown that stopped partway, leaving a
@@ -964,10 +1075,20 @@ impl Warden {
     /// onto the internet. Reopening is [`Warden::set_credentials`], which clears
     /// the marker.
     ///
+    /// The marker is asked THREE times, and the two extra reads are the two
+    /// windows this route cannot close by asking once: the apply window, where
+    /// the Deployment goes away between the read and the write, and the rollout
+    /// wait, which is a whole `ready_timeout` wide. Each one re-reads the marker
+    /// rather than guessing from the missing workload.
+    ///
     /// [`TenantStatus::Stopped`] WITHOUT the marker is a job nobody finished,
     /// and it proceeds: the credential and the volume are where they were and
     /// only the workload is missing, which is exactly what the delete-recreate
-    /// window above leaves behind.
+    /// window above leaves behind. With ONE exception, and it is a migration
+    /// rather than a rule - a tenant cancelled before the marker existed reads
+    /// exactly like that too, and [`Warden::torn_down_before_the_marker`] is
+    /// what keeps this route from resurrecting one on the first tick after the
+    /// deploy.
     ///
     /// Secrets are never rewritten. This converges SHAPE; identities,
     /// credentials and keys are what they were when it started, and the two
@@ -1030,13 +1151,25 @@ impl Warden {
                 tenant = %name,
                 "refusing to reconcile a cancelled account; reopening one is a re-consent"
             );
-            return Err(WardenError::NotReconcilable);
+            return Err(WardenError::Cancelled);
         }
         match self.status_of(&name).await? {
             TenantStatus::Active | TenantStatus::Failed => {}
             // Stopped with nothing recording a cancellation: a job that did not
-            // finish, and finishing it is the whole point of the route.
+            // finish, and finishing it is the whole point of the route - unless
+            // this tenant was cancelled before there was a marker to record it
+            // with, which is what the bridge above answers. See
+            // [`Warden::torn_down_before_the_marker`]; the reads either side of
+            // it are the whole reason it is asked here and not at the top.
             TenantStatus::Stopped => {
+                if self.torn_down_before_the_marker(&name).await? {
+                    tracing::warn!(
+                        tenant = %name,
+                        "refusing to rebuild a workload nothing routes and nothing claims; \
+                         a teardown that predates the cancellation marker looks exactly like this"
+                    );
+                    return Err(WardenError::Cancelled);
+                }
                 tracing::info!(
                     tenant = %name,
                     "resuming a reconcile that did not finish; nothing cancelled this tenant"
@@ -1121,7 +1254,7 @@ impl Warden {
                         tenant = %name,
                         "the workload was deleted while reconciling; refusing to rebuild it"
                     );
-                    return Err(WardenError::NotReconcilable);
+                    return Err(WardenError::Cancelled);
                 }
                 "created"
             }
@@ -1209,10 +1342,32 @@ impl Warden {
         // serving, which is what a caller acting on the answer - the fleet
         // roll in [`Warden::roll`], stepping to the next tenant - is entitled
         // to assume it means.
-        self.cluster
+        //
+        // The window this wait opens is the WIDEST one on the route - a whole
+        // `ready_timeout`, where the apply window above is a few API calls - so
+        // the same question gets asked a third time on the way out. A
+        // [`ClusterError::NoPod`] here means the Deployment went away while the
+        // rollout was being watched, and the only thing that deletes a live
+        // tenant's workload is a cancellation. Reported as a cluster failure it
+        // would halt the whole fleet roll and page somebody at midnight to
+        // discover that an account holder closed their account, which is the
+        // system working; reported as what it is, the roll files it as a skip
+        // and moves on. See [`Warden::roll`].
+        if let Err(e) = self
+            .cluster
             .rollout_complete(name.as_str(), self.config.ready_timeout)
             .await
-            .map_err(|e| fail(name.as_str(), "not_ready", &e))?;
+        {
+            if matches!(e, ClusterError::NoPod) && self.cancelled(&name).await.unwrap_or(false) {
+                tracing::warn!(
+                    tenant = %name,
+                    "the workload was deleted while its rollout was being watched; \
+                     the account was cancelled under this reconcile"
+                );
+                return Err(WardenError::Cancelled);
+            }
+            return Err(fail(name.as_str(), "not_ready", &e));
+        }
 
         tracing::info!(tenant = %name, deployment = outcome, "tenant reconciled");
         Ok(Reconciled::new(outcome))
@@ -1885,6 +2040,21 @@ impl Warden {
 
     /// Derive the status from what exists. See [`TenantStatus`].
     async fn status_of(&self, name: &TenantName) -> Result<TenantStatus, WardenError> {
+        Ok(self.workload(name).await?.1)
+    }
+
+    /// The tenant's Deployment and the status word it implies, from one read of
+    /// it.
+    ///
+    /// [`Warden::status_of`] is still the single definition of what the four
+    /// words mean; this is that definition plus the object it was derived from,
+    /// for the callers that need both. Handing back the Deployment is what lets
+    /// [`Warden::inspect`] and [`Warden::drift`] reach a verdict without a
+    /// second GET of an object they are already holding.
+    async fn workload(
+        &self,
+        name: &TenantName,
+    ) -> Result<(Option<Deployment>, TenantStatus), WardenError> {
         let deployment = self
             .cluster
             .get_deployment(name.as_str())
@@ -1894,13 +2064,15 @@ impl Warden {
         if let Some(deployment) = deployment {
             let ready = deployment
                 .status
+                .as_ref()
                 .and_then(|s| s.ready_replicas)
                 .unwrap_or(0);
-            return Ok(if ready >= 1 {
+            let status = if ready >= 1 {
                 TenantStatus::Active
             } else {
                 TenantStatus::Failed
-            });
+            };
+            return Ok((Some(deployment), status));
         }
         // No workload. Whether that is "never started" or "deleted" is the
         // difference between a signup to finish and an account to reopen, and
@@ -1910,11 +2082,57 @@ impl Warden {
             .get_secret(&name.credential_secret())
             .await
             .map_err(|e| fail(name.as_str(), "cluster_unavailable", &e))?;
-        Ok(if sealed.is_some() {
-            TenantStatus::Stopped
-        } else {
-            TenantStatus::Pending
-        })
+        Ok((
+            None,
+            if sealed.is_some() {
+                TenantStatus::Stopped
+            } else {
+                TenantStatus::Pending
+            },
+        ))
+    }
+
+    /// Whether a workload-less tenant that carries NO cancellation marker was
+    /// torn down by a `delete` that ran before the marker existed.
+    ///
+    /// A MIGRATION BRIDGE, and the last place in this file that reads intent out
+    /// of shape. Every tenant cancelled from now on carries
+    /// [`objects::CANCELLED_AT_ANNOTATION`], because [`Warden::delete`] writes
+    /// it before it removes anything and refuses to remove anything if it
+    /// cannot. Tenants cancelled by the warden this one replaces carry nothing:
+    /// their identity Secret is intact, their credential is sealed, their
+    /// Deployment is gone, and they are byte-for-byte indistinguishable from a
+    /// reconcile that died in its own delete-recreate window. Without this, the
+    /// first tick after the deploy reads every one of them as a job to finish
+    /// and puts a closed mailbox back on the internet on its stored credential.
+    ///
+    /// The signal is the one the old warden used, and it is sound in the
+    /// direction that refuses:
+    ///
+    /// - Every path that puts a workload up applies the SERVICE FIRST -
+    ///   [`Warden::set_credentials`] and [`Warden::reconcile`] both - so a call
+    ///   that died anywhere near the Deployment left the Service standing.
+    /// - Every teardown takes the Service BEFORE the Deployment, in both the old
+    ///   order and the current one, so a teardown that got as far as removing
+    ///   the workload had already removed the Service.
+    ///
+    /// So a Service standing over a missing Deployment is a job to finish, and
+    /// its ABSENCE is a teardown - which is the reading this returns. The
+    /// Ingress would not do: it is the object an operator is most likely to have
+    /// applied by hand, and a hand-applied Ingress must not read as consent to
+    /// restart a cancelled mailbox.
+    ///
+    /// Delete this, its `get` on services in `deploy/hosted/10-warden-rbac.yaml`
+    /// and [`Cluster::get_service`] together, once no tenant cancelled by the
+    /// old warden is left. Until then it costs one GET on the one path that
+    /// reaches it: a tenant with no workload and no marker.
+    async fn torn_down_before_the_marker(&self, name: &TenantName) -> Result<bool, WardenError> {
+        Ok(self
+            .cluster
+            .get_service(name.as_str())
+            .await
+            .map_err(|e| fail(name.as_str(), "cluster_unavailable", &e))?
+            .is_none())
     }
 
     async fn apply(

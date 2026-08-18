@@ -25,7 +25,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use k8s_openapi::ByteString;
 use k8s_openapi::api::apps::v1::{Deployment, DeploymentStatus};
-use k8s_openapi::api::core::v1::Secret;
+use k8s_openapi::api::core::v1::{Secret, Service};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{FieldsV1, ManagedFieldsEntry};
 
 use crate::cluster::{Cluster, ClusterError, ExecOutput, Kind, Object, rolled_out};
@@ -521,6 +521,16 @@ impl Cluster for MockCluster {
         }
         Ok(match self.object(Kind::Deployment, name) {
             Some(Object::Deployment(deployment)) => Some(*deployment),
+            _ => None,
+        })
+    }
+
+    async fn get_service(&self, name: &str) -> Result<Option<Service>, ClusterError> {
+        if !self.lock().reads_ok {
+            return Err(ClusterError::NoPod);
+        }
+        Ok(match self.object(Kind::Service, name) {
+            Some(Object::Service(service)) => Some(*service),
             _ => None,
         })
     }

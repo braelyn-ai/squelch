@@ -127,6 +127,10 @@ everything in "Self-host compatibility" below applies the moment you push it.
 
 ## Surface 2: hosted carrier rollout
 
+**The step-by-step is `deploy/hosted/ROLLOUT.md`** — preflight, the four pins,
+the apply order, what converging looks like, and what each failure means. What
+follows here is the shape of it; that page is what to have open while you do it.
+
 The order matters: images first (above), then the box.
 
 ```sh

@@ -375,6 +375,9 @@ mailbox is down for the length of a provision.
 
 ## Rolling the daemon image
 
+> **Doing one right now?** `ROLLOUT.md` is the checklist, in order, with the
+> commands. This section is why it is shaped that way.
+
 Three steps, and only the middle one is a decision.
 
 1. **CI publishes.** A `daemon-X.Y.Z` tag builds
