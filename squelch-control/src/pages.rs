@@ -321,7 +321,11 @@ a.button {{ display: inline-block; margin: 0.25rem 0 1.25rem; padding: 0.65rem 1
    light-mode Passband to match it to. That is why every colour the dark media
    query above sets is RESTATED here instead of being inherited from it, which
    would leave this page reading as warm paper for anybody whose OS is light. */
-body.console {{ background: #0f0f10; color: #f5f5f7; }}
+/* THE ACCENT COMES WITH THE GROUND. `--brand` is the mark's ink ramp on light
+   and its lit ramp on dark, chosen by the media query above; this surface is
+   dark in BOTH, so it must state the dark one or a light-mode operator gets the
+   ink ramp on a near-black field. */
+body.console {{ --brand: #7cc8eb; background: #0f0f10; color: #f5f5f7; }}
 /* Wider ONLY when there is a board to lay out, the same way the base sheet
    above widens for a table. The login door is one field, and a credential
    stretched across fifty-four rems reads as a page that lost its layout. */
@@ -363,11 +367,15 @@ body.console :is(td.act, th:last-child) {{ width: 1%; white-space: nowrap;
    them and the eye lands on it. (The direct-invite form at the foot of the page
    is filled too, and should be: it is a form's submit, not one of forty
    identical row actions, and it competes with nothing above it.) */
-body.console .flag {{ display: inline-block; margin-right: 0.6rem;
-  padding: 0.12rem 0.55rem; border-radius: 999px; color: #f2b8b5;
-  border: 1px solid rgba(242, 184, 181, 0.35);
+body.console :is(.flag, .done) {{ display: inline-block; margin-right: 0.55rem;
+  padding: 0.12rem 0.55rem; border-radius: 999px; border: 1px solid;
   font-size: 0.72rem; font-weight: 600; letter-spacing: 0.06em;
   text-transform: uppercase; }}
+body.console .flag {{ color: #f2b8b5; border-color: rgba(242, 184, 181, 0.35); }}
+/* The other end of the funnel, and the reason this column exists: the invite
+   was spent, so there is a mailbox. Quieter than the red one, because a board
+   should draw the eye to what is broken before what worked. */
+body.console .done {{ color: var(--brand); border-color: rgba(124, 200, 235, 0.3); }}
 /* The direct invite: field and button on one row, at the foot of the board.
    It used to sit BETWEEN the two lists, which split the one thing this page is
    for (reading down a list of people) into two halves either side of a form. */
@@ -754,19 +762,43 @@ pub fn admin_page(
             // case (the mail went out; the button is there for the person who
             // lost it), and a missing one is the loud case: this row is
             // approved and nobody was told.
-            let outcome = match r.notified_at {
-                Some(at) => format!(
+            // THREE STATES, AND THE LAST ONE IS THE POINT OF THE COLUMN.
+            //
+            // Redemption was always in the store (`invite_codes.used_at`, joined
+            // on in `list_waitlist`) and the re-send handler already refused a
+            // spent code with INVITE_SPENT. What was missing was SAYING so: the
+            // only way to learn somebody had signed up was to press a button and
+            // read the refusal. Now the board says it, and offers NO button on
+            // that row, because the one it used to offer could only ever fail.
+            //
+            // No button is the honest answer rather than a tidy one. A spent
+            // code means a mailbox exists, and minting a second for the same
+            // person is a tenant nobody approved, which is what the handler's
+            // refusal is there to stop.
+            let outcome = if let Some(at) = r.accepted_at {
+                let label = r
+                    .accepted_label
+                    .as_deref()
+                    .map(|l| format!(" <code>{}</code>", escape_html(l)))
+                    .unwrap_or_default();
+                format!(
+                    r#"<span class="done">signed up</span><span class="muted">{}</span>{label}"#,
+                    day(at),
+                )
+            } else if let Some(at) = r.notified_at {
+                format!(
                     r#"<span class="muted">Invited {}</span> {}"#,
                     day(at),
                     action_form("/admin/send", r.id, "Re-send", true),
-                ),
+                )
+            } else {
                 // A PILL, not the `.stop` rule. `.stop` is a left border meant
                 // for a whole paragraph, and inline beside a button it drew a
                 // stray red tick that ran into the label next to it.
-                None => format!(
+                format!(
                     r#"<span class="flag">email not sent</span>{}"#,
                     action_form("/admin/send", r.id, "Send invite", false),
-                ),
+                )
             };
             let approved_on = r
                 .approved_at
@@ -786,7 +818,8 @@ pub fn admin_page(
         "Waitlist",
         &format!(
             r#"<h1>Waitlist</h1>
-<p class="tally">{waiting_count} waiting, {approved_count} approved recently</p>
+<p class="tally">{waiting_count} waiting, {approved_count} approved recently,
+{accepted_count} of those signed up</p>
 {error_html}
 <h2>Waiting</h2>
 <p class="hint">Approving mints one invite code and emails it. The code works
@@ -802,18 +835,20 @@ once and expires in {ttl} days.</p>
 <button type="submit">Mint and email an invite</button>
 </form>
 <p class="hint">They do not have to be on the list. The address lands under
-Approved above, with the same re-send button as everybody else. Nothing here can
-read a code back out, so a lost invite is replaced rather than resent.</p>"#,
+Approved above and is tracked from there like everybody else. Nothing here can
+read a code back out, so a lost invite is replaced rather than resent, and a
+code that was already spent is not replaced at all.</p>"#,
             error_html = stop_note(error),
             waiting_count = pending.len(),
             approved_count = approved.len(),
+            accepted_count = approved.iter().filter(|r| r.accepted_at.is_some()).count(),
             waiting_table = table(
                 r#"<th>Email</th><th>Joined</th><th></th>"#,
                 &waiting,
                 "Nobody is waiting.",
             ),
             history_table = table(
-                r#"<th>Email</th><th>Dates</th><th>Invite</th>"#,
+                r#"<th>Email</th><th>Dates</th><th>Outcome</th>"#,
                 &history,
                 "Nobody has been approved yet.",
             ),
@@ -891,6 +926,24 @@ mod tests {
 
     async fn body_of(r: Response) -> String {
         String::from_utf8(to_bytes(r.into_body(), 1 << 20).await.unwrap().to_vec()).unwrap()
+    }
+
+    /// The rendered page WITHOUT the shell's stylesheet: what a reader can
+    /// actually see.
+    ///
+    /// USE THIS FOR ANY "MUST NOT APPEAR" ASSERTION. Every page here renders
+    /// through the one shell in [`render`], inline stylesheet and comments and
+    /// all, so a negative match against the whole response is really a match
+    /// against whatever those comments happen to say this week. That has broken
+    /// three separate assertions already: a comment about the signup form, one
+    /// about the admin board's `.invite` row, and one about re-sending being the
+    /// rarer errand. None of the three was ever about the stylesheet.
+    async fn document_of(r: Response) -> String {
+        let html = body_of(r).await;
+        html.split_once("</style>")
+            .expect("every page carries the shell's stylesheet")
+            .1
+            .to_string()
     }
 
     #[test]
@@ -1103,6 +1156,18 @@ mod tests {
             approved_at: Some(at),
             invite_id: Some(7),
             notified_at: notified.then_some(at),
+            accepted_at: None,
+            accepted_label: None,
+        }
+    }
+
+    /// The same row after they spent the code: a mailbox exists.
+    fn accepted_row(id: i64, email: &str, label: &str) -> WaitlistRow {
+        let at = DateTime::from_timestamp(1_767_225_600, 0).unwrap();
+        WaitlistRow {
+            accepted_at: Some(at),
+            accepted_label: Some(label.to_string()),
+            ..row(id, email, true)
         }
     }
 
@@ -1169,6 +1234,43 @@ mod tests {
         assert!(waiting.contains(r#"action="/admin/approve""#), "{waiting}");
         // No JavaScript on this page either: a button that acts is a form.
         assert!(!waiting.contains("<script"), "{waiting}");
+    }
+
+    /// THE FAR END OF THE FUNNEL, which the board could not show at all before
+    /// the redemption join: an invite that was spent means a mailbox, and the
+    /// row says which one.
+    ///
+    /// NO BUTTON ON THAT ROW. `admin::send` refuses a spent code (INVITE_SPENT)
+    /// because a second code for somebody who already has a mailbox is a tenant
+    /// nobody approved, so offering the press was offering a guaranteed
+    /// refusal, and pressing it was the only way to discover they had signed up.
+    #[tokio::test]
+    async fn a_spent_invite_says_which_mailbox_it_became_and_offers_no_button() {
+        let html = document_of(admin_page(
+            &[],
+            &[accepted_row(1, "ada@example.com", "ada")],
+            None,
+        ))
+        .await;
+        assert!(html.contains(r#"<span class="done">signed up</span>"#), "{html}");
+        assert!(html.contains("<code>ada</code>"), "{html}");
+        assert!(html.contains("1 of those signed up"), "{html}");
+        // The whole point: no press, and nothing that could mint a second code.
+        assert!(!html.contains("Re-send"), "{html}");
+        assert!(!html.contains("/admin/send"), "{html}");
+
+        // An outstanding invite is unchanged: still offered, still quiet.
+        let waiting_on_them =
+            document_of(admin_page(&[], &[row(1, "ada@example.com", true)], None)).await;
+        assert!(waiting_on_them.contains("Re-send"), "{waiting_on_them}");
+        assert!(
+            !waiting_on_them.contains("signed up</span>"),
+            "{waiting_on_them}"
+        );
+        assert!(
+            waiting_on_them.contains("0 of those signed up"),
+            "{waiting_on_them}"
+        );
     }
 
     /// The door names nothing that is behind it, and a refusal is a 401 rather

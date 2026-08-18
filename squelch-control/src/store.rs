@@ -188,6 +188,18 @@ pub struct WaitlistRow {
     /// When the invite email was accepted for delivery. `None` on an approved
     /// row is the "email not sent" case.
     pub notified_at: Option<DateTime<Utc>>,
+    /// When this row's invite was SPENT, from the code it was minted: the
+    /// moment somebody finished signup and a mailbox came into existence.
+    ///
+    /// Joined rather than stored, because `invite_codes` is already the one
+    /// place redemption is written and a copy here would be a second truth to
+    /// keep in step. `None` means the code is still outstanding (or the row was
+    /// never approved, or its code was revoked from the CLI and the row now
+    /// points at nothing).
+    pub accepted_at: Option<DateTime<Utc>>,
+    /// The mailbox that code became, by label. Present exactly when
+    /// [`Self::accepted_at`] is.
+    pub accepted_label: Option<String>,
 }
 
 /// One tenant row.
@@ -694,14 +706,16 @@ impl ControlStore {
         let conn = self.lock();
         let mut rows = select_waitlist(
             &conn,
-            "SELECT id, email, created_at, status, approved_at, invite_id, notified_at
-               FROM waitlist WHERE status = ?1 ORDER BY id ASC LIMIT ?2",
+            &format!(
+                "SELECT {WAITLIST_COLUMNS} WHERE w.status = ?1 ORDER BY w.id ASC LIMIT ?2"
+            ),
             params![WAITLIST_PENDING, WAITLIST_PENDING_LIMIT],
         )?;
         rows.extend(select_waitlist(
             &conn,
-            "SELECT id, email, created_at, status, approved_at, invite_id, notified_at
-               FROM waitlist WHERE status <> ?1 ORDER BY id DESC LIMIT ?2",
+            &format!(
+                "SELECT {WAITLIST_COLUMNS} WHERE w.status <> ?1 ORDER BY w.id DESC LIMIT ?2"
+            ),
             params![WAITLIST_PENDING, WAITLIST_APPROVED_LIMIT],
         )?);
         Ok(rows)
@@ -712,8 +726,7 @@ impl ControlStore {
         Ok(self
             .lock()
             .query_row(
-                "SELECT id, email, created_at, status, approved_at, invite_id, notified_at
-                   FROM waitlist WHERE id = ?1",
+                &format!("SELECT {WAITLIST_COLUMNS} WHERE w.id = ?1"),
                 params![id],
                 waitlist_row,
             )
@@ -813,8 +826,22 @@ fn waitlist_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<WaitlistRow> {
         approved_at: r.get::<_, Option<String>>(4)?.map(parse_ts),
         invite_id: r.get(5)?,
         notified_at: r.get::<_, Option<String>>(6)?.map(parse_ts),
+        accepted_at: r.get::<_, Option<String>>(7)?.map(parse_ts),
+        accepted_label: r.get(8)?,
     })
 }
+
+/// The columns every waitlist statement selects, in the order
+/// [`waitlist_row`] reads them.
+///
+/// The LEFT JOIN is what makes redemption visible without a second round trip
+/// and without a column of its own: `invite_codes` already records who spent a
+/// code and when, and `waitlist.invite_id` already points at the row. LEFT, not
+/// inner, because a pending row has no invite and an approved row whose code
+/// was revoked from the CLI points at nothing; both must still be listed.
+const WAITLIST_COLUMNS: &str = "w.id, w.email, w.created_at, w.status, w.approved_at,
+        w.invite_id, w.notified_at, i.used_at, i.used_by_label
+   FROM waitlist w LEFT JOIN invite_codes i ON i.id = w.invite_id";
 
 /// Bring an older store's `invite_codes` up to the schema above.
 ///
