@@ -1,4 +1,11 @@
-import { useEffect, useMemo, useRef, useState, type FormEvent } from "react";
+import {
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type FormEvent,
+  type PointerEvent,
+} from "react";
 
 // The background is a procedurally repeated fake inbox: the drudgery Passband
 // exists to kill, blurred into wallpaper so the pitch sits on top of it.
@@ -140,37 +147,44 @@ const styles = {
     lineHeight: 1.5,
     textAlign: "center",
   },
-  pill: {
-    padding: "0.28rem 0.8rem",
-    borderRadius: "999px",
-    border: "1px solid #3a3a3f",
-    color: "#b8b8bd",
-    fontSize: "0.75rem",
-    background: "transparent",
-    fontFamily: "inherit",
-  },
+  // A COLUMN, not a row. The join button is the same piece of hardware the
+  // landing page leads with, and that button is far too tall to stand beside a
+  // text field without one of the two looking wrong.
   waitlistForm: {
     display: "flex",
-    flexWrap: "wrap",
-    alignItems: "center",
-    justifyContent: "center",
-    gap: "0.5rem",
+    flexDirection: "column",
+    alignSelf: "stretch",
+    gap: "0.55rem",
   },
   waitlistInput: {
-    padding: "0.4rem 0.75rem",
+    padding: "0.55rem 0.8rem",
     borderRadius: "0.6rem",
     border: "1px solid rgba(255, 255, 255, 0.14)",
     background: "rgba(255, 255, 255, 0.04)",
     color: "#f5f5f7",
-    fontSize: "0.9rem",
+    fontSize: "0.95rem",
     fontFamily: "inherit",
-    minWidth: "15rem",
+    width: "100%",
+    boxSizing: "border-box",
   },
   status: {
     margin: 0,
     color: "#b8b8bd",
     fontSize: "0.9rem",
     textAlign: "center",
+  },
+  // The line under the button, for the people the button is not for: anyone
+  // holding an invite already, who would otherwise find the homepage a dead
+  // end now that the download has moved into the flow behind it.
+  note: {
+    margin: "0.4rem 0 0",
+    color: "#8a8a90",
+    fontSize: "0.85rem",
+    textAlign: "center",
+  },
+  noteLink: {
+    color: "#b8b8bd",
+    textUnderlineOffset: "0.15em",
   },
   corner: {
     position: "absolute",
@@ -270,21 +284,25 @@ const BRASS = "240, 204, 128";
 // limit from it and the draw loop sizes the curve from it.
 const FULL_W = 0.19;
 
-const DOWNLOAD_CSS = `
-.pb-dl {
+const CTA_CSS = `
+.pb-cta {
   position: relative;
   isolation: isolate;
   display: inline-flex;
   align-items: center;
+  justify-content: center;
   gap: 0.6rem;
   margin-top: 0.65rem;
   padding: 0.9rem 1.9rem 1.3rem;
   border-radius: 0.9rem;
   overflow: hidden;
   text-decoration: none;
+  font-family: inherit;
   font-size: 0.95rem;
   font-weight: 600;
   letter-spacing: 0.015em;
+  cursor: pointer;
+  appearance: none;
   color: #e9e2d4;
   background: linear-gradient(180deg, #1e1e22, #131315);
   border: 1px solid rgba(${BRASS}, 0.22);
@@ -297,8 +315,8 @@ const DOWNLOAD_CSS = `
     box-shadow 0.4s ease,
     color 0.4s ease;
 }
-.pb-dl:hover,
-.pb-dl:focus-visible {
+.pb-cta:hover,
+.pb-cta:focus-visible {
   color: #fff6e4;
   transform: translateY(-2px);
   border-color: rgba(${BRASS}, 0.62);
@@ -307,13 +325,13 @@ const DOWNLOAD_CSS = `
     0 0 34px -6px rgba(${BRASS}, 0.45),
     0 16px 38px rgba(0, 0, 0, 0.55);
 }
-.pb-dl:active { transform: translateY(0) scale(0.995); }
-.pb-dl:focus-visible {
+.pb-cta:active { transform: translateY(0) scale(0.995); }
+.pb-cta:focus-visible {
   outline: 2px solid rgba(${BRASS}, 0.75);
   outline-offset: 3px;
 }
 /* Machined top edge: a filament that comes up with the rest of the hardware. */
-.pb-dl::before {
+.pb-cta::before {
   content: "";
   position: absolute;
   inset: 0 0 auto;
@@ -323,35 +341,54 @@ const DOWNLOAD_CSS = `
   background: linear-gradient(90deg, transparent, rgba(${BRASS}, 0.8), transparent);
   transition: opacity 0.4s ease;
 }
-.pb-dl:hover::before,
-.pb-dl:focus-visible::before { opacity: 1; }
-.pb-dl-meter {
+.pb-cta:hover::before,
+.pb-cta:focus-visible::before { opacity: 1; }
+.pb-cta-meter {
   position: absolute;
   inset: 0;
   z-index: 0;
   width: 100%;
   height: 100%;
 }
-.pb-dl-arrow,
-.pb-dl-label { position: relative; z-index: 1; }
-.pb-dl-arrow { transition: transform 0.4s cubic-bezier(0.2, 0.8, 0.2, 1); }
-.pb-dl:hover .pb-dl-arrow,
-.pb-dl:focus-visible .pb-dl-arrow { transform: translateY(2px); }
+.pb-cta-arrow,
+.pb-cta-label { position: relative; z-index: 1; }
+.pb-cta-arrow { transition: transform 0.4s cubic-bezier(0.2, 0.8, 0.2, 1); }
+.pb-cta:hover .pb-cta-arrow,
+.pb-cta:focus-visible .pb-cta-arrow { transform: translateX(3px); }
+/* The submit button in the waitlist card spans its field, so the meter under
+   the label is the full width of the form rather than a stub in the middle. */
+.pb-cta-wide { display: flex; width: 100%; margin-top: 0; }
+/* In flight. The meter keeps running (the request is the thing being waited
+   on) but the hardware stops answering the pointer. */
+.pb-cta[disabled] { cursor: progress; color: #a9a49a; }
+.pb-cta[disabled]:hover,
+.pb-cta[disabled]:hover .pb-cta-arrow { transform: none; }
+.pb-cta[disabled]:hover { border-color: rgba(${BRASS}, 0.22); box-shadow:
+  inset 0 1px 0 rgba(255, 255, 255, 0.07), 0 12px 30px rgba(0, 0, 0, 0.5); }
 @media (prefers-reduced-motion: reduce) {
-  .pb-dl,
-  .pb-dl-arrow { transition-duration: 0.01ms; }
-  .pb-dl:hover,
-  .pb-dl:focus-visible,
-  .pb-dl:hover .pb-dl-arrow,
-  .pb-dl:focus-visible .pb-dl-arrow { transform: none; }
+  .pb-cta,
+  .pb-cta-arrow { transition-duration: 0.01ms; }
+  .pb-cta:hover,
+  .pb-cta:focus-visible,
+  .pb-cta:hover .pb-cta-arrow,
+  .pb-cta:focus-visible .pb-cta-arrow { transform: none; }
 }
 `;
 
-// The one piece of hardware on the page. At rest the meter shows a noise floor
-// (the same slop scrolling behind the frost); on hover the filter closes and
-// only the passband survives, lit in the icon's brass. The animation is the
-// product's own metaphor, which is the price of putting motion here at all.
-function DownloadButton() {
+// The one piece of hardware in the product, and now it appears twice: on the
+// homepage as the call to action and on the waitlist form as its submit. At
+// rest the meter shows a noise floor (the same slop scrolling behind the
+// frost); on hover the filter closes and only the passband survives, lit in the
+// icon's brass. The animation is the product's own metaphor, which is the price
+// of putting motion here at all.
+//
+// A HOOK RATHER THAN A COMPONENT because the pointer handlers have to sit on
+// the button, not on the canvas inside it: the meter is ground beneath a label,
+// and the geometry it reads is the button's own box. So the hook hands back
+// both halves, the caller spreads the handlers onto whatever element it is
+// building, and the two pages share one meter rather than growing two that
+// drift apart.
+function useMeter() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   // Hover lives in a ref, not state: the rAF loop reads it every frame and CSS
   // already owns the chrome, so a re-render would buy nothing.
@@ -496,69 +533,119 @@ function DownloadButton() {
     };
   }, []);
 
+  return {
+    // Everything that goes INSIDE the button: the stylesheet, and the canvas
+    // the loop above draws on.
+    chrome: (
+      <>
+        {/* href + precedence is React 19's hoist path: the rules land in <head>
+            and dedupe by href instead of sitting loose in the body, which is
+            also what lets both buttons render this without shipping it twice. */}
+        <style href="pb-cta" precedence="default">
+          {CTA_CSS}
+        </style>
+        <canvas ref={canvasRef} className="pb-cta-meter" aria-hidden="true" />
+      </>
+    ),
+    // Everything that goes ON it.
+    handlers: {
+      onPointerEnter: () => {
+        hovered.current = true;
+      },
+      onPointerMove: (event: PointerEvent<HTMLElement>) => {
+        const box = event.currentTarget.getBoundingClientRect();
+        const x = (event.clientX - box.left) / (box.width || 1);
+        // Screen y grows downward and the hump grows upward, so invert: the
+        // top of the button is the filter wide open.
+        const lift = 1 - (event.clientY - box.top) / (box.height || 1);
+        // Never fully shut: at zero the hump has no height and no width, so
+        // the bars all die and the button looks broken rather than tuned. The
+        // top of the travel goes past 1, which is the meter's nominal full
+        // height, so the peak reaches up behind the label instead of stopping
+        // politely beneath it.
+        const aperture = 0.38 + 0.8 * Math.min(1, Math.max(0, lift));
+        // Clamped by the skirts' real width, not a fixed margin: a wide hump
+        // needs more room to keep both shoulders on the button than a narrow
+        // one, so the travel opens up exactly as the filter closes down. The
+        // quartic is down to a percent of peak by 1.5 half-widths, so 0.72 is
+        // where the shoulder has visually landed.
+        const edge = 0.72 * FULL_W * aperture;
+        tuned.current = {
+          x: Math.min(1 - edge, Math.max(edge, x)),
+          lift: aperture,
+        };
+      },
+      onPointerLeave: () => {
+        hovered.current = false;
+        // Home, so the next hover starts centred and open rather than
+        // wherever the last one happened to end.
+        tuned.current = { x: 0.5, lift: 1 };
+      },
+      // Keyboard focus has no cursor to follow, so it gets the centred band.
+      onFocus: () => {
+        hovered.current = true;
+      },
+      onBlur: () => {
+        hovered.current = false;
+      },
+    },
+  };
+}
+
+// The arrow both buttons wear. It points the way the press goes, which is
+// onward now rather than down: the homepage leads to the waitlist, and the
+// waitlist form sends. Label first, arrow second, so the two read left to right
+// in the order they happen.
+function Arrow() {
   return (
-    <>
-      {/* href + precedence is React 19's hoist path: the rules land in <head>
-          and dedupe by href instead of sitting loose in the body. */}
-      <style href="pb-download" precedence="default">
-        {DOWNLOAD_CSS}
-      </style>
-      <a
-        className="pb-dl"
-        href="/download/latest"
-        onPointerEnter={() => (hovered.current = true)}
-        onPointerMove={(event) => {
-          const box = event.currentTarget.getBoundingClientRect();
-          const x = (event.clientX - box.left) / (box.width || 1);
-          // Screen y grows downward and the hump grows upward, so invert: the
-          // top of the button is the filter wide open.
-          const lift = 1 - (event.clientY - box.top) / (box.height || 1);
-          // Never fully shut: at zero the hump has no height and no width, so
-          // the bars all die and the button looks broken rather than tuned. The
-          // top of the travel goes past 1, which is the meter's nominal full
-          // height, so the peak reaches up behind the label instead of stopping
-          // politely beneath it.
-          const aperture = 0.38 + 0.8 * Math.min(1, Math.max(0, lift));
-          // Clamped by the skirts' real width, not a fixed margin: a wide hump
-          // needs more room to keep both shoulders on the button than a narrow
-          // one, so the travel opens up exactly as the filter closes down. The
-          // quartic is down to a percent of peak by 1.5 half-widths, so 0.72 is
-          // where the shoulder has visually landed.
-          const edge = 0.72 * FULL_W * aperture;
-          tuned.current = {
-            x: Math.min(1 - edge, Math.max(edge, x)),
-            lift: aperture,
-          };
-        }}
-        onPointerLeave={() => {
-          hovered.current = false;
-          // Home, so the next hover starts centred and open rather than
-          // wherever the last one happened to end.
-          tuned.current = { x: 0.5, lift: 1 };
-        }}
-        // Keyboard focus has no cursor to follow, so it gets the centred band.
-        onFocus={() => (hovered.current = true)}
-        onBlur={() => (hovered.current = false)}
-      >
-        <canvas ref={canvasRef} className="pb-dl-meter" aria-hidden="true" />
-        <svg
-          className="pb-dl-arrow"
-          width="14"
-          height="15"
-          viewBox="0 0 14 15"
-          fill="none"
-          stroke="currentColor"
-          strokeWidth="1.6"
-          strokeLinecap="round"
-          strokeLinejoin="round"
-          aria-hidden="true"
-        >
-          <path d="M7 1.5v8.2m0 0 3.3-3.3M7 9.7 3.7 6.4" />
-          <path d="M1.4 13.2h11.2" />
-        </svg>
-        <span className="pb-dl-label">download the client</span>
-      </a>
-    </>
+    <svg
+      className="pb-cta-arrow"
+      width="15"
+      height="14"
+      viewBox="0 0 15 14"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="1.6"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+    >
+      <path d="M1.4 7h11.2m0 0L9.3 3.7M12.6 7 9.3 10.3" />
+    </svg>
+  );
+}
+
+// THE HOMEPAGE'S ONE ACTION. It used to be the download, and the client is not
+// a thing worth holding before there is a mailbox behind it: the door here is
+// the list, and the download waits at the end of the invite flow, where it is
+// the next thing somebody actually needs.
+function JoinButton() {
+  const { chrome, handlers } = useMeter();
+  return (
+    <a className="pb-cta" href="/waitlist" {...handlers}>
+      {chrome}
+      <span className="pb-cta-label">join the waitlist</span>
+      <Arrow />
+    </a>
+  );
+}
+
+// The same hardware as a form submit, spanning the field above it. `busy` is
+// the request in flight: the meter keeps running, because that is the part that
+// is honestly still happening, and the button stops answering the pointer.
+function SubmitButton({ busy }: { busy: boolean }) {
+  const { chrome, handlers } = useMeter();
+  return (
+    <button
+      className="pb-cta pb-cta-wide"
+      type="submit"
+      disabled={busy}
+      {...handlers}
+    >
+      {chrome}
+      <span className="pb-cta-label">{busy ? "sending" : "join"}</span>
+      {!busy && <Arrow />}
+    </button>
   );
 }
 
@@ -600,7 +687,16 @@ export function App() {
         />
         <h1 style={styles.title}>Passband</h1>
         <p style={styles.tagline}>fuck email. lets make it bearable</p>
-        <DownloadButton />
+        <JoinButton />
+        {/* The second door, for the people the button is not for. Muted, and
+            a line rather than a button, because there is one primary action on
+            this page and this is not it. */}
+        <p style={styles.note}>
+          already have an invite?{" "}
+          <a style={styles.noteLink} href={SIGNUP_URL}>
+            set up your mailbox
+          </a>
+        </p>
       </div>
       <CornerLinks />
     </main>
@@ -610,6 +706,11 @@ export function App() {
 // The control plane answers 200 for a fresh address and for one already on the
 // list, so this page can never become a membership oracle.
 const WAITLIST_URL = "https://signup.passband.app/waitlist";
+
+// Where an invite is redeemed. The emailed link goes straight here with the
+// code in it; this is the way in for somebody who has the mail open on another
+// device, or who lost it and kept the code.
+const SIGNUP_URL = "https://signup.passband.app";
 
 export function WaitlistPage() {
   const [email, setEmail] = useState("");
@@ -656,36 +757,44 @@ export function WaitlistPage() {
           />
           <h1 style={styles.title}>Passband</h1>
         </a>
+        {/* THE WHOLE CARD TURNS OVER ON SUCCESS, pitch included. Leaving the
+            pitch standing above the confirmation left the card selling the list
+            to somebody who had just joined it, and saying "your invite lands by
+            email" twice in four lines. What replaces it is the only thing still
+            unanswered at that point: what arrives, and what is at the end of
+            it, which is where the client lives now. */}
         <section style={{ ...styles.card, marginTop: "0.5rem" }}>
-          <span style={styles.cardLabel}>hosted beta</span>
-          <p style={styles.cardCopy}>
-            we run the daemon for you. join the list and your invite lands by
-            email.
-          </p>
           {state === "done" ? (
-            <p style={styles.status}>you're on the list. watch your inbox.</p>
+            <>
+              <span style={styles.cardLabel}>you're on the list</span>
+              <p style={styles.cardCopy}>
+                the invite lands by email when a spot opens. it walks you
+                through setup, and the app is waiting at the end of it.
+              </p>
+            </>
           ) : (
-            <form style={styles.waitlistForm} onSubmit={submit}>
-              <input
-                style={styles.waitlistInput}
-                type="email"
-                name="email"
-                required
-                autoComplete="email"
-                placeholder="you@example.com"
-                aria-label="email address"
-                value={email}
-                disabled={state === "busy"}
-                onChange={(event) => setEmail(event.target.value)}
-              />
-              <button
-                style={styles.pill}
-                type="submit"
-                disabled={state === "busy"}
-              >
-                {state === "busy" ? "sending" : "join"}
-              </button>
-            </form>
+            <>
+              <span style={styles.cardLabel}>hosted beta</span>
+              <p style={styles.cardCopy}>
+                we run the daemon for you. join the list and your invite lands
+                by email.
+              </p>
+              <form style={styles.waitlistForm} onSubmit={submit}>
+                <input
+                  style={styles.waitlistInput}
+                  type="email"
+                  name="email"
+                  required
+                  autoComplete="email"
+                  placeholder="you@example.com"
+                  aria-label="email address"
+                  value={email}
+                  disabled={state === "busy"}
+                  onChange={(event) => setEmail(event.target.value)}
+                />
+                <SubmitButton busy={state === "busy"} />
+              </form>
+            </>
           )}
           {state === "error" && (
             <p style={{ ...styles.status, color: "#d8a39a" }}>
@@ -693,6 +802,14 @@ export function WaitlistPage() {
             </p>
           )}
         </section>
+        {/* Same second door as the homepage, for somebody who followed the
+            join link with a code already sitting in their inbox. */}
+        <p style={styles.note}>
+          already have an invite?{" "}
+          <a style={styles.noteLink} href={SIGNUP_URL}>
+            set up your mailbox
+          </a>
+        </p>
       </div>
       <CornerLinks />
     </main>

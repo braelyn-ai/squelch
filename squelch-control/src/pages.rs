@@ -84,6 +84,24 @@ pub fn deep_link(tenant_url: &str, pair_code: &str) -> String {
     )
 }
 
+/// Where the client is downloaded from.
+///
+/// THIS IS WHERE THE DOWNLOAD LIVES NOW. The landing page used to lead with it
+/// and leads with the waitlist instead: an app is not worth holding before
+/// there is a mailbox behind it to point at, so the download waits until the
+/// end of this flow, which is the first moment somebody actually needs it. The
+/// pages that name it are the two that finish a flow, [`success`] and
+/// [`app_signed_in`], and on both of them it is the literal next step.
+///
+/// HARDCODED, NOT CONFIGURED, for the reason [`crate::resend::MARK_URL`] is:
+/// there is one place the Mac client is published and it is not the operator's
+/// origin. A self-hoster's own host serves no zips, so a variable pointing this
+/// at their site would only ever produce a 404 with their domain in front of
+/// it. `/download/latest` is the site's own redirect to whatever the appcast
+/// says shipped last (`passband-site/server.ts`), so this URL does not move
+/// when a release does.
+const DOWNLOAD_URL: &str = "https://passband.app/download/latest";
+
 /// Where a finished console login sends the browser: the tenant's own console,
 /// carrying the pairing code it will claim.
 ///
@@ -423,7 +441,7 @@ pub fn success(tenant_url: &str, pair_code: &str, minutes: i64) -> Response {
 <p>Your daemon is running at <code>{url}</code> and is syncing your mail now.
 One more step: connect the app.</p>
 <ol>
-<li>Download Passband from <code>passband.app</code> and open it.</li>
+<li><a href="{download}">Download Passband</a> and open it.</li>
 <li>Press <strong>Pair</strong>.</li>
 <li>Enter the code below, or open the link on the same device.</li>
 </ol>
@@ -437,6 +455,7 @@ device in.</p>"#,
             url = escape_html(tenant_url),
             code = escape_html(pair_code),
             link = escape_html(&link),
+            download = DOWNLOAD_URL,
             minutes = minutes,
         ),
     )
@@ -476,7 +495,8 @@ pub fn app_signed_in(
 <p><a class="button" href="{link}">Open Passband</a></p>
 <h2>If that button does nothing</h2>
 <p>Passband may not be installed on this device, or your browser may not open
-app links. Open Passband yourself, choose hosted, and enter these:</p>
+app links. <a href="{download}">Download Passband</a> if you need it, then open
+it, choose hosted, and enter these:</p>
 <p><code>{url}</code></p>
 <p><span class="code">{code}</span></p>
 <p class="muted">The code is good for {minutes} minutes and works once. If it
@@ -487,6 +507,7 @@ device in.</p>"#,
             url = escape_html(tenant_url),
             code = escape_html(pair_code),
             link = escape_html(&link),
+            download = DOWNLOAD_URL,
             minutes = minutes,
         ),
     )
@@ -911,6 +932,41 @@ mod tests {
         );
         assert!(html.contains("passband.app"));
         assert!(!html.contains("<script"));
+    }
+
+    /// THE DOWNLOAD LIVES AT THE END OF THE FLOW, not on the landing page: that
+    /// page leads with the waitlist now, so these two are the only screens that
+    /// hand anybody the client. Both need it, and each for its own reason: one
+    /// has just built a mailbox for somebody who has no app, and the other is
+    /// the page a person lands on precisely when the deep link did nothing,
+    /// which is most often because the app is not installed.
+    ///
+    /// A REAL `href`, not the bare hostname the success page used to print. It
+    /// was `<code>passband.app</code>` in the middle of a numbered step, which
+    /// asks somebody mid-setup to retype a domain, and now it is the one thing
+    /// on that step that can be pressed.
+    #[tokio::test]
+    async fn the_pages_that_finish_a_flow_hand_over_the_client() {
+        for html in [
+            body_of(success("https://ada.passband.email", "ABCD-EFGH", 10)).await,
+            body_of(app_signed_in(
+                "ada@example.com",
+                "https://ada.passband.email",
+                "ABCD-EFGH",
+                10,
+            ))
+            .await,
+        ] {
+            assert!(
+                html.contains(&format!(r#"<a href="{DOWNLOAD_URL}">Download Passband</a>"#)),
+                "{html}"
+            );
+        }
+        // And nowhere else. The signup form is somebody deciding whether to
+        // hand over their mail, and an app they cannot yet point at anything is
+        // not what that page is for.
+        let form = body_of(signup_form("passband.email", None, "", "", None)).await;
+        assert!(!form.contains(DOWNLOAD_URL), "{form}");
     }
 
     /// The console redirect is assembled from a validated tenant URL and a
