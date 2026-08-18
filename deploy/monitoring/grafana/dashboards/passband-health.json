@@ -1970,6 +1970,797 @@
     },
     {
       "type": "row",
+      "title": "Daemon rollout",
+      "collapsed": false,
+      "id": 36,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 65
+      },
+      "panels": []
+    },
+    {
+      "type": "stat",
+      "title": "Image versions live",
+      "id": 37,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "description": "How many distinct daemon image versions the fleet is running right now. 1 is converged, 2 is a roll in flight, 3 or more means a roll stalled partway and nobody noticed.",
+      "gridPos": {
+        "h": 5,
+        "w": 4,
+        "x": 0,
+        "y": 66
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "count(count by (version) (label_replace(kube_pod_container_info{namespace=\"tenants\", container=\"squelchd\"}, \"version\", \"$1\", \"image_spec\", \".*[:@](?:daemon-)?(.+)\"))) OR on() vector(0)",
+          "refId": "A",
+          "range": false,
+          "instant": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [],
+          "unit": "short",
+          "decimals": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 2
+              },
+              {
+                "color": "orange",
+                "value": 3
+              }
+            ]
+          },
+          "noValue": "NO DATA"
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto"
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Off the majority image",
+      "id": 38,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "description": "Pods not yet on whichever image most of the fleet runs. Counts down to 0 as a roll finishes, so a number that stops falling is the roll stalling.",
+      "gridPos": {
+        "h": 5,
+        "w": 4,
+        "x": 4,
+        "y": 66
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "(count(kube_pod_container_info{namespace=\"tenants\", container=\"squelchd\"}) - max(count by (image_spec) (kube_pod_container_info{namespace=\"tenants\", container=\"squelchd\"}))) OR on() vector(0)",
+          "refId": "A",
+          "range": false,
+          "instant": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [],
+          "unit": "short",
+          "decimals": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 1
+              }
+            ]
+          },
+          "noValue": "NO DATA"
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto"
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Image pull failures",
+      "id": 39,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "description": "A wedged roll rather than a slow one: the tag the warden was pointed at does not exist in the registry, or the GHCR pull secret is wrong. Nonzero here means the affected tenants are down, not merely behind.",
+      "gridPos": {
+        "h": 5,
+        "w": 4,
+        "x": 8,
+        "y": 66
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "count(kube_pod_container_status_waiting_reason{namespace=\"tenants\", reason=~\"ImagePullBackOff|ErrImagePull\"} == 1) OR on() vector(0)",
+          "refId": "A",
+          "range": false,
+          "instant": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [],
+          "unit": "short",
+          "decimals": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          },
+          "noValue": "NO DATA"
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto"
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Ahead of the daemon",
+      "id": 40,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "description": "Pods whose spec image is a version the process inside is not reporting: the image rolled but the daemon has not come up on it. Seconds of this per pod is a normal roll; sticky is a crash loop on the new build. Counts only tenants whose daemon exports metrics at all, so it reads 0 rather than lying while squelchd_build_info is still rolling out.",
+      "gridPos": {
+        "h": 5,
+        "w": 4,
+        "x": 12,
+        "y": 66
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "count(max by (tenant, version) (label_replace(label_replace(kube_pod_container_info{namespace=\"tenants\", container=\"squelchd\"}, \"version\", \"$1\", \"image_spec\", \".*[:@](?:daemon-)?(.+)\"), \"tenant\", \"$1\", \"pod\", \"(.+)-[^-]+-[^-]+\")) unless on (tenant, version) squelchd_build_info and on (tenant) squelchd_build_info) OR on() vector(0)",
+          "refId": "A",
+          "range": false,
+          "instant": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [],
+          "unit": "short",
+          "decimals": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 1
+              }
+            ]
+          },
+          "noValue": "NO DATA"
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto"
+      }
+    },
+    {
+      "type": "bargauge",
+      "title": "Fleet share by version",
+      "id": 41,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "description": "The same roll as a single bar per version. Read it as percent of tenant pods; a roll is done when one bar is at 100%.",
+      "gridPos": {
+        "h": 5,
+        "w": 8,
+        "x": 16,
+        "y": 66
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "count by (version) (label_replace(kube_pod_container_info{namespace=\"tenants\", container=\"squelchd\"}, \"version\", \"$1\", \"image_spec\", \".*[:@](?:daemon-)?(.+)\")) / scalar(count(kube_pod_container_info{namespace=\"tenants\", container=\"squelchd\"}))",
+          "refId": "A",
+          "range": false,
+          "instant": true,
+          "legendFormat": "{{version}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "continuous-BlYlRd"
+          },
+          "unit": "percentunit",
+          "min": 0,
+          "max": 1,
+          "decimals": 0,
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "blue",
+                "value": null
+              }
+            ]
+          },
+          "noValue": "NO DATA"
+        },
+        "overrides": []
+      },
+      "options": {
+        "displayMode": "gradient",
+        "orientation": "horizontal",
+        "showUnfilled": true,
+        "valueMode": "color",
+        "minVizWidth": 8,
+        "minVizHeight": 16,
+        "maxVizHeight": 300,
+        "namePlacement": "auto",
+        "sizing": "auto",
+        "legend": {
+          "showLegend": false,
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": []
+        },
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        }
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Pods by image version (what Kubernetes was told to run)",
+      "id": 42,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "description": "The rollout curve, from kube-state-metrics. This moves the instant the warden patches a Deployment, whether or not the new pod ever starts, so it is the honest picture of what has been asked for. Watch the old version's band shrink as the new one grows. The total dips by one at each handoff because a tenant Deployment is Recreate, not RollingUpdate: its SQLite store takes one writer, so the old pod goes away before the new one arrives.",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 71
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "count by (version) (label_replace(kube_pod_container_info{namespace=\"tenants\", container=\"squelchd\"}, \"version\", \"$1\", \"image_spec\", \".*[:@](?:daemon-)?(.+)\"))",
+          "refId": "A",
+          "range": true,
+          "instant": false,
+          "legendFormat": "{{version}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "unit": "short",
+          "min": 0,
+          "decimals": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "stepAfter",
+            "lineWidth": 1,
+            "fillOpacity": 60,
+            "showPoints": "never",
+            "pointSize": 5,
+            "spanNulls": false,
+            "axisBorderShow": false,
+            "gradientMode": "none",
+            "stacking": {
+              "mode": "normal",
+              "group": "A"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "showLegend": true,
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Pods by daemon version (what the process reports)",
+      "id": 43,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "description": "The same curve as told from inside the daemons, off port 9464. It lags the panel to its left by however long a pod takes to pull, start and serve. A gap that does not close is a pod that has the new image and cannot run it. Empty for any tenant not yet re-applied with SQUELCH_METRICS_BIND.",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 71
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "count by (version) (squelchd_build_info)",
+          "refId": "A",
+          "range": true,
+          "instant": false,
+          "legendFormat": "{{version}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "unit": "short",
+          "min": 0,
+          "decimals": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "stepAfter",
+            "lineWidth": 1,
+            "fillOpacity": 60,
+            "showPoints": "never",
+            "pointSize": 5,
+            "spanNulls": false,
+            "axisBorderShow": false,
+            "gradientMode": "none",
+            "stacking": {
+              "mode": "normal",
+              "group": "A"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "showLegend": true,
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "type": "state-timeline",
+      "title": "Version by tenant",
+      "id": 44,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "description": "One band per tenant and version, so the switchover is readable per tenant rather than in aggregate: each band starts when that tenant's pod took that image and ends when it left it. The gap between a tenant's two bands is that tenant's downtime for the release, which Recreate makes unavoidable and which is worth being able to see. A gap that does not close is a pod that never came back.",
+      "gridPos": {
+        "h": 10,
+        "w": 24,
+        "x": 0,
+        "y": 79
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "count by (tenant, version) (label_replace(label_replace(kube_pod_container_info{namespace=\"tenants\", container=\"squelchd\"}, \"version\", \"$1\", \"image_spec\", \".*[:@](?:daemon-)?(.+)\"), \"tenant\", \"$1\", \"pod\", \"(.+)-[^-]+-[^-]+\"))",
+          "refId": "A",
+          "range": true,
+          "instant": false,
+          "legendFormat": "{{tenant}} \u00b7 {{version}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "unit": "short",
+          "min": 0,
+          "decimals": 0,
+          "custom": {
+            "lineWidth": 0,
+            "fillOpacity": 80,
+            "spanNulls": false,
+            "insertNulls": false,
+            "hideFrom": {
+              "tooltip": false,
+              "viz": false,
+              "legend": false
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "noValue": "NO DATA"
+        },
+        "overrides": []
+      },
+      "options": {
+        "showValue": "never",
+        "alignValue": "left",
+        "mergeValues": true,
+        "rowHeight": 0.9,
+        "legend": {
+          "showLegend": false,
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "single",
+          "sort": "none"
+        }
+      }
+    },
+    {
+      "type": "table",
+      "title": "Tenant image inventory",
+      "id": 45,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "description": "The current state as a list: what each tenant was told to run, what its daemon says it is running, and how long that pod has been up (which is how long ago it rolled). Digest is the resolved image ID, the only column that can tell two pulls of the same mutable tag apart.",
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 89
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "max by (tenant, pod, version, image_spec, image_id) (label_replace(label_replace(kube_pod_container_info{namespace=\"tenants\", container=\"squelchd\"}, \"version\", \"$1\", \"image_spec\", \".*[:@](?:daemon-)?(.+)\"), \"tenant\", \"$1\", \"pod\", \"(.+)-[^-]+-[^-]+\"))",
+          "refId": "A",
+          "range": false,
+          "instant": true,
+          "format": "table"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "time() - max by (tenant) (label_replace(kube_pod_start_time{namespace=\"tenants\"}, \"tenant\", \"$1\", \"pod\", \"(.+)-[^-]+-[^-]+\"))",
+          "refId": "B",
+          "range": false,
+          "instant": true,
+          "format": "table"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "max by (tenant, running) (label_replace(max by (tenant, version) (squelchd_build_info), \"running\", \"$1\", \"version\", \"(.+)\"))",
+          "refId": "C",
+          "range": false,
+          "instant": true,
+          "format": "table"
+        }
+      ],
+      "transformations": [
+        {
+          "id": "joinByField",
+          "options": {
+            "byField": "tenant",
+            "mode": "outer"
+          }
+        },
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {
+              "Time": true,
+              "Time 1": true,
+              "Time 2": true,
+              "Time 3": true,
+              "Value #A": true,
+              "Value #C": true
+            },
+            "renameByName": {
+              "tenant": "Tenant",
+              "version": "Image version",
+              "running": "Daemon reports",
+              "Value #B": "Pod age",
+              "pod": "Pod",
+              "image_spec": "Image",
+              "image_id": "Digest"
+            },
+            "indexByName": {
+              "tenant": 0,
+              "version": 1,
+              "running": 2,
+              "Value #B": 3,
+              "pod": 4,
+              "image_spec": 5,
+              "image_id": 6
+            }
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "align": "auto",
+            "cellOptions": {
+              "type": "auto"
+            },
+            "inspect": false,
+            "filterable": true
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          },
+          "noValue": "NO DATA"
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Tenant"
+            },
+            "properties": [
+              {
+                "id": "custom.width",
+                "value": 150
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Image version"
+            },
+            "properties": [
+              {
+                "id": "custom.width",
+                "value": 165
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Daemon reports"
+            },
+            "properties": [
+              {
+                "id": "custom.width",
+                "value": 175
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Pod age"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "s"
+              },
+              {
+                "id": "decimals",
+                "value": 0
+              },
+              {
+                "id": "custom.width",
+                "value": 130
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Pod"
+            },
+            "properties": [
+              {
+                "id": "custom.width",
+                "value": 250
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Digest"
+            },
+            "properties": [
+              {
+                "id": "custom.width",
+                "value": 220
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "showHeader": true,
+        "cellHeight": "sm",
+        "footer": {
+          "show": false,
+          "reducer": [
+            "sum"
+          ],
+          "countRows": false,
+          "fields": ""
+        },
+        "sortBy": [
+          {
+            "displayName": "Image version",
+            "desc": true
+          }
+        ]
+      }
+    },
+    {
+      "type": "row",
       "title": "Inside squelchd",
       "collapsed": false,
       "id": 30,
@@ -1977,7 +2768,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 65
+        "y": 97
       },
       "panels": []
     },
@@ -1994,7 +2785,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 66
+        "y": 98
       },
       "targets": [
         {
@@ -2079,7 +2870,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 66
+        "y": 98
       },
       "targets": [
         {
@@ -2160,7 +2951,7 @@
         "h": 8,
         "w": 8,
         "x": 0,
-        "y": 74
+        "y": 106
       },
       "targets": [
         {
@@ -2229,7 +3020,7 @@
         "h": 8,
         "w": 8,
         "x": 8,
-        "y": 74
+        "y": 106
       },
       "targets": [
         {
@@ -2303,7 +3094,7 @@
         "h": 8,
         "w": 8,
         "x": 16,
-        "y": 74
+        "y": 106
       },
       "targets": [
         {
@@ -2369,6 +3160,22 @@
     "list": []
   },
   "annotations": {
-    "list": []
+    "list": [
+      {
+        "name": "New daemon image",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "prometheus"
+        },
+        "enable": true,
+        "hide": false,
+        "iconColor": "purple",
+        "expr": "count by (version) (label_replace(kube_pod_container_info{namespace=\"tenants\", container=\"squelchd\"}, \"version\", \"$1\", \"image_spec\", \".*[:@](?:daemon-)?(.+)\")) unless count by (version) (label_replace(kube_pod_container_info{namespace=\"tenants\", container=\"squelchd\"} offset 10m, \"version\", \"$1\", \"image_spec\", \".*[:@](?:daemon-)?(.+)\"))",
+        "titleFormat": "daemon {{version}} first seen",
+        "textFormat": "",
+        "tagKeys": "version",
+        "step": "60s"
+      }
+    ]
   }
 }
