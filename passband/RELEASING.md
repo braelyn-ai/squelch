@@ -46,6 +46,12 @@ whoever holds it can sign updates for every install).
 5. Commit and push `passband-site/appcast.xml` — the site redeploys and every
    install sees the update on its next check.
 
+What an install then shows is Passband's own card, bottom centre of the window:
+"Passband X.Y.Z is available" and one Update button that downloads, installs and
+relaunches. Sparkle's own windows are not used (see Model/Updater.swift), so a
+release with nothing but a version bump still reads correctly — the card never
+shows release notes, and the appcast does not need to carry any.
+
 The appcast enclosure points at `https://passband.app/download/<zip>`, which
 the site 302s to the GitHub release asset, so the feed URL never depends on
 where the archives are stored. `releases/` is the generator's working set:

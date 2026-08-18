@@ -33,6 +33,14 @@ struct RootView: View {
         // so a surface only has to know the bar's height and not also how the
         // window is inset.
         .ignoresSafeArea(edges: .top)
+        // THE NEW-VERSION CARD, above every connection state on purpose: an
+        // update is worth taking whether or not the daemon is answering, and
+        // the Connect gate is exactly where someone sits when an old client is
+        // the reason it will not pair.
+        .overlay(alignment: .bottom) {
+            UpdateAlert()
+                .padding(.bottom, 18)
+        }
         // ADD ACCOUNT — the same form as the gate, over a working app. Hung on
         // the whole shell rather than on any one surface: it is raised from
         // Settings, from the rail's account menu, from the Accounts menu, and
