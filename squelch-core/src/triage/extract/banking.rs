@@ -254,6 +254,7 @@ mod tests {
             category: category.into(),
             received_at: Utc::now(),
             sensitivity: Sensitivity::Normal,
+            retriage_at: None,
         }
     }
 

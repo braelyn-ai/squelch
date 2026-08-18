@@ -111,8 +111,17 @@ CREATE TABLE IF NOT EXISTS triage (
     matched_rule_id INTEGER,
     -- STAGE-1 LLM marker. NULL = still needs the Stage-1 refine pass (its
     -- heuristic seed values are provisional). Otherwise the Stage-1 model id,
-    -- 'rule' when a sender rule already decided the row (no model spend), or
-    -- 'heuristic-only' when the pass fell back to the seed.
+    -- 'rule' when a sender rule already decided the row (no model spend),
+    -- 'human' when the account owner corrected the verdict by hand, 'n/a' for
+    -- sealed and sent mail, or one of the two NO-VERDICT sentinels:
+    --   'stale-skip'      too old for the pass's horizon; no model was asked.
+    --   'heuristic-only'  a model WAS asked and did not answer (refusal or a
+    --                     permanent failure), so the seed stands.
+    -- Both leave the row on its heuristic seed and they are easy to conflate,
+    -- which is why they are separate strings: they are opposite facts, and the
+    -- row is the only place either one is recorded. Rows stamped before the
+    -- split may carry 'heuristic-only' for either reason and cannot be
+    -- re-attributed — nothing records when a row was processed.
     stage1_model_used TEXT,
     -- Set to 1 by `triage::router::should_escalate` over the Stage-1 verdict, or
     -- at ingest for a Filtered rule needing want_text evaluation, to mark the row
@@ -157,6 +166,15 @@ CREATE TABLE IF NOT EXISTS triage (
     -- PRESERVES a processed marker and only refreshes 'pending'; sealing NULLs
     -- it, and retriage re-pends it.
     ship_extract_model TEXT,
+    -- WHEN A HUMAN LAST ASKED for this row to be re-triaged (RFC3339 UTC), NULL
+    -- when nobody ever has. Stamped by `Store::retriage_reset` on exactly the
+    -- rows it requeues, and read by the LLM passes as a FORCE: a re-triage is an
+    -- explicit request, so for `RETRIAGE_FORCE_WINDOW` after it the row bypasses
+    -- the age-based stale skip that would otherwise stamp it processed without a
+    -- model call. The window is what keeps the force from outliving the request:
+    -- the same row can re-enter a queue months later through a revisit, and a
+    -- permanent stamp would quietly buy every one of those a frontier call.
+    retriage_at     TEXT,
     status          TEXT NOT NULL DEFAULT 'new',
     surfaced_at     TEXT,
     resolved_at     TEXT,

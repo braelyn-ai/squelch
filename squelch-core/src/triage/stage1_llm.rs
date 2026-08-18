@@ -416,6 +416,10 @@ pub fn apply_revisit_result(
         is_known_contact: queued.is_known_contact,
         sender_corrected: queued.sender_corrected,
         sensitivity: queued.sensitivity,
+        // A revisit is the pipeline's own schedule, not a human request, and it
+        // has no stale skip to be forced past: `None` regardless of whether the
+        // row was ever re-triaged by hand.
+        retriage_at: None,
     };
     let mut applied = apply_result_with_rule(
         &as_stage1,
@@ -674,6 +678,7 @@ mod tests {
             is_known_contact: known,
             sender_corrected: false,
             sensitivity: Sensitivity::Normal,
+            retriage_at: None,
         }
     }
 

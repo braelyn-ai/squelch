@@ -423,6 +423,137 @@ fn retriage_reset_clears_a_donated_item_name_in_both_shipment_tables() {
     assert_eq!(order_prov, None);
 }
 
+/// DEFECT: a re-triage of anything older than the pass's age cutoff requeued the
+/// row and then watched the very next tick stamp it processed with no model call
+/// — "stale-skipped 1" in the log, an unchanged verdict on screen, and no way to
+/// ask again that would work any better. The cutoff exists so a fresh install
+/// does not spend its cap on a backlog nobody asked about; a re-triage IS asking.
+#[test]
+fn a_re_triaged_row_carries_the_stamp_that_overrides_the_stale_skip() {
+    let (store, acct) = store();
+    let now = Utc::now();
+
+    // Old mail — past every pass's cutoff — that the LLM already ruled on, and
+    // that also carries a shipping signal, so it sits in two queues at once.
+    let old = triaged_row(acct, "g-old", "t-old", None, false, Sensitivity::Normal)
+        .received_at(now - chrono::Duration::days(120))
+        .ship_extract(true)
+        .ingest(&store);
+    {
+        let conn = store.lock().unwrap();
+        conn.execute(
+            "UPDATE triage SET stage1_model_used='claude-x', model_used='claude-x',
+                    extractor_model_used='claude-x', ship_extract_model='claude-x',
+                    category='banking_statement'
+             WHERE message_id=?1",
+            rusqlite::params![old],
+        )
+        .unwrap();
+    }
+
+    assert_eq!(store.retriage_reset(acct, Some(old), 7).unwrap(), 1);
+
+    // Every queue the row re-enters carries the request, so every pass's stale
+    // skip yields to it.
+    let s1 = store.stage1_queue(acct, 10).unwrap();
+    assert_eq!(s1.len(), 1);
+    assert!(
+        crate::triage::retriage_forced(s1[0].retriage_at, Utc::now()),
+        "stage-1 must see the hand request on the row it just requeued"
+    );
+    let ship = store.ship_extract_queue(acct, 10).unwrap();
+    assert_eq!(ship.len(), 1);
+    assert!(crate::triage::retriage_forced(
+        ship[0].retriage_at,
+        Utc::now()
+    ));
+    let ext = store
+        .extract_queue(acct, &["banking_statement"], 10)
+        .unwrap();
+    assert_eq!(ext.len(), 1);
+    assert!(crate::triage::retriage_forced(
+        ext[0].retriage_at,
+        Utc::now()
+    ));
+
+    // AND STAGE-2, which the row only reaches after Stage-1 re-runs and escalates
+    // it. The stamp has to survive that hop: a re-triage that redoes Stage-1 and
+    // then skips the escalation it asked for is half a re-triage.
+    {
+        let conn = store.lock().unwrap();
+        conn.execute(
+            "UPDATE triage SET stage1_model_used='claude-x', needs_stage2=1
+             WHERE message_id=?1",
+            rusqlite::params![old],
+        )
+        .unwrap();
+    }
+    let s2 = store.stage2_queue(acct, 10).unwrap();
+    assert_eq!(s2.len(), 1);
+    assert!(
+        crate::triage::retriage_forced(s2[0].retriage_at, Utc::now()),
+        "the stamp must outlive the Stage-1 apply that escalates the row"
+    );
+}
+
+/// A row nobody asked about keeps a NULL stamp, so the age cutoff still decides
+/// for it. Without this the fix would read as "re-triage forces everything".
+#[test]
+fn an_untouched_row_carries_no_re_triage_stamp() {
+    let (store, acct) = store();
+    triaged_row(acct, "g-plain", "t-plain", None, false, Sensitivity::Normal).ingest(&store);
+    let q = store.stage1_queue(acct, 10).unwrap();
+    assert_eq!(q.len(), 1);
+    assert_eq!(q[0].retriage_at, None);
+    assert!(!crate::triage::retriage_forced(
+        q[0].retriage_at,
+        Utc::now()
+    ));
+}
+
+/// `batch_per_cycle` is a real ceiling, so a hand-requested row that sorted
+/// purely by age would wait behind the backlog for ticks — which reads exactly
+/// like the skip it is not.
+#[test]
+fn a_hand_re_triaged_row_jumps_the_backlog() {
+    let (store, acct) = store();
+    let now = Utc::now();
+
+    let old = triaged_row(acct, "g-old", "t-old", None, false, Sensitivity::Normal)
+        .received_at(now - chrono::Duration::days(120))
+        .ingest(&store);
+    {
+        let conn = store.lock().unwrap();
+        conn.execute(
+            "UPDATE triage SET stage1_model_used='claude-x' WHERE message_id=?1",
+            rusqlite::params![old],
+        )
+        .unwrap();
+    }
+    // Newer, never-classified mail already waiting in the queue.
+    for i in 0..3 {
+        triaged_row(
+            acct,
+            &format!("g-new{i}"),
+            &format!("t-new{i}"),
+            None,
+            false,
+            Sensitivity::Normal,
+        )
+        .received_at(now - chrono::Duration::minutes(i))
+        .ingest(&store);
+    }
+
+    store.retriage_reset(acct, Some(old), 7).unwrap();
+
+    let batch = store.stage1_queue(acct, 1).unwrap();
+    assert_eq!(batch.len(), 1);
+    assert_eq!(
+        batch[0].message_id, old,
+        "the row a human asked for goes first, not last"
+    );
+}
+
 #[test]
 fn retriage_reset_requeues_llm_rows_but_never_filtered_or_sealed() {
     let (store, acct) = store();

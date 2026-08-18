@@ -352,6 +352,7 @@ mod tests {
             is_known_contact: false,
             sender_corrected: false,
             sensitivity: Sensitivity::Normal,
+            retriage_at: None,
         };
         let confident = crate::store::SeedVerdict {
             tier: Tier::Signal,

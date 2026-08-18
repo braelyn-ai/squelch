@@ -15,7 +15,8 @@ impl SqliteStore {
                         t.one_line, t.reason, t.field_reasons, t.deadline,
                         t.matched_rule_id, t.status, t.surfaced_at, t.resolved_at,
                         t.stage1_model_used, t.model_used, t.needs_stage2,
-                        t.extractor_model_used, t.created_at, m.thread_id
+                        t.extractor_model_used, t.created_at, m.thread_id,
+                        t.retriage_at
                  FROM triage t
                  JOIN messages m ON m.id = t.message_id
                  WHERE t.account_id = ?1 AND t.message_id = ?2
@@ -45,6 +46,7 @@ impl SqliteStore {
                         extractor_model_used: r.get(16)?,
                         created_at: r.get(17)?,
                         thread_id: r.get(18)?,
+                        retriage_at: r.get(19)?,
                     })
                 },
             )
