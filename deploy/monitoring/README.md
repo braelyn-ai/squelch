@@ -49,8 +49,68 @@ No inbound port; the firewall stays 22/80/443. Total footprint ~200 MB.
 - **Certificates & edge** — cert-manager expiry (wildcard renewal failing
   shows here first), Traefik request/5xx/latency.
 - **Tenants** — pod count vs the 100-user cap, per-tenant CPU/memory/PVC/restarts.
+- **Daemon rollout** — which image version each tenant pod runs, and the
+  switchover as it happens. See below.
 - **Inside squelchd** — sync staleness per tenant, Gmail API errors by kind,
   24h LLM spend, store size, triage throughput.
+
+## Watching a release roll
+
+Releases are rolling: the warden repoints one tenant Deployment at a time, so
+for a while the fleet runs two versions at once. The **Daemon rollout** row is
+that window, told twice over.
+
+The version a panel means is the image tag with its `daemon-` prefix stripped,
+so `ghcr.io/braelyn-ai/squelchd:daemon-0.4.0` reads as `0.4.0` — the same
+spelling `squelchd_build_info` uses, which is what lets the two sides be
+compared. A digest-pinned image has no tag to strip and reads as its digest.
+
+Two sources, and the gap between them is the point:
+
+- **kube-state-metrics** (`kube_pod_container_info`) is what Kubernetes was
+  *told* to run. It moves the instant a Deployment is patched, whether or not
+  the pod ever starts.
+- **the daemon itself** (`squelchd_build_info`, off port 9464) is what is
+  *actually running*. It lags by however long a pull and a start take.
+
+So "Pods by image version" leads and "Pods by daemon version" follows, and a
+gap that does not close is a pod holding the new image it cannot run. **Ahead
+of the daemon** counts exactly those, and deliberately counts only tenants
+whose daemon exports metrics at all, so it reads 0 rather than crying wolf on
+tenants not yet re-applied with `SQUELCH_METRICS_BIND`.
+
+The tenant label on the kube-state-metrics side is derived from the pod name,
+because kube-state-metrics does not carry pod labels unless allowlisted. A pod
+is named `<deployment>-<replicaset>-<pod>` and the warden names a Deployment
+after the tenant, so the tenant is the pod name minus its last two hyphen
+segments. Tenant labels may contain hyphens themselves, which is why the regex
+takes from the end.
+
+Reading the row during a release:
+
+| Panel | Converged | Rolling | Wrong |
+|---|---|---|---|
+| Image versions live | 1 | 2 | 3+, or stuck at 2 |
+| Off the majority image | 0 | counting down | stops falling |
+| Image pull failures | 0 | 0 | any — bad tag or pull secret |
+| Ahead of the daemon | 0 | brief, per pod | sticky — crash loop on the new build |
+
+**Version by tenant** is the per-tenant answer: one band per tenant and
+version, so you can see which tenants have gone over and which have not. The
+gap between a tenant's two bands is its downtime for the release: a tenant
+Deployment is `Recreate`, not `RollingUpdate`, because its SQLite store takes
+exactly one writer, so the old pod is gone before the new one starts. That is
+also why the stacked totals dip by one at each handoff rather than bulging.
+A gap that does not close is a pod that never came back.
+
+**Tenant image inventory** is the same thing as a list, plus pod age (how long
+ago that tenant rolled) and the resolved digest, which is the only column that
+can tell two pulls of the same mutable tag apart.
+
+A dashboard-wide annotation marks the moment a version nothing ran ten minutes
+ago first appears on a pod, so the roll is a vertical line across every other
+panel too — which is how you tell "the restarts at 14:05" from "the release at
+14:04".
 
 ## The daemon's own metrics
 
