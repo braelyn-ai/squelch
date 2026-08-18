@@ -29,6 +29,7 @@ use crate::sync::ingest::{
 };
 use crate::triage::events;
 use crate::triage::extract::{self, CategoryExtractor, RowAction, banking, marketing, shipments};
+use crate::triage::retriage_forced;
 use crate::triage::stage1_llm::{self, HEURISTIC_ONLY};
 use crate::triage::stage2::{self, ClassifyOutcome, RowContext};
 use crate::triage::{stage1_sealed_guard, stage2_sealed_guard};
@@ -1772,7 +1773,9 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
             }
 
             // SKIP-STALE: mark processed WITHOUT a model call, keeping the seed.
-            if row.received_at < stale_cutoff {
+            // UNLESS a human just asked for this row by hand, which is the one
+            // thing the age cutoff was never meant to overrule.
+            if row.received_at < stale_cutoff && !retriage_forced(row.retriage_at, Utc::now()) {
                 let _ = self.store.stage1_mark_processed(
                     self.account_id,
                     row.message_id,
@@ -1994,7 +1997,7 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
             // then the stale skip, then the extractor lookup. It lives in
             // `route_extract_row` so a new specialist cannot be added behind a
             // guard that does not know about it.
-            let extractor = match extract::route_extract_row(row, stale_cutoff) {
+            let extractor = match extract::route_extract_row(row, stale_cutoff, Utc::now()) {
                 RowAction::Sealed => {
                     // Re-run the guard purely to log its redacted message.
                     if let Err(e) = extract::extract_sealed_guard(row) {
@@ -2190,8 +2193,9 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
             }
 
             // SKIP-STALE: mark processed WITHOUT a model call, so an old row
-            // neither spends budget nor sits queued forever.
-            if row.received_at < ship_cutoff {
+            // neither spends budget nor sits queued forever — and here too, a
+            // hand-requested re-triage runs however old the mail is.
+            if row.received_at < ship_cutoff && !retriage_forced(row.retriage_at, Utc::now()) {
                 let _ =
                     self.store
                         .ship_extract_mark(self.account_id, row.message_id, STALE_SKIP_MODEL);
@@ -2336,7 +2340,10 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
 
             // SKIP-STALE: mark processed WITHOUT a model call, keeping Stage-1
             // values, so the row neither spends budget nor sits queued forever.
-            if row.received_at < stale_cutoff {
+            // A hand-requested re-triage overrules the cutoff: half a re-triage,
+            // with Stage-1 redone and the escalation it asked for skipped, is not
+            // the verdict the user asked to be redone.
+            if row.received_at < stale_cutoff && !retriage_forced(row.retriage_at, Utc::now()) {
                 let _ = self.store.stage2_mark_processed(
                     self.account_id,
                     row.message_id,

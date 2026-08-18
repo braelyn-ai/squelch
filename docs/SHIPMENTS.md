@@ -480,9 +480,10 @@ column is the queue.
 
 **Queue.** The shipments extractor has its own queue, separate from the
 category-routed banking and marketing extractors, because it routes on that
-trigger rather than on a triage category. It drains newest-first, up to
-`stage1.batch_per_cycle` rows per sync cycle, and skips (without a model call)
-anything older than `carriers.max_age_days`. That horizon is deliberately the
+trigger rather than on a triage category. It drains hand-re-triaged rows first
+and then newest-first, up to `stage1.batch_per_cycle` rows per sync cycle, and
+skips (without a model call) anything older than `carriers.max_age_days` unless
+a human re-triaged it in the last day. That horizon is deliberately the
 carrier poller's, not the usual one-week extractor horizon: a package ordered
 three weeks ago is still in flight, and one horizon for the whole feature means
 the poller can never end up chasing a row the extractor skipped unread.

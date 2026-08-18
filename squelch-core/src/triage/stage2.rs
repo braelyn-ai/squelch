@@ -903,6 +903,7 @@ mod tests {
             sender_history: Default::default(),
             thread: Vec::new(),
             sensitivity: Sensitivity::Normal,
+            retriage_at: None,
         }
     }
 

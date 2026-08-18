@@ -561,6 +561,7 @@ mod tests {
             category: "general".into(),
             received_at: Utc::now(),
             sensitivity: Sensitivity::Normal,
+            retriage_at: None,
         }
     }
 

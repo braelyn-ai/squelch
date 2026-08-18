@@ -157,6 +157,15 @@ CREATE TABLE IF NOT EXISTS triage (
     -- PRESERVES a processed marker and only refreshes 'pending'; sealing NULLs
     -- it, and retriage re-pends it.
     ship_extract_model TEXT,
+    -- WHEN A HUMAN LAST ASKED for this row to be re-triaged (RFC3339 UTC), NULL
+    -- when nobody ever has. Stamped by `Store::retriage_reset` on exactly the
+    -- rows it requeues, and read by the LLM passes as a FORCE: a re-triage is an
+    -- explicit request, so for `RETRIAGE_FORCE_WINDOW` after it the row bypasses
+    -- the age-based stale skip that would otherwise stamp it processed without a
+    -- model call. The window is what keeps the force from outliving the request:
+    -- the same row can re-enter a queue months later through a revisit, and a
+    -- permanent stamp would quietly buy every one of those a frontier call.
+    retriage_at     TEXT,
     status          TEXT NOT NULL DEFAULT 'new',
     surfaced_at     TEXT,
     resolved_at     TEXT,

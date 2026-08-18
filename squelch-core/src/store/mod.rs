@@ -207,6 +207,9 @@ pub struct TriageDebug {
     /// The Gmail-side thread id, joined from `messages`. APPENDED LAST on
     /// purpose: an older client decoding this shape must keep working.
     pub thread_id: String,
+    /// When a human last asked for this row to be re-triaged, `None` when
+    /// nobody ever has. APPENDED LAST for the reason `thread_id` was.
+    pub retriage_at: Option<String>,
 }
 
 /// The stored unsubscribe intent for one NON-SEALED message, resolved by
@@ -434,6 +437,9 @@ pub struct Stage2Queued {
     pub thread: Vec<ThreadSibling>,
     /// Always `'normal'` for queued rows; carried so the sealed guard can assert.
     pub sensitivity: Sensitivity,
+    /// When a human last asked for this row to be re-triaged; see
+    /// [`Stage1Queued::retriage_at`]. Overrides the SKIP-STALE check above.
+    pub retriage_at: Option<DateTime<Utc>>,
 }
 
 /// How the account owner has treated this sender before. Aggregates, not
@@ -518,6 +524,11 @@ pub struct Stage1Queued {
     pub sender_corrected: bool,
     /// Always `'normal'` for queued rows; carried so the sealed guard can assert.
     pub sensitivity: Sensitivity,
+    /// `triage.retriage_at`: when a human last asked for THIS row to be
+    /// re-triaged, `None` when nobody ever has. Read through
+    /// [`crate::triage::retriage_forced`], which is what lets an explicit
+    /// re-triage of old mail bypass the pass's stale skip.
+    pub retriage_at: Option<DateTime<Utc>>,
 }
 
 /// A triage row's HEURISTIC SEED verdict, read back when the Stage-1 model call
@@ -624,6 +635,10 @@ pub struct ExtractQueued {
     pub received_at: DateTime<Utc>,
     /// Always `'normal'` for queued rows; carried so the sealed guard can assert.
     pub sensitivity: Sensitivity,
+    /// When a human last asked for this row to be re-triaged; see
+    /// [`Stage1Queued::retriage_at`]. Overrides the stale skip in
+    /// [`crate::triage::extract::route_extract_row`] and in the shipments loop.
+    pub retriage_at: Option<DateTime<Utc>>,
 }
 
 /// The store-facing outcome of running the marketing extractor on a row: a

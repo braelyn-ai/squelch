@@ -448,6 +448,29 @@ pub fn stage1_sealed_guard(row: &Stage1Queued) -> crate::error::Result<()> {
     Ok(())
 }
 
+/// How long a human's re-triage request FORCES a row through the LLM passes.
+///
+/// Every LLM pass skips mail older than its age cutoff — a guard against a fresh
+/// install spending the daily cap on a backlog nobody asked about. A re-triage
+/// IS asking about it, by hand, on one row, so within this window the cutoff
+/// steps aside (see [`retriage_forced`]).
+///
+/// A day rather than forever, because the stamp outlives the pass: a row that
+/// stays queued through an exhausted budget or a bad credential gets every
+/// remaining tick of the day to land, while a row that re-enters a queue MONTHS
+/// later through a revisit is old mail again and skips like any other. Forever
+/// would quietly buy each of those a frontier call.
+pub const RETRIAGE_FORCE_WINDOW: chrono::Duration = chrono::Duration::hours(24);
+
+/// Is this row's stale skip overridden by a recent re-triage? `retriage_at` is
+/// `triage.retriage_at` — when a human last asked for this row specifically, or
+/// `None` when nobody ever has.
+pub fn retriage_forced(retriage_at: Option<DateTime<Utc>>, now: DateTime<Utc>) -> bool {
+    // A stamp from the FUTURE (clock skew, a hand-edited DB) still counts: the
+    // request happened, and `now - at` going negative must not read as expired.
+    retriage_at.is_some_and(|at| now - at < RETRIAGE_FORCE_WINDOW)
+}
+
 /// Sealed-guard entry for callers that only have a [`Sensitivity`]: a real
 /// release-mode check that errors on sealed input. See docs/SECURITY.md.
 pub fn stage2_llm_triage(sensitivity: Sensitivity) -> crate::error::Result<()> {
@@ -462,7 +485,7 @@ pub fn stage2_llm_triage(sensitivity: Sensitivity) -> crate::error::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::TimeZone;
+    use chrono::{Duration, TimeZone};
 
     fn now() -> DateTime<Utc> {
         Utc.with_ymd_and_hms(2026, 7, 7, 12, 0, 0).unwrap()
@@ -987,6 +1010,7 @@ mod tests {
             sender_history: Default::default(),
             thread: Vec::new(),
             sensitivity,
+            retriage_at: None,
         }
     }
 
@@ -1015,6 +1039,7 @@ mod tests {
             is_known_contact: false,
             sender_corrected: false,
             sensitivity,
+            retriage_at: None,
         }
     }
 
@@ -1034,5 +1059,22 @@ mod tests {
         // Must be a REAL error return regardless of build profile.
         assert!(stage2_llm_triage(Sensitivity::Sealed).is_err());
         assert!(stage2_llm_triage(Sensitivity::Normal).is_ok());
+    }
+
+    #[test]
+    fn a_re_triage_forces_the_row_for_a_day_and_then_stops() {
+        let t = now();
+        // Nobody ever asked: the age cutoff decides, as it always has.
+        assert!(!retriage_forced(None, t));
+        // Asked just now, and asked most of a day ago: both still force.
+        assert!(retriage_forced(Some(t), t));
+        assert!(retriage_forced(Some(t - Duration::hours(23)), t));
+        // The request expires, so a row that re-enters a queue LATER — through a
+        // revisit, months on — is old mail again and skips like any other.
+        assert!(!retriage_forced(Some(t - RETRIAGE_FORCE_WINDOW), t));
+        assert!(!retriage_forced(Some(t - Duration::days(30)), t));
+        // A stamp from the future (clock skew) is still a request, not an
+        // expired one: the subtraction must not read as negative-is-old.
+        assert!(retriage_forced(Some(t + Duration::hours(1)), t));
     }
 }

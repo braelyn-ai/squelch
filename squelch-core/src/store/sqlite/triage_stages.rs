@@ -218,9 +218,10 @@ impl SqliteStore {
             .map(|i| format!("?{}", i + 3))
             .collect::<Vec<_>>()
             .join(",");
+        // Hand-requested rows sort first; see `stage1_queue`.
         let sql = format!(
             "SELECT m.id, m.thread_id, m.from_addr, m.from_name, m.subject, m.body,
-                    t.category, t.sensitivity, m.received_at
+                    t.category, t.sensitivity, m.received_at, t.retriage_at
              FROM triage t
              JOIN messages m ON m.id = t.message_id
              WHERE t.account_id = ?1
@@ -232,7 +233,7 @@ impl SqliteStore {
                    SELECT 1 FROM receipts r
                    WHERE r.account_id = t.account_id AND r.message_id = t.message_id
                )
-             ORDER BY m.received_at DESC
+             ORDER BY t.retriage_at IS NULL, t.retriage_at DESC, m.received_at DESC
              LIMIT ?2"
         );
         let mut stmt = conn.prepare(&sql)?;
@@ -257,6 +258,7 @@ impl SqliteStore {
                     category: r.get(6)?,
                     sensitivity: Sensitivity::parse(&r.get::<_, String>(7)?),
                     received_at: dt(r, 8)?,
+                    retriage_at: dt_opt(r, 9)?,
                 })
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -278,16 +280,17 @@ impl SqliteStore {
         // COALESCE on the category because the trigger is stamped at INGEST: a row
         // can queue here before Stage-1 ever assigns a category, and
         // `ExtractQueued.category` is a `String`.
+        // Hand-requested rows sort first; see `stage1_queue`.
         let mut stmt = conn.prepare(
             "SELECT m.id, m.thread_id, m.from_addr, m.from_name, m.subject, m.body,
-                    COALESCE(t.category, ''), t.sensitivity, m.received_at
+                    COALESCE(t.category, ''), t.sensitivity, m.received_at, t.retriage_at
              FROM triage t
              JOIN messages m ON m.id = t.message_id
              WHERE t.account_id = ?1
                AND t.ship_extract_model = 'pending'
                AND t.sensitivity = 'normal'
                AND m.is_sent = 0
-             ORDER BY m.received_at DESC
+             ORDER BY t.retriage_at IS NULL, t.retriage_at DESC, m.received_at DESC
              LIMIT ?2",
         )?;
         let out = stmt
@@ -303,6 +306,7 @@ impl SqliteStore {
                     category: r.get(6)?,
                     sensitivity: Sensitivity::parse(&r.get::<_, String>(7)?),
                     received_at: dt(r, 8)?,
+                    retriage_at: dt_opt(r, 9)?,
                 })
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -331,7 +335,8 @@ impl SqliteStore {
         days: u32,
     ) -> Result<u64> {
         let conn = self.lock()?;
-        let cutoff = (Utc::now() - chrono::Duration::days(days as i64)).to_rfc3339();
+        let now = Utc::now();
+        let cutoff = (now - chrono::Duration::days(days as i64)).to_rfc3339();
         // Scope: one message, or the trailing-days inbound window. Normal
         // sensitivity only, and never a rule-decided ('rule'), human-corrected
         // ('human') or sealed/sent ('n/a') marker — rules are authoritative, a
@@ -350,9 +355,17 @@ impl SqliteStore {
         // shipping signal at ingest", and blanking it would be indistinguishable
         // from that. Only a row that EVER carried a signal is re-pended; a NULL
         // stays NULL and re-enters nothing.
+        //
+        // AND THE STAMP THAT SAYS A HUMAN ASKED. Every LLM pass skips mail older
+        // than its age cutoff, so without this a re-triage of anything past the
+        // window requeues the row only to have the next tick mark it processed
+        // with no model call — a request answered by a no-op. The passes read it
+        // through `triage::retriage_forced`, which expires it after a day so the
+        // force covers this request and not the row's whole future.
         let update = format!(
             "UPDATE triage SET stage1_model_used = NULL, model_used = NULL,
                     needs_stage2 = 0, extractor_model_used = NULL,
+                    retriage_at = ?3,
                     ship_extract_model = CASE
                         WHEN ship_extract_model IS NOT NULL THEN 'pending' ELSE NULL END
              WHERE account_id = ?1
@@ -363,7 +376,10 @@ impl SqliteStore {
                    WHERE m.account_id = ?1 AND m.is_sent = 0 AND {scope_sql}
                )"
         );
-        let n = conn.execute(&update, rusqlite::params![account_id, scope_param])?;
+        let n = conn.execute(
+            &update,
+            rusqlite::params![account_id, scope_param, now.to_rfc3339()],
+        )?;
         // The rows the UPDATE just reset (their Stage-1 marker is now NULL),
         // reused by every specialist cleanup below.
         let reset_scope = format!(
@@ -447,9 +463,15 @@ impl SqliteStore {
         // Rows still needing Stage-1: heuristic seed values in place
         // (stage1_model_used IS NULL), non-sealed, non-sent. Rule-decided rows
         // carry stage1_model_used='rule' and are excluded.
+        //
+        // ORDER: a row a human asked for by hand comes FIRST, most recent request
+        // first, and only then the newest-first backlog. `LIMIT batch_per_cycle`
+        // is a real ceiling — behind a backlog, a re-triaged row sorted purely by
+        // age would wait ticks for its turn, which reads exactly like the skip it
+        // is not. Every other queue orders the same way, for the same reason.
         let mut stmt = conn.prepare(
             "SELECT m.id, m.thread_id, m.from_addr, m.subject, m.body, t.sensitivity,
-                    m.received_at,
+                    m.received_at, t.retriage_at,
                     EXISTS(
                         SELECT 1 FROM contacts c
                         WHERE c.account_id = m.account_id
@@ -467,7 +489,7 @@ impl SqliteStore {
                AND t.stage1_model_used IS NULL
                AND t.sensitivity = 'normal'
                AND m.is_sent = 0
-             ORDER BY m.received_at DESC
+             ORDER BY t.retriage_at IS NULL, t.retriage_at DESC, m.received_at DESC
              LIMIT ?2",
         )?;
         let out = stmt
@@ -481,8 +503,9 @@ impl SqliteStore {
                     body: r.get(4)?,
                     sensitivity: Sensitivity::parse(&r.get::<_, String>(5)?),
                     received_at: dt(r, 6)?,
-                    is_known_contact: r.get::<_, i64>(7)? != 0,
-                    sender_corrected: r.get::<_, i64>(8)? != 0,
+                    retriage_at: dt_opt(r, 7)?,
+                    is_known_contact: r.get::<_, i64>(8)? != 0,
+                    sender_corrected: r.get::<_, i64>(9)? != 0,
                 })
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -970,9 +993,10 @@ impl SqliteStore {
         // Queue predicate: Stage-1 finished the row, flagged it for escalation,
         // and Stage-2 has not processed it. Sealed rows are structurally
         // excluded. The LEFT JOIN carries a matched Filtered rule's want_text.
+        // Hand-requested rows sort first; see `stage1_queue`.
         let mut stmt = conn.prepare(
             "SELECT m.id, m.thread_id, m.from_addr, m.subject, m.body, t.sensitivity,
-                    sr.want_text, m.received_at,
+                    sr.want_text, m.received_at, t.retriage_at,
                     EXISTS(
                         SELECT 1 FROM contacts c
                         WHERE c.account_id = m.account_id
@@ -989,7 +1013,7 @@ impl SqliteStore {
                AND t.model_used IS NULL
                AND t.sensitivity = 'normal'
                AND m.is_sent = 0
-             ORDER BY m.received_at DESC
+             ORDER BY t.retriage_at IS NULL, t.retriage_at DESC, m.received_at DESC
              LIMIT ?2",
         )?;
         let mut out = stmt
@@ -1004,8 +1028,9 @@ impl SqliteStore {
                     sensitivity: Sensitivity::parse(&r.get::<_, String>(5)?),
                     rule_want_text: r.get::<_, Option<String>>(6)?.filter(|s| !s.is_empty()),
                     received_at: dt(r, 7)?,
-                    is_known_contact: r.get::<_, i64>(8)? != 0,
-                    escalation_reason: r.get::<_, Option<String>>(9)?,
+                    retriage_at: dt_opt(r, 8)?,
+                    is_known_contact: r.get::<_, i64>(9)? != 0,
+                    escalation_reason: r.get::<_, Option<String>>(10)?,
                     // Filled per row below; both need the row's own identifiers,
                     // and the batch is `batch_per_cycle` rows, not a table scan.
                     sender_history: SenderHistory::default(),

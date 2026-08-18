@@ -76,13 +76,23 @@ pub enum RowAction {
 /// sealed guard first, then the stale skip, then the extractor lookup. Pure, so
 /// the ordering is unit-testable without an LLM or a store — and so a new
 /// specialist can never be added behind a guard that does not know about it.
-pub fn route_extract_row(row: &ExtractQueued, stale_cutoff: DateTime<Utc>) -> RowAction {
+///
+/// `now` is the pass clock, and it is here only for the re-triage force: a row a
+/// human asked for by hand within [`crate::triage::RETRIAGE_FORCE_WINDOW`] runs
+/// however old it is.
+pub fn route_extract_row(
+    row: &ExtractQueued,
+    stale_cutoff: DateTime<Utc>,
+    now: DateTime<Utc>,
+) -> RowAction {
     // SEALED FIRST, unconditionally: a sealed row must be refused even when it
-    // is also stale, so the stale skip can never stamp it processed.
+    // is also stale, so the stale skip can never stamp it processed — and the
+    // re-triage force sits UNDER this line for the same reason: a human asking
+    // to re-triage sealed mail does not make it reachable.
     if extract_sealed_guard(row).is_err() {
         return RowAction::Sealed;
     }
-    if row.received_at < stale_cutoff {
+    if row.received_at < stale_cutoff && !crate::triage::retriage_forced(row.retriage_at, now) {
         return RowAction::Stale;
     }
     match extractor_for_category(&row.category) {
@@ -194,6 +204,7 @@ mod tests {
             category: "banking_statement".into(),
             received_at: Utc::now(),
             sensitivity,
+            retriage_at: None,
         }
     }
 
@@ -268,47 +279,82 @@ mod tests {
     fn a_marketing_row_routes_to_the_marketing_extractor_not_the_skip_marker() {
         let mut row = queued(Sensitivity::Normal);
         row.category = "marketing".into();
-        let action = route_extract_row(&row, Utc::now() - Duration::days(30));
+        let action = route_extract_row(&row, Utc::now() - Duration::days(30), Utc::now());
         assert_eq!(action, RowAction::Run(CategoryExtractor::Marketing));
         assert_ne!(action, RowAction::NoExtractor);
     }
 
     #[test]
     fn route_extract_row_runs_banking_skips_unowned_categories() {
-        let cutoff = Utc::now() - Duration::days(30);
+        let now = Utc::now();
+        let cutoff = now - Duration::days(30);
         let mut row = queued(Sensitivity::Normal);
         for cat in ["banking_statement", "transaction_alert", "autopay_bill"] {
             row.category = cat.into();
             assert_eq!(
-                route_extract_row(&row, cutoff),
+                route_extract_row(&row, cutoff, now),
                 RowAction::Run(CategoryExtractor::Banking)
             );
         }
         for cat in ["general", "invoice"] {
             row.category = cat.into();
-            assert_eq!(route_extract_row(&row, cutoff), RowAction::NoExtractor);
+            assert_eq!(route_extract_row(&row, cutoff, now), RowAction::NoExtractor);
         }
     }
 
     #[test]
     fn route_extract_row_refuses_sealed_and_skips_stale() {
-        let cutoff = Utc::now() - Duration::days(30);
+        let now = Utc::now();
+        let cutoff = now - Duration::days(30);
         assert_eq!(
-            route_extract_row(&queued(Sensitivity::Sealed), cutoff),
+            route_extract_row(&queued(Sensitivity::Sealed), cutoff, now),
             RowAction::Sealed
         );
 
         let mut old = queued(Sensitivity::Normal);
         old.received_at = cutoff - Duration::hours(1);
-        assert_eq!(route_extract_row(&old, cutoff), RowAction::Stale);
+        assert_eq!(route_extract_row(&old, cutoff, now), RowAction::Stale);
 
         // The boundary is `<` cutoff, exactly as the pass reads it.
         let mut at_cutoff = queued(Sensitivity::Normal);
         at_cutoff.received_at = cutoff;
         assert_eq!(
-            route_extract_row(&at_cutoff, cutoff),
+            route_extract_row(&at_cutoff, cutoff, now),
             RowAction::Run(CategoryExtractor::Banking)
         );
+    }
+
+    #[test]
+    fn a_hand_re_triaged_row_runs_however_old_it_is() {
+        let now = Utc::now();
+        let cutoff = now - Duration::days(30);
+        let mut old = queued(Sensitivity::Normal);
+        old.received_at = cutoff - Duration::days(400);
+        assert_eq!(route_extract_row(&old, cutoff, now), RowAction::Stale);
+
+        // The same row, with a human's re-triage stamp on it.
+        old.retriage_at = Some(now - Duration::hours(1));
+        assert_eq!(
+            route_extract_row(&old, cutoff, now),
+            RowAction::Run(CategoryExtractor::Banking),
+            "an explicit re-triage is the one thing the age cutoff yields to"
+        );
+
+        // And the force expires with the request, not with the row.
+        old.retriage_at = Some(now - Duration::days(30));
+        assert_eq!(route_extract_row(&old, cutoff, now), RowAction::Stale);
+    }
+
+    #[test]
+    fn a_re_triage_stamp_never_unseals_a_sealed_row() {
+        // Sealing outranks the account owner's own re-triage: the force sits
+        // BELOW the sealed guard, so this must refuse rather than run.
+        let now = Utc::now();
+        let cutoff = now - Duration::days(30);
+        let mut row = queued(Sensitivity::Sealed);
+        row.received_at = cutoff - Duration::days(400);
+        row.retriage_at = Some(now);
+        assert_eq!(route_extract_row(&row, cutoff, now), RowAction::Sealed);
     }
 
     #[test]
@@ -316,9 +362,10 @@ mod tests {
         // A sealed AND stale row must be refused, not stamped processed: the
         // sealed guard is unconditionally first.
         let mut row = queued(Sensitivity::Sealed);
-        let cutoff = Utc::now() - Duration::days(30);
+        let now = Utc::now();
+        let cutoff = now - Duration::days(30);
         row.received_at = cutoff - Duration::days(400);
-        assert_eq!(route_extract_row(&row, cutoff), RowAction::Sealed);
+        assert_eq!(route_extract_row(&row, cutoff, now), RowAction::Sealed);
     }
 
     #[test]

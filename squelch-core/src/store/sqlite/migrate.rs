@@ -100,6 +100,11 @@ pub(super) fn migrate(conn: &Connection) -> Result<()> {
         "revisit_count",
         "INTEGER NOT NULL DEFAULT 0",
     )?;
+    // WHEN A HUMAN LAST ASKED for this row to be re-triaged. NULL on every
+    // pre-existing row and NOT backfilled: nobody has asked, and a backfilled
+    // stamp would force the whole mailbox through the LLM passes on the next
+    // tick — the exact opposite of what the age-based stale skip is for.
+    add_column_if_missing(conn, "triage", "retriage_at", "TEXT")?;
 
     // stage2_usage grew `category` INSIDE ITS PRIMARY KEY. ALTER ADD COLUMN
     // cannot change a PK, and the bump upsert's ON CONFLICT(account_id, day,
