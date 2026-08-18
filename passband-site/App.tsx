@@ -133,6 +133,15 @@ const styles = {
     gap: "1rem",
     textDecoration: "none",
   },
+  // The one line that answers the press. Brighter than the detail under it and
+  // quieter than the tagline above it, which stays the page's loudest line in
+  // every state.
+  confirm: {
+    margin: "0.65rem 0 0",
+    color: "#f5f5f7",
+    fontSize: "1rem",
+    textAlign: "center",
+  },
   status: {
     margin: 0,
     maxWidth: "26rem",
@@ -141,19 +150,6 @@ const styles = {
     lineHeight: 1.5,
     textAlign: "center",
     padding: "0 1.5rem",
-  },
-  // The line under the button, for the people the button is not for: anyone
-  // holding an invite already, who would otherwise find the homepage a dead
-  // end now that the download has moved into the flow behind it.
-  note: {
-    margin: "0.4rem 0 0",
-    color: "#8a8a90",
-    fontSize: "0.85rem",
-    textAlign: "center",
-  },
-  noteLink: {
-    color: "#b8b8bd",
-    textUnderlineOffset: "0.15em",
   },
   corner: {
     position: "absolute",
@@ -741,21 +737,16 @@ function CornerLinks() {
 // list, so this page can never become a membership oracle.
 const WAITLIST_URL = "https://signup.passband.app/waitlist";
 
-// Where an invite is redeemed. The emailed link goes straight here with the
-// code in it; this is the way in for somebody who has the mail open on another
-// device, or who lost it and kept the code.
-const SIGNUP_URL = "https://signup.passband.app";
-
 // The path the waitlist state answers to. A real URL, deep-linkable and
 // shareable, even though reaching it from the homepage never loads a document.
 const WAITLIST_PATH = "/waitlist";
 
 // The waitlist, as a state of the homepage rather than a page of its own.
 //
-// It renders into the SAME SLOT the tagline and the button occupy, which is
-// what makes the swap sit still: the mark, the wordmark, the corner links and
-// the line underneath never move, and one line of copy changes its words while
-// the button becomes the rig.
+// It renders into the slot THE BUTTON occupies, and nothing above it moves: the
+// mark, the wordmark and the tagline are the page's constants in every state,
+// so joining the list swaps exactly one element and the rest of the page holds
+// perfectly still.
 function Waitlist() {
   const { chrome, handlers } = useMeter();
   const [email, setEmail] = useState("");
@@ -784,7 +775,7 @@ function Waitlist() {
   if (state === "done") {
     return (
       <>
-        <p style={styles.tagline}>you're on the list.</p>
+        <p style={styles.confirm}>you're on the list.</p>
         <p style={styles.status}>
           the invite lands by email when a spot opens. it walks you through
           setup, and the app is waiting at the end of it.
@@ -795,9 +786,6 @@ function Waitlist() {
 
   return (
     <>
-      <p style={styles.tagline}>
-        we run the daemon for you. your invite lands by email.
-      </p>
       <form className="pb-rig" onSubmit={submit} {...handlers}>
         {chrome}
         <input
@@ -883,23 +871,12 @@ export function App() {
         ) : (
           masthead
         )}
+        <p style={styles.tagline}>fuck email. lets make it bearable</p>
         {joining ? (
           <Waitlist />
         ) : (
-          <>
-            <p style={styles.tagline}>fuck email. lets make it bearable</p>
-            <JoinButton onClick={go(WAITLIST_PATH, true)} />
-          </>
+          <JoinButton onClick={go(WAITLIST_PATH, true)} />
         )}
-        {/* The second door, for the people the button is not for. Muted, and a
-            line rather than a button, because there is one primary action here
-            and this is not it. */}
-        <p style={styles.note}>
-          already have an invite?{" "}
-          <a style={styles.noteLink} href={SIGNUP_URL}>
-            set up your mailbox
-          </a>
-        </p>
       </div>
       <CornerLinks />
     </main>
