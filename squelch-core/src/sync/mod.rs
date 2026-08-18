@@ -29,10 +29,10 @@ use crate::sync::ingest::{
 };
 use crate::triage::events;
 use crate::triage::extract::{self, CategoryExtractor, RowAction, banking, marketing, shipments};
-use crate::triage::retriage_forced;
 use crate::triage::stage1_llm::{self, HEURISTIC_ONLY};
 use crate::triage::stage2::{self, ClassifyOutcome, RowContext};
-use crate::triage::{stage1_sealed_guard, stage2_sealed_guard};
+use crate::triage::{STALE_SKIP_MODEL, retriage_forced};
+use crate::triage::{Stage1RowAction, stage1_sealed_guard, stage2_sealed_guard};
 use crate::types::{AccountId, SenderRule, Sensitivity};
 
 /// Gmail REST base for the authenticated user. Fixed; not user-tunable. `pub`
@@ -95,11 +95,6 @@ enum IngestOrigin {
     /// A history walk or a catch-up re-scan: mail that may be genuinely new.
     Incremental,
 }
-
-/// Model id stamped on a row older than `stage2_max_age_days`: marked processed
-/// WITHOUT a model call, keeping its Stage-1 values, so it neither spends budget
-/// nor sits queued forever.
-const STALE_SKIP_MODEL: &str = "stale-skip";
 
 /// The SHIPMENTS extractor's own stale cutoff, from `carriers.max_age_days`.
 ///
@@ -1767,23 +1762,34 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
         for row in &queued {
             // SEALED GUARD: the queue already excludes sealed rows in SQL;
             // re-check before every classify call (docs/SECURITY.md).
-            if let Err(e) = stage1_sealed_guard(row) {
-                eprintln!("squelch: stage-1 sealed guard tripped ({e}); skipping row");
-                continue;
-            }
-
-            // SKIP-STALE: mark processed WITHOUT a model call, keeping the seed.
-            // UNLESS a human just asked for this row by hand, which is the one
-            // thing the age cutoff was never meant to overrule.
-            if row.received_at < stale_cutoff && !retriage_forced(row.retriage_at, Utc::now()) {
-                let _ = self.store.stage1_mark_processed(
-                    self.account_id,
-                    row.message_id,
-                    HEURISTIC_ONLY,
-                );
-                stale_skipped += 1;
-                self.metrics.record_stage1(Stage1Verdict::StaleSkipped);
-                continue;
+            // ONE ORDERED DECISION per row — sealed guard, then the stale skip
+            // and the re-triage force that overrules it. It lives in
+            // `route_stage1_row` for the reason the extract pass's lives in
+            // `route_extract_row`: the ordering is the invariant, and it is
+            // testable there without an LLM or a store.
+            match crate::triage::route_stage1_row(row, stale_cutoff, Utc::now()) {
+                Stage1RowAction::Sealed => {
+                    // Re-run the guard purely to log its redacted message.
+                    if let Err(e) = stage1_sealed_guard(row) {
+                        eprintln!("squelch: stage-1 sealed guard tripped ({e}); skipping row");
+                    }
+                    continue;
+                }
+                // SKIP-STALE: mark processed WITHOUT a model call, keeping the
+                // seed. STALE_SKIP_MODEL, never HEURISTIC_ONLY: the seed stands
+                // either way, but "too old to ask" and "asked, no answer" are
+                // opposite facts and the row is the only place either is recorded.
+                Stage1RowAction::Stale => {
+                    let _ = self.store.stage1_mark_processed(
+                        self.account_id,
+                        row.message_id,
+                        STALE_SKIP_MODEL,
+                    );
+                    stale_skipped += 1;
+                    self.metrics.record_stage1(Stage1Verdict::StaleSkipped);
+                    continue;
+                }
+                Stage1RowAction::Run => {}
             }
 
             // GLOBAL budget check (Stage-1's ONLY scope). Once hit, every

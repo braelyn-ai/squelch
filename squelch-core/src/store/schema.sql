@@ -111,8 +111,17 @@ CREATE TABLE IF NOT EXISTS triage (
     matched_rule_id INTEGER,
     -- STAGE-1 LLM marker. NULL = still needs the Stage-1 refine pass (its
     -- heuristic seed values are provisional). Otherwise the Stage-1 model id,
-    -- 'rule' when a sender rule already decided the row (no model spend), or
-    -- 'heuristic-only' when the pass fell back to the seed.
+    -- 'rule' when a sender rule already decided the row (no model spend),
+    -- 'human' when the account owner corrected the verdict by hand, 'n/a' for
+    -- sealed and sent mail, or one of the two NO-VERDICT sentinels:
+    --   'stale-skip'      too old for the pass's horizon; no model was asked.
+    --   'heuristic-only'  a model WAS asked and did not answer (refusal or a
+    --                     permanent failure), so the seed stands.
+    -- Both leave the row on its heuristic seed and they are easy to conflate,
+    -- which is why they are separate strings: they are opposite facts, and the
+    -- row is the only place either one is recorded. Rows stamped before the
+    -- split may carry 'heuristic-only' for either reason and cannot be
+    -- re-attributed — nothing records when a row was processed.
     stage1_model_used TEXT,
     -- Set to 1 by `triage::router::should_escalate` over the Stage-1 verdict, or
     -- at ingest for a Filtered rule needing want_text evaluation, to mark the row

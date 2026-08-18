@@ -448,6 +448,21 @@ pub fn stage1_sealed_guard(row: &Stage1Queued) -> crate::error::Result<()> {
     Ok(())
 }
 
+/// Model id stamped on a row skipped for AGE: marked processed WITHOUT a model
+/// call, keeping whatever values it already had, so it neither spends budget nor
+/// sits queued forever. Used by every pass that has an age cutoff — Stage-1,
+/// Stage-2, the category extractors and the shipments extractor.
+///
+/// DISTINCT FROM [`stage1_llm::HEURISTIC_ONLY`] on purpose. Both leave a Stage-1
+/// row sitting on its heuristic seed, but they are opposite facts: this one
+/// means "too old, nobody ever asked a model", and `heuristic-only` means "a
+/// model was asked and did not answer". Stage-1 used to stamp `heuristic-only`
+/// for both, which made the two indistinguishable in the row — and the first
+/// question anyone asks of a wrong verdict is which of the two happened.
+/// Historical rows stamped before the split stay ambiguous; nothing records when
+/// they were processed, so they cannot be re-attributed after the fact.
+pub const STALE_SKIP_MODEL: &str = "stale-skip";
+
 /// How long a human's re-triage request FORCES a row through the LLM passes.
 ///
 /// Every LLM pass skips mail older than its age cutoff — a guard against a fresh
@@ -469,6 +484,44 @@ pub fn retriage_forced(retriage_at: Option<DateTime<Utc>>, now: DateTime<Utc>) -
     // A stamp from the FUTURE (clock skew, a hand-edited DB) still counts: the
     // request happened, and `now - at` going negative must not read as expired.
     retriage_at.is_some_and(|at| now - at < RETRIAGE_FORCE_WINDOW)
+}
+
+/// What the Stage-1 pass should do with one queued row, decided ahead of any
+/// budget spend or model call. The Stage-1 twin of
+/// [`extract::RowAction`](crate::triage::extract::RowAction).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Stage1RowAction {
+    /// Sealed row that slipped past the queue's SQL exclusion: refuse it.
+    Sealed,
+    /// Older than the pass's stale cutoff, and no live re-triage request to
+    /// override it: mark processed with [`STALE_SKIP_MODEL`], no model call.
+    Stale,
+    /// Classify it.
+    Run,
+}
+
+/// The per-row decision for the Stage-1 pass, as ONE ordered expression: sealed
+/// guard first, then the stale skip. Pure, so the ordering is unit-testable
+/// without an LLM or a store — the same reason
+/// [`extract::route_extract_row`](crate::triage::extract::route_extract_row)
+/// exists, and the reason the re-triage force cannot be added to one pass's
+/// cutoff and quietly forgotten at another's.
+pub fn route_stage1_row(
+    row: &Stage1Queued,
+    stale_cutoff: DateTime<Utc>,
+    now: DateTime<Utc>,
+) -> Stage1RowAction {
+    // SEALED FIRST, unconditionally: a sealed row must be refused even when it
+    // is also stale, so the stale skip can never stamp it processed — and the
+    // re-triage force sits under that too. Asking to re-triage sealed mail does
+    // not make it reachable.
+    if stage1_sealed_guard(row).is_err() {
+        return Stage1RowAction::Sealed;
+    }
+    if row.received_at < stale_cutoff && !retriage_forced(row.retriage_at, now) {
+        return Stage1RowAction::Stale;
+    }
+    Stage1RowAction::Run
 }
 
 /// Sealed-guard entry for callers that only have a [`Sensitivity`]: a real
@@ -1059,6 +1112,72 @@ mod tests {
         // Must be a REAL error return regardless of build profile.
         assert!(stage2_llm_triage(Sensitivity::Sealed).is_err());
         assert!(stage2_llm_triage(Sensitivity::Normal).is_ok());
+    }
+
+    #[test]
+    fn the_two_no_verdict_markers_are_never_the_same_string() {
+        // They are opposite facts about a row that looks identical either way —
+        // seed values, out of the queue. Collapsing them (Stage-1 used to stamp
+        // HEURISTIC_ONLY for both) makes "was a model ever asked about this?"
+        // unanswerable from the row, which is the first question anyone asks.
+        assert_ne!(STALE_SKIP_MODEL, stage1_llm::HEURISTIC_ONLY);
+    }
+
+    fn stage1_row_at(
+        received_at: DateTime<Utc>,
+        retriage_at: Option<DateTime<Utc>>,
+    ) -> Stage1Queued {
+        let mut row = stage1_queued_row(Sensitivity::Normal);
+        row.received_at = received_at;
+        row.retriage_at = retriage_at;
+        row
+    }
+
+    #[test]
+    fn route_stage1_row_runs_fresh_mail_and_skips_old_mail() {
+        let now = now();
+        let cutoff = now - Duration::days(7);
+
+        let fresh = stage1_row_at(now, None);
+        assert_eq!(route_stage1_row(&fresh, cutoff, now), Stage1RowAction::Run);
+
+        let old = stage1_row_at(cutoff - Duration::hours(1), None);
+        assert_eq!(route_stage1_row(&old, cutoff, now), Stage1RowAction::Stale);
+
+        // The boundary is `<` cutoff, exactly as the pass reads it.
+        let at_cutoff = stage1_row_at(cutoff, None);
+        assert_eq!(
+            route_stage1_row(&at_cutoff, cutoff, now),
+            Stage1RowAction::Run
+        );
+    }
+
+    #[test]
+    fn route_stage1_row_lets_a_hand_re_triage_beat_the_cutoff() {
+        let now = now();
+        let cutoff = now - Duration::days(7);
+        let ancient = cutoff - Duration::days(400);
+
+        let asked = stage1_row_at(ancient, Some(now - Duration::hours(1)));
+        assert_eq!(route_stage1_row(&asked, cutoff, now), Stage1RowAction::Run);
+
+        // ...and the force expires with the request, not with the row.
+        let spent = stage1_row_at(ancient, Some(now - Duration::days(30)));
+        assert_eq!(
+            route_stage1_row(&spent, cutoff, now),
+            Stage1RowAction::Stale
+        );
+    }
+
+    #[test]
+    fn route_stage1_row_refuses_sealed_before_anything_else() {
+        // Sealed outranks both the stale skip and the owner's own re-triage: a
+        // sealed row must be REFUSED, never stamped processed and never run.
+        let now = now();
+        let cutoff = now - Duration::days(7);
+        let mut row = stage1_row_at(cutoff - Duration::days(400), Some(now));
+        row.sensitivity = Sensitivity::Sealed;
+        assert_eq!(route_stage1_row(&row, cutoff, now), Stage1RowAction::Sealed);
     }
 
     #[test]
