@@ -34,7 +34,15 @@ use std::time::Duration;
 /// watching a spinner and the client gives up at 15s: past that the save has
 /// already been reported as failed even though it landed. So the entire call is
 /// bounded here, and the expiry is `Filtered` like every other non-answer.
-const INFER_BUDGET: Duration = Duration::from_secs(8);
+///
+/// 12s, not the 8s that was right for a small model. This call now runs
+/// `Stage1Config::model` — a reasoning model that thinks before it emits its
+/// first byte — and a budget the model cannot beat is not a budget, it is a
+/// switch that turns every inferred rule into `Filtered`. It stays under the
+/// client's 15s deadline, which is the constraint that actually matters: the
+/// budget exists so the user sees an answer, not so the model does. Re-check
+/// this number whenever the Stage-1 model or effort changes.
+const INFER_BUDGET: Duration = Duration::from_secs(12);
 /// Per-request timeout. The real ceiling on the save path is [`INFER_BUDGET`],
 /// which wraps the whole retry ladder; this only bounds a single attempt for
 /// direct [`classify_at`] callers.

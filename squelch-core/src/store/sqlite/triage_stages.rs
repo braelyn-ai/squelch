@@ -89,6 +89,12 @@ fn sender_history_conn(
 /// is not an exception — see docs/SECURITY.md. Sent siblings ARE included, and
 /// are the most valuable rows here: a thread the owner has replied in is one
 /// they have already voted for.
+///
+/// THE MOST RECENT `limit` SIBLINGS, re-sorted ascending for display. Taking the
+/// oldest instead would drop the owner's own recent reply off the end of any
+/// thread longer than the cap, and the prompt states "the account owner HAS
+/// WRITTEN / has never written in it" as a fact — a window that can silently
+/// omit the reply turns the single most useful signal here into a false one.
 fn thread_siblings_conn(
     conn: &Connection,
     account_id: AccountId,
@@ -108,10 +114,10 @@ fn thread_siblings_conn(
            AND m.thread_id = ?2
            AND m.id != ?3
            AND t.sensitivity = 'normal'
-         ORDER BY m.received_at ASC
+         ORDER BY m.received_at DESC
          LIMIT ?4",
     )?;
-    let out = stmt
+    let mut out = stmt
         .query_map(
             params![account_id, thread_id, exclude_message_id, limit as i64],
             |r| {
@@ -126,6 +132,9 @@ fn thread_siblings_conn(
             },
         )?
         .collect::<std::result::Result<Vec<_>, _>>()?;
+    // Newest-first off the index, oldest-first for the reader: the prompt renders
+    // these as a conversation, and a conversation runs forwards.
+    out.reverse();
     Ok(out)
 }
 
@@ -590,13 +599,19 @@ impl SqliteStore {
         Ok(())
     }
 
-    /// Revisits that have come due: pending, past their date, on a NON-SEALED
-    /// row that has not exhausted its lifetime budget and that the account owner
-    /// has not corrected by hand.
+    /// Revisits that have come due: pending, past their date, on a NON-SEALED,
+    /// NOT-DONE row that has not exhausted its lifetime budget and that the
+    /// account owner has not corrected by hand.
     ///
     /// The human-correction exclusion is the important one. A revisit rewrites a
     /// verdict, and a verdict the owner personally fixed is the one thing in
     /// this system a model may never overwrite.
+    ///
+    /// `status = 'done'` is excluded for a weaker version of the same reason, and
+    /// it is not a rare case: receipts and banking rows are INGESTED done so they
+    /// live only in their rail, and a model-scheduled revisit on one of those
+    /// would spend a call to re-open something nobody asked to see again. The
+    /// staleness sweep has always excluded them; the due queue has to agree.
     pub(super) fn revisit_queue(
         &self,
         account_id: AccountId,
@@ -627,6 +642,7 @@ impl SqliteStore {
                AND v.fired_at IS NULL
                AND v.revisit_at <= ?2
                AND t.sensitivity = 'normal'
+               AND t.status != 'done'
                AND t.revisit_count < ?3
                AND m.is_sent = 0
                AND NOT EXISTS(
@@ -709,6 +725,14 @@ impl SqliteStore {
     /// deserve another look. Returns message ids to schedule an immediate
     /// [`RevisitSource::FyeStale`](crate::triage::revisit::RevisitSource::FyeStale)
     /// revisit for.
+    ///
+    /// `older_than` is BOTH bounds of one window. A row qualifies when its mail
+    /// is older than that moment AND nothing has re-scored it since — the pending
+    /// check alone is not a cooldown, because a swept row schedules at `now`,
+    /// fires in the same pass, and is pending no longer. Without the fired-since
+    /// clause the same row re-sweeps on the NEXT sync tick, forty-five seconds
+    /// later, and every stale row in the standing band turns into a metronome
+    /// billing a frontier-model call until the daily cap runs out.
     pub(super) fn revisit_stale_standing(
         &self,
         account_id: AccountId,
@@ -733,7 +757,7 @@ impl SqliteStore {
                    SELECT 1 FROM triage_revisits v
                    WHERE v.account_id = t.account_id
                      AND v.message_id = t.message_id
-                     AND v.fired_at IS NULL
+                     AND (v.fired_at IS NULL OR v.fired_at > ?2)
                )
                AND NOT EXISTS(
                    SELECT 1 FROM triage_feedback f
@@ -760,7 +784,10 @@ impl SqliteStore {
     /// two things only a revisit needs: `model_used` is CLEARED so a newly
     /// escalated row can re-enter the Stage-2 queue (its old Stage-2 marker
     /// describes a verdict that no longer exists), and the guard also refuses a
-    /// row the owner has corrected by hand.
+    /// row the owner has corrected by hand or already resolved. Both refusals
+    /// re-check in the write what [`Self::revisit_queue`] filtered in the read:
+    /// the two are separated by a model call, which is plenty of time for
+    /// someone to mark a row done from a client.
     pub(super) fn revisit_apply(&self, applied: &Stage1Applied) -> Result<bool> {
         let mut conn = self.lock()?;
         let tx = conn.transaction()?;
@@ -784,6 +811,7 @@ impl SqliteStore {
                  escalation_reason = ?12,
                  model_used = NULL
              WHERE message_id = ?1 AND account_id = ?2 AND sensitivity = 'normal'
+               AND status != 'done'
                AND NOT EXISTS(
                    SELECT 1 FROM triage_feedback f
                    WHERE f.account_id = ?2 AND f.message_id = ?1
@@ -813,6 +841,38 @@ impl SqliteStore {
         }
         tx.commit()?;
         Ok(n > 0)
+    }
+
+    /// The heuristic seed verdict as it currently stands on a row, for the
+    /// Stage-1 fallback's notification decision. `None` when the row is gone or
+    /// sealed.
+    pub(super) fn triage_seed_verdict(
+        &self,
+        account_id: AccountId,
+        message_id: i64,
+    ) -> Result<Option<SeedVerdict>> {
+        let conn = self.lock()?;
+        let row = conn
+            .query_row(
+                "SELECT tier, importance, one_line, needs_stage2, deadline
+                 FROM triage
+                 WHERE message_id = ?1 AND account_id = ?2 AND sensitivity = 'normal'",
+                params![message_id, account_id],
+                |r| {
+                    Ok(SeedVerdict {
+                        tier: Tier::parse(&r.get::<_, String>(0)?).unwrap_or(Tier::Noise),
+                        importance: r.get::<_, i64>(1)?.clamp(0, 100) as u8,
+                        one_line: r.get(2)?,
+                        needs_stage2: r.get::<_, i64>(3)? != 0,
+                        deadline: r
+                            .get::<_, Option<String>>(4)?
+                            .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
+                            .map(|d| d.with_timezone(&Utc)),
+                    })
+                },
+            )
+            .optional()?;
+        Ok(row)
     }
 
     pub(super) fn stage1_mark_processed(

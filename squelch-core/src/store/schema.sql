@@ -56,6 +56,11 @@ CREATE TABLE IF NOT EXISTS messages (
 
 CREATE INDEX IF NOT EXISTS idx_messages_thread ON messages(account_id, thread_id);
 CREATE INDEX IF NOT EXISTS idx_messages_received ON messages(account_id, received_at);
+-- Sender lookups: the escalation context assembles one sender's track record per
+-- queued row, inside a per-row loop that runs every sync tick. Unindexed, that is
+-- a full scan of `messages JOIN triage` per escalated row, taken while holding
+-- the store's single connection mutex.
+CREATE INDEX IF NOT EXISTS idx_messages_from ON messages(account_id, from_addr);
 
 CREATE TABLE IF NOT EXISTS contacts (
     account_id INTEGER NOT NULL,
@@ -500,15 +505,25 @@ CREATE TABLE IF NOT EXISTS triage_feedback (
 
 CREATE INDEX IF NOT EXISTS idx_triage_feedback_at
     ON triage_feedback(account_id, corrected_at);
+-- The two shapes every triage queue asks of this table, once per queued row:
+-- "has the owner ever corrected this SENDER" (the router's strongest signal) and
+-- "did they correct THIS MESSAGE" (the row a model may never overwrite).
+CREATE INDEX IF NOT EXISTS idx_triage_feedback_sender
+    ON triage_feedback(account_id, sender);
+CREATE INDEX IF NOT EXISTS idx_triage_feedback_msg
+    ON triage_feedback(account_id, message_id);
 
 -- SCHEDULED RE-EVALUATIONS. A verdict is true as of a moment, and some mail
 -- stops mattering when a date passes (see `crate::triage::revisit`). Each row is
 -- one future point at which a message should be scored again.
 --
--- Rows are APPEND-ONLY and fired at most once: `fired_at` moves NULL -> a
--- timestamp and the row is never deleted, so the schedule doubles as the audit
--- trail of why a message's verdict changed after the fact. The pass reads
--- `fired_at IS NULL AND revisit_at <= now`, which is exactly the index below.
+-- A row fires at most once: `fired_at` moves NULL -> a timestamp and stays. A
+-- FIRED row is then permanent history — the audit trail of why a message's
+-- verdict changed after the fact — while PENDING rows are replaced wholesale
+-- each time a new verdict lands, so a re-triaged message carries one current
+-- schedule rather than the accumulated intentions of every verdict it ever had.
+-- The pass reads `fired_at IS NULL AND revisit_at <= now`, which is exactly the
+-- index below.
 CREATE TABLE IF NOT EXISTS triage_revisits (
     id         INTEGER PRIMARY KEY,
     account_id INTEGER NOT NULL,

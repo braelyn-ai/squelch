@@ -4883,7 +4883,7 @@ async fn triage_config_get_default_shape() {
 
     assert_eq!(json["thread_daily_cap"], 3);
     assert_eq!(json["sender_daily_cap"], 5);
-    assert_eq!(json["global_daily_cap"], 200);
+    assert_eq!(json["global_daily_cap"], 120);
     assert_eq!(json["sources"]["thread_daily_cap"], "default");
     assert_eq!(json["sources"]["sender_daily_cap"], "default");
     assert_eq!(json["sources"]["global_daily_cap"], "default");
@@ -4900,11 +4900,11 @@ async fn triage_config_get_default_shape() {
     // context and reasoning depth, not a different reader.
     assert_eq!(json["stage2_model"], "claude-opus-5");
 
-    // Stage-1 block: GLOBAL-only cap (default 1000), "default" source, null
+    // Stage-1 block: GLOBAL-only cap (default 500), "default" source, null
     // tokens/call (empty ledger), and prices.
     let s1 = &json["stage1"];
     assert_eq!(s1["model"], "claude-opus-5");
-    assert_eq!(s1["global_daily_cap"], 1000);
+    assert_eq!(s1["global_daily_cap"], 500);
     assert_eq!(s1["source"], "default");
     assert_eq!(s1["avg_calls_per_day"], 0.0);
     assert!(s1["avg_tokens_in_per_call"].is_null());

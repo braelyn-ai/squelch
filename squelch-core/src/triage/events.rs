@@ -144,6 +144,44 @@ pub fn ingest_context<'a>(
     }
 }
 
+/// Gather the [`EventContext`] for a Stage-1 row whose model call produced NO
+/// verdict, from the heuristic seed the row still carries. `None` means this row
+/// must not notify from its seed.
+///
+/// THE GATE IS THE SEED'S OWN CONFIDENCE, read back rather than guessed at:
+/// ingest stores `needs_stage2 = !confident`, so a row still bound for Stage-2
+/// has another verdict coming and must wait for it. A CONFIDENT seed on a row
+/// that failed Stage-1 permanently is the final word — nothing else will look at
+/// it, and `UNIQUE(message_id)` means a notification skipped now is skipped
+/// forever — so it notifies, exactly as the seed does on a daemon with no API
+/// key at all. That equivalence is the point: "no model to wait for" covers a
+/// model that refused as surely as a model that was never configured.
+pub fn seed_context<'a>(
+    row: &'a crate::store::Stage1Queued,
+    seed: &'a crate::store::SeedVerdict,
+    deadline: Option<&'a DeadlineHit>,
+    rule: Option<Disposition>,
+) -> Option<EventContext<'a>> {
+    if seed.needs_stage2 {
+        return None;
+    }
+    Some(EventContext {
+        account_id: row.account_id,
+        message_id: row.message_id,
+        thread_id: &row.thread_id,
+        sender: &row.from_addr,
+        one_line: &seed.one_line,
+        received_at: row.received_at,
+        sensitivity: row.sensitivity,
+        // The Stage-1 queue selects `m.is_sent = 0`.
+        is_sent: false,
+        rule,
+        tier: seed.tier,
+        importance: seed.importance,
+        deadline,
+    })
+}
+
 /// The sender's rule as the list stands NOW, for the REFINE sites (Stage-1 /
 /// Stage-2 apply). They cannot read it off the triage row: a rule the user adds
 /// AFTER ingest — the reactive squelch, the common case — leaves no mark on rows
@@ -292,6 +330,60 @@ mod tests {
             None,
             "one second past the skew allowance"
         );
+    }
+
+    /// The Stage-1 fallback notifies from the seed, but only when the seed is
+    /// the LAST word. Ingest stopped emitting on the promise that a model verdict
+    /// was coming; a refusal or a permanent failure is that promise breaking, and
+    /// one event per message ever means a notification skipped here is skipped
+    /// for good.
+    #[test]
+    fn a_confident_seed_notifies_when_the_model_never_answered() {
+        let now = Utc::now();
+        let cfg = NotifyConfig::default();
+        let row = crate::store::Stage1Queued {
+            message_id: 7,
+            account_id: 1,
+            thread_id: "t1".into(),
+            from_addr: "alerts@monitoring.example".into(),
+            subject: "checkout api is down".into(),
+            body: String::new(),
+            received_at: now,
+            is_known_contact: false,
+            sender_corrected: false,
+            sensitivity: Sensitivity::Normal,
+        };
+        let confident = crate::store::SeedVerdict {
+            tier: Tier::Signal,
+            importance: 75,
+            one_line: "incident opened".into(),
+            needs_stage2: false,
+            deadline: None,
+        };
+
+        let ctx = seed_context(&row, &confident, None, None).expect("a confident seed is final");
+        assert_eq!(ctx.one_line, "incident opened", "the seed's own words");
+        assert_eq!(
+            worthy_kind(&ctx, &cfg, now),
+            Some(EventKind::Surfaced),
+            "and it notifies"
+        );
+
+        // A row still bound for Stage-2 has another verdict coming: that pass
+        // owns the notification, and emitting twice is emitting the weaker one
+        // first.
+        let unsure = crate::store::SeedVerdict {
+            needs_stage2: true,
+            ..confident.clone()
+        };
+        assert!(
+            seed_context(&row, &unsure, None, None).is_none(),
+            "a seed with an escalation still pending must stay quiet"
+        );
+
+        // A rule the owner added since is still honored here.
+        let ctx = seed_context(&row, &confident, None, Some(Disposition::Squelch)).unwrap();
+        assert_eq!(worthy_kind(&ctx, &cfg, now), None, "squelched, so silent");
     }
 
     /// The refine sites read the rule list LIVE, so a rule added after a message

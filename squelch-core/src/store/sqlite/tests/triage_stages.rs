@@ -1663,6 +1663,172 @@ fn firing_is_idempotent_and_spends_the_lifetime_budget() {
     assert_eq!(count, 1, "fired twice, charged once");
 }
 
+fn revisit_count(store: &SqliteStore, acct: AccountId, message_id: i64) -> i64 {
+    store
+        .lock()
+        .unwrap()
+        .query_row(
+            "SELECT revisit_count FROM triage WHERE account_id=?1 AND message_id=?2",
+            params![acct, message_id],
+            |r| r.get(0),
+        )
+        .unwrap()
+}
+
+/// THE PASS ORDER IS LOAD-BEARING, so it is asserted here rather than left to
+/// the sync engine to get right silently.
+///
+/// `revisits_schedule` deletes every PENDING revisit for the message — including
+/// the one being processed — and only a row that still exists can be stamped
+/// fired. Firing is what charges the lifetime budget, so scheduling first would
+/// leave `revisit_count` at zero forever and the termination guarantee would
+/// never engage on a single message.
+#[test]
+fn a_revisit_charges_its_budget_only_if_fired_before_the_reschedule() {
+    let (store, acct) = store();
+    let id = seed_triage_row(&store, acct, "g-r", "t-r", Sensitivity::Normal);
+    let now = Utc::now();
+    store
+        .revisits_schedule(acct, id, &[req(now, "due", RevisitSource::Model)], now)
+        .unwrap();
+
+    // The order the pass uses: fire, THEN rebuild the schedule.
+    let rid = store.revisit_queue(acct, now, 6, 10).unwrap()[0].revisit_id;
+    store.revisit_mark_fired(acct, rid, now).unwrap();
+    let next = now + chrono::Duration::days(2);
+    store
+        .revisits_schedule(acct, id, &[req(next, "next", RevisitSource::Model)], now)
+        .unwrap();
+    assert_eq!(
+        revisit_count(&store, acct, id),
+        1,
+        "the re-evaluation spent one of the message's lifetime budget"
+    );
+
+    // The other order, demonstrating what it costs: a pending revisit the
+    // reschedule deleted can never be charged, however many times it is fired.
+    let rid2 = store.revisit_queue(acct, next, 6, 10).unwrap()[0].revisit_id;
+    store.revisits_schedule(acct, id, &[], now).unwrap();
+    store.revisit_mark_fired(acct, rid2, next).unwrap();
+    assert_eq!(
+        revisit_count(&store, acct, id),
+        1,
+        "a deleted revisit charges nothing: fire first, or do not charge at all"
+    );
+    // A SHARPER EDGE on the same ordering, worth naming: `id` is the rowid, and
+    // SQLite hands a deleted rowid back out to the next insert. Firing a stale
+    // revisit_id after a reschedule does not merely miss — it can charge, and
+    // consume, whichever revisit inherited the number. One re-evaluation per
+    // message per pass (the sync loop's own guard) plus firing before
+    // rescheduling is what keeps a stale id from ever being fired.
+}
+
+/// A row the pipeline or the user has already resolved is not a candidate for
+/// re-evaluation. Receipts and banking mail are INGESTED done so they live only
+/// in their rail, and a model-scheduled revisit must not spend a call to drag one
+/// back out.
+#[test]
+fn a_done_row_is_never_re_evaluated() {
+    let (store, acct) = store();
+    let id = seed_triage_row(&store, acct, "g-d", "t-d", Sensitivity::Normal);
+    let now = Utc::now();
+    store
+        .revisits_schedule(acct, id, &[req(now, "check", RevisitSource::Model)], now)
+        .unwrap();
+    assert_eq!(store.revisit_queue(acct, now, 6, 10).unwrap().len(), 1);
+
+    store
+        .lock()
+        .unwrap()
+        .execute(
+            "UPDATE triage SET status='done' WHERE account_id=?1 AND message_id=?2",
+            params![acct, id],
+        )
+        .unwrap();
+
+    assert!(
+        store.revisit_queue(acct, now, 6, 10).unwrap().is_empty(),
+        "the queue must not hand out a resolved row"
+    );
+    // ...and the apply refuses it directly, for the row someone resolves DURING
+    // the model call.
+    let applied = Stage1Applied {
+        message_id: id,
+        account_id: acct,
+        importance: 90,
+        tier: Tier::Signal,
+        one_line: "back from the dead".into(),
+        reason: "re-evaluated".into(),
+        field_reasons: crate::types::FieldReasons::default(),
+        stage1_model_used: "claude-opus-5".into(),
+        needs_stage2: false,
+        escalation_reason: None,
+        deadline: None,
+        category: Some("general".into()),
+    };
+    assert!(
+        !store.revisit_apply(&applied).unwrap(),
+        "revisit_apply must refuse a resolved row"
+    );
+}
+
+/// The staleness sweep has a COOLDOWN, and the pending-revisit check is not it: a
+/// swept row schedules at `now` and fires in the same pass, so within one sync
+/// tick it is pending no longer. Without the fired-since half of the window every
+/// stale standing row re-sweeps every 45 seconds, spending a frontier-model call
+/// each time until the daily cap runs out.
+#[test]
+fn the_staleness_sweep_waits_a_full_window_before_asking_again() {
+    let (store, acct) = store();
+    let now = Utc::now();
+    let window = chrono::Duration::days(14);
+    let id = triaged(acct, "g-stale", "t-stale")
+        .tier(Tier::Deadline)
+        .importance(80)
+        .one_line("invoice, unpaid")
+        .reason("stage-1")
+        .received_at(now - chrono::Duration::days(20))
+        .seed(&store);
+    store
+        .stage1_mark_processed(acct, id, "claude-opus-5")
+        .unwrap();
+
+    let older_than = now - window;
+    assert_eq!(
+        store
+            .revisit_stale_standing(acct, older_than, 6, 10)
+            .unwrap(),
+        vec![id],
+        "a standing row nobody has touched in a fortnight is swept"
+    );
+
+    // The sweep's own revisit, scheduled at `now` and fired in the same pass.
+    store
+        .revisits_schedule(acct, id, &[req(now, "stale", RevisitSource::FyeStale)], now)
+        .unwrap();
+    let rid = store.revisit_queue(acct, now, 6, 10).unwrap()[0].revisit_id;
+    store.revisit_mark_fired(acct, rid, now).unwrap();
+
+    assert!(
+        store
+            .revisit_stale_standing(acct, older_than, 6, 10)
+            .unwrap()
+            .is_empty(),
+        "the next tick, 45 seconds later, must not sweep the same row again"
+    );
+
+    // A full window later it is fair game once more: the row is still sitting
+    // there, and the question is worth asking again.
+    let a_window_later = (now + window) - window + chrono::Duration::hours(1);
+    assert_eq!(
+        store
+            .revisit_stale_standing(acct, a_window_later, 6, 10)
+            .unwrap(),
+        vec![id],
+        "one full window later the sweep asks again"
+    );
+}
+
 /// The termination guarantee: past the lifetime cap, a message stops being
 /// re-evaluated even if something keeps scheduling it.
 #[test]
@@ -1874,6 +2040,66 @@ fn thread_context_never_carries_a_sealed_sibling() {
     assert_eq!(q[0].thread.len(), 1, "only the non-sealed sibling: {ids:?}");
     assert_ne!(escalated, normal_sib);
     assert_ne!(escalated, sealed_sib);
+}
+
+/// THE THREAD WINDOW TAKES THE NEWEST SIBLINGS, not the oldest.
+///
+/// The prompt states "the account owner HAS WRITTEN / has never written in it" as
+/// a fact, and on a long thread the owner's reply is at the END. An oldest-first
+/// window drops it, and the second pass is then told, as trusted context, the
+/// exact opposite of the single most useful thing in the thread.
+#[test]
+fn thread_context_keeps_the_newest_siblings_including_the_owners_reply() {
+    let (store, acct) = store();
+    let now = Utc::now();
+    // A long thread: twelve inbound messages, then the owner's own reply.
+    for i in 0..12 {
+        triaged_row(
+            acct,
+            &format!("g-old{i}"),
+            "t-long",
+            None,
+            false,
+            Sensitivity::Normal,
+        )
+        .subject(&format!("old {i}"))
+        .received_at(now - chrono::Duration::days(20 - i))
+        .ingest(&store);
+    }
+    triaged_row(acct, "g-reply", "t-long", None, false, Sensitivity::Normal)
+        .subject("the owner replies")
+        .is_sent(true)
+        .received_at(now - chrono::Duration::hours(2))
+        .ingest(&store);
+
+    let escalated = triaged_row(acct, "g-esc", "t-long", None, false, Sensitivity::Normal)
+        .subject("the row under judgement")
+        .received_at(now)
+        .ingest(&store);
+    store
+        .lock()
+        .unwrap()
+        .execute(
+            "UPDATE triage SET stage1_model_used='claude-opus-5', needs_stage2=1
+             WHERE account_id=?1 AND message_id=?2",
+            params![acct, escalated],
+        )
+        .unwrap();
+
+    let q = store.stage2_queue(acct, 10).unwrap();
+    assert_eq!(q.len(), 1);
+    let thread = &q[0].thread;
+    assert!(
+        thread.iter().any(|s| s.is_sent),
+        "the owner's reply is the last message and must survive the window: {:?}",
+        thread.iter().map(|s| &s.subject).collect::<Vec<_>>()
+    );
+    assert!(
+        thread
+            .windows(2)
+            .all(|w| w[0].received_at <= w[1].received_at),
+        "still rendered oldest-first"
+    );
 }
 
 /// An escalated row arrives knowing WHY it was escalated and what this sender's
