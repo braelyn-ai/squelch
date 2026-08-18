@@ -804,15 +804,26 @@ pub const HEALTHZ_PATH: &str = "/healthz";
 /// accept answers the wrong question: the daemon binds its listener BEFORE it
 /// builds its embedder, deliberately, so that a first-run model download cannot
 /// leave the doors unreachable — which means a TCP probe calls a tenant Ready
-/// seconds into a startup that has not happened yet, and calls one Ready
-/// forever whose sync engine died on a credential. `/healthz` answers 503 until
-/// the daemon is genuinely up and 503 again if it comes apart afterwards.
+/// seconds into a startup that has not happened yet, and calls one Ready that
+/// died on the way up after the bind. `/healthz` answers 503 until the daemon
+/// has finished starting, and 503 again if its sync task comes apart afterwards.
 ///
-/// The knob is OFF by default and switching it on before the fleet is on a
-/// daemon that serves the route takes every tenant that is behind DOWN; see
-/// [`crate::config::Config::http_readiness`] for the sequence that avoids it.
-/// The route is reachable at all because the warden sets `SQUELCH_METRICS_BIND`
-/// on every tenant it renders; see [`daemon_env`].
+/// What it does NOT catch is a credential Google has stopped accepting: the
+/// daemon's sync loop retries that forever rather than ending, on purpose, and
+/// a mailbox pulled out of its own Service is a mailbox its owner cannot reach
+/// to re-consent through. That is an alert on the metrics next door, not a
+/// readiness state.
+///
+/// The knob is OFF by default, and it has TWO prerequisites rather than one.
+/// Switching it on before the fleet is on a daemon that serves the route takes
+/// every tenant that is behind DOWN; and because `/healthz` waits out the
+/// first-run model download, a tenant whose weights cache is cold does not
+/// answer 200 for as long as that download takes — which is longer than
+/// [`crate::config::Config::ready_timeout`], so a signup times out and a roll
+/// reads the tenant as a casualty. [`crate::config::Config::model_pvc`] is what
+/// removes the download; see [`crate::config::Config::http_readiness`] for the
+/// sequence. The route is reachable at all because the warden sets
+/// `SQUELCH_METRICS_BIND` on every tenant it renders; see [`daemon_env`].
 ///
 /// Everything except the action is identical between the two, so flipping the
 /// knob changes exactly one thing about a tenant. The initial delay stays small

@@ -320,7 +320,14 @@ kubectl -n tenants get secret <label>-identity \
 
 An empty answer means nobody cancelled this tenant and a `reconcile` will finish
 the job. `set_credentials` — reopening the account — is the only thing that
-clears it.
+clears it, and it clears it LAST, after the workload it promised is up: a reopen
+that dies partway leaves the account closed and retryable rather than leaving a
+mailbox serving on a cancelled credential with nothing on record saying so.
+
+**Tenants cancelled before this warden shipped carry no marker at all**, and
+they are the one case where the answer above is not the whole story. See
+"Tenants cancelled before the marker existed" below before you act on an empty
+answer for an account you believe was closed.
 
 **A tenant that is marked cancelled AND still serving means its teardown failed
 partway.** `DELETE` removes four objects one at a time and stops at its first
@@ -346,10 +353,14 @@ CronJob, or confirm the tenant is still gone once the run finishes
 `squelch-warden/README.md`, "What the drift report cannot see", has the
 mechanism.
 
-**The fallback, for what reconcile refuses.** A `pending` tenant, and one whose
-identity Secret carries the cancellation marker — whatever its status word and
-whatever objects are still standing — come back as `409 not_reconcilable`;
-starting either back up is a different transition, not a shape repair.
+**The fallback, for what reconcile refuses.** A `pending` tenant comes back as
+`409 not_reconcilable`, and one whose identity Secret carries the cancellation
+marker — whatever its status word and whatever objects are still standing — as
+`409 cancelled`. Same status, two words, because the next move is different:
+finish the signup, or re-consent. `POST .../pair` and `PUT .../llm-key` refuse a
+cancelled account the same way, for the same reason — a pairing code is full
+access to a mailbox, and an LLM key is a live gateway credential the teardown
+deliberately deleted.
 
 Reopening one is **re-consent, not a re-`PUT`**. Nothing outside the tenant's
 own Secret holds a copy of that ciphertext: `squelch-control`'s schema carries
@@ -359,6 +370,48 @@ control plane seals a fresh credential to the recipient the warden still holds,
 and `PUT /v1/tenants/{label}/credentials` rebuilds every object from today's
 code. The volume, the identity and the old sealed blob were never touched; the
 mailbox is down for the length of a provision.
+
+### Tenants cancelled before the marker existed
+
+**Read this once, at the deploy that introduces the marker, and then never
+again.**
+
+The warden this one replaces recorded a cancellation nowhere. It deleted the
+Ingress, the Service, the Deployment and the NetworkPolicy and left the identity
+Secret, the credential Secret and the volume — which is byte-for-byte what a
+`reconcile` that died in its own delete/apply window leaves too. The marker is
+what tells those apart from now on, and a tenant cancelled before the marker
+existed has none.
+
+Nothing about that is silent, and nothing about it needs a data migration: the
+warden falls back to the signal the old one used, which is the **Service**.
+Every path that puts a workload up applies the Service first, and every teardown
+takes the Service before the Deployment, so:
+
+- **Service standing over a missing Deployment** → an interrupted reconcile.
+  `reconcile <label>` finishes it, exactly as before.
+- **Neither** → a teardown. `reconcile` answers `409 cancelled` and the roller
+  files the tenant under "no workload to converge" rather than naming it DOWN.
+
+That fallback is why `10-warden-rbac.yaml` still grants `get` on services, and
+why it must be applied **before** the new image rather than after. It is the one
+place left in the warden that reads intent out of shape, and it can be deleted —
+along with the RBAC verb — once no tenant cancelled by the old warden remains.
+
+**The one thing the fallback cannot see** is a teardown that failed partway
+*before* this deploy: a `DELETE` that died on the Ingress left the Deployment up
+and running, so the tenant reads `active`, drifts like any other, and this
+warden will roll it like any other. Going forward the marker covers that case;
+retroactively there is nothing to read. Before you apply the new image, check
+the control plane for accounts it believes are cancelled and confirm each one
+has no workload:
+
+```sh
+kubectl -n tenants get deploy -l app.kubernetes.io/instance=<label>
+```
+
+Anything still standing wants a `DELETE` (which now writes the marker first, and
+is idempotent) before the roller gets to it.
 
 > **Standing rule: no hand edits on a tenant Deployment. Ever.** Not
 > `kubectl set env`, not `kubectl edit`, not a client-side `kubectl apply`. An
@@ -446,12 +499,12 @@ The run's answer is its exit code, which is also the Job's status:
 | Exit | Means | What to do |
 |---|---|---|
 | 0 | The fleet is on today's render and serving it. A run with nothing to do is this, and so is `--dry-run` over a fleet that needs nothing. | Nothing. |
-| 1 | Not converged, in one of five ways. The summary line says which. | Suspend the CronJob while you work; at most the one named tenant was written. Then, by case — see the five paragraphs below. |
+| 1 | Not converged, in one of six ways. The summary line says which. | Suspend the CronJob while you work; at most the one named tenant was written. Then, by case — see the six paragraphs below. |
 | 2 | Everything this run could converge did, and something is left that no run will ever fix: a tenant skipped for foreign drift, or an identity Secret whose label does not validate. | For foreign drift: `squelch-control drift <label>`, then `reconcile <label>` when you are ready for that mailbox to be down for a pod cycle. For an unreadable label: see below. Nothing fixes itself. |
-| 3 | It rolled a tenant and more are queued behind it. **Normal.** | Nothing. The next tick takes the next one. If N stops falling across runs, read the stall note in `90-warden-roller.yaml`. |
+| 3 | The fleet is behind and the run is working through it. Usually "it rolled a tenant and more are queued"; also the tick that spent its one attempt on a tenant that turned out to be foreign or cancelled mid-flight. **Normal.** | Nothing. The next tick takes the next one. If N stops falling across runs, read the stall note in `90-warden-roller.yaml`. A foreign skip raised during a run like this surfaces as a 2 once the queue drains. |
 | 64 | The Job's argument list is wrong. | Fix `args:` in `90-warden-roller.yaml`. Nothing was read and nothing was applied. |
 
-The five shapes of a 1, and what each wants:
+The six shapes of a 1, and what each wants:
 
 - **Halted on a tenant** (`HALTED on <label>`) — that tenant's reconcile did not
   finish. `kubectl -n tenants logs deploy/<label>` and
@@ -460,6 +513,17 @@ The five shapes of a 1, and what each wants:
   tick; everything else in the fleet is exactly as the last run left it.
 - **Casualty** (`HALTED before applying anything`) — below.
 - **A tenant DOWN with no workload** — below.
+- **A tenant that can never be rendered** (`a workload whose sealed credential
+  Secret is gone`) — its `<label>-credential` Secret is missing, so the warden
+  cannot build the render to compare or apply. The run deliberately does NOT
+  halt on it: that state never resolves on its own, and stopping there would
+  park every tenant after it in alphabetical order behind a run that fails at
+  the same label every fifteen minutes. The pod is probably still serving (the
+  daemon copied its credential onto its own volume long ago), so this is not
+  urgent in the way a DOWN tenant is — but nothing will ever roll that mailbox
+  again until a person puts the Secret back, and there is no automated way to:
+  the ciphertext existed in one place. Reopening the account
+  (`PUT .../credentials`) is the recovery.
 - **Never started** — a config value the warden refused, or an API server it
   could not reach. There are no per-tenant lines at all in the log, only the
   sentence. Nothing was applied.
@@ -561,6 +625,13 @@ Deployment is missing. The roller will not finish somebody else's half-done
 repair unattended, so it names the tenant and leaves it. `squelch-control
 reconcile <label>` is the finish.
 
+A closed account never appears here, and the SERVICE is why: a teardown takes
+it before the Deployment, so a tenant with no workload and no Service is a
+cancellation (marked or, for the ones that predate the marker, inferred) and
+lands under "no workload to converge" instead. That distinction is load-bearing
+— naming a cancelled account as DOWN would send you to the `reconcile` that
+puts it back on the internet.
+
 **A foreign-drift skip (exit 2) is a page for a person, not a bug.** The roller
 refuses to repair a Deployment another field manager owns fields on, because the
 only repair server-side apply allows is deleting the Deployment and applying a
@@ -590,15 +661,37 @@ A knob with an order attached, and the order is the whole warning.
 TCP accept on 8848 to an HTTP GET of `/healthz` on 9464. It is worth having: the
 daemon binds its listeners before it finishes starting (on purpose — a first-run
 model download must not leave the doors unreachable), so an accept calls a tenant
-Ready about two seconds in, and calls one Ready forever whose sync engine died on
-a rejected credential. `/healthz` answers 200 only once the daemon is genuinely
-up.
+Ready about two seconds in, and calls one Ready that died on the way up straight
+after the bind. `/healthz` answers 200 only once the daemon has finished
+starting, and 503 again if its sync task comes apart afterwards.
 
-**Only a daemon that ships the route serves it.** A tenant on an image that
+**It does not catch a dead credential**, and that is deliberate rather than a
+gap. The daemon's sync loop retries a token Google has stopped accepting rather
+than giving up, so the task stays alive and `/healthz` stays 200. Answering 503
+there would pull the pod out of its own Service — taking away the one door its
+owner would use to re-consent — and the roller would read the tenant as a
+casualty and stop converging the fleet. A rejected credential is an alert on the
+metrics next door, not a readiness state.
+
+**Two prerequisites, and both of them take tenants down if you skip them.**
+
+*Only a daemon that ships the route serves it.* A tenant on an image that
 predates it fails an HTTP probe on every period, never reports Ready, is pulled
 out of its own Service, and halts the next roll. Turning this on before the fleet
 is converged therefore takes every tenant that is behind DOWN, one after another,
 and none of them come back until the knob goes off again.
+
+*And `/healthz` waits out the first-run model download.* It answers 503 until the
+daemon's background embedder init has settled, which on a cold weights cache
+means ~130 MB from Hugging Face — longer than
+`SQUELCH_WARDEN_READY_TIMEOUT_SECS` (default 180). Each tenant caches those
+weights on its own volume, so this bites the FIRST boot of any tenant: a new
+signup gets `500 not_ready` for a mailbox that is perfectly healthy, and the next
+roll reads that same tenant as a casualty and stops the whole fleet.
+`SQUELCH_WARDEN_MODEL_PVC` is what removes the download (every tenant's init
+container copies from a pre-seeded PVC instead), and it is commented out in
+`15-warden-config.yaml` today. The warden logs a warning at startup if this knob
+is on and that one is unset.
 
 So, in order, with a roll between each:
 
@@ -607,7 +700,11 @@ So, in order, with a roll between each:
 2. Let the roller converge, and CHECK it did — a clean `roll --dry-run`, or
    `kubectl -n tenants get deploy -o jsonpath` over the images. Every tenant, not
    most of them: the ones left behind are exactly the ones the next step breaks.
-3. Set `SQUELCH_WARDEN_HTTP_READINESS: "on"` in `15-warden-config.yaml`, apply,
+3. Seed and set `SQUELCH_WARDEN_MODEL_PVC` (or raise
+   `SQUELCH_WARDEN_READY_TIMEOUT_SECS` past a cold model download and accept a
+   slow first provision). Skipping this does not break the tenants you have; it
+   breaks the next one that signs up.
+4. Set `SQUELCH_WARDEN_HTTP_READINESS: "on"` in `15-warden-config.yaml`, apply,
    restart the warden, and let the roller converge again. Each tenant's pod
    restarts once more, because the probe is part of the pod spec.
 

@@ -63,11 +63,11 @@ it costs a compare.
 | Route | Success | Failures |
 |---|---|---|
 | `POST /v1/tenants` | `201 { recipient }` | `409` label taken, `422` invalid label / address, `400` malformed JSON |
-| `PUT /v1/tenants/{label}/credentials` | `200 { pair_code, pair_url, deep_link }` | `404` unknown label, `409` already serving, `422` unarmored ciphertext, `500` machine reason |
+| `PUT /v1/tenants/{label}/credentials` | `200 { pair_code, pair_url, deep_link }` | `404` unknown label, `409` already serving (a **cancelled** account is exempt: this is the reopen), `422` unarmored ciphertext, `500` machine reason |
 | `GET /v1/tenants/{label}` | `200 { status }`: `pending` / `active` / `failed` / `stopped` | `404` |
 | `GET /v1/tenants/{label}/drift` | `200 { status, deployment_present, foreign, changes }` | `404`, `422` invalid label, `500` machine reason |
-| `POST /v1/tenants/{label}/reconcile` | `200 { deployment, status }`: `converged` / `recreated` / `created` | `404`, `409 not_reconcilable`, `500` machine reason |
-| `POST /v1/tenants/{label}/pair` | `200 { pair_code, pair_url, deep_link }` | `404`, `500 no_ready_pod` |
+| `POST /v1/tenants/{label}/reconcile` | `200 { deployment, status }`: `converged` / `recreated` / `created` | `404`, `409 not_reconcilable`, `409 cancelled`, `500` machine reason |
+| `POST /v1/tenants/{label}/pair` | `200 { pair_code, pair_url, deep_link }` | `404`, `409 cancelled`, `500 no_ready_pod` |
 | `DELETE /v1/tenants/{label}` | `204` (workload gone, **data kept**) | - |
 | `GET /healthz` | `200 ok` (no token: it is a probe and says nothing) | - |
 
@@ -430,14 +430,26 @@ would make the route useless in the case it exists for. `pending` is
 signup to finish, not a shape to converge.
 
 A tenant carrying `passband.email/cancelled-at` on its identity Secret is
-`409 not_reconcilable` **whatever its status word and whatever objects are still
+`409 cancelled` **whatever its status word and whatever objects are still
 standing**, because that annotation is the account holder's decision written
-down and no shape repair overrides one. Reopening is `set_credentials`, which
-clears it.
+down and no shape repair overrides one. `POST .../pair` and `PUT .../llm-key`
+answer the same way, and for a sharper reason: a pairing code is full access to
+a mailbox and an LLM key is a live gateway credential the teardown deliberately
+deleted. Reopening is `set_credentials`, which clears the marker — LAST, after
+the workload it promised is up, so a reopen that dies partway leaves the account
+closed and retryable rather than leaving a mailbox serving on a cancelled
+credential with nothing on record saying so.
 
 `stopped` WITHOUT the marker is a job nobody finished — a reconcile that died in
 its own delete/recreate window leaves exactly that — and it proceeds: the
 credential and the volume are where they were, and only the workload is missing.
+
+**One exception, and it expires.** A tenant cancelled before the marker existed
+also reads `stopped` with no marker, and rebuilding one would put a closed
+mailbox back on the internet. The warden falls back to the signal the old one
+used — a surviving Service means an interrupted reconcile, its absence means a
+teardown — for that case alone. `deploy/hosted/PRODUCTION.md`, "Tenants
+cancelled before the marker existed", says when it can be deleted.
 
 The marker is why this is a lookup and not a deduction. `DELETE` removes four
 objects one at a time and stops at its first error, so a cancellation can leave
@@ -538,7 +550,15 @@ makes running this unattended defensible at all. A read that fails halts it too,
 before the write pass — a tenant this warden could not even inspect is not one it
 may step past, because the tenant it would roll instead would be rolled on the
 strength of a cluster that has just stopped answering. Every read happens before
-any write, so a failed read costs the run and not a half-rolled fleet.
+any write, so a failed read costs the run and not a half-rolled fleet. A halted
+run still reports the tenants it had already marked, as `still behind`: they were
+verdicts it reached, and `checked` is a sum of verdicts.
+
+**One read failure does not halt it**, and it is the one that would never stop:
+a workload whose `<label>-credential` Secret is gone can never be rendered by any
+run, so stopping there would park every tenant after it in fleet order behind a
+run that fails at the same label every fifteen minutes. That one is named for a
+person and the walk goes on.
 
 The exit code is the whole interface for whatever scheduled it, and anything
 other than `0` marks the Job failed on purpose:
@@ -546,9 +566,9 @@ other than `0` marks the Job failed on purpose:
 | Exit | The run | What it wants |
 |---|---|---|
 | `0` | The fleet is on today's render and serving it. A run with nothing to do is this, and so is a `--dry-run` over a fleet that needs nothing. | Nothing. |
-| `1` | Not converged, in any of its five forms. | Read the log for the named label, and suspend the CronJob while you work: at most the one named tenant was written. **Halted** — the tenant did not come back; look at that pod. It goes back on the queue. **Casualty** (`HALTED before applying anything`) — the tenant already carries today's render and is not serving it, so nothing was applied anywhere; the render is the suspect, not the tenant. **DOWN** — no workload and no cancellation on record, a job that did not finish; `squelch-control reconcile <label>` finishes it. **Never started** — a refused config value or an API server it could not reach; the log line is the sentence. **`--dry-run` found work** — this is the flag doing its job; read what it would roll, and its length is how many ticks the real roll takes. |
+| `1` | Not converged, in any of its six forms. | Read the log for the named label, and suspend the CronJob while you work: at most the one named tenant was written. **Halted** — the tenant did not come back; look at that pod. It goes back on the queue. **Casualty** (`HALTED before applying anything`) — the tenant already carries today's render and is not serving it, so nothing was applied anywhere; the render is the suspect, not the tenant. **DOWN** — no workload and no cancellation on record, a job that did not finish; `squelch-control reconcile <label>` finishes it. **Cannot be rendered** — its sealed credential Secret is gone, so no run will ever converge it; the pod is probably still serving, and the recovery is re-consent (`PUT .../credentials`). **Never started** — a refused config value or an API server it could not reach; the log line is the sentence. **`--dry-run` found work** — this is the flag doing its job; read what it would roll, and its length is how many ticks the real roll takes. |
 | `2` | Everything this run could converge did, and something is left that no run will ever converge: another field manager owns part of a tenant's Deployment, or an identity Secret's label does not validate. | For foreign drift, `squelch-control drift <label>` to see who owns what, then `reconcile <label>` when you are ready for that mailbox to be down for a pod cycle. For an unreadable label, `PRODUCTION.md` has the recipe for finding it. Until then every run reports it again. |
-| `3` | It rolled a tenant and more are queued behind it. This is what every tick of a fleet mid-roll looks like. | Nothing. The next tick takes the next one. Its own code because it is the one outcome that is both "not on today's render" and "no human should do anything": `0` would make `roll` unable to say when a bump has landed, and `1` would spend the alarm on the normal case. |
+| `3` | The fleet is behind and the run is working through it. Usually "it rolled a tenant and more are queued", which is what every tick of a fleet mid-roll looks like; also the tick that spent its one attempt on a tenant that turned out to be foreign, or whose account was cancelled mid-flight. | Nothing. The next tick takes the next one. Its own code because it is the one outcome that is both "not on today's render" and "no human should do anything": `0` would make `roll` unable to say when a bump has landed, and `1` would spend the alarm on the normal case. A foreign skip raised on a tick like this is reported once the queue drains, as a `2`. |
 | `64` | The argument list was none of the three this binary accepts. | Fix `args:` on the CronJob. Deliberately outside the 0–3 range: a mistyped argument is not a verdict on the fleet. |
 
 Anything other than `0` marks the Job failed, because Kubernetes knows zero and
@@ -605,13 +625,20 @@ active tenant per tick. Cancelling an account while a roll is in flight is still
 worth doing deliberately — suspend the CronJob, or confirm the tenant is gone
 afterwards.
 
-**`status: active` in a reconcile's answer is weaker than it sounds.** It means
-a pod matching the tenant's selector reported Ready, not that the pod running
-the new spec did. On the converged path the old pod is often still Ready while
-`Recreate` is terminating it, so a reconcile onto a render that cannot start —
-an image tag GHCR does not hold is the easy way to do this — can answer
-`200 converged` and then sit in `ImagePullBackOff`. Watch the pod after a
-reconcile that changed the image or the env; do not take the answer for it.
+**`status: active` in a reconcile's answer means the ROLLOUT finished, and the
+two other routes are weaker.** A reconcile waits on the Deployment's rollout —
+the controller has observed this spec, and every replica is on it, serving, and
+has stayed serving for `minReadySeconds` — so a reconcile onto a render that
+cannot start (an image tag GHCR does not hold is the easy way) times out with
+`500 not_ready` rather than answering `200 converged` over an `ImagePullBackOff`.
+That is what the fleet roll steps to the next tenant on.
+
+`GET /v1/tenants/{label}` is the weaker one, and deliberately: it says `active`
+for one ready replica of any generation, which is the right answer to "is this
+mailbox serving" and the wrong one to "is it serving what I just applied". Under
+`Recreate` the pod being replaced is Ready and in the tenant's selector until it
+terminates, so a status read taken seconds after an apply can be describing the
+pod that is going away.
 
 **Duplicate names in a keyed list hide behind the first one.** `diff_spec`
 aligns containers, env vars, volumes and ports by `name` and takes the first
@@ -668,11 +695,17 @@ says nothing about the three owners every healthy Deployment has, that a
 reconcile converges a clean tenant, delete-recreates one another manager owns,
 refuses to apply while the old pod still holds the volume, refuses a tenant
 with no workload at all, and answers only once the rollout is complete rather
-than on the first Ready pod, that a fleet roll walks every tenant in the cluster
-in sorted order and moves only the drifted ones, leaves the ones another manager
-owns and the ones with no workload where they are, halts on the first tenant
-whose rollout does not finish and names it, and writes nothing at all in a dry
-run, that the sweep collects abandoned pending tenants and nothing else, every
+than on the first Ready pod, that every route which could act on a cancelled
+account refuses one — reconcile, pair and llm-key alike, on every prefix a
+failed teardown can leave — that a reopen which dies partway leaves the account
+closed rather than leaving a mailbox up on a cancelled credential, that a
+cancellation landing in either of the reconcile's two windows is a skip and not
+a halt, that a tenant cancelled before the marker existed is still refused, that
+a fleet roll walks every tenant in the cluster in sorted order and moves only the
+drifted ones, leaves the ones another manager owns and the ones with no workload
+where they are, halts on the first tenant whose rollout does not finish and names
+it, carries on past the one tenant no run could ever render, and writes nothing
+at all in a dry run, that the sweep collects abandoned pending tenants and nothing else, every
 4xx path, that DELETE keeps the volume and both Secrets, a 401 for every way of
 getting the bearer wrong, that a cluster error never reaches a log line
 verbatim, the boot-refusal table for every environment variable, the binary's

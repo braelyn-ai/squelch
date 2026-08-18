@@ -205,12 +205,18 @@ spec:
       # next scheduled tick is a retry anyway once somebody has looked.
       backoffLimit: 0
       # The ceiling on one pass, so a wedged run cannot hold the `Forbid` lock
-      # forever and quietly stop the fleet converging at all. Size it above
-      # SQUELCH_WARDEN_READY_TIMEOUT_SECS times the number of tenants that could
-      # be drifted at once, or a growing fleet starts getting cut off mid-walk.
-      # Being cut off is safe but not free: the tenants already rolled stay
-      # rolled, the rest are picked up by the next run, and the fleet is
-      # split-version until then.
+      # forever and quietly stop the fleet converging at all.
+      #
+      # It does NOT scale with the fleet. A run converges AT MOST ONE tenant, so
+      # what it has to cover is the read pass over every tenant (a handful of
+      # API calls each, no waiting) plus ONE
+      # SQUELCH_WARDEN_READY_TIMEOUT_SECS for the tenant it takes. An hour is
+      # far above that and stays that way as the fleet grows; raising it in
+      # proportion to the tenant count would only mean a genuinely stuck run
+      # holds the lock for hours before anything notices.
+      #
+      # Being cut off is safe but not free: the tenant that was mid-roll is
+      # picked up by the next run, and the fleet is split-version until then.
       activeDeadlineSeconds: 3600
       template:
         metadata:

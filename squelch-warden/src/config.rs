@@ -247,6 +247,16 @@ pub struct Config {
     /// The order is: ship the daemon that serves the route, roll the fleet onto
     /// it, THEN turn this on and roll again. See `deploy/hosted/PRODUCTION.md`,
     /// "Turning on the HTTP readiness probe".
+    ///
+    /// It also puts the first-run MODEL DOWNLOAD inside every wait this warden
+    /// makes. `/healthz` answers 503 until the daemon's background embedder init
+    /// has settled, which on a cold weights cache means ~130 MB from Hugging
+    /// Face — longer than [`Config::ready_timeout`]. With no [`Config::model_pvc`]
+    /// every new tenant's first pod pays it, so a signup gets `500 not_ready`
+    /// for a tenant that is perfectly healthy, and the next roll reads that
+    /// tenant as a casualty and stops the whole fleet. Set `model_pvc`, or raise
+    /// `ready_timeout` past a cold download, before turning this on; the warden
+    /// warns at startup if neither is true.
     pub http_readiness: bool,
     /// UID/GID tenant daemons run as.
     pub run_as: i64,

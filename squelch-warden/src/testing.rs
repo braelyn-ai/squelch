@@ -143,6 +143,8 @@ struct MockInner {
     pods_linger: bool,
     /// Whether reads answer at all.
     reads_ok: bool,
+    /// A tenant whose reads all fail, while the rest of the cluster answers.
+    reads_broken_for: Option<String>,
     /// Whether the next `create` loses a race with a concurrent one.
     create_loses_race: bool,
     /// A kind whose deletes all fail, for the partial-teardown paths.
@@ -157,6 +159,9 @@ struct MockInner {
     /// marker goes on and the Deployment goes away, the way a real `DELETE`
     /// landing mid-reconcile leaves things.
     cancel_on_apply: Option<String>,
+    /// The same event, one window later: the cancellation lands while the
+    /// rollout is being waited out rather than while the objects are going in.
+    cancel_on_rollout: Option<String>,
 }
 
 /// A cluster that records instead of connecting.
@@ -204,6 +209,34 @@ impl MockCluster {
     /// Every read fails, as a partitioned API server would.
     pub fn break_reads(&self) {
         self.lock().reads_ok = false;
+    }
+
+    /// Reads about ONE tenant fail and the rest of the cluster answers
+    /// normally. What an API server having a bad moment looks like from inside
+    /// a fleet walk: the run is several tenants in, one read fails, and what
+    /// matters is whether the walk stops there or carries on rolling the fleet
+    /// on the strength of a cluster that has stopped answering.
+    ///
+    /// Matched on the object's name PREFIX, so it covers a tenant's Deployment,
+    /// its Service and all three of its Secrets - every read `inspect` makes
+    /// about that one tenant. `list_secrets` is deliberately not covered: the
+    /// fleet enumeration is one call about every tenant at once, and a failure
+    /// there is the run never starting rather than the walk stopping partway.
+    pub fn break_reads_for(&self, label: &str) {
+        self.lock().reads_broken_for = Some(label.to_string());
+    }
+
+    fn reads(&self, name: &str) -> Result<(), ClusterError> {
+        let inner = self.lock();
+        if !inner.reads_ok {
+            return Err(ClusterError::NoPod);
+        }
+        match &inner.reads_broken_for {
+            Some(label) if name == label || name.starts_with(&format!("{label}-")) => {
+                Err(ClusterError::NoPod)
+            }
+            _ => Ok(()),
+        }
     }
 
     /// An applied Deployment's rollout never completes: the controller has not
@@ -284,6 +317,38 @@ impl MockCluster {
         self.lock().cancel_on_apply = Some(label.to_string());
     }
 
+    /// The same cancellation, in the LATER window: everything is applied and
+    /// the caller is waiting for the rollout when the `DELETE` lands.
+    ///
+    /// Its own knob because the two windows are different sizes. The apply
+    /// window is a few API calls; this one is a whole
+    /// [`crate::config::Config::ready_timeout`], which is the widest gap on the
+    /// route and therefore the likeliest place for a real cancellation to land.
+    /// A caller that only re-read the marker in the first window reports this
+    /// one as a cluster failure and halts a fleet roll over it.
+    pub fn cancelled_arrives_during_the_rollout(&self, label: &str) {
+        self.lock().cancel_on_rollout = Some(label.to_string());
+    }
+
+    /// Stamp the cancellation marker and take the Deployment, which is what a
+    /// `DELETE` landing in either window leaves behind.
+    fn cancel(inner: &mut MockInner, label: &str) {
+        if let Some(Object::Secret(identity)) = inner
+            .objects
+            .get_mut(&(Kind::Secret, format!("{label}-identity")))
+        {
+            identity
+                .metadata
+                .annotations
+                .get_or_insert_with(BTreeMap::new)
+                .insert(
+                    crate::objects::CANCELLED_AT_ANNOTATION.to_string(),
+                    "1".to_string(),
+                );
+        }
+        inner.objects.remove(&(Kind::Deployment, label.to_string()));
+    }
+
     /// What the next `squelchd pair` prints.
     pub fn exec_prints(&self, stdout: &str) {
         let mut inner = self.lock();
@@ -354,17 +419,7 @@ impl MockCluster {
             stamp_foreign(deployment);
         }
         if let Some(label) = inner.cancel_on_apply.take() {
-            if let Some(Object::Secret(identity)) = inner
-                .objects
-                .get_mut(&(Kind::Secret, format!("{label}-identity")))
-            {
-                identity
-                    .metadata
-                    .annotations
-                    .get_or_insert_with(BTreeMap::new)
-                    .insert(crate::objects::CANCELLED_AT_ANNOTATION.to_string(), "1".to_string());
-            }
-            inner.objects.remove(&(Kind::Deployment, label));
+            Self::cancel(&mut inner, &label);
         }
     }
 }
@@ -483,9 +538,7 @@ impl Cluster for MockCluster {
     }
 
     async fn get_secret(&self, name: &str) -> Result<Option<Secret>, ClusterError> {
-        if !self.lock().reads_ok {
-            return Err(ClusterError::NoPod);
-        }
+        self.reads(name)?;
         Ok(self.secret(name))
     }
 
@@ -516,9 +569,7 @@ impl Cluster for MockCluster {
     }
 
     async fn get_deployment(&self, name: &str) -> Result<Option<Deployment>, ClusterError> {
-        if !self.lock().reads_ok {
-            return Err(ClusterError::NoPod);
-        }
+        self.reads(name)?;
         Ok(match self.object(Kind::Deployment, name) {
             Some(Object::Deployment(deployment)) => Some(*deployment),
             _ => None,
@@ -526,9 +577,7 @@ impl Cluster for MockCluster {
     }
 
     async fn get_service(&self, name: &str) -> Result<Option<Service>, ClusterError> {
-        if !self.lock().reads_ok {
-            return Err(ClusterError::NoPod);
-        }
+        self.reads(name)?;
         Ok(match self.object(Kind::Service, name) {
             Some(Object::Service(service)) => Some(*service),
             _ => None,
@@ -590,6 +639,16 @@ impl Cluster for MockCluster {
     /// become complete while nobody applies anything, so this answers at once
     /// rather than spending the deadline.
     async fn rollout_complete(&self, name: &str, within: Duration) -> Result<(), ClusterError> {
+        // The `DELETE` that landed while this was being waited out: the poll's
+        // next read of the Deployment finds nothing, which is exactly what the
+        // real one answers `NoPod` to.
+        {
+            let mut inner = self.lock();
+            if inner.cancel_on_rollout.as_deref() == Some(name) {
+                let label = inner.cancel_on_rollout.take().unwrap_or_default();
+                Self::cancel(&mut inner, &label);
+            }
+        }
         let Some(deployment) = self.get_deployment(name).await? else {
             return Err(ClusterError::NoPod);
         };

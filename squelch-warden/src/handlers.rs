@@ -87,6 +87,13 @@ fn error_response(e: &WardenError) -> Response {
         // has no workload to converge. The control plane's answer is a
         // different call (finish the signup, or re-consent), not a retry.
         WardenError::NotReconcilable => (StatusCode::CONFLICT, "not_reconcilable", None),
+        // The same 409 as its neighbour, and a different word, because the
+        // caller's next move is different: a pending tenant needs its signup
+        // finished, and a cancelled one needs the account holder to re-consent
+        // through `PUT /credentials`. The label is not a secret (it is a public
+        // subdomain), and that a subdomain was cancelled is already implied by
+        // every other answer this tenant gives.
+        WardenError::Cancelled => (StatusCode::CONFLICT, "cancelled", None),
         // 503, not 422: the request was fine, this deployment is what lacks
         // the LLM gateway. The control plane should not be calling here at all.
         WardenError::LlmNotConfigured => {
@@ -752,9 +759,12 @@ mod tests {
         )
         .await;
         call(&h, authed("DELETE", "/v1/tenants/alice", "")).await;
+        // The SAME 409 with a different word: this tenant is not merely
+        // workload-less, it is an account somebody closed, and the caller's next
+        // move is a re-consent rather than a signup to finish.
         let (status, body) = call(&h, authed("POST", "/v1/tenants/alice/reconcile", "")).await;
         assert_eq!(status, StatusCode::CONFLICT);
-        assert_eq!(body["error"], "not_reconcilable");
+        assert_eq!(body["error"], "cancelled");
 
         let (status, body) = call(&h, authed("POST", "/v1/tenants/-nope-/reconcile", "")).await;
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);

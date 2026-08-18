@@ -53,9 +53,10 @@ usage:
 
 `roll` rolls AT MOST ONE tenant per run: the next tick takes the next one, so a
 fleet with N tenants behind needs N runs. It exits 0 converged (nothing to do
-counts), 1 not converged (it halted, it never started, a tenant is down, or a
-dry run found work), 2 nothing left it can fix on its own (foreign drift, an
-unreadable label), 3 it rolled a tenant and more are queued behind it.
+counts), 1 not converged (it halted, it never started, a tenant is down or
+cannot be rendered, or a dry run found work), 2 nothing left it can fix on its
+own (foreign drift, an unreadable label), 3 the fleet is behind and the run is
+working through it.
 ";
 
 // `roll`'s exit status is the CronJob's entire interface to a run: the pod's
@@ -64,11 +65,12 @@ unreadable label), 3 it rolled a tenant and more are queued behind it.
 /// The fleet is on today's render and every tenant is serving it. A run with
 /// nothing to do is this; a run that would have had something to do is not.
 const EXIT_CONVERGED: u8 = 0;
-/// The fleet is NOT converged, in any of the four ways that can be true: the
+/// The fleet is NOT converged, in any of the five ways that can be true: the
 /// roll halted on the tenant it took, it stopped on a casualty of an earlier
 /// run, it never started at all (a refused config, an API server it could not
-/// reach), or it found a tenant with no workload and no cancellation on record.
-/// A dry run that would roll anything is here too - it has just
+/// reach), it found a tenant with no workload and no cancellation on record, or
+/// it found one whose sealed credential is gone and which therefore cannot be
+/// rendered at all. A dry run that would roll anything is here too - it has just
 /// reported that the fleet is behind, and reporting that as converged is the
 /// one answer that would make `--dry-run` worse than useless.
 ///
@@ -82,10 +84,24 @@ const EXIT_NOT_CONVERGED: u8 = 1;
 /// that does not validate, so no run can even address it. Both want a person,
 /// and neither wants one tonight.
 const EXIT_SKIPPED: u8 = 2;
-/// The run rolled a tenant and there are more behind it. Working exactly as
-/// designed: see [`squelch_warden::Warden::roll`] for why one tenant per run is
-/// the safety model, and expect one of these per remaining tenant after every
-/// image bump.
+/// The fleet is not on today's render, this run left it no worse, and nobody
+/// should do anything. Working exactly as designed: see
+/// [`squelch_warden::Warden::roll`] for why one tenant per run is the safety
+/// model, and expect one of these per remaining tenant after every image bump.
+///
+/// Ordinarily that means it rolled a tenant and more are queued behind it. It
+/// also covers the two ways a run spends its one attempt without converging
+/// anything - the tenant it took turned out to be somebody else's to fix
+/// (`recreate_refused`), or its account was cancelled mid-flight - because in
+/// both the queue behind it is real, no person is wanted, and the next tick
+/// takes the next tenant. What it never covers is a fleet with nothing left to
+/// do: [`squelch_warden::Rolled::remaining`] is zero then, and this code is not
+/// reachable.
+///
+/// A foreign skip or an unreadable label raised during a run like this is NOT
+/// lost, only deferred: those tenants are still there on the tick that drains
+/// the queue, and that run exits [`EXIT_SKIPPED`]. Pacing outranks a skip on
+/// purpose - both say "not tonight", and only one of them is finished.
 ///
 /// Its own code rather than folded into either neighbour, because it is the one
 /// outcome that is both "the fleet is not on today's render" and "no human
@@ -142,7 +158,11 @@ fn command(args: &[String]) -> Option<Command> {
 /// made no progress, which is the whole idea.
 fn verdict(rolled: &Rolled, dry_run: bool) -> u8 {
     let would_roll = dry_run && !rolled.rolled.is_empty();
-    if rolled.halted_on.is_some() || !rolled.stranded.is_empty() || would_roll {
+    if rolled.halted_on.is_some()
+        || !rolled.stranded.is_empty()
+        || !rolled.unrenderable.is_empty()
+        || would_roll
+    {
         EXIT_NOT_CONVERGED
     } else if rolled.remaining > 0 {
         EXIT_PROGRESSING
@@ -177,8 +197,18 @@ fn summarize(rolled: &Rolled, dry_run: bool) -> String {
     // doing its job, and the number is the only thing that says how many more
     // ticks the bump has left in it.
     if rolled.remaining > 0 {
+        // A halted run had already marked these and then stopped before taking
+        // any of them, so the ordinary promise does not hold: the next tick
+        // re-reads the fleet and meets whatever stopped this one. Saying "the
+        // next at the next tick" there would be the summary telling an operator
+        // to wait for something that is not going to happen.
+        let tail = if rolled.halted_on.is_some() {
+            "and this run stopped before it took any of them"
+        } else {
+            "the next at the next tick"
+        };
         out.push_str(&format!(
-            "  still behind, one per run: {} more, the next at the next tick\n",
+            "  still behind, one per run: {} more, {tail}\n",
             rolled.remaining
         ));
     }
@@ -208,6 +238,16 @@ fn summarize(rolled: &Rolled, dry_run: bool) -> String {
             "  DOWN (no workload, and nothing recorded a cancellation; a job that did not \
              finish): {}\n",
             rolled.stranded.join(", ")
+        ));
+    }
+    // Named, and named as permanent: this is the one per-tenant read failure a
+    // later run does not retry its way out of, and the remedy is a person
+    // putting the Secret back rather than anything the roller can do.
+    if !rolled.unrenderable.is_empty() {
+        out.push_str(&format!(
+            "  needs a person (a workload whose sealed credential Secret is gone, so no run \
+             can render it): {}\n",
+            rolled.unrenderable.join(", ")
         ));
     }
     // The casualty line replaces the halt line rather than joining it: they name
@@ -346,6 +386,16 @@ async fn serve() -> anyhow::Result<()> {
     if warden.config().llm_base_url.is_none() {
         tracing::warn!(
             "no LLM gateway configured (SQUELCH_WARDEN_LLM_BASE_URL unset): every tenant runs heuristic-only triage, and llm-key installs will be refused"
+        );
+    }
+    // A warning and not a refusal, because the operator has a second way out:
+    // a `ready_timeout` wide enough to sit through a cold model download. What
+    // is not survivable is doing neither by accident, and the failure looks like
+    // a healthy tenant timing out on its own signup.
+    if warden.config().http_readiness && warden.config().model_pvc.is_none() {
+        tracing::warn!(
+            ready_timeout_secs = warden.config().ready_timeout.as_secs(),
+            "SQUELCH_WARDEN_HTTP_READINESS is on with no SQUELCH_WARDEN_MODEL_PVC: /healthz waits out the first-run embedding-model download, so a new tenant is NotReady for the whole of it - longer than SQUELCH_WARDEN_READY_TIMEOUT_SECS, which fails the signup and makes the next fleet roll read that tenant as a casualty"
         );
     }
 
@@ -517,6 +567,50 @@ mod tests {
         assert_eq!(verdict(&inactive, false), EXIT_CONVERGED);
     }
 
+    /// A workload whose sealed credential is gone is a mailbox no run will ever
+    /// put on today's render. The roller deliberately does NOT halt on it - one
+    /// broken tenant must not park the fleet behind it - so the exit code is the
+    /// only thing left that can say a person is needed.
+    #[test]
+    fn an_unrenderable_tenant_cannot_exit_converged() {
+        let unrenderable = Rolled {
+            checked: 2,
+            current: 1,
+            unrenderable: vec!["bob".into()],
+            ..Rolled::default()
+        };
+        assert_eq!(verdict(&unrenderable, false), EXIT_NOT_CONVERGED);
+        assert_eq!(verdict(&unrenderable, true), EXIT_NOT_CONVERGED);
+
+        // Including on the tick that rolled somebody else, which is the run
+        // this actually happens on: the walk goes past bob and converges carol.
+        let rolled_around_it = Rolled {
+            rolled: vec!["carol".into()],
+            ..unrenderable.clone()
+        };
+        assert_eq!(verdict(&rolled_around_it, false), EXIT_NOT_CONVERGED);
+    }
+
+    /// A run that stopped in the READ pass names what it had already queued.
+    /// The tenants are not rolled and not lost, and the summary says both.
+    #[test]
+    fn a_halt_still_reports_the_queue_it_had_marked() {
+        let halted = Rolled {
+            checked: 3,
+            remaining: 2,
+            halted_on: Some("carol".into()),
+            casualty: Some("carol".into()),
+            ..Rolled::default()
+        };
+        assert_eq!(verdict(&halted, false), EXIT_NOT_CONVERGED);
+
+        let out = summarize(&halted, false);
+        assert!(out.contains("2 more"), "{out}");
+        // Not the ordinary promise: the next tick meets the same casualty.
+        assert!(!out.contains("the next at the next tick"), "{out}");
+        assert!(out.contains("HALTED before applying anything"), "{out}");
+    }
+
     /// A run that rolled a tenant and has more queued is PROGRESSING: not
     /// converged, and not a problem either. Getting this wrong in either
     /// direction is what the code exists to prevent - green would make `roll`
@@ -590,6 +684,7 @@ mod tests {
                 skipped_foreign: vec!["bob".into()],
                 skipped_inactive: vec!["carol".into()],
                 stranded: vec!["erin".into()],
+                unrenderable: vec!["frank".into()],
                 unreadable: 3,
                 halted_on: Some("dave".into()),
                 casualty: None,
@@ -602,6 +697,7 @@ mod tests {
             "carol",
             "dave",
             "erin",
+            "frank",
             "5 checked",
             "2 more",
             "HALTED",
@@ -610,6 +706,7 @@ mod tests {
         }
         assert!(out.contains("DOWN"), "{out}");
         assert!(out.contains("does not validate"), "{out}");
+        assert!(out.contains("sealed credential Secret is gone"), "{out}");
         assert!(!out.contains("dry run"));
     }
 

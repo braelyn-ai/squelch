@@ -1463,17 +1463,35 @@ fn report_metrics_posture(config: &Config) {
 ///
 /// Two conditions, and each rules out a state a bare TCP accept calls healthy:
 ///
-/// - **The sync engine is running.** It is spawned before the doors bind and it
-///   is what makes a mailbox a mailbox. When its task ends — a credential the
-///   store has not got, or one Google has stopped accepting, are the ordinary
-///   ways — both doors go on accepting connections in front of a store nothing
-///   is filling, and every probe that only opens a socket passes forever.
+/// - **The sync engine's task is alive.** It is spawned before the doors bind
+///   and it is what makes a mailbox a mailbox. If that task ends or panics,
+///   both doors go on accepting connections in front of a store nothing is
+///   filling, and every probe that only opens a socket passes forever.
 /// - **The background embedder init has settled.** SETTLED, not succeeded: a
 ///   first-run model download is the long pole of a cold start and is precisely
 ///   what a probe must wait out, but an embedder that can NEVER build (no
 ///   egress to the model host, a corrupt cache) leaves a daemon that syncs,
 ///   serves both doors and searches by keyword. Refusing to call that ready
 ///   would take a working mailbox down over a degraded search index.
+///
+/// ## What this does NOT catch, and why it is left that way
+///
+/// A credential Google has stopped accepting does not make a daemon unready.
+/// `SyncEngine::run` retries with backoff on every error and returns only when
+/// shutdown is signalled, so a rejected token, an expired grant and a network
+/// that is down all leave the task alive and this flag set. The first flag
+/// therefore means "the sync task has not died", not "sync is working".
+///
+/// That is the deliberate answer rather than a gap to close later, because
+/// readiness is what a Service routes on. A mailbox whose OAuth grant expired
+/// still holds every message it has ever synced, still serves both doors, and
+/// is reached through exactly one route — which is also where its owner has to
+/// go to re-consent. Answering 503 would pull that pod out of its own Service
+/// and take the door away at the moment it is needed, and it would stop the
+/// hosted fleet roller dead — that pass reads a tenant carrying today's render
+/// and not serving it as a casualty, and refuses to roll anything else at all.
+/// A dead credential is a thing to ALERT on, and the metrics door next to this
+/// one is where that signal belongs.
 ///
 /// The store is deliberately not a flag. `SqliteStore::open` and its migrations
 /// run before the runtime exists and a failure exits the process, so there is

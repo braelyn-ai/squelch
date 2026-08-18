@@ -28,11 +28,19 @@
 # tenant is pending, only past the TTL, and never a credential Secret) rather
 # than about RBAC. Credential Secrets and volumes are still beyond it entirely.
 #
-# What was here and is gone: `get` on services. It existed to tell a cancelled
-# tenant from an interrupted reconcile, which a marker on the identity Secret
-# does now. APPLY THIS WITH THE IMAGE THAT STOPPED NEEDING IT, not before - a
-# warden still on an older image calls `get` on a Service during a reconcile's
-# resume path, and a Role without the verb turns that into a 403.
+# `get` on services is a MIGRATION verb with an expiry date. Telling a cancelled
+# tenant from an interrupted reconcile is the marker's job now
+# (`passband.email/cancelled-at`, below), but every tenant cancelled by a warden
+# that predates the marker carries no marker at all - and reading one of those
+# as an interrupted reconcile would rebuild a closed mailbox on its stored
+# credential. The old signal still separates them: a teardown takes the Service
+# before the Deployment, and every path that puts a workload up applies the
+# Service first, so a Service standing over a missing Deployment is a job to
+# finish and its absence is a teardown. APPLY THIS BEFORE THE IMAGE, not after -
+# a warden that reaches for the verb without the Role gets a 403 and halts its
+# fleet roll on the first workload-less tenant it meets. Drop the verb, and
+# `Warden::torn_down_before_the_marker` with it, once no tenant cancelled by the
+# old warden is left.
 #
 # The other half of the bound on this token is Pod Security Admission on the
 # `tenants` namespace (see 00-namespaces.yaml). Holding it lets you create a
@@ -67,14 +75,13 @@ rules:
   - apiGroups: [""]
     resources: ["persistentvolumeclaims"]
     verbs: ["create", "patch"]
-  # Applied with the rest of a tenant's objects, deleted with them, and never
-  # read back: `get` was here to tell a cancelled tenant from an interrupted
-  # reconcile, and a marker on the identity Secret does that now. Dropped rather
-  # than kept as slack, because a verb nothing calls is a verb a later mistake
-  # can reach for.
+  # `get` is read on ONE path and only until the migration is over: a tenant
+  # with no workload and no cancellation marker, where a surviving Service is
+  # what says an interrupted reconcile rather than a closed account. See the
+  # header for when it goes.
   - apiGroups: [""]
     resources: ["services"]
-    verbs: ["create", "patch", "delete"]
+    verbs: ["get", "create", "patch", "delete"]
   # Read only, and by label selector. The warden never creates a pod directly;
   # the Deployment does. This is the readiness wait during a provision.
   - apiGroups: [""]

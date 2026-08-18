@@ -70,6 +70,7 @@
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use k8s_openapi::api::apps::v1::Deployment;
 use k8s_openapi::api::core::v1::Secret;
 
 use crate::cluster::{Cluster, ClusterError, Kind, Object};
@@ -150,7 +151,13 @@ impl Reconciled {
 /// controller's access log already. An operator reading this has to be able to
 /// say which tenants moved, which ones need a person, and where a halted run
 /// stopped; nothing else about a tenant belongs in it. See [`Warden::roll`].
-#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+///
+/// Not `Serialize`, deliberately. `roll` is a library call and not an HTTP route
+/// ([`crate`]'s binary docs say why), so this answers an exit code and a block
+/// of text on a terminal; a derive here would be a standing invitation to put
+/// the fleet-wide label list on a wire, which is the one thing the paragraph
+/// above is careful about.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Rolled {
     /// How many tenants this run reached a VERDICT on: the buckets below plus
     /// the one named in [`Rolled::halted_on`], and nothing else. It is a sum
@@ -170,19 +177,26 @@ pub struct Rolled {
     /// applies nothing and so no tenant goes first; the number of RUNS that
     /// list costs is its length.
     pub rolled: Vec<String>,
-    /// Marked for a roll and left for a later run: the queue BEHIND the one
-    /// tenant this run took, whatever became of that one. Zero and a converged
-    /// [`Rolled::rolled`] is the fleet being current; non-zero says this run
-    /// made progress and the fleet is not there yet, which is the distinction
-    /// the exit code has to carry.
+    /// Marked for a roll and left for a later run: every tenant the read pass
+    /// queued that this run did not take.
     ///
-    /// Behind it and not including it, even when the run halted on it:
-    /// [`Rolled::tally`] counts a halted tenant through [`Rolled::halted_on`],
-    /// and a tenant in both buckets would push `checked` past the size of the
-    /// fleet.
+    /// Normally that is the queue BEHIND the one tenant it took, whatever became
+    /// of that one. Zero and a converged [`Rolled::rolled`] is the fleet being
+    /// current; non-zero says the fleet is not there yet, which is the
+    /// distinction the exit code has to carry.
     ///
-    /// Always zero in a dry run, where the whole queue is in
-    /// [`Rolled::rolled`].
+    /// When the READ pass stopped - a casualty, or a tenant it could not read -
+    /// it is everything already marked when it stopped, and [`Rolled::rolled`]
+    /// is empty because nothing was applied. Discarding that count instead would
+    /// make [`Rolled::checked`] report a three-tenant fleet as one.
+    ///
+    /// Behind the tenant this run took and not including it, even when the run
+    /// halted on it: [`Rolled::tally`] counts a halted tenant through
+    /// [`Rolled::halted_on`], and a tenant in both buckets would push `checked`
+    /// past the size of the fleet.
+    ///
+    /// Zero in a dry run that finished, where the whole queue is in
+    /// [`Rolled::rolled`]; the halt case above applies to a dry run too.
     pub remaining: usize,
     /// Already matched the render. A re-run of a finished roll is all of these
     /// and no writes at all.
@@ -204,6 +218,22 @@ pub struct Rolled {
     /// instead, and they are the reason a run that rolled everything it could
     /// can still refuse to call the fleet converged.
     pub stranded: Vec<String>,
+    /// A workload standing over a credential Secret that is gone, so this
+    /// warden cannot render the tenant at all: `credential_missing`.
+    ///
+    /// Its own bucket because it is the one per-tenant READ failure that is
+    /// permanent. Every other one means the API server stopped answering, which
+    /// stops the run - the right answer, because the next tenant would be rolled
+    /// on the strength of a cluster that has just gone quiet. This one is a fact
+    /// about one tenant that no retry changes, and stopping on it would park
+    /// every tenant after it in [`Warden::fleet`] order behind a run that halts
+    /// at the same label every fifteen minutes, forever.
+    ///
+    /// The pod is probably still up - the daemon installed its credential onto
+    /// its own volume long ago - so this is not [`Rolled::stranded`]. It is a
+    /// mailbox with no way back onto today's render, and the remedy is a person
+    /// restoring the Secret, not a run trying again.
+    pub unrenderable: Vec<String>,
     /// Identity Secrets whose label does not validate, from [`Warden::fleet`].
     /// A COUNT and never the names, because the name is precisely the string
     /// that failed validation.
@@ -239,6 +269,7 @@ impl Rolled {
             + self.skipped_foreign.len()
             + self.skipped_inactive.len()
             + self.stranded.len()
+            + self.unrenderable.len()
             + usize::from(self.halted_on.is_some());
     }
 }
@@ -256,6 +287,9 @@ enum Step {
     Inactive,
     /// No workload, nothing recording a cancellation: [`Rolled::stranded`].
     Stranded,
+    /// A workload this warden cannot render, permanently:
+    /// [`Rolled::unrenderable`].
+    Unrenderable,
     /// On today's render and not serving it: [`Rolled::casualty`]. The verdict
     /// that stops the run before it writes anything.
     Casualty,
@@ -274,10 +308,13 @@ enum Step {
 /// `Failed` by the time a drift report exists to pair it with.
 fn verdict_of(status: TenantStatus, report: &DriftReport) -> Option<Step> {
     if !report.deployment_present {
-        // The Deployment was there when the status was read and is gone now.
-        // Whichever way it went, this tenant has no workload, and reading an
-        // empty report as "no changes, therefore fine" would file a mailbox
-        // that just disappeared under converged.
+        // A status word that says there is a workload over a report that says
+        // there is not. [`Warden::inspect`] derives both from ONE read, so it
+        // cannot hand this pairing in; a report built from two reads with a
+        // delete between them can, and so can any other caller of this
+        // function. Reading an empty report as "no changes, therefore fine"
+        // would file a mailbox that just disappeared under converged, so the
+        // rule is stated here rather than left to whoever assembles the two.
         return None;
     }
     if status == TenantStatus::Failed && report.changes.is_empty() {
@@ -1646,6 +1683,13 @@ impl Warden {
     /// happens before any write, so a failed read costs the run and not a
     /// half-rolled fleet.
     ///
+    /// With ONE exception, and it is the difference between a cluster that has
+    /// gone quiet and a tenant that is broken. A workload whose credential
+    /// Secret is gone can never be rendered, by this run or any other, so
+    /// halting on it would park every tenant after it in [`Warden::fleet`] order
+    /// behind a run that stops at the same label every tick, forever. That one
+    /// is named in [`Rolled::unrenderable`] and the walk goes on.
+    ///
     /// ## Two passes, because one halt only protects one run
     ///
     /// Halting inside a single pass is not enough on its own, and the gap is
@@ -1715,7 +1759,11 @@ impl Warden {
     /// see it and call [`Warden::reconcile`] on that one label.
     /// [`objects::CANCELLED_AT_ANNOTATION`] is what tells the two apart, and it
     /// is a record of the account holder's intent rather than a shape worked
-    /// out from whichever objects a teardown happened to leave standing.
+    /// out from whichever objects a teardown happened to leave standing. The
+    /// one tenant the marker cannot speak for is one cancelled before it
+    /// existed; [`Warden::torn_down_before_the_marker`] is the bridge that keeps
+    /// those out of `stranded`, because naming a closed account as a mailbox
+    /// that is down sends an operator to the call that would reopen it.
     ///
     /// Which leaves [`TenantStatus::Active`] and [`TenantStatus::Failed`], the
     /// two that have a workload for today's render to apply to; the casualty
@@ -1792,7 +1840,16 @@ impl Warden {
                 // midnight to discover exactly that. Nothing was applied that
                 // matters, the next tick's read pass files the tenant as
                 // inactive without ever queueing it, and the run says so here.
-                Err(WardenError::NotReconcilable) => {
+                //
+                // Both words, and the cancellation is the one that matters
+                // here: `reconcile` asks the marker three times - once on the
+                // way in, once if the workload vanishes under the apply, and
+                // once if it vanishes under the rollout wait, which is a whole
+                // `ready_timeout` wide - and a DELETE landing in any of the
+                // three answers `Cancelled`. `NotReconcilable` is the same
+                // shape of event without the intent: a tenant that stopped
+                // being a workload between the read pass and the write.
+                Err(WardenError::Cancelled | WardenError::NotReconcilable) => {
                     tracing::info!(
                         tenant = %first,
                         "the tenant this run took is no longer a shape to converge; skipping it"
@@ -1829,6 +1886,7 @@ impl Warden {
             skipped_foreign = summary.skipped_foreign.len(),
             skipped_inactive = summary.skipped_inactive.len(),
             stranded = summary.stranded.len(),
+            unrenderable = summary.unrenderable.len(),
             unreadable = summary.unreadable,
             halted = summary.halted_on.is_some(),
             casualty = summary.casualty.is_some(),
@@ -1846,7 +1904,12 @@ impl Warden {
     /// A stop - a casualty, or a tenant that could not be read - returns an
     /// EMPTY queue along with the halted summary, which is what makes "applies
     /// nothing" a property of the shape here rather than of a flag the write
-    /// pass has to remember to check.
+    /// pass has to remember to check. The tenants it had already marked are
+    /// counted into [`Rolled::remaining`] on the way out, because the read pass
+    /// DID reach a verdict on them and [`Rolled::checked`] is a sum of verdicts:
+    /// dropping them would report a three-tenant fleet as one checked, and the
+    /// one number in the summary an operator can add up would be the one number
+    /// that lies.
     async fn read_pass<'a>(&self, fleet: &'a [TenantName]) -> (Rolled, Vec<&'a TenantName>) {
         let mut summary = Rolled::default();
         let mut queue: Vec<&TenantName> = Vec::new();
@@ -1858,6 +1921,7 @@ impl Warden {
                 Ok(Step::Foreign) => summary.skipped_foreign.push(label),
                 Ok(Step::Inactive) => summary.skipped_inactive.push(label),
                 Ok(Step::Stranded) => summary.stranded.push(label),
+                Ok(Step::Unrenderable) => summary.unrenderable.push(label),
                 Ok(Step::Casualty) => {
                     tracing::error!(
                         tenant = %name,
@@ -1866,6 +1930,7 @@ impl Warden {
                     );
                     summary.casualty = Some(label.clone());
                     summary.halted_on = Some(label);
+                    summary.remaining = queue.len();
                     return (summary, Vec::new());
                 }
                 // Already logged with its machine reason. A tenant this warden
@@ -1878,6 +1943,7 @@ impl Warden {
                         "fleet roll halted while reading the fleet; nothing was applied"
                     );
                     summary.halted_on = Some(label);
+                    summary.remaining = queue.len();
                     return (summary, Vec::new());
                 }
             }
@@ -1901,20 +1967,54 @@ impl Warden {
         // the run would halt on it. Every tick. First in the queue every time,
         // refused every time, and nothing else in the fleet ever converged: one
         // account somebody closed would stop the roller permanently.
-        if self.cancelled(name).await? {
+        //
+        // A tenant whose identity Secret has gone between the fleet listing and
+        // this read is the same answer, for [`Warden::cancelled`]'s reason: the
+        // absence of the one record `delete` deliberately keeps is a harder
+        // teardown than a cancellation, not a softer one.
+        let Some(identity) = self.identity(name).await? else {
+            return Ok(Step::Inactive);
+        };
+        if is_cancelled(&identity) {
             return Ok(Step::Inactive);
         }
-        let status = match self.status_of(name).await? {
+        // ONE read of the Deployment for both the status word and the drift
+        // report below. This runs over every tenant on every tick, and it is
+        // also the only way one tenant's verdict is reached from one view of it:
+        // two reads with a delete between them produce a status that says there
+        // is a workload and a report that says there is not.
+        let (live, status) = self.workload(name).await?;
+        let status = match status {
             status @ (TenantStatus::Active | TenantStatus::Failed) => status,
             // A signup that never reached phase two: no workload has ever
             // existed here, so there is nothing to be down.
             TenantStatus::Pending => return Ok(Step::Inactive),
-            TenantStatus::Stopped => return Ok(self.stranded(name)),
+            TenantStatus::Stopped => return self.workloadless(name).await,
         };
 
-        let report = self.drift(name.as_str()).await?;
+        let report = match self.drift_of(name, status, live).await {
+            Ok(report) => report,
+            // A tenant this warden can see and can NEVER render: the workload
+            // is there and the Secret its render is built from is not. Every
+            // other error out of a read is the cluster failing to answer, which
+            // is a reason to stop the whole run - but this one is a fact about
+            // one tenant that no number of retries changes, and halting on it
+            // would park the fleet behind it forever, in sorted order, with
+            // every tenant after it never converged again.
+            Err(WardenError::Cluster {
+                reason: CREDENTIAL_MISSING,
+            }) => {
+                tracing::error!(
+                    tenant = %name,
+                    "a workload with no sealed credential behind it; no run can render \
+                     this tenant until a person puts one back"
+                );
+                return Ok(Step::Unrenderable);
+            }
+            Err(e) => return Err(e),
+        };
         let Some(step) = verdict_of(status, &report) else {
-            return Ok(self.stranded(name));
+            return self.workloadless(name).await;
         };
         match step {
             // COUNT, not names, for the reason `reconcile` gives: a
@@ -1938,21 +2038,38 @@ impl Warden {
         Ok(step)
     }
 
-    /// A tenant with no workload at all, which by the time it reaches here is a
-    /// job somebody did not finish. See [`Rolled::stranded`].
+    /// A tenant with no workload at all, and what to make of it.
     ///
-    /// The other reading - an account somebody closed - cannot arrive here:
-    /// [`Warden::inspect`] asks [`Warden::cancelled`] before it asks for a
-    /// status, and a tenant whose identity Secret has gone is caught by the
-    /// same read. What is left is a volume and a credential still standing over
-    /// a missing Deployment, which is a mailbox that is DOWN.
-    fn stranded(&self, name: &TenantName) -> Step {
+    /// An account somebody closed cannot arrive here with its marker on:
+    /// [`Warden::inspect`] reads the identity Secret before it reads a status,
+    /// and a tenant whose identity Secret has gone is caught by the same read.
+    /// What is left is a volume and a credential still standing over a missing
+    /// Deployment, which is a mailbox that is DOWN - [`Rolled::stranded`], named
+    /// for a person.
+    ///
+    /// Except for the one tenant that shape cannot be told from: an account
+    /// cancelled before the marker existed. That is
+    /// [`Warden::torn_down_before_the_marker`]'s question, it costs one GET on
+    /// this path alone, and getting it wrong here is not a miscount - the
+    /// summary would name a closed account as a mailbox that is down, exit 1
+    /// over it every fifteen minutes, and send an operator to
+    /// `squelch-control reconcile <label>`, which is the call that would put it
+    /// back on the internet.
+    async fn workloadless(&self, name: &TenantName) -> Result<Step, WardenError> {
+        if self.torn_down_before_the_marker(name).await? {
+            tracing::info!(
+                tenant = %name,
+                "no workload, no route and no marker; reading it as a cancellation that \
+                 predates the marker rather than as a mailbox that is down"
+            );
+            return Ok(Step::Inactive);
+        }
         tracing::warn!(
             tenant = %name,
             "a tenant with no workload and no cancellation on record; \
              a job that did not finish left it down"
         );
-        Step::Stranded
+        Ok(Step::Stranded)
     }
 
     /// The tenant's identity Secret, if phase one ever ran.
@@ -2471,6 +2588,114 @@ mod tests {
         assert_ne!(before, pod_annotation(&h));
     }
 
+    /// A phase two that REPLACES a workload waits for the rollout before it
+    /// takes a pod to exec in, and a phase two that creates one does not.
+    ///
+    /// `Recreate` keeps the old pod Ready, and in this tenant's own selector,
+    /// until it terminates - so "the first Ready pod" can be the pod this apply
+    /// just condemned, and `squelchd pair` execed into it writes a live pairing
+    /// code into a container the kubelet is killing. The handoff goes with it.
+    ///
+    /// A fresh signup has no old pod to be confused with, and making every new
+    /// tenant wait out `minReadySeconds` as well would spend a good part of the
+    /// deadline on a race it cannot lose.
+    #[tokio::test]
+    async fn a_re_consent_waits_for_the_rollout_and_a_first_provision_does_not() {
+        // Fresh: the controller never observes the new spec, and the signup
+        // still completes, because nothing here is waiting on it.
+        let h = Harness::new();
+        h.cluster.rollout_hangs();
+        h.warden
+            .create_tenant("alice", "alice@example.com")
+            .await
+            .unwrap();
+        assert!(
+            h.warden
+                .set_credentials("alice", &armored("first"))
+                .await
+                .is_ok()
+        );
+
+        // Replacing: the same hung rollout is now a refusal, because the answer
+        // this route gives is a pairing code and the pod it came from has to be
+        // the one that survives.
+        let h = Harness::new();
+        h.warden
+            .create_tenant("bob", "bob@example.com")
+            .await
+            .unwrap();
+        h.warden
+            .set_credentials("bob", &armored("first"))
+            .await
+            .unwrap();
+        stop_serving(&h, "bob").await;
+        h.cluster.rollout_hangs();
+        assert_eq!(
+            h.warden
+                .set_credentials("bob", &armored("second"))
+                .await
+                .unwrap_err(),
+            WardenError::cluster("not_ready")
+        );
+    }
+
+    /// A reopen that fails partway leaves the account CLOSED.
+    ///
+    /// The marker is the account holder's decision, and the two orders this
+    /// call could clear it in fail in opposite directions. Cleared last - what
+    /// this asserts - a failed reopen leaves a tenant every reader still
+    /// refuses, and the retry is this same call, which is exempt from the 409
+    /// for exactly that reason. Cleared FIRST, the same failure leaves a
+    /// mailbox up and serving on the credential its owner cancelled with
+    /// nothing on record saying anybody cancelled it, and the next roll
+    /// converges it like any other tenant.
+    #[tokio::test]
+    async fn a_reopen_that_does_not_finish_leaves_the_account_closed() {
+        let h = Harness::new();
+        h.warden
+            .create_tenant("alice", "alice@example.com")
+            .await
+            .unwrap();
+        h.warden
+            .set_credentials("alice", &armored("first"))
+            .await
+            .unwrap();
+        // The teardown that failed on the Ingress: closed account, Deployment
+        // still up. The state the reopen exemption exists for.
+        h.cluster.fail_delete_of(Kind::Ingress);
+        assert!(h.warden.delete("alice").await.is_err());
+        assert!(is_cancelled(&h.cluster.secret("alice-identity").unwrap()));
+
+        // The reopen gets as far as applying the new render and no further.
+        h.cluster.never_ready();
+        assert_eq!(
+            h.warden
+                .set_credentials("alice", &armored("second"))
+                .await
+                .unwrap_err(),
+            WardenError::cluster("not_ready")
+        );
+        assert!(
+            is_cancelled(&h.cluster.secret("alice-identity").unwrap()),
+            "a reopen that did not finish took the cancellation off the record"
+        );
+        // So nothing else will touch it, and the roll will not converge it.
+        assert_eq!(
+            h.warden.reconcile("alice").await.unwrap_err(),
+            WardenError::Cancelled
+        );
+
+        // And the retry - this same call - is what finishes it.
+        h.cluster.becomes_ready();
+        assert!(
+            h.warden
+                .set_credentials("alice", &armored("second"))
+                .await
+                .is_ok()
+        );
+        assert!(!is_cancelled(&h.cluster.secret("alice-identity").unwrap()));
+    }
+
     /// The annotation the running pod carries, as the mock stored it.
     fn pod_annotation(h: &Harness) -> String {
         pod_annotations(h)[objects::CREDENTIAL_HASH_ANNOTATION].clone()
@@ -2961,6 +3186,9 @@ mod tests {
         assert!(h.cluster.deleted().is_empty());
     }
 
+    /// A pairing code is full access to a mailbox, so the two ways a tenant can
+    /// have no pod are two different refusals - and only one of them is about
+    /// the cluster.
     #[tokio::test]
     async fn a_stopped_tenant_cannot_be_paired() {
         let h = Harness::new();
@@ -2972,12 +3200,91 @@ mod tests {
             .set_credentials("alice", &armored("alice"))
             .await
             .unwrap();
-        h.warden.delete("alice").await.unwrap();
-        h.cluster.never_ready();
+
+        // Nothing running, and nobody cancelled anything: this cluster cannot
+        // do the thing right now.
+        h.cluster.delete(Kind::Deployment, "alice").await.unwrap();
         assert_eq!(
             h.warden.repair("alice").await.unwrap_err(),
             WardenError::cluster("no_ready_pod")
         );
+
+        // Cancelled, and that is not a cluster problem at all.
+        h.warden.delete("alice").await.unwrap();
+        assert_eq!(
+            h.warden.repair("alice").await.unwrap_err(),
+            WardenError::Cancelled
+        );
+    }
+
+    /// The state the marker exists for, on the route where getting it wrong is
+    /// worst: a teardown that failed on the Ingress leaves the account closed,
+    /// the Deployment up and a pod Ready. Every shape says "a running tenant",
+    /// and minting here would hand a new device full access to a mailbox its
+    /// owner already closed.
+    #[tokio::test]
+    async fn a_cancelled_account_that_is_still_up_cannot_be_paired() {
+        let h = Harness::new();
+        h.warden
+            .create_tenant("alice", "alice@example.com")
+            .await
+            .unwrap();
+        h.warden
+            .set_credentials("alice", &armored("alice"))
+            .await
+            .unwrap();
+
+        h.cluster.fail_delete_of(Kind::Ingress);
+        assert!(h.warden.delete("alice").await.is_err());
+        // The workload really is still serving, so nothing about the SHAPE of
+        // this tenant refuses the call.
+        assert_eq!(
+            h.warden.status("alice").await.unwrap(),
+            TenantStatus::Active
+        );
+        assert_eq!(
+            h.warden.repair("alice").await.unwrap_err(),
+            WardenError::Cancelled
+        );
+
+        // And reopening it - the one exit a closed account has - restores the
+        // route along with everything else.
+        h.warden
+            .set_credentials("alice", &armored("again"))
+            .await
+            .unwrap();
+        assert!(h.warden.repair("alice").await.is_ok());
+    }
+
+    /// Same tenant, same reasoning, on the other route that touches a cancelled
+    /// account's objects: an LLM key is a live gateway credential, `delete`
+    /// removes it on purpose, and storing one back would both undo that and
+    /// roll the pod of a mailbox nobody is entitled to run.
+    #[tokio::test]
+    async fn a_cancelled_account_takes_no_llm_key() {
+        let h = Harness::with_config(crate::testing::llm_test_config());
+        h.warden
+            .create_tenant("alice", "alice@example.com")
+            .await
+            .unwrap();
+        h.warden
+            .set_credentials("alice", &armored("alice"))
+            .await
+            .unwrap();
+
+        h.cluster.fail_delete_of(Kind::Ingress);
+        assert!(h.warden.delete("alice").await.is_err());
+        let applied = h.cluster.applied();
+        assert_eq!(
+            h.warden
+                .set_llm_key("alice", Some("sk-live-key"), None)
+                .await
+                .unwrap_err(),
+            WardenError::Cancelled
+        );
+        // Refused before anything was written: no Secret, and no roll.
+        assert_eq!(h.cluster.applied(), applied);
+        assert!(!h.cluster.exists(Kind::Secret, "alice-llm"));
     }
 
     #[tokio::test]
@@ -3575,7 +3882,11 @@ mod tests {
     /// cancelled mailbox straight back onto the internet.
     ///
     /// So this asserts the marker on every prefix, and then asserts the
-    /// consequence: reconcile refuses, and writes nothing.
+    /// consequence on EVERY route that would otherwise act on the wreckage:
+    /// each one refuses, and each one writes nothing. A guard that only
+    /// `reconcile` holds is not a guard - `repair` would mint a live pairing
+    /// code for the closed account, and `set_llm_key` would store a gateway
+    /// credential against it and roll its pod.
     #[tokio::test]
     async fn every_prefix_of_a_failed_teardown_is_still_a_cancelled_account() {
         for failing in [
@@ -3584,7 +3895,9 @@ mod tests {
             Kind::Deployment,
             Kind::NetworkPolicy,
         ] {
-            let h = Harness::new();
+            // With the gateway configured, so `set_llm_key` gets as far as the
+            // marker instead of stopping at the feature gate.
+            let h = Harness::with_config(crate::testing::llm_test_config());
             h.warden
                 .create_tenant("alice", "alice@example.com")
                 .await
@@ -3607,8 +3920,21 @@ mod tests {
             let applied = h.cluster.applied().len();
             assert_eq!(
                 h.warden.reconcile("alice").await.unwrap_err(),
-                WardenError::NotReconcilable,
+                WardenError::Cancelled,
                 "a teardown that died on {failing:?} was reconcilable"
+            );
+            assert_eq!(
+                h.warden.repair("alice").await.unwrap_err(),
+                WardenError::Cancelled,
+                "a teardown that died on {failing:?} would still mint a pairing code"
+            );
+            assert_eq!(
+                h.warden
+                    .set_llm_key("alice", Some("sk-live-key"), None)
+                    .await
+                    .unwrap_err(),
+                WardenError::Cancelled,
+                "a teardown that died on {failing:?} would still take an llm key"
             );
             assert_eq!(h.cluster.applied().len(), applied);
         }
@@ -3627,7 +3953,7 @@ mod tests {
         assert!(h.cluster.exists(Kind::Service, "alice"));
         assert_eq!(
             h.warden.reconcile("alice").await.unwrap_err(),
-            WardenError::NotReconcilable
+            WardenError::Cancelled
         );
         // And a roll walks past it rather than converging it, for the same
         // reason: it is an account somebody closed, not a shape to repair.
@@ -3655,6 +3981,100 @@ mod tests {
         assert!(h.cluster.deleted().is_empty());
         assert_eq!(h.warden.status("alice").await.unwrap(), TenantStatus::Active);
         assert!(!is_cancelled(&h.cluster.secret("alice-identity").unwrap()));
+    }
+
+    /// The tenants this change inherits: cancelled by the warden this one
+    /// replaces, so their identity Secret carries NO marker at all.
+    ///
+    /// Nothing about their shape distinguishes them from a reconcile that died
+    /// in its own delete-recreate window - identity intact, credential sealed,
+    /// no Deployment - and reading them as that is not a miscount but a
+    /// resurrection: the route would rebuild a closed mailbox on its stored
+    /// credential, and the roller would name it as DOWN and send an operator to
+    /// the exact call that does it.
+    ///
+    /// The one thing that does distinguish them is what the OLD warden's
+    /// teardown took with the workload. See
+    /// [`Warden::torn_down_before_the_marker`].
+    #[tokio::test]
+    async fn a_cancellation_that_predates_the_marker_is_still_a_cancellation() {
+        let h = Harness::new();
+        h.warden
+            .create_tenant("alice", "alice@example.com")
+            .await
+            .unwrap();
+        h.warden
+            .set_credentials("alice", &armored("alice"))
+            .await
+            .unwrap();
+        h.warden.delete("alice").await.unwrap();
+        // Roll the clock back: this is the tenant as the old warden left it,
+        // with the marker the new one writes taken off again.
+        h.cluster
+            .annotate_secret("alice-identity", objects::CANCELLED_AT_ANNOTATION, None)
+            .await
+            .unwrap();
+        assert!(!is_cancelled(&h.cluster.secret("alice-identity").unwrap()));
+        assert_eq!(
+            h.warden.status("alice").await.unwrap(),
+            TenantStatus::Stopped
+        );
+
+        let stopped = h.cluster.applied().len();
+        assert_eq!(
+            h.warden.reconcile("alice").await.unwrap_err(),
+            WardenError::Cancelled
+        );
+        assert_eq!(h.cluster.applied().len(), stopped);
+
+        // And the roller files her under "nothing to converge" rather than
+        // naming a closed account as a mailbox that is down.
+        let rolled = h.warden.roll(false).await.unwrap();
+        assert_eq!(rolled.skipped_inactive, vec!["alice"]);
+        assert_eq!(rolled.stranded, Vec::<String>::new());
+        assert_eq!(rolled.checked, 1);
+    }
+
+    /// The other side of that bridge, and the reason it is the SERVICE it asks
+    /// about: a reconcile that died in its own delete-recreate window has to
+    /// stay finishable.
+    ///
+    /// Both tenants read `stopped` with no marker. The one whose Service is
+    /// still standing was left that way by a call that applies the Service
+    /// before it touches the Deployment, which is a job to finish; the one
+    /// whose Service is gone was torn down by a `delete`, which took the
+    /// Service first.
+    #[tokio::test]
+    async fn a_reconcile_that_died_in_its_own_window_is_still_finishable() {
+        let h = Harness::new();
+        h.warden
+            .create_tenant("alice", "alice@example.com")
+            .await
+            .unwrap();
+        h.warden
+            .set_credentials("alice", &armored("alice"))
+            .await
+            .unwrap();
+        hand_edit_the_deployment(&h).await;
+        // The window: the Deployment is deleted and the pod will not let go of
+        // the volume, so the reconcile refuses before it can apply a new one.
+        h.cluster.pods_linger();
+        assert!(h.warden.reconcile("alice").await.is_err());
+        assert_eq!(
+            h.warden.status("alice").await.unwrap(),
+            TenantStatus::Stopped
+        );
+        assert!(!is_cancelled(&h.cluster.secret("alice-identity").unwrap()));
+        // The Service the reconcile applied on its way in is still there, and
+        // that is the whole difference from the tenant above.
+        assert!(h.cluster.exists(Kind::Service, "alice"));
+
+        h.cluster.pods_release();
+        assert_eq!(
+            h.warden.reconcile("alice").await.unwrap().deployment,
+            "created"
+        );
+        assert!(h.cluster.exists(Kind::Deployment, "alice"));
     }
 
     /// Reopening is a re-consent, and it is the one path that takes the marker
@@ -3737,7 +4157,7 @@ mod tests {
         let stopped = h.cluster.applied().len();
         assert_eq!(
             h.warden.reconcile("alice").await.unwrap_err(),
-            WardenError::NotReconcilable
+            WardenError::Cancelled
         );
         assert_eq!(h.cluster.applied().len(), stopped);
     }
@@ -3772,10 +4192,14 @@ mod tests {
         // this is also the proof that `created` names a race rather than a
         // state: the only way to reach that branch is a DELETE landing between
         // the status read and the get.
+        //
+        // `Cancelled` rather than `NotReconcilable`, and the two words are the
+        // point of the pair above: pending is a signup nobody finished, and
+        // this is an account somebody closed. Same 409, opposite next move.
         let stopped = h.cluster.applied().len();
         assert_eq!(
             h.warden.reconcile("alice").await.unwrap_err(),
-            WardenError::NotReconcilable
+            WardenError::Cancelled
         );
         assert_eq!(h.cluster.applied().len(), stopped);
     }
@@ -4353,11 +4777,20 @@ mod tests {
         for label in ["alice", "bob"] {
             assert_eq!(daemon_image(&h, label), PREVIOUS_IMAGE);
         }
+        // And the summary adds up. Alice and bob were both marked for a roll
+        // before the walk reached carol, so they are verdicts this run reached
+        // and `checked` has to count them: a three-tenant fleet reported as one
+        // checked would make the one number an operator can add up the one
+        // number that lies about how far the run got.
+        assert_eq!(rolled.remaining, 2);
+        assert_eq!(rolled.checked, 3);
 
         // A dry run is the same refusal: the read pass is the whole of it.
         let dry = h.warden.roll(true).await.unwrap();
         assert_eq!(dry.casualty, Some("carol".to_string()));
         assert_eq!(dry.rolled, Vec::<String>::new());
+        assert_eq!(dry.remaining, 2);
+        assert_eq!(dry.checked, 3);
     }
 
     /// The other half of the casualty rule, and the case this whole feature was
@@ -4492,6 +4925,43 @@ mod tests {
         assert_eq!(second.halted_on, None);
     }
 
+    /// The same cancellation, in the window that is a hundred times wider.
+    ///
+    /// `reconcile` applies everything and THEN waits for the rollout, and that
+    /// wait is a whole `ready_timeout` - where the apply window above is a few
+    /// API calls. A `DELETE` landing in it takes the Deployment out from under
+    /// the wait, which the cluster answers with `NoPod`, which reads exactly
+    /// like a render that could not come up. Reported that way it is a halt,
+    /// exit 1, and the midnight page the test above exists to prevent - so the
+    /// marker is re-read here too, and the answer is the same skip.
+    #[tokio::test]
+    async fn an_account_cancelled_during_the_rollout_wait_is_also_a_skip() {
+        let h = Harness::new();
+        for label in ["alice", "bob"] {
+            serving_tenant(&h, label).await;
+            age_the_render(&h, label).await;
+        }
+        h.cluster.cancelled_arrives_during_the_rollout("alice");
+
+        let rolled = h.warden.roll(false).await.unwrap();
+        assert_eq!(rolled.skipped_inactive, vec!["alice"]);
+        assert_eq!(rolled.halted_on, None);
+        assert_eq!(rolled.rolled, Vec::<String>::new());
+        assert_eq!(rolled.remaining, 1);
+        assert!(!h.cluster.exists(Kind::Deployment, "alice"));
+
+        // A rollout that hangs for any OTHER reason is still a halt. The
+        // distinction is the marker and nothing else about the shape: both
+        // tenants end the run with no finished rollout behind them.
+        let h = Harness::new();
+        serving_tenant(&h, "alice").await;
+        age_the_render(&h, "alice").await;
+        h.cluster.rollout_hangs();
+        let rolled = h.warden.roll(false).await.unwrap();
+        assert_eq!(rolled.halted_on, Some("alice".to_string()));
+        assert_eq!(rolled.skipped_inactive, Vec::<String>::new());
+    }
+
     /// The two entry points, on one hand-edited tenant. An unattended caller
     /// has no delete branch to reach at all; the operator's route still
     /// repairs the same tenant the only way server-side apply allows.
@@ -4561,11 +5031,54 @@ mod tests {
         assert!(!h.cluster.exists(Kind::Deployment, "alice"));
     }
 
-    /// A tenant this warden cannot render honestly stops the run in the READ
-    /// pass, before anything is applied to anyone - and the summary still adds
-    /// up, because [`Rolled::checked`] counts verdicts and a halt is one.
+    /// A tenant this warden cannot READ stops the run in the READ pass, before
+    /// anything is applied to anyone - and the summary still adds up, because
+    /// [`Rolled::checked`] counts verdicts and the tenants already queued when
+    /// the walk stopped were verdicts too.
+    ///
+    /// The read that fails is about one tenant, but what it says is that this
+    /// cluster is not answering, and the next tenant would be rolled on the
+    /// strength of that. So the run stops where it stands.
     #[tokio::test]
     async fn a_tenant_that_cannot_be_read_halts_the_run_before_the_write_pass() {
+        let h = Harness::new();
+        for label in ["alice", "bob", "carol", "dave"] {
+            serving_tenant(&h, label).await;
+        }
+        // Alice is behind and would have been rolled; carol is behind and is
+        // never reached. The API server stops answering about bob, between them.
+        age_the_render(&h, "alice").await;
+        age_the_render(&h, "carol").await;
+        h.cluster.break_reads_for("bob");
+        let applied = h.cluster.applied();
+
+        let rolled = h.warden.roll(false).await.unwrap();
+        assert_eq!(rolled.halted_on, Some("bob".to_string()));
+        assert_eq!(rolled.casualty, None);
+        assert_eq!(rolled.rolled, Vec::<String>::new());
+        // Alice was queued before the walk stopped, and the count says so: one
+        // queued, one halted on, and nothing else reached. A summary that
+        // dropped alice would report a four-tenant fleet as one checked.
+        assert_eq!(rolled.remaining, 1);
+        assert_eq!(rolled.current, 0);
+        assert_eq!(rolled.checked, 2);
+
+        // Nothing was applied to anyone, alice included: the read pass covers
+        // the whole fleet before the write pass touches one tenant.
+        assert_eq!(h.cluster.applied(), applied);
+        assert_eq!(daemon_image(&h, "alice"), PREVIOUS_IMAGE);
+        assert_eq!(daemon_image(&h, "carol"), PREVIOUS_IMAGE);
+    }
+
+    /// The one per-tenant read failure that must NOT stop the run, because no
+    /// number of retries changes it.
+    ///
+    /// A workload whose sealed credential Secret is gone cannot be rendered by
+    /// this run or any other. Halting on it would park every tenant after it in
+    /// fleet order behind a run that stops at the same label every fifteen
+    /// minutes, forever - so it is named for a person and the walk goes on.
+    #[tokio::test]
+    async fn a_tenant_that_can_never_be_rendered_is_named_and_not_a_halt() {
         let h = Harness::new();
         for label in ["alice", "bob", "carol"] {
             serving_tenant(&h, label).await;
@@ -4578,18 +5091,23 @@ mod tests {
             .delete(Kind::Secret, &bob.credential_secret())
             .await
             .unwrap();
-        let applied = h.cluster.applied();
 
         let rolled = h.warden.roll(false).await.unwrap();
-        assert_eq!(rolled.halted_on, Some("bob".to_string()));
-        assert_eq!(rolled.casualty, None);
+        assert_eq!(rolled.halted_on, None);
+        assert_eq!(rolled.unrenderable, vec!["bob"]);
         assert_eq!(rolled.current, 1);
-        assert_eq!(rolled.rolled, Vec::<String>::new());
-        assert_eq!(rolled.checked, 2);
+        // Carol is BEHIND bob in fleet order and still got rolled, which is the
+        // whole point: one broken tenant does not park the fleet behind it.
+        assert_eq!(rolled.rolled, vec!["carol"]);
+        assert_eq!(rolled.checked, 3);
+        assert_eq!(daemon_image(&h, "carol"), h.config.image);
 
-        // Carol was behind and was never reached: the read pass stopped at Bob.
-        assert_eq!(h.cluster.applied(), applied);
-        assert_eq!(daemon_image(&h, "carol"), PREVIOUS_IMAGE);
+        // And it is not a green run: a mailbox nobody can render is a fleet
+        // that is not on today's render, permanently.
+        let rolled = h.warden.roll(false).await.unwrap();
+        assert_eq!(rolled.unrenderable, vec!["bob"]);
+        assert_eq!(rolled.current, 2);
+        assert_eq!(rolled.rolled, Vec::<String>::new());
     }
 
     /// An identity Secret whose label will not parse is a tenant this warden
