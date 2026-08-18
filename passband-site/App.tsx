@@ -777,7 +777,7 @@ function Waitlist() {
       <>
         <p style={styles.confirm}>you're on the list.</p>
         <p style={styles.status}>
-          the invite lands by email when a spot opens. it walks you through
+          you will receive an email when a spot opens. it walks you through
           setup, and the app is waiting at the end of it.
         </p>
       </>
