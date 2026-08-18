@@ -12,9 +12,11 @@
 //! - `stringData` on a Secret is stored as `data`. A mock that echoed
 //!   `stringData` back would let a reader that looks at the wrong field pass
 //!   here and find nothing on a real cluster.
-//! - a Deployment that has been applied reports a ready replica, unless the
-//!   test says otherwise. That is what makes `pending` / `active` / `failed`
-//!   testable without a scheduler.
+//! - a Deployment that has been applied reports the status a running one would
+//!   have: a generation the controller has observed, and every replica updated,
+//!   present and ready, unless a knob says otherwise. That is what makes
+//!   `pending` / `active` / `failed` and a finished rollout testable without a
+//!   scheduler.
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
@@ -24,14 +26,15 @@ use async_trait::async_trait;
 use k8s_openapi::ByteString;
 use k8s_openapi::api::apps::v1::{Deployment, DeploymentStatus};
 use k8s_openapi::api::core::v1::{Secret, Service};
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::{FieldsV1, ManagedFieldsEntry};
 
-use crate::cluster::{Cluster, ClusterError, ExecOutput, Kind, Object};
+use crate::cluster::{Cluster, ClusterError, ExecOutput, Kind, Object, rolled_out};
 use crate::config::{
-    Config, DEFAULT_BIND, DEFAULT_CPU_LIMIT, DEFAULT_CPU_REQUEST, DEFAULT_EPHEMERAL_LIMIT,
-    DEFAULT_EPHEMERAL_REQUEST, DEFAULT_INGRESS_CLASS, DEFAULT_INGRESS_NAMESPACE,
-    DEFAULT_MEMORY_LIMIT, DEFAULT_MEMORY_REQUEST, DEFAULT_OAUTH_SECRET_NAME,
-    DEFAULT_PENDING_TTL_SECS, DEFAULT_RUN_AS, DEFAULT_STORAGE_CLASS, DEFAULT_STORAGE_SIZE,
-    DEFAULT_TENANT_NAMESPACE, DEFAULT_TLS_SECRET, DEFAULT_TMP_SIZE, Resources,
+    Config, DEFAULT_BIND, DEFAULT_CPU_LIMIT, DEFAULT_CPU_REQUEST,
+    DEFAULT_EPHEMERAL_LIMIT, DEFAULT_EPHEMERAL_REQUEST, DEFAULT_INGRESS_CLASS,
+    DEFAULT_INGRESS_NAMESPACE, DEFAULT_MEMORY_LIMIT, DEFAULT_MEMORY_REQUEST, DEFAULT_MIN_READY_SECS,
+    DEFAULT_OAUTH_SECRET_NAME, DEFAULT_PENDING_TTL_SECS, DEFAULT_RUN_AS, DEFAULT_STORAGE_CLASS,
+    DEFAULT_STORAGE_SIZE, DEFAULT_TENANT_NAMESPACE, DEFAULT_TLS_SECRET, DEFAULT_TMP_SIZE, Resources,
 };
 use crate::provision::Warden;
 
@@ -69,7 +72,11 @@ pub fn test_config() -> Config {
         user_namespaces: true,
         model_pvc: None,
         node_cidr: None,
+        // Off, like production until the whole fleet is on a daemon that serves
+        // `/healthz`: the tests that render the HTTP probe turn it on.
+        http_readiness: false,
         run_as: DEFAULT_RUN_AS,
+        min_ready_secs: DEFAULT_MIN_READY_SECS,
         ready_timeout: Duration::from_secs(1),
         pending_ttl: Duration::from_secs(DEFAULT_PENDING_TTL_SECS),
         trusted_proxy_hops: 0,
@@ -130,14 +137,31 @@ struct MockInner {
     exec_ok: bool,
     /// Whether an applied Deployment comes up.
     ready: bool,
+    /// Whether the controller ever notices an applied Deployment.
+    rollout_hangs: bool,
     /// Whether a deleted Deployment's pods hang around holding the volume.
     pods_linger: bool,
     /// Whether reads answer at all.
     reads_ok: bool,
+    /// A tenant whose reads all fail, while the rest of the cluster answers.
+    reads_broken_for: Option<String>,
     /// Whether the next `create` loses a race with a concurrent one.
     create_loses_race: bool,
     /// A kind whose deletes all fail, for the partial-teardown paths.
     fail_delete: Option<Kind>,
+    /// A tenant whose Deployment gains a foreign field manager the moment
+    /// anything is applied.
+    foreign_on_apply: Option<String>,
+    /// Whether the annotation patch fails, for the teardown that cannot record
+    /// its own cancellation.
+    fail_annotate: bool,
+    /// A tenant whose account is CANCELLED the moment anything is applied: the
+    /// marker goes on and the Deployment goes away, the way a real `DELETE`
+    /// landing mid-reconcile leaves things.
+    cancel_on_apply: Option<String>,
+    /// The same event, one window later: the cancellation lands while the
+    /// rollout is being waited out rather than while the objects are going in.
+    cancel_on_rollout: Option<String>,
 }
 
 /// A cluster that records instead of connecting.
@@ -187,6 +211,46 @@ impl MockCluster {
         self.lock().reads_ok = false;
     }
 
+    /// Reads about ONE tenant fail and the rest of the cluster answers
+    /// normally. What an API server having a bad moment looks like from inside
+    /// a fleet walk: the run is several tenants in, one read fails, and what
+    /// matters is whether the walk stops there or carries on rolling the fleet
+    /// on the strength of a cluster that has stopped answering.
+    ///
+    /// Matched on the object's name PREFIX, so it covers a tenant's Deployment,
+    /// its Service and all three of its Secrets - every read `inspect` makes
+    /// about that one tenant. `list_secrets` is deliberately not covered: the
+    /// fleet enumeration is one call about every tenant at once, and a failure
+    /// there is the run never starting rather than the walk stopping partway.
+    pub fn break_reads_for(&self, label: &str) {
+        self.lock().reads_broken_for = Some(label.to_string());
+    }
+
+    fn reads(&self, name: &str) -> Result<(), ClusterError> {
+        let inner = self.lock();
+        if !inner.reads_ok {
+            return Err(ClusterError::NoPod);
+        }
+        match &inner.reads_broken_for {
+            Some(label) if name == label || name.starts_with(&format!("{label}-")) => {
+                Err(ClusterError::NoPod)
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// An applied Deployment's rollout never completes: the controller has not
+    /// observed the new spec, so `status.observedGeneration` stays behind
+    /// `metadata.generation` forever and `rollout_complete` times out.
+    ///
+    /// The state a bad render produces on a real cluster is the neighbouring
+    /// one — the controller sees the spec and the pod never becomes ready,
+    /// which is [`MockCluster::never_ready`] — and both have to be failures a
+    /// caller can be held to, because the fleet roll stops on either.
+    pub fn rollout_hangs(&self) {
+        self.lock().rollout_hangs = true;
+    }
+
     /// A deleted Deployment's pod never goes: `pods_gone` times out, the way a
     /// pod wedged in Terminating on a stuck unmount does. The state that must
     /// stop a recreate dead, because the volume is `ReadWriteOnce` and the pod
@@ -209,11 +273,80 @@ impl MockCluster {
         self.lock().fail_delete = Some(kind);
     }
 
+    /// Every `annotate_secret` fails. The one thing `delete` does before it
+    /// deletes anything, so this is how a test reaches the teardown that could
+    /// not write its own marker - the state the whole ordering exists to make
+    /// impossible.
+    pub fn fail_annotate(&self) {
+        self.lock().fail_annotate = true;
+    }
+
     /// The next `create` loses a race, the way a second signup for one label
     /// does: the read said the name was free and the write says it is not.
     /// The only way to reach that path, since the mock is otherwise serialized.
     pub fn create_loses_race(&self) {
         self.lock().create_loses_race = true;
+    }
+
+    /// A field manager arrives MID-RUN: the next apply of anything stamps
+    /// `label`'s stored Deployment with a foreign owner, once.
+    ///
+    /// The window it models is the one a caller cannot close by reading first.
+    /// A fleet roll reads a tenant's drift, finds nobody else on it, and calls
+    /// a reconcile that reads the same object again several API calls later;
+    /// somebody running `kubectl set env` in between is invisible to the first
+    /// read and present at the second. Hooked to an apply because that is the
+    /// only event between the two that this mock can see, and because it puts
+    /// the edit exactly where a test needs it: after the read pass, before the
+    /// write pass looks.
+    pub fn foreign_arrives_on_next_apply(&self, label: &str) {
+        self.lock().foreign_on_apply = Some(label.to_string());
+    }
+
+    /// An account is CANCELLED mid-run: the next apply of anything stamps
+    /// `label`'s identity Secret with the cancellation marker and removes its
+    /// Deployment, once.
+    ///
+    /// Both halves, because that is what a real `DELETE` landing in this window
+    /// does - it writes the marker first and then takes the workload - and
+    /// either half alone would model a state no caller can produce. The window
+    /// is the one a reconcile cannot close by reading first: it checks the
+    /// marker, then applies the volume, the policy and the Service, and only
+    /// then reads the Deployment it is about to replace.
+    pub fn cancelled_arrives_on_next_apply(&self, label: &str) {
+        self.lock().cancel_on_apply = Some(label.to_string());
+    }
+
+    /// The same cancellation, in the LATER window: everything is applied and
+    /// the caller is waiting for the rollout when the `DELETE` lands.
+    ///
+    /// Its own knob because the two windows are different sizes. The apply
+    /// window is a few API calls; this one is a whole
+    /// [`crate::config::Config::ready_timeout`], which is the widest gap on the
+    /// route and therefore the likeliest place for a real cancellation to land.
+    /// A caller that only re-read the marker in the first window reports this
+    /// one as a cluster failure and halts a fleet roll over it.
+    pub fn cancelled_arrives_during_the_rollout(&self, label: &str) {
+        self.lock().cancel_on_rollout = Some(label.to_string());
+    }
+
+    /// Stamp the cancellation marker and take the Deployment, which is what a
+    /// `DELETE` landing in either window leaves behind.
+    fn cancel(inner: &mut MockInner, label: &str) {
+        if let Some(Object::Secret(identity)) = inner
+            .objects
+            .get_mut(&(Kind::Secret, format!("{label}-identity")))
+        {
+            identity
+                .metadata
+                .annotations
+                .get_or_insert_with(BTreeMap::new)
+                .insert(
+                    crate::objects::CANCELLED_AT_ANNOTATION.to_string(),
+                    "1".to_string(),
+                );
+        }
+        inner.objects.remove(&(Kind::Deployment, label.to_string()));
     }
 
     /// What the next `squelchd pair` prints.
@@ -272,15 +405,50 @@ impl MockCluster {
     fn store(&self, object: Object) {
         let mut inner = self.lock();
         let key = (object.kind(), object.name().to_string());
-        let ready = inner.ready;
+        let (ready, rollout_hangs) = (inner.ready, inner.rollout_hangs);
         inner.applied.push(key.clone());
-        inner.objects.insert(key, persist(object, ready));
+        inner
+            .objects
+            .insert(key, persist(object, ready, rollout_hangs));
+        // After the store, so an apply of the Deployment itself is stamped
+        // rather than stamping the object it replaced.
+        if let Some(label) = inner.foreign_on_apply.take()
+            && let Some(Object::Deployment(deployment)) =
+                inner.objects.get_mut(&(Kind::Deployment, label.clone()))
+        {
+            stamp_foreign(deployment);
+        }
+        if let Some(label) = inner.cancel_on_apply.take() {
+            Self::cancel(&mut inner, &label);
+        }
     }
+}
+
+/// Give a stored Deployment a field manager that is not the warden.
+///
+/// The shape is what the API server records for a `kubectl set env`: an `Update`
+/// entry owning one field inside the pod template. Only the LEDGER is written,
+/// not the field it claims - what [`crate::drift::foreign_managers`] reads is
+/// the ledger, and a test double that had to reproduce a real edit as well
+/// would be reproducing the part that does not decide anything.
+fn stamp_foreign(deployment: &mut Deployment) {
+    deployment.metadata.managed_fields = Some(vec![ManagedFieldsEntry {
+        manager: Some("kubectl-set".to_string()),
+        operation: Some("Update".to_string()),
+        fields_v1: Some(FieldsV1(serde_json::json!({
+            "f:spec": { "f:template": { "f:spec": {
+                "f:containers": {
+                    "k:{\"name\":\"squelchd\"}": { "f:env": {} }
+                }
+            }}}
+        }))),
+        ..Default::default()
+    }]);
 }
 
 /// Imitate the API server: `stringData` is folded into `data`, and an applied
 /// Deployment gets the status a running one would have.
-fn persist(object: Object, ready: bool) -> Object {
+fn persist(object: Object, ready: bool, rollout_hangs: bool) -> Object {
     match object {
         Object::Secret(mut secret) => {
             if let Some(string_data) = secret.string_data.take() {
@@ -292,8 +460,33 @@ fn persist(object: Object, ready: bool) -> Object {
             Object::Secret(secret)
         }
         Object::Deployment(mut deployment) => {
+            let desired = deployment
+                .spec
+                .as_ref()
+                .and_then(|spec| spec.replicas)
+                .unwrap_or(1);
+            // The whole status, not just the ready count, because
+            // `rollout_complete` reads all five numbers and a mock that left
+            // four of them absent would report every roll as unfinished.
+            //
+            // The API server bumps `metadata.generation` on every spec write
+            // and the deployment controller copies it into
+            // `status.observedGeneration` once it has acted on that spec;
+            // `rollout_hangs` is a controller stuck in the gap between the two.
+            deployment.metadata.generation = Some(1);
             deployment.status = Some(DeploymentStatus {
-                ready_replicas: Some(i32::from(ready)),
+                observed_generation: Some(if rollout_hangs { 0 } else { 1 }),
+                // The replicas exist and are on the applied template either
+                // way: a pod that will not come up is a pod that is there and
+                // is not Ready, which is what `ready` decides.
+                replicas: Some(desired),
+                updated_replicas: Some(desired),
+                ready_replicas: Some(if ready { desired } else { 0 }),
+                // A pod that stayed Ready long enough for `minReadySeconds`.
+                // The mock has no clock, so a tenant that comes up is one that
+                // stayed up; the soak is a real cluster's to run, and what is
+                // tested here is that the render asks for it.
+                available_replicas: Some(if ready { desired } else { 0 }),
                 ..Default::default()
             });
             Object::Deployment(deployment)
@@ -322,9 +515,15 @@ impl Cluster for MockCluster {
         &self,
         deployment: Deployment,
     ) -> Result<Deployment, ClusterError> {
-        let ready = self.lock().ready;
-        let Object::Deployment(deployment) = persist(Object::Deployment(Box::new(deployment)), ready)
-        else {
+        let (ready, rollout_hangs) = {
+            let inner = self.lock();
+            (inner.ready, inner.rollout_hangs)
+        };
+        let Object::Deployment(deployment) = persist(
+            Object::Deployment(Box::new(deployment)),
+            ready,
+            rollout_hangs,
+        ) else {
             unreachable!("persist does not change an object's kind")
         };
         Ok(*deployment)
@@ -339,9 +538,7 @@ impl Cluster for MockCluster {
     }
 
     async fn get_secret(&self, name: &str) -> Result<Option<Secret>, ClusterError> {
-        if !self.lock().reads_ok {
-            return Err(ClusterError::NoPod);
-        }
+        self.reads(name)?;
         Ok(self.secret(name))
     }
 
@@ -372,9 +569,7 @@ impl Cluster for MockCluster {
     }
 
     async fn get_deployment(&self, name: &str) -> Result<Option<Deployment>, ClusterError> {
-        if !self.lock().reads_ok {
-            return Err(ClusterError::NoPod);
-        }
+        self.reads(name)?;
         Ok(match self.object(Kind::Deployment, name) {
             Some(Object::Deployment(deployment)) => Some(*deployment),
             _ => None,
@@ -382,13 +577,37 @@ impl Cluster for MockCluster {
     }
 
     async fn get_service(&self, name: &str) -> Result<Option<Service>, ClusterError> {
-        if !self.lock().reads_ok {
-            return Err(ClusterError::NoPod);
-        }
+        self.reads(name)?;
         Ok(match self.object(Kind::Service, name) {
             Some(Object::Service(service)) => Some(*service),
             _ => None,
         })
+    }
+
+    /// The one write that is not an apply: the named annotation moves and
+    /// nothing else about the Secret does. A Secret that is not stored is
+    /// success, the way a merge patch of a missing object is treated by its
+    /// caller — see [`Cluster::annotate_secret`].
+    async fn annotate_secret(
+        &self,
+        name: &str,
+        key: &str,
+        value: Option<&str>,
+    ) -> Result<(), ClusterError> {
+        let mut inner = self.lock();
+        if inner.fail_annotate {
+            return Err(ClusterError::Timeout(Duration::from_secs(1)));
+        }
+        let Some(Object::Secret(secret)) = inner.objects.get_mut(&(Kind::Secret, name.to_string()))
+        else {
+            return Ok(());
+        };
+        let annotations = secret.metadata.annotations.get_or_insert_with(BTreeMap::new);
+        match value {
+            Some(value) => annotations.insert(key.to_string(), value.to_string()),
+            None => annotations.remove(key),
+        };
+        Ok(())
     }
 
     async fn delete(&self, kind: Kind, name: &str) -> Result<(), ClusterError> {
@@ -412,6 +631,31 @@ impl Cluster for MockCluster {
             .find_map(|part| part.strip_prefix("app.kubernetes.io/instance="))
             .ok_or(ClusterError::NoPod)?;
         Ok(format!("{instance}-abc123"))
+    }
+
+    /// The stored Deployment's own status, put through the same
+    /// [`rolled_out`] the real poll loop uses, so a test cannot pass on a rule
+    /// the cluster does not apply. A roll that is not complete is not going to
+    /// become complete while nobody applies anything, so this answers at once
+    /// rather than spending the deadline.
+    async fn rollout_complete(&self, name: &str, within: Duration) -> Result<(), ClusterError> {
+        // The `DELETE` that landed while this was being waited out: the poll's
+        // next read of the Deployment finds nothing, which is exactly what the
+        // real one answers `NoPod` to.
+        {
+            let mut inner = self.lock();
+            if inner.cancel_on_rollout.as_deref() == Some(name) {
+                let label = inner.cancel_on_rollout.take().unwrap_or_default();
+                Self::cancel(&mut inner, &label);
+            }
+        }
+        let Some(deployment) = self.get_deployment(name).await? else {
+            return Err(ClusterError::NoPod);
+        };
+        if rolled_out(&deployment) {
+            return Ok(());
+        }
+        Err(ClusterError::Timeout(within))
     }
 
     /// The mock keeps no pods, so a deleted Deployment has taken its pod with

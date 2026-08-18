@@ -129,6 +129,15 @@ pub enum CiphertextError {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct TenantName(String);
 
+/// What marks a Secret as a tenant's identity record rather than one of the
+/// other Secrets the warden labels the same way.
+///
+/// Named rather than spelled twice, because the two spellings are a pair: one
+/// writes the name and one reads it back, and a caller enumerating the fleet
+/// has to be able to tell a name that is not an identity at all from an
+/// identity whose label it can no longer parse.
+pub const IDENTITY_SUFFIX: &str = "-identity";
+
 impl TenantName {
     /// Normalize and validate, or refuse.
     pub fn parse(raw: &str) -> Result<Self, LabelError> {
@@ -152,13 +161,13 @@ impl TenantName {
     /// ([`crate::provision::Warden::sweep_pending`], and only while the tenant
     /// is still pending).
     pub fn identity_secret(&self) -> String {
-        format!("{}-identity", self.0)
+        format!("{}{IDENTITY_SUFFIX}", self.0)
     }
 
     /// The label inside `<label>-identity`, for the sweep, which starts from a
     /// Secret name and has to get back to a validated tenant.
     pub fn from_identity_secret(secret_name: &str) -> Option<Self> {
-        Self::parse(secret_name.strip_suffix("-identity")?).ok()
+        Self::parse(secret_name.strip_suffix(IDENTITY_SUFFIX)?).ok()
     }
 
     /// `<label>-credential`: the Secret holding the age-armored credentials

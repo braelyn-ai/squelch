@@ -28,6 +28,20 @@
 # tenant is pending, only past the TTL, and never a credential Secret) rather
 # than about RBAC. Credential Secrets and volumes are still beyond it entirely.
 #
+# `get` on services is a MIGRATION verb with an expiry date. Telling a cancelled
+# tenant from an interrupted reconcile is the marker's job now
+# (`passband.email/cancelled-at`, below), but every tenant cancelled by a warden
+# that predates the marker carries no marker at all - and reading one of those
+# as an interrupted reconcile would rebuild a closed mailbox on its stored
+# credential. The old signal still separates them: a teardown takes the Service
+# before the Deployment, and every path that puts a workload up applies the
+# Service first, so a Service standing over a missing Deployment is a job to
+# finish and its absence is a teardown. APPLY THIS BEFORE THE IMAGE, not after -
+# a warden that reaches for the verb without the Role gets a 403 and halts its
+# fleet roll on the first workload-less tenant it meets. Drop the verb, and
+# `Warden::torn_down_before_the_marker` with it, once no tenant cancelled by the
+# old warden is left.
+#
 # The other half of the bound on this token is Pod Security Admission on the
 # `tenants` namespace (see 00-namespaces.yaml). Holding it lets you create a
 # workload here; PSA decides what KIND of workload, and at `restricted` that is
@@ -45,9 +59,15 @@ metadata:
   name: squelch-warden
   namespace: tenants
 rules:
-  # Identity and credential Secrets. `get` for the status derivation, `list` for
-  # the pending sweep, `create`/`patch` for the two writes, `delete` for the
-  # sweep alone: see the header.
+  # Identity and credential Secrets. `get` for the status derivation and the
+  # cancellation marker, `list` for the pending sweep, `create`/`patch` for the
+  # writes, `delete` for the sweep alone: see the header.
+  #
+  # `patch` covers two different writes now. One is the ordinary server-side
+  # apply of a Secret. The other is a JSON merge patch of a single annotation -
+  # `passband.email/cancelled-at`, which `delete` stamps on the identity Secret
+  # before it removes anything - and it is a merge patch precisely because an
+  # apply would declare the whole object and take that Secret's age key with it.
   - apiGroups: [""]
     resources: ["secrets"]
     verbs: ["get", "list", "create", "patch", "delete"]
@@ -55,8 +75,10 @@ rules:
   - apiGroups: [""]
     resources: ["persistentvolumeclaims"]
     verbs: ["create", "patch"]
-  # `get` is what tells a cancelled tenant from an interrupted reconcile: both
-  # read `stopped`, and only the cancelled one had its Service deleted too.
+  # `get` is read on ONE path and only until the migration is over: a tenant
+  # with no workload and no cancellation marker, where a surviving Service is
+  # what says an interrupted reconcile rather than a closed account. See the
+  # header for when it goes.
   - apiGroups: [""]
     resources: ["services"]
     verbs: ["get", "create", "patch", "delete"]

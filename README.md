@@ -102,6 +102,8 @@ Optional: `SQUELCH_DB_PATH` (default `~/.local/share/squelch/squelch.db`), `SQUE
 
 `SQUELCH_METRICS_BIND` (unset by default, e.g. `127.0.0.1:9464`) opens a second listener serving Prometheus text metrics at `/metrics`: sync timestamps, Gmail error counts, LLM spend, store sizes. **That listener is plaintext and unauthenticated**, by design, because a scrape credential in a Prometheus config is its own problem. Bind it to loopback or to a private interface and let your collector reach it there; never bind it to a public one. Leave it unset and the daemon opens no such port at all.
 
+The same listener answers `GET /healthz`, for an orchestrator that needs to know when this daemon is actually serving: `200 ok` once the sync engine is running and the embedder init has settled, `503` before that and `503` again if either stops. Two states and one word, deliberately — anything that reaches the port reads the answer, so it says nothing about the mailbox behind it. The daemon binds its doors before it finishes starting, so that a first-run model download cannot make them unreachable, which is exactly why "the port accepts" is not the same question.
+
 To turn on LLM triage, provide an API key: `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, or the explicit `SQUELCH_STAGE2_API_KEY` (provider sniffed from the key prefix). Both stages share the one key; without a key, triage runs heuristic-only. Models, prices, and budgets are tunable under `[stage1]` / `[stage2]` in `~/.config/squelch/config.toml` or via `SQUELCH_STAGE1_*` / `SQUELCH_STAGE2_*` env vars, and the daily caps can be changed at runtime (no restart) from Passband's Settings.
 
 ### 3. Authorize and run

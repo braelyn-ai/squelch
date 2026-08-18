@@ -31,12 +31,12 @@ use std::collections::BTreeMap;
 
 use k8s_openapi::api::apps::v1::{Deployment, DeploymentSpec, DeploymentStrategy};
 use k8s_openapi::api::core::v1::{
-    Capabilities, Container, ContainerPort, EmptyDirVolumeSource, EnvVar, EnvVarSource, KeyToPath,
-    LocalObjectReference, PersistentVolumeClaim, PersistentVolumeClaimSpec,
-    PersistentVolumeClaimVolumeSource, PodSecurityContext, PodSpec, PodTemplateSpec, Probe,
-    ResourceRequirements, SeccompProfile, Secret, SecretKeySelector, SecretVolumeSource,
-    SecurityContext, Service, ServicePort, ServiceSpec, TCPSocketAction, Volume, VolumeMount,
-    VolumeResourceRequirements,
+    Capabilities, Container, ContainerPort, EmptyDirVolumeSource, EnvVar, EnvVarSource,
+    HTTPGetAction, KeyToPath, LocalObjectReference, PersistentVolumeClaim,
+    PersistentVolumeClaimSpec, PersistentVolumeClaimVolumeSource, PodSecurityContext, PodSpec,
+    PodTemplateSpec, Probe, ResourceRequirements, SeccompProfile, Secret, SecretKeySelector,
+    SecretVolumeSource, SecurityContext, Service, ServicePort, ServiceSpec, TCPSocketAction,
+    Volume, VolumeMount, VolumeResourceRequirements,
 };
 use k8s_openapi::api::networking::v1::{
     HTTPIngressPath, HTTPIngressRuleValue, IPBlock, Ingress, IngressBackend, IngressRule,
@@ -175,6 +175,29 @@ pub const LLM_KEY_HASH_ANNOTATION: &str = "passband.email/llm-key-hash";
 /// seconds. The pending sweep needs an age, and this is the only place a
 /// tenant's own record of one lives.
 pub const CREATED_AT_ANNOTATION: &str = "passband.email/created-at";
+
+/// Annotation on the identity Secret recording that this account was
+/// CANCELLED, as Unix seconds. Present means cancelled; the value is for a
+/// person reading `kubectl get secret -o yaml`, and no code compares it.
+///
+/// It is a record of INTENT, and that is what makes it worth an annotation
+/// rather than a shape somebody works out from the objects that are left.
+/// [`crate::provision::Warden::delete`] removes four objects one at a time and
+/// stops at its first error, so a cancellation can leave any prefix of that
+/// teardown standing - a Deployment still running with its Service and Ingress
+/// already gone, for instance. Every reader that has to tell "this account is
+/// closed" from "this repair did not finish" was reading that wreckage, and
+/// wreckage cannot say which one it is: the same missing Deployment is both.
+/// So `delete` stamps this FIRST, before it removes anything, and the readers
+/// ask the marker. A stopped tenant carrying it is a closed account; one
+/// without it is an unfinished job.
+///
+/// On the identity Secret because that is the one object of a tenant's that
+/// `delete` deliberately keeps ([`identity_secret`]) - a marker on anything the
+/// teardown removes would be a marker the teardown erases. Cleared by
+/// [`crate::provision::Warden::set_credentials`], which is the reopen path: a
+/// tenant that has just been re-credentialed is not cancelled any more.
+pub const CANCELLED_AT_ANNOTATION: &str = "passband.email/cancelled-at";
 
 /// Selects everything this warden created, for the pending sweep. Matches the
 /// managed-by label [`labels`] puts on every tenant object.
@@ -611,8 +634,11 @@ pub fn ingress(config: &Config, name: &TenantName) -> Ingress {
 /// connection from the node's own address, which matches no pod and no
 /// namespace, so a CNI that does not exempt host-originated traffic drops every
 /// probe and every provision times out on a pod that is perfectly healthy. The
-/// hole is one CIDR to one port, and it lets in node-originated traffic only:
-/// another tenant's pod still arrives from a pod IP and is still refused.
+/// hole is one CIDR to the two ports a probe can land on — 8848 and
+/// [`METRICS_PORT`], both of them whichever probe [`readiness_probe`] currently
+/// renders, for the reason at the rule itself — and it lets in node-originated
+/// traffic only: another tenant's pod still arrives from a pod IP and is still
+/// refused.
 pub fn network_policy(config: &Config, name: &TenantName) -> NetworkPolicy {
     let (ingress_label_key, ingress_label_value) = config.ingress_pod_label.clone();
 
@@ -663,6 +689,24 @@ pub fn network_policy(config: &Config, name: &TenantName) -> NetworkPolicy {
         }]),
     });
     if let Some(node_cidr) = &config.node_cidr {
+        let mut probe_ports = daemon_port;
+        // BOTH probe ports, whichever probe is currently rendered. The hole has
+        // to cover whatever port the kubelet was told to probe, and that is one
+        // config flip away ([`readiness_probe`]) — while a NetworkPolicy is the
+        // object no roll ever converges, because a drift report renders and
+        // diffs a tenant's Deployment alone. Narrowing this to today's probe
+        // would mean the edit that moves the probe silently needs a per-tenant
+        // `reconcile` first, and skipping it takes the whole fleet NotReady on
+        // exactly the clusters that needed this rule at all.
+        //
+        // The peer is the node's own address. It already holds every Secret
+        // mounted into the pods it runs; letting it read a tenant's counters is
+        // not the boundary that matters here.
+        probe_ports.push(NetworkPolicyPort {
+            port: Some(IntOrString::Int(METRICS_PORT)),
+            protocol: Some("TCP".to_string()),
+            ..Default::default()
+        });
         ingress.push(NetworkPolicyIngressRule {
             from: Some(vec![NetworkPolicyPeer {
                 ip_block: Some(IPBlock {
@@ -671,7 +715,7 @@ pub fn network_policy(config: &Config, name: &TenantName) -> NetworkPolicy {
                 }),
                 ..Default::default()
             }]),
-            ports: Some(daemon_port),
+            ports: Some(probe_ports),
         });
     }
 
@@ -740,6 +784,78 @@ pub fn network_policy(config: &Config, name: &TenantName) -> NetworkPolicy {
                 },
             ]),
         }),
+    }
+}
+
+/// The daemon's readiness route, on [`METRICS_PORT`]. Two states, one word,
+/// nothing about the tenant behind it.
+pub const HEALTHZ_PATH: &str = "/healthz";
+
+/// The tenant daemon's readiness probe, in one of its two shapes.
+///
+/// **A bare TCP accept on the door, by default.** The doors serve nothing
+/// unauthenticated, so an HTTP probe against 8848 would have to hold a bearer
+/// token, and a token the kubelet holds is a credential in a pod spec.
+///
+/// **An HTTP GET of [`HEALTHZ_PATH`] on [`METRICS_PORT`], when
+/// [`crate::config::Config::http_readiness`] is on.** That listener is already
+/// unauthenticated and already rendered into every tenant pod, so the honest
+/// probe costs no new authenticated surface. It is worth having because the
+/// accept answers the wrong question: the daemon binds its listener BEFORE it
+/// builds its embedder, deliberately, so that a first-run model download cannot
+/// leave the doors unreachable — which means a TCP probe calls a tenant Ready
+/// seconds into a startup that has not happened yet, and calls one Ready that
+/// died on the way up after the bind. `/healthz` answers 503 until the daemon
+/// has finished starting, and 503 again if its sync task comes apart afterwards.
+///
+/// What it does NOT catch is a credential Google has stopped accepting: the
+/// daemon's sync loop retries that forever rather than ending, on purpose, and
+/// a mailbox pulled out of its own Service is a mailbox its owner cannot reach
+/// to re-consent through. That is an alert on the metrics next door, not a
+/// readiness state.
+///
+/// The knob is OFF by default, and it has TWO prerequisites rather than one.
+/// Switching it on before the fleet is on a daemon that serves the route takes
+/// every tenant that is behind DOWN; and because `/healthz` waits out the
+/// first-run model download, a tenant whose weights cache is cold does not
+/// answer 200 for as long as that download takes — which is longer than
+/// [`crate::config::Config::ready_timeout`], so a signup times out and a roll
+/// reads the tenant as a casualty. [`crate::config::Config::model_pvc`] is what
+/// removes the download; see [`crate::config::Config::http_readiness`] for the
+/// sequence. The route is reachable at all because the warden sets
+/// `SQUELCH_METRICS_BIND` on every tenant it renders; see [`daemon_env`].
+///
+/// Everything except the action is identical between the two, so flipping the
+/// knob changes exactly one thing about a tenant. The initial delay stays small
+/// because the route answers while it is starting rather than refusing the
+/// connection, and a readiness probe that fails never restarts a container:
+/// a daemon two minutes into a model download is NotReady and untouched, which
+/// is precisely what it should be.
+fn readiness_probe(config: &Config) -> Probe {
+    let (tcp_socket, http_get) = if config.http_readiness {
+        (
+            None,
+            Some(HTTPGetAction {
+                path: Some(HEALTHZ_PATH.to_string()),
+                port: IntOrString::Int(METRICS_PORT),
+                ..Default::default()
+            }),
+        )
+    } else {
+        (
+            Some(TCPSocketAction {
+                port: IntOrString::Int(DAEMON_PORT),
+                ..Default::default()
+            }),
+            None,
+        )
+    };
+    Probe {
+        tcp_socket,
+        http_get,
+        initial_delay_seconds: Some(2),
+        period_seconds: Some(3),
+        ..Default::default()
     }
 }
 
@@ -936,18 +1052,7 @@ pub fn deployment(
             },
             tmp_mount,
         ]),
-        // A TCP accept, not an HTTP GET: the daemon serves no unauthenticated
-        // health route, and a probe that has to hold a bearer token is a
-        // credential in a pod spec.
-        readiness_probe: Some(Probe {
-            tcp_socket: Some(TCPSocketAction {
-                port: IntOrString::Int(DAEMON_PORT),
-                ..Default::default()
-            }),
-            initial_delay_seconds: Some(2),
-            period_seconds: Some(3),
-            ..Default::default()
-        }),
+        readiness_probe: Some(readiness_probe(config)),
         security_context: Some(container_security),
         resources: Some(requirements(&config.daemon_resources)),
         ..Default::default()
@@ -957,6 +1062,17 @@ pub fn deployment(
         metadata: meta(config, name, name.as_str().to_string()),
         spec: Some(DeploymentSpec {
             replicas: Some(1),
+            // How long the pod must STAY Ready before the controller counts the
+            // replica Available. Readiness is a snapshot and a daemon that
+            // comes up and dies passes through it, so this is the per-tenant
+            // soak that a caller waiting on `availableReplicas` gets for free;
+            // see [`crate::config::Config::min_ready_secs`].
+            //
+            // Absent rather than `0` when the operator turned it off: zero is
+            // the API server's own default and would be dropped from the
+            // object it stores, leaving every drift report quoting a field the
+            // live object does not carry.
+            min_ready_seconds: (config.min_ready_secs > 0).then_some(config.min_ready_secs),
             // Never two daemons on one SQLite file: the volume is
             // ReadWriteOnce, and a rolling update would try to start the new
             // pod before the old one released it.
@@ -1168,6 +1284,7 @@ pub fn pair_argv(config: &Config, name: &TenantName) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::DEFAULT_MIN_READY_SECS;
     use crate::testing::test_config;
 
     fn name() -> TenantName {
@@ -1297,6 +1414,76 @@ mod tests {
             .collect();
         writable.sort_unstable();
         assert_eq!(writable, vec!["/data", "/tmp"]);
+    }
+
+    /// The two probe shapes, and the flag that is the only difference between
+    /// them.
+    ///
+    /// Off is the default and has to stay the default: the HTTP shape asks for
+    /// a route only a new enough daemon serves, and a tenant on an older image
+    /// would fail it on every period and never report Ready.
+    #[test]
+    fn the_readiness_probe_is_an_accept_until_the_operator_says_otherwise() {
+        let mut c = test_config();
+        assert!(!c.http_readiness, "the render must not opt a fleet in");
+
+        let probe = tenant_deployment(&c)
+            .spec
+            .unwrap()
+            .template
+            .spec
+            .unwrap()
+            .containers[0]
+            .readiness_probe
+            .clone()
+            .unwrap();
+        assert_eq!(
+            probe.tcp_socket.unwrap().port,
+            IntOrString::Int(DAEMON_PORT)
+        );
+        assert!(probe.http_get.is_none(), "the door serves no health route");
+        let (delay, period) = (probe.initial_delay_seconds, probe.period_seconds);
+
+        c.http_readiness = true;
+        let probe = tenant_deployment(&c)
+            .spec
+            .unwrap()
+            .template
+            .spec
+            .unwrap()
+            .containers[0]
+            .readiness_probe
+            .clone()
+            .unwrap();
+        let get = probe.http_get.unwrap();
+        assert_eq!(get.path.as_deref(), Some(HEALTHZ_PATH));
+        // The metrics listener, not the door: it is the one that is already
+        // unauthenticated, so the probe holds no credential.
+        assert_eq!(get.port, IntOrString::Int(METRICS_PORT));
+        assert!(probe.tcp_socket.is_none(), "one action, not two");
+        // Nothing else about the probe moves with the flag, so flipping it
+        // changes exactly one thing about a tenant.
+        assert_eq!(
+            (probe.initial_delay_seconds, probe.period_seconds),
+            (delay, period)
+        );
+    }
+
+    /// The per-tenant soak: a replica is not Available until it has been Ready
+    /// this long, which is what `rolled_out` waits on.
+    #[test]
+    fn a_tenant_pod_has_to_stay_ready_before_it_counts() {
+        let mut c = test_config();
+        assert_eq!(
+            tenant_deployment(&c).spec.unwrap().min_ready_seconds,
+            Some(DEFAULT_MIN_READY_SECS)
+        );
+
+        // Turned off, the field is ABSENT rather than 0: zero is the API
+        // server's own default and would be dropped from the stored object,
+        // leaving every drift report quoting a field the live object lacks.
+        c.min_ready_secs = 0;
+        assert_eq!(tenant_deployment(&c).spec.unwrap().min_ready_seconds, None);
     }
 
     #[test]
@@ -2169,10 +2356,31 @@ mod tests {
         // node-originated traffic, not "anything on that address".
         assert!(from[0].pod_selector.is_none());
         assert!(from[0].namespace_selector.is_none());
+        // The two ports a kubelet probe can land on, and nothing else. Both
+        // whichever probe is rendered: a NetworkPolicy is the object no roll
+        // converges, so a hole that tracked the current probe would have to be
+        // re-applied per tenant, by hand, in the same edit that moves it.
+        let expected = vec![
+            Some(IntOrString::Int(DAEMON_PORT)),
+            Some(IntOrString::Int(METRICS_PORT)),
+        ];
         let ports = ingress[2].ports.clone().unwrap();
-        assert_eq!(ports.len(), 1);
-        assert_eq!(ports[0].port, Some(IntOrString::Int(8848)));
-        assert_eq!(ports[0].protocol.as_deref(), Some("TCP"));
+        assert_eq!(
+            ports.iter().map(|p| p.port.clone()).collect::<Vec<_>>(),
+            expected
+        );
+        assert!(ports.iter().all(|p| p.protocol.as_deref() == Some("TCP")));
+
+        c.http_readiness = true;
+        let ingress = network_policy(&c, &name()).spec.unwrap().ingress.unwrap();
+        let ports = ingress[2].ports.clone().unwrap();
+        assert_eq!(
+            ports.iter().map(|p| p.port.clone()).collect::<Vec<_>>(),
+            expected,
+            "flipping the probe must not need a second NetworkPolicy apply"
+        );
+        // And the peer is still the node and only the node.
+        assert!(ingress[2].from.clone().unwrap()[0].pod_selector.is_none());
     }
 
     #[test]

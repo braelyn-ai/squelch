@@ -57,7 +57,7 @@ Decisions made and closed:
   tiers, because Google forbids a redirect URI per tenant subdomain, so the hop
   goes through the control plane and appears only when `SQUELCH_CONSOLE_SSO_URL`
   is set — which for hosted tenants the warden does, from
-  `SQUELCH_WARDEN_CONSOLE_SSO_URL` in `deploy/hosted/20-warden.yaml`, and which a
+  `SQUELCH_WARDEN_CONSOLE_SSO_URL` in `deploy/hosted/15-warden-config.yaml`, and which a
   self-host never sets. Gates and cookie posture: `docs/SECURITY.md` §4.
 - **No end-to-end-encryption story for hosted.** Hosted means we hold it: encrypted at
   rest, per-tenant process isolation, honest about it. The half-crypto alternatives

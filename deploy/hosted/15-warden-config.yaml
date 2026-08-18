@@ -1,0 +1,179 @@
+# Every knob both warden processes read, in one object.
+#
+# The serving Deployment (`20-warden.yaml`) and the fleet roller
+# (`90-warden-roller.yaml`) run the same binary against the same tenants: one
+# renders a tenant's Deployment at signup, the other re-renders every tenant on
+# a timer. They therefore have to agree on every value `Config::from_env` reads,
+# and one ConfigMap behind two `envFrom`s is how they agree by construction
+# rather than by an operator remembering to diff two files.
+#
+# Two env blocks that disagree take turns rewriting the same tenant every
+# quarter hour, each half behaving correctly and neither one visibly wrong: the
+# roller applies its render, the next signup or `llm mint` writes the other
+# back, pods restart forever, and both drift reports say the fleet is behind.
+#
+# The sharpest case is `SQUELCH_WARDEN_IMAGE`. A bump that reached the serving
+# pod and not the roller is a roller that spends the next tick DOWNGRADING every
+# tenant to the image it still holds, and it keeps the fleet pinned backwards
+# with `drift` reading clean the whole time, because the fleet does match what
+# the roller renders. There is no code that can catch that; there is only this
+# file, which makes it unrepresentable.
+#
+# EDIT BEFORE APPLYING: the three entries marked EDIT ME below.
+#
+# ## Three rules for editing it
+#
+# 1. **Never re-inline an entry as a container `env:` entry.** A container `env:`
+#    name outranks the same name from `envFrom`, silently, in whichever pod spec
+#    carries it, which is exactly the divergence this object exists to make
+#    impossible. Add knobs here; change knobs here.
+# 2. **Apply, then restart the warden.** `envFrom` is read once, when a pod
+#    starts. The roller picks up a change on its next tick because every run is a
+#    fresh pod; the serving pod does not, and goes on rendering the old values
+#    into new signups until `kubectl -n warden rollout restart
+#    deploy/squelch-warden`. Do both in the same minute: 15 minutes is the whole
+#    window in which the two disagree.
+# 3. **Quote every value.** `data` is `map[string]string`, and YAML reads a bare
+#    `on` as a boolean, at which point kubectl refuses the whole file with
+#    `cannot unmarshal bool into Go value of type string`. Loud, and only
+#    puzzling if you were not expecting it.
+#
+# ## What is not here, and cannot be
+#
+# - **The bearer token.** It is a Secret (`warden-token.example.yaml`), read by
+#   `secretKeyRef` in both pod specs. `roll` serves nothing and checks no bearer
+#   and still needs it: the config validator refuses to start without a token of
+#   real length, so the roller carries the real one rather than a placeholder.
+# - **The image each POD runs.** `image:` is a pod-spec field and no ConfigMap
+#   carries it, so the warden's own image is written in `20-warden.yaml` and
+#   again in `90-warden-roller.yaml`. Those two must name the SAME tag: this
+#   binary is the renderer, and a roller on an older one renders older tenants.
+#   It is the one value two files still have to agree on by hand, so check it
+#   after any bump:
+#
+#       kubectl -n warden get deploy/squelch-warden \
+#         -o jsonpath='{.spec.template.spec.containers[0].image}{"\n"}'
+#       kubectl -n warden get cronjob/squelch-warden-roll \
+#         -o jsonpath='{.spec.jobTemplate.spec.template.spec.containers[0].image}{"\n"}'
+#
+# ## Which of these a roll can actually deliver
+#
+# The roller's drift report renders and diffs a tenant's **Deployment** and
+# nothing else. So the entries that land on a tenant's Service, Ingress,
+# NetworkPolicy or PVC (`SQUELCH_WARDEN_TLS_SECRET`, the three
+# `SQUELCH_WARDEN_INGRESS_*` values, `SQUELCH_WARDEN_NODE_CIDR` and
+# `SQUELCH_WARDEN_STORAGE_*`) reach new signups only, and no roll will ever
+# report an existing tenant as drifted for them.
+# Existing tenants take those from `squelch-control reconcile <label>`, which
+# re-applies all five objects, one label at a time. See
+# `squelch-warden/README.md`, "What the drift report cannot see".
+#
+# A bad value here is a warden that refuses to start and a roll Job that fails,
+# never a tenant rendered from something half-valid: every entry is validated at
+# boot by both processes, and the table of refusals is a test.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: squelch-warden-config
+  namespace: warden
+  labels:
+    app.kubernetes.io/name: squelch-warden
+data:
+  # 1. EDIT ME
+  SQUELCH_WARDEN_BASE_DOMAIN: "passband.email"
+  # 2. EDIT ME. Pinned to a tag or a digest on purpose: an untagged image would
+  # silently upgrade every tenant's daemon on any pod restart. The warden
+  # refuses to start without one. Changing this value and applying is what a
+  # daemon rollout IS; the roller does the rest.
+  SQUELCH_WARDEN_IMAGE: "ghcr.io/braelyn-ai/squelchd:daemon-0.0.1"
+  # Everything below is a default, restated so this file is the one place an
+  # operator has to look. See squelch-warden/README.md.
+  SQUELCH_WARDEN_TENANT_NAMESPACE: "tenants"
+  SQUELCH_WARDEN_INGRESS_CLASS: "traefik"
+  SQUELCH_WARDEN_INGRESS_NAMESPACE: "kube-system"
+  SQUELCH_WARDEN_INGRESS_POD_LABEL: "app.kubernetes.io/name=traefik"
+  SQUELCH_WARDEN_TLS_SECRET: "passband-wildcard-tls"
+  SQUELCH_WARDEN_STORAGE_CLASS: "local-path"
+  # Raising this on a storage class without `allowVolumeExpansion` is refused by
+  # the API server on every apply. On its own that reaches nobody (a PVC is not
+  # part of the Deployment a drift report diffs); in the same edit as an image
+  # bump it stops every roll at `volume_failed` on the first drifted tenant,
+  # every tick, because a reconcile applies the volume before the workload. See
+  # `90-warden-roller.yaml`, "A run that halts on the same tenant every tick".
+  SQUELCH_WARDEN_STORAGE_SIZE: "10Gi"
+  # The Secret holding the Google web client every tenant daemon refreshes with,
+  # in the tenant namespace. Without it a tenant pod exits at boot; see
+  # google-oauth-client.example.yaml.
+  SQUELCH_WARDEN_OAUTH_SECRET_NAME: "google-oauth-client"
+  # The LLM gateway, which is how a hosted tenant gets model triage at all. With
+  # this set, every tenant pod sends its Anthropic-wire traffic to Bifrost's
+  # /anthropic route with a per-tenant virtual key the control plane mints at
+  # signup (Secret <label>-llm, installed via PUT /v1/tenants/{label}/llm-key).
+  # Unset = no LLM env injected and llm-key installs refused. An UNMINTED tenant
+  # resolves no key at all and runs heuristic-only triage until
+  # `squelch-control llm mint`. True only of tenants THIS warden rendered: one
+  # provisioned before the shared-key bridge was removed still carries the legacy
+  # ANTHROPIC_API_KEY env, and is 401ing on every Stage-2 call rather than
+  # idling, until llm mint re-applies its Deployment. See PRODUCTION.md,
+  # "History". The four tuning knobs (SQUELCH_WARDEN_LLM_STAGE1_MODEL,
+  # _STAGE2_MODEL, _STAGE1_DAILY_CAP, _STAGE2_DAILY_CAP) are refused at boot
+  # unless this one is set.
+  SQUELCH_WARDEN_LLM_BASE_URL: "https://bifrost.passband.app/anthropic"
+  # 3. EDIT ME. The control plane's origin, handed to every tenant daemon as
+  # SQUELCH_CONSOLE_SSO_URL. It is what puts "Continue with Google" on a tenant's
+  # own /console login page: Google forbids wildcard redirect URIs, so a
+  # per-tenant hostname cannot run OAuth itself and the control plane does the
+  # hop. An ORIGIN, no path: the daemon builds /console/auth?tenant=<label>
+  # itself. Leave it out and every console is the pasted-code form only (which is
+  # what a self-host gets, and what `squelchd pair` is for).
+  SQUELCH_WARDEN_CONSOLE_SSO_URL: "https://signup.passband.app"
+  # Per-tenant-container bounds. The number of tenants a box carries is these
+  # divided into it; size them with 70-tenant-limits.yaml, not separately.
+  SQUELCH_WARDEN_CPU_REQUEST: "100m"
+  SQUELCH_WARDEN_CPU_LIMIT: "1000m"
+  SQUELCH_WARDEN_MEMORY_REQUEST: "256Mi"
+  SQUELCH_WARDEN_MEMORY_LIMIT: "1Gi"
+  SQUELCH_WARDEN_EPHEMERAL_REQUEST: "256Mi"
+  SQUELCH_WARDEN_EPHEMERAL_LIMIT: "1Gi"
+  SQUELCH_WARDEN_TMP_SIZE: "512Mi"
+  # How long an abandoned signup (phase one, never phase two) keeps its identity
+  # Secret and its subdomain before the sweep collects it. Recovery is signing up
+  # again. Inert in the roller, which runs no sweep, and here anyway: one file to
+  # read beats a rule about which file a knob lives in, and a value the roller
+  # validates at boot is a value checked twice.
+  SQUELCH_WARDEN_PENDING_TTL_SECS: "86400"
+  # One ingress controller in front of the serving listener, which is what makes
+  # the rate limiter's per-IP buckets per-CLIENT rather than one shared bucket
+  # for the whole cluster. Set it to the number of proxies YOU run; 0 (the
+  # default) reads no forwarded header at all. Inert in the roller, which serves
+  # nothing, for the reason above.
+  SQUELCH_WARDEN_TRUSTED_PROXY_HOPS: "1"
+  # UNCOMMENT ONLY IF kubelet probes are dropped by the CNI, which makes every
+  # provision time out on a healthy pod. See "Verify the policy" in SETUP.md;
+  # this opens 8848 on every tenant to the node's own address and to nothing
+  # else. It lands on the tenant NetworkPolicy, so existing tenants take it from
+  # `squelch-control reconcile <label>` and never from a roll.
+  # SQUELCH_WARDEN_NODE_CIDR: "10.0.0.5/32"
+  # Per-tenant user namespaces. Turn this off ONLY if tenant pods fail to start
+  # with a hostUsers error; read the isolation section of SETUP.md before you do.
+  SQUELCH_WARDEN_USER_NAMESPACES: "on"
+  # How long a tenant's pod must stay Ready before the Deployment controller
+  # calls the replica Available. The roller waits for Available, so this is a
+  # per-tenant soak: a daemon that comes up and dies cannot buy a run a green.
+  # Costs 30s per tenant on a roll and must stay below the ready timeout.
+  SQUELCH_WARDEN_MIN_READY_SECS: "30"
+  # ORDER MATTERS. On, the readiness probe becomes an HTTP GET of the daemon's
+  # /healthz on 9464 instead of a TCP accept on 8848, which is the difference
+  # between "the socket is open" and "the daemon finished starting". The route
+  # exists only on a daemon image that ships it, so a tenant still on an older
+  # one would fail the probe forever, be pulled out of its own Service, and halt
+  # the next roll. Bump SQUELCH_WARDEN_IMAGE first, let the roller converge the
+  # WHOLE fleet, confirm it, and only then flip this and roll again. See
+  # PRODUCTION.md, "Turning on the HTTP readiness probe".
+  SQUELCH_WARDEN_HTTP_READINESS: "off"
+  # Uncomment once the shared weights volume exists (SETUP.md step 10).
+  # SQUELCH_WARDEN_MODEL_PVC: "squelch-models"
+  # Uncomment if the squelchd image is private. This is the pull secret for
+  # TENANT pods; the warden's own pod takes `imagePullSecrets` in
+  # `20-warden.yaml`, and the roller's in `90-warden-roller.yaml`.
+  # SQUELCH_WARDEN_IMAGE_PULL_SECRET: "ghcr"

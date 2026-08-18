@@ -96,6 +96,24 @@ pub const DEFAULT_RUN_AS: i64 = 10001;
 /// is generous for that and short enough that a signup does not hang forever.
 pub const DEFAULT_READY_TIMEOUT_SECS: u64 = 180;
 
+/// How long a tenant's pod must stay Ready before the Deployment controller
+/// counts the replica Available (`minReadySeconds`).
+///
+/// Thirty seconds, and the number is picked against the failure it catches: a
+/// daemon that comes up and dies on its first real work. A rejected credential
+/// surfaces within a sync tick and an OOM on the first embed batch within tens
+/// of seconds, so half a minute of staying up is the difference between "the
+/// process started" and "the process survived contact with the mailbox". It is
+/// also cheap: it adds 30s to one tenant's roll, and every wait it lengthens is
+/// bounded by [`DEFAULT_READY_TIMEOUT_SECS`], which it has to stay well under.
+pub const DEFAULT_MIN_READY_SECS: i32 = 30;
+
+/// Ceiling on `SQUELCH_WARDEN_MIN_READY_SECS`. A soak longer than this is a
+/// fleet roll that spends its whole window watching one healthy tenant; the
+/// tighter bound is the ready timeout, which is checked against the configured
+/// value rather than against this one.
+pub const MAX_MIN_READY_SECS: i32 = 300;
+
 /// How long a tenant may sit `pending` before the sweep collects it. A signup
 /// that reached phase one and never came back has parked an identity Secret
 /// that nothing will ever use and that holds the subdomain against everyone
@@ -212,11 +230,47 @@ pub struct Config {
     /// matches no peer in a tenant's NetworkPolicy. Some CNIs exempt
     /// host-originated traffic and some do not; on one that does not, every
     /// provision times out waiting for a pod that is healthy. Setting this adds
-    /// one ingress rule allowing that CIDR to the daemon port. See
-    /// `deploy/hosted/SETUP.md`, "Verify the policy".
+    /// one ingress rule allowing that CIDR to the two ports a probe can land
+    /// on, the daemon port and the metrics port. See `deploy/hosted/SETUP.md`,
+    /// "Verify the policy".
     pub node_cidr: Option<String>,
+    /// Whether a tenant's readiness probe is an HTTP GET of the daemon's
+    /// `/healthz` on the metrics port instead of a bare TCP accept on the door.
+    ///
+    /// OFF by default, and the default is the load-bearing half. `/healthz`
+    /// exists only on a daemon image new enough to serve it; a tenant still on
+    /// an older one would fail an HTTP probe on every period, never report
+    /// Ready, never be counted Available, and be pulled out of its own Service
+    /// for it. Flipping this while any tenant is behind therefore takes those
+    /// tenants DOWN, and the roller would halt on the first of them.
+    ///
+    /// The order is: ship the daemon that serves the route, roll the fleet onto
+    /// it, THEN turn this on and roll again. See `deploy/hosted/PRODUCTION.md`,
+    /// "Turning on the HTTP readiness probe".
+    ///
+    /// It also puts the first-run MODEL DOWNLOAD inside every wait this warden
+    /// makes. `/healthz` answers 503 until the daemon's background embedder init
+    /// has settled, which on a cold weights cache means ~130 MB from Hugging
+    /// Face — longer than [`Config::ready_timeout`]. With no [`Config::model_pvc`]
+    /// every new tenant's first pod pays it, so a signup gets `500 not_ready`
+    /// for a tenant that is perfectly healthy, and the next roll reads that
+    /// tenant as a casualty and stops the whole fleet. Set `model_pvc`, or raise
+    /// `ready_timeout` past a cold download, before turning this on; the warden
+    /// warns at startup if neither is true.
+    pub http_readiness: bool,
     /// UID/GID tenant daemons run as.
     pub run_as: i64,
+    /// `minReadySeconds` on every tenant Deployment: how long a pod has to stay
+    /// Ready before the controller reports the replica Available.
+    ///
+    /// A per-tenant soak, and defence in depth behind the roller's own pacing.
+    /// Readiness is a snapshot and a crash loop passes through it — a daemon
+    /// that comes up, reports Ready and dies is Ready for as long as the probe
+    /// takes to notice, which is long enough for a sweep to step to the next
+    /// tenant on the strength of it. `availableReplicas` is the count that
+    /// waits this long before agreeing, and it is what
+    /// [`crate::cluster::rolled_out`] stands on.
+    pub min_ready_secs: i32,
     pub ready_timeout: Duration,
     /// How long a `pending` tenant survives the sweep.
     pub pending_ttl: Duration,
@@ -265,7 +319,9 @@ impl std::fmt::Debug for Config {
             .field("user_namespaces", &self.user_namespaces)
             .field("model_pvc", &self.model_pvc)
             .field("node_cidr", &self.node_cidr)
+            .field("http_readiness", &self.http_readiness)
             .field("run_as", &self.run_as)
+            .field("min_ready_secs", &self.min_ready_secs)
             .field("ready_timeout", &self.ready_timeout)
             .field("pending_ttl", &self.pending_ttl)
             .field("trusted_proxy_hops", &self.trusted_proxy_hops)
@@ -320,6 +376,23 @@ fn quantity_var(get: Lookup, name: &str, default: &str) -> Result<String, Config
         )));
     }
     Ok(value)
+}
+
+/// A var that is a switch, defaulting to `default` when unset.
+///
+/// Anything that is neither spelling is REFUSED rather than read as off. A
+/// switch here decides an isolation boundary or the shape of a probe, and a
+/// typo that quietly meant "off" would leave an operator certain they had
+/// turned something on.
+fn switch_var(get: Lookup, name: &str, default: bool) -> Result<bool, ConfigError> {
+    match var(get, name) {
+        None => Ok(default),
+        Some(v) => match v.to_ascii_lowercase().as_str() {
+            "1" | "true" | "on" | "yes" => Ok(true),
+            "0" | "false" | "off" | "no" => Ok(false),
+            _ => Err(ConfigError::invalid(format!("{name} must be on or off"))),
+        },
+    }
 }
 
 /// A var that must be an optional Kubernetes object name.
@@ -407,18 +480,8 @@ impl Config {
             (key.to_string(), value.to_string())
         };
 
-        let user_namespaces = match var(get, "SQUELCH_WARDEN_USER_NAMESPACES") {
-            None => true,
-            Some(v) => match v.to_ascii_lowercase().as_str() {
-                "1" | "true" | "on" | "yes" => true,
-                "0" | "false" | "off" | "no" => false,
-                _ => {
-                    return Err(ConfigError::invalid(
-                        "SQUELCH_WARDEN_USER_NAMESPACES must be on or off",
-                    ));
-                }
-            },
-        };
+        let user_namespaces = switch_var(get, "SQUELCH_WARDEN_USER_NAMESPACES", true)?;
+        let http_readiness = switch_var(get, "SQUELCH_WARDEN_HTTP_READINESS", false)?;
 
         let run_as = match var(get, "SQUELCH_WARDEN_RUN_AS_UID") {
             None => DEFAULT_RUN_AS,
@@ -453,6 +516,33 @@ impl Config {
                 secs
             }
         };
+
+        let min_ready_secs = match var(get, "SQUELCH_WARDEN_MIN_READY_SECS") {
+            None => DEFAULT_MIN_READY_SECS,
+            Some(v) => {
+                let secs: i32 = v.parse().map_err(|e| {
+                    ConfigError::invalid(format!(
+                        "invalid SQUELCH_WARDEN_MIN_READY_SECS `{v}`: {e}"
+                    ))
+                })?;
+                if !(0..=MAX_MIN_READY_SECS).contains(&secs) {
+                    return Err(ConfigError::invalid(format!(
+                        "SQUELCH_WARDEN_MIN_READY_SECS must be between 0 and {MAX_MIN_READY_SECS} (0 turns the soak off)"
+                    )));
+                }
+                secs
+            }
+        };
+        // The soak is spent INSIDE every rollout wait: a reconcile blocks until
+        // the replica is Available, and Available cannot arrive before the pod
+        // has been Ready this long. A soak at or past the timeout would make
+        // that wait unwinnable — every tenant would roll correctly and then be
+        // reported as one that did not come back.
+        if u64::from(min_ready_secs.unsigned_abs()) >= ready_timeout {
+            return Err(ConfigError::invalid(format!(
+                "SQUELCH_WARDEN_MIN_READY_SECS ({min_ready_secs}) must be below SQUELCH_WARDEN_READY_TIMEOUT_SECS ({ready_timeout}); a soak the rollout wait cannot outlast times out on every healthy tenant"
+            )));
+        }
 
         let pending_ttl = match var(get, "SQUELCH_WARDEN_PENDING_TTL_SECS") {
             None => DEFAULT_PENDING_TTL_SECS,
@@ -605,7 +695,9 @@ impl Config {
             user_namespaces,
             model_pvc: optional_name_var(get, "SQUELCH_WARDEN_MODEL_PVC")?,
             node_cidr,
+            http_readiness,
             run_as,
+            min_ready_secs,
             ready_timeout: Duration::from_secs(ready_timeout),
             pending_ttl: Duration::from_secs(pending_ttl),
             trusted_proxy_hops,
@@ -905,7 +997,13 @@ mod tests {
         assert_eq!(c.ready_timeout, Duration::from_secs(180));
         assert_eq!(c.pending_ttl, Duration::from_secs(86_400));
         assert_eq!(c.trusted_proxy_hops, 0);
+        assert_eq!(c.min_ready_secs, DEFAULT_MIN_READY_SECS);
         assert!(c.user_namespaces);
+        // OFF, and it has to stay off: an HTTP probe against a daemon image
+        // that predates `/healthz` never passes, so a fleet that is not yet on
+        // a capable daemon would go NotReady tenant by tenant. See
+        // `Config::http_readiness`.
+        assert!(!c.http_readiness);
         assert!(c.node_cidr.is_none());
         assert!(c.model_pvc.is_none());
         assert!(c.pull_secret.is_none());
@@ -972,8 +1070,15 @@ mod tests {
             ("SQUELCH_WARDEN_RUN_AS_UID", "999"),
             ("SQUELCH_WARDEN_RUN_AS_UID", "65534"),
             ("SQUELCH_WARDEN_RUN_AS_UID", "root"),
+            ("SQUELCH_WARDEN_MIN_READY_SECS", "-1"),
+            ("SQUELCH_WARDEN_MIN_READY_SECS", "301"),
+            ("SQUELCH_WARDEN_MIN_READY_SECS", "half a minute"),
+            // A soak the rollout wait cannot outlast: every healthy tenant
+            // would time out, one per roll, forever.
+            ("SQUELCH_WARDEN_MIN_READY_SECS", "180"),
             // Flags and counts.
             ("SQUELCH_WARDEN_USER_NAMESPACES", "maybe"),
+            ("SQUELCH_WARDEN_HTTP_READINESS", "maybe"),
             ("SQUELCH_WARDEN_TRUSTED_PROXY_HOPS", "9"),
             ("SQUELCH_WARDEN_TRUSTED_PROXY_HOPS", "-1"),
             // The one that opens a hole in every tenant's ingress policy.
@@ -1029,6 +1134,39 @@ mod tests {
             !with("SQUELCH_WARDEN_USER_NAMESPACES", "off")
                 .unwrap()
                 .user_namespaces
+        );
+        // Every spelling of a switch, because a ConfigMap is edited by hand and
+        // an operator who wrote `true` meant on.
+        for on in ["on", "1", "true", "yes", "YES"] {
+            assert!(
+                with("SQUELCH_WARDEN_HTTP_READINESS", on)
+                    .unwrap()
+                    .http_readiness,
+                "`{on}` must turn the HTTP probe on"
+            );
+        }
+        for off in ["off", "0", "false", "no"] {
+            assert!(
+                !with("SQUELCH_WARDEN_HTTP_READINESS", off)
+                    .unwrap()
+                    .http_readiness,
+                "`{off}` must leave the accept probe alone"
+            );
+        }
+        // Zero is the soak turned off, and it is a value rather than a refusal:
+        // an operator whose cluster cannot afford the wait is not making a
+        // mistake, they are making a trade.
+        assert_eq!(
+            with("SQUELCH_WARDEN_MIN_READY_SECS", "0")
+                .unwrap()
+                .min_ready_secs,
+            0
+        );
+        assert_eq!(
+            with("SQUELCH_WARDEN_MIN_READY_SECS", " 45 ")
+                .unwrap()
+                .min_ready_secs,
+            45
         );
         assert_eq!(
             with("SQUELCH_WARDEN_TRUSTED_PROXY_HOPS", "1")

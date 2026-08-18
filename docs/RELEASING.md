@@ -51,10 +51,14 @@ wrong number somewhere:
   the same things locally. The Sparkle ordering key is the BUILD number
   (`git rev-list --count HEAD`), which is why marketing versions can move
   backwards without stranding installs.
-- **Deploy pins** — `deploy/hosted/20-warden.yaml` pins the warden image and
-  `SQUELCH_WARDEN_IMAGE` (the tenant image), both at `daemon-*` tags.
-  `deploy/hosted/60-models.yaml` pins the model-warm job's image separately and
-  is easy to forget.
+- **Deploy pins** — the tenant image is `SQUELCH_WARDEN_IMAGE` in
+  `deploy/hosted/15-warden-config.yaml`, written once and read by both processes
+  that render tenants. The **warden's own** image is a pod-spec field, so it is
+  written twice, in `deploy/hosted/20-warden.yaml` and
+  `deploy/hosted/90-warden-roller.yaml`, and those two must name the same
+  `daemon-*` tag: the roller runs this binary, and an older one renders older
+  tenants. `deploy/hosted/60-models.yaml` pins the model-warm job's image
+  separately and is easy to forget.
 
 **The 2026-08 consolidation.** The tag namespaces used to be `v*` (daemon),
 `passband-v*` (Mac) and `ios-v*` (iOS), and the numbers had drifted apart badly
@@ -123,33 +127,101 @@ everything in "Self-host compatibility" below applies the moment you push it.
 
 ## Surface 2: hosted carrier rollout
 
+**The step-by-step is `deploy/hosted/ROLLOUT.md`** — preflight, the four pins,
+the apply order, what converging looks like, and what each failure means. What
+follows here is the shape of it; that page is what to have open while you do it.
+
 The order matters: images first (above), then the box.
 
 ```sh
 ssh carrier
-# 1. Repoint pins, then apply in numbered order (SETUP.md "Apply" section):
-#    20-warden.yaml: warden image tag + SQUELCH_WARDEN_IMAGE
+# 1. Repoint pins, then apply in numbered order (SETUP.md §8):
+#    15-warden-config.yaml: SQUELCH_WARDEN_IMAGE, the image TENANTS run
+#    20-warden.yaml + 90-warden-roller.yaml: the warden's own image, the SAME
+#      tag in both (see below)
 #    60-models.yaml: model-warm job tag (chronically forgotten)
+kubectl apply -f deploy/hosted/15-warden-config.yaml
 kubectl apply -f deploy/hosted/20-warden.yaml
+kubectl apply -f deploy/hosted/90-warden-roller.yaml
+# The ConfigMap is read once, when a pod starts: the roller gets it on its next
+# tick, the serving warden only here.
+kubectl -n warden rollout restart deploy/squelch-warden
 kubectl -n warden rollout status deploy/squelch-warden
 curl -sS https://warden.passband.app/healthz   # -> ok
 ```
 
-Two things about tenant pods that are by design and will surprise you anyway:
+**Applying that pin IS the rollout decision, and it is the only one.** The
+warden is not a controller: it writes a tenant's objects at provision time and
+never revisits them, so a new `SQUELCH_WARDEN_IMAGE` changes what the next
+signup gets and nothing about the tenants already running. What closes the gap
+is the roller — the CronJob in `90-warden-roller.yaml`, which runs the warden's
+own binary as `squelch-warden roll` every 15 minutes under the warden's
+ServiceAccount. Each run reads the whole fleet, converges ONE drifted tenant onto
+today's render, waits for that rollout to finish, and exits. Each tenant blips
+for one pod restart; the fleet is never down; no mail is lost, because Gmail is
+the source of truth and the daemon resumes syncing on its next tick.
 
-- **Existing tenants do not move on their own.** The warden is not a
-  controller; it writes objects at provision time only. Changing
-  `SQUELCH_WARDEN_IMAGE`, or any object-shape change (new env vars, ports,
-  NetworkPolicy rules, Ingress prefixes), affects NEW tenants until somebody
-  asks for the rest. Asking is per tenant, from the control service:
-  `squelch-control drift` lists who is behind and `squelch-control reconcile
-  <label>` re-applies one label from today's code, waiting for a ready pod
-  before it answers. It takes `active` and `failed`; `pending` and `stopped`
-  come back `409` and still want `PUT /v1/tenants/<label>/credentials`
-  (SETUP.md "Operating notes", upgrade section). Budget one pass over the
-  tenant list per release that changes tenant shape.
+Five things about it that will surprise you anyway:
+
+- **A bump takes one tick per tenant.** Ten tenants behind is ten runs, two and
+  a half hours on the default schedule, and the run says how many are left
+  (`still behind, one per run: N more`). The gap between ticks is the safety
+  model, not a scheduling accident: a finished rollout only means the API server
+  saw a ready replica, and squelchd binds its socket before it finishes starting,
+  so what actually clears a render is fifteen minutes of a real daemon serving
+  real mail followed by a read pass that refuses to roll anything if that mailbox
+  is carrying today's render and not up. **Every tick but the last exits 3 and
+  marks its Job failed**, which is by design and is why an alert on failed Jobs
+  alone is the wrong alert — see PRODUCTION.md.
+
+- **The serving warden does not see a ConfigMap change until it restarts.**
+  `envFrom` is read at pod start. The roller is a fresh pod every 15 minutes and
+  picks the new pin up on its own; the warden keeps rendering the old one into
+  new signups and into every `llm mint` until
+  `kubectl -n warden rollout restart deploy/squelch-warden`. Apply and restart
+  together.
+- **The roller converges the DEPLOYMENT only.** Drift is computed from that one
+  object, so a release that changes a tenant's Service, Ingress, NetworkPolicy
+  or PVC lands on new signups and on nobody else — the roll will report those
+  tenants as already current. Those releases need `squelch-control reconcile`
+  per tenant, which re-applies all five objects. Check the diff before you
+  assume the timer has it.
+- **A skipped tenant stays skipped.** The roller refuses to touch a Deployment
+  another field manager owns fields on (`kubectl set env` is the usual way to
+  get one), because the only repair is deleting it — a real outage window for
+  that mailbox, and not a timer's decision. That is exit code 2, and it wants
+  `squelch-control drift <label>` then `squelch-control reconcile <label>` from
+  a person. `pending` tenants and cancelled accounts are skipped too, and still
+  want `PUT /v1/tenants/<label>/credentials` (SETUP.md "Operating notes").
 - **`imagePullPolicy: IfNotPresent` + a tag the node has seen = no pull.**
   Roll forward with a new tag, not by moving an old one.
+
+Watch it converge, or push it along:
+
+```sh
+kubectl -n warden get jobs                            # one row per run
+kubectl -n warden logs job/<name>                     # per-tenant lines, then a summary
+kubectl -n warden patch cronjob squelch-warden-roll -p '{"spec":{"suspend":true}}'
+```
+
+Suspending stops the next tick and not the run in flight, and
+`kubectl create job --from=cronjob` makes a standalone Job that
+`concurrencyPolicy: Forbid` does not count — two rollers, two mailboxes down at
+once. The safe manual-run recipe is in `90-warden-roller.yaml`'s header and in
+PRODUCTION.md.
+
+Exit 0 is a converged fleet (nothing to do counts, and so does a clean
+`--dry-run`); 1 is a tenant wanting a person while the fleet keeps converging
+around it — halted on the tenant it took, a tenant DOWN with no workload and no
+cancellation on record, one whose sealed credential is gone, never started, or a
+`--dry-run` that found work; 2 is everything it could
+converge converged with something left that no run ever will (foreign drift, or
+an identity Secret whose label does not validate); 3 is a tenant rolled with more
+queued behind it, which is every tick of a normal bump; 4 is a casualty that
+froze the fleet, which is the one code worth paging on; 64 is a bad argument
+list. Anything but 0 marks the Job failed on purpose, so 3 marks it failed too.
+PRODUCTION.md, "Rolling the daemon image", has the full table and what to do
+about each, and "Alerting on this, without alerting on normal" has the query.
 
 If the release touched monitoring (scrape config, dashboards):
 
@@ -164,7 +236,8 @@ does. The first line of every restore drill is
 tenant creates an empty DB that litestream would happily stream over real
 history (PRODUCTION.md, backups section). Read the drill before you need it.
 
-Post-rollout verification, per tenant:
+Post-rollout verification. The first stop is the roll Job's log, which names
+every tenant it moved and every one it could not; then, per tenant:
 
 - Pod Ready and the dashboard's "Inside squelchd" row healthy: sync staleness
   under a few minutes, errors flat. The dashboard has no version panel, so
@@ -178,7 +251,7 @@ Post-rollout verification, per tenant:
 
 **The first time `drift` is ever run against this cluster, treat its output as
 unproven.** Its whole test suite runs against a mock with no server-side-apply
-merge in it, so four things are only assertions until a real API server has
+merge in it, so five things are only assertions until a real API server has
 answered them. Check them once, on one tenant, and then trust the command:
 
 1. **A freshly provisioned tenant reports zero changes.** Both sides of the
@@ -199,6 +272,20 @@ answered them. Check them once, on one tenant, and then trust the command:
    answers `recreated`, `kubectl -n tenants get deploy <label> --show-managed-
    fields -o yaml` should carry exactly one manager entry, `squelch-warden`.
    That is the claim the entire route rests on.
+5. **The cancellation marker lands, and it lands as a MERGE PATCH.** `DELETE`
+   the scratch tenant, then read its identity Secret back:
+
+   ```sh
+   kubectl -n tenants get secret <label>-identity -o yaml
+   ```
+
+   The annotation `passband.email/cancelled-at` must be there, **and every key
+   under `data:` must still be there with it** — that Secret holds the age key
+   every credential the tenant ever had was sealed to, and a patch that arrived
+   as a server-side apply would have taken it. This is the one write in the
+   service that is not an apply, and this is the check that it stayed that way.
+   Then `PUT` credentials back and confirm the annotation is gone: reopening is
+   the only thing that clears it.
 
 Then delete the scratch tenant. Doing this on a tenant with real mail in it is
 how a verification becomes an incident.
@@ -309,19 +396,22 @@ roll the carrier promptly.
 
 1. No CI test gate on any tag path — the tag workflows verify versions, not
    behavior. The preflight above is the gate.
-2. Nothing checks that `20-warden.yaml`'s pins name tags that exist in GHCR;
-   that one is still hand-checked. (The tag-to-`Cargo.toml` half is closed —
-   `release-daemon.yml` verifies it.)
-3. `60-models.yaml` pins drift behind `20-warden.yaml` (they did already).
+2. Nothing checks that the deploy pins name tags that exist in GHCR — neither
+   `SQUELCH_WARDEN_IMAGE` in `15-warden-config.yaml` nor the warden image in
+   `20-warden.yaml` and `90-warden-roller.yaml`; those are still hand-checked,
+   and so is the fact that the last two agree with each other. (The
+   tag-to-`Cargo.toml` half is closed — `release-daemon.yml` verifies it.)
+3. `60-models.yaml` pins drift behind the warden's (they did already).
 4. The warden image on carrier predates the CI job: the running
    `squelch-warden:v0.2.0` in containerd was hand-built and exists in no
    registry — that tag is from the retired numbering and nothing will ever
    publish it. Do not delete it from containerd until a `daemon-*` tag is cut
    and `20-warden.yaml` is repointed at a tag the registry actually holds
    (PRODUCTION.md, registry-gap note).
-5. There is no fleet-upgrade lever for tenants, and there is not going to be
-   one: a daemon rollout is `squelch-control drift` to see who is behind, then
-   `squelch-control reconcile <label>` per tenant, one at a time, verified as
-   you go. O(tenants) by design — a loop that re-applies to the whole fleet is
-   a loop that takes every mailbox down on one bad render. What is genuinely
-   missing is anything that RUNS the fleet drift check on a schedule.
+5. Nothing alerts when a roll does not converge. The roller walks the fleet
+   every 15 minutes and halts on the first tenant that does not come back, which
+   is the right behavior and is invisible: it shows up as a failed Job in ns
+   `warden` and nowhere else, with 24 runs of history — six hours at this
+   schedule — before the evidence rotates away. kube-state-metrics is already
+   scraped off carrier, so the alert is
+   `kube_job_status_failed{namespace="warden"} > 0`; it wants writing.
