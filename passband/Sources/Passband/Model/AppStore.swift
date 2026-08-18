@@ -1019,6 +1019,10 @@ final class AppStore {
         ThreadPrefetch.shared.wipe()
         HeroCache.shared.wipe()
         AttachmentThumbs.shared.wipe()
+        // The staged preview files, for the same reason and with more teeth: a
+        // survivor here is another account's attachment served from this
+        // account's id, straight into a preview.
+        AttachmentFiles.shared.wipe()
         FrameHeights.shared.wipeAll()
         // The reader's live-frame pool. In EmailWebCore, which both targets
         // compile, so no platform fence.

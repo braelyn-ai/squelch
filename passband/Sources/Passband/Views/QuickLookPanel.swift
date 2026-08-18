@@ -15,10 +15,14 @@
 //      clicks, and becomes first responder on the way in. That is also what
 //      settles which of a thread's many strips owns the panel: the one that was
 //      clicked.
-//   2. QUICK LOOK READS FILES, so bytes are fetched and staged on disk per item,
-//      and lazily — opening one photo must not download the other eleven. An
-//      item whose fetch is still in flight has no URL yet and previews blank;
-//      `refreshCurrentPreviewItem()` fills it in when the bytes land.
+//   2. QUICK LOOK READS FILES, and the files come from AttachmentFiles — which
+//      usually already has them, because rendering a photo in the column stages
+//      the original on its way past and a hover warms everything else. That is
+//      the difference between a panel that opens with the picture in it and one
+//      that opens empty and fills in. When the cache does miss, the fetch is
+//      lazy (opening one photo must not download the other eleven), the item
+//      previews blank until it lands, and `refreshCurrentPreviewItem()` fills
+//      it in. This view deletes no files: the cache owns their lifetime.
 //   3. THE PANEL IS ONE OF OUR WINDOWS, so the app's global key monitor sees its
 //      Escape before it does and would eat it. KeyMonitor stands down for the
 //      panel explicitly — see Keys/KeyDispatch.swift.
@@ -84,8 +88,13 @@
             guard let index = items.firstIndex(where: { $0.attachment.id == attachment.id })
             else { return }
             pendingIndex = index
-            // First, because the panel reads the responder chain the moment it is
-            // asked to appear.
+            // BEFORE the panel opens, not after. When the bytes are already on
+            // disk — the column rendered this picture, or a hover warmed it —
+            // this puts the URL in place synchronously, so the panel's very first
+            // read has one and the empty state is never drawn at all.
+            stage(index)
+            // Then this, because the panel reads the responder chain the moment
+            // it is asked to appear.
             window?.makeFirstResponder(self)
 
             guard let panel = QLPreviewPanel.shared() else { return }
@@ -100,7 +109,6 @@
                 // data source and the starting index get set.
                 panel.makeKeyAndOrderFront(nil)
             }
-            stage(index)
         }
 
         // The three below come from an informal NSObject category, so Swift sees
@@ -124,26 +132,36 @@
             MainActor.assumeIsolated {
                 panel.dataSource = nil
                 panel.delegate = nil
-                releaseStagedBytes()
+                unpin()
             }
         }
 
         // MARK: - staging
 
-        /// Fetch and stage one item's bytes if they are not already on disk.
+        /// Put one item's file in place, fetching it only if the cache has none.
         private func stage(_ index: Int) {
             guard items.indices.contains(index) else { return }
             let item = items[index]
             let id = item.attachment.id
-            guard item.staged == nil, !fetching.contains(id) else { return }
+
+            // A file this item held may have been evicted while the panel walked
+            // past it. Drop the stale URL rather than preview a deleted path.
+            if item.staged != nil, AttachmentFiles.shared.cached(id) == nil { item.staged = nil }
+
+            // The whole point: usually already there, and this returns having
+            // done no work and started no request.
+            if let file = AttachmentFiles.shared.cached(id) {
+                item.staged = file
+                return
+            }
+            guard !fetching.contains(id) else { return }
             fetching.insert(id)
             Task { @MainActor in
                 defer { fetching.remove(id) }
                 do {
-                    let fetched = try await APIClient.shared.fetchAttachment(
-                        id, fallbackName: item.attachment.filename)
-                    item.staged = try StagedAttachment.stage(
-                        id: id, bytes: fetched.bytes, filename: fetched.filename)
+                    item.staged = try await AttachmentFiles.shared.file(for: item.attachment)
+                } catch is CancellationError {
+                    return
                 } catch {
                     onError?(errText(error, "preview failed"))
                     return
@@ -160,19 +178,12 @@
             }
         }
 
-        /// The staged files go when the panel does. The delay is for the panel's
-        /// own "Open with Preview": that hands the URL to another app and closes,
-        /// so deleting on the spot would pull the file out from under the app
-        /// just asked to show it. Nothing survives the session either way —
-        /// StagedAttachment.purgeRoot() sweeps at launch.
-        private func releaseStagedBytes() {
-            let staged = items.compactMap(\.staged)
-            for item in items { item.staged = nil }
-            guard !staged.isEmpty else { return }
-            Task.detached(priority: .background) {
-                try? await Task.sleep(for: .seconds(30))
-                for file in staged { file.cleanUp() }
-            }
+        /// Let the cache have its file back. The host deletes NOTHING: the files
+        /// belong to AttachmentFiles, which is also what makes reopening the same
+        /// picture instant and what makes the panel's own "Open with Preview"
+        /// safe — the file it handed to another app is still there.
+        private func unpin() {
+            AttachmentFiles.shared.pinned = nil
         }
 
         // MARK: - teardown
@@ -193,7 +204,7 @@
             panel.dataSource = nil
             panel.delegate = nil
             if panel.isVisible { panel.orderOut(nil) }
-            releaseStagedBytes()
+            unpin()
         }
     }
 
@@ -209,6 +220,10 @@
             // opening one photo from downloading the other eleven while still
             // making the arrow keys feel instant.
             if abs(index - panel.currentPreviewItemIndex) <= 1 { stage(index) }
+            // Whatever is on screen is off limits to the cache's eviction.
+            if index == panel.currentPreviewItemIndex {
+                AttachmentFiles.shared.pinned = items[index].attachment.id
+            }
             return items[index]
         }
     }

@@ -75,9 +75,11 @@ struct AttachmentStrip: View {
                     .sheet(item: $staged) { file in
                         QuickLookPreview(url: file.url)
                             .ignoresSafeArea()
-                            // The bytes leave the disk with the sheet — nothing an
-                            // attachment contained outlives looking at it.
-                            .onDisappear { file.cleanUp() }
+                        // No cleanUp here, deliberately: the file belongs to
+                        // AttachmentFiles now, and deleting it behind the cache's
+                        // back would leave an entry pointing at a removed
+                        // directory. The cache evicts, the account switch wipes,
+                        // and launch sweeps the root.
                     }
                     .fileExporter(
                         isPresented: Binding(
@@ -155,19 +157,22 @@ struct AttachmentStrip: View {
         /// both belong to the host view, which is what the panel talks to.
         private func openPreview(_ att: Attachment) { quickLook.open(att) }
     #else
-        /// QuickLook reads a FILE, so the bytes are fetched and staged before the
-        /// sheet opens rather than behind a spinner inside it. The staging
-        /// directory belongs to the sheet and is removed on dismiss.
+        /// QuickLook reads a FILE, so the sheet opens on a staged one rather than
+        /// on a spinner. Usually there is nothing to wait for: a photo rendered in
+        /// the column staged its own original on the way past, and this finds it.
         private func openPreview(_ att: Attachment) {
+            if let file = AttachmentFiles.shared.cached(att.id) {
+                staged = file
+                return
+            }
             guard opening == nil else { return }
             opening = att.id
             Task {
                 defer { opening = nil }
                 do {
-                    let fetched = try await APIClient.shared.fetchAttachment(
-                        att.id, fallbackName: att.filename)
-                    staged = try StagedAttachment.stage(
-                        id: att.id, bytes: fetched.bytes, filename: fetched.filename)
+                    staged = try await AttachmentFiles.shared.file(for: att)
+                } catch is CancellationError {
+                    // The account changed under the fetch. Nothing to say.
                 } catch {
                     store.pushToast(errText(error, "preview failed"), .error)
                 }
@@ -214,6 +219,7 @@ private struct AttachmentCard: View {
     let onPreview: (() -> Void)?
 
     @State private var hovering = false
+    @State private var warmer: Task<Void, Never>?
 
     private var stored: Bool { attachment.downloadable }
     private var pdf: Bool { stored && AttachmentKinds.isPDF(attachment.mime) }
@@ -267,7 +273,22 @@ private struct AttachmentCard: View {
         .opacity(stored ? 1 : 0.55)
         .contentShape(Rectangle())
         .onTapGesture { onPreview?() }
-        .onHover { hovering = $0 }
+        .onHover { inside in
+            hovering = inside
+            warmer?.cancel()
+            // The pointer is the earliest honest signal that this one is about to
+            // be opened, and it arrives a few hundred milliseconds before the
+            // click — which is most of a fetch. The DWELL is what keeps that from
+            // becoming a download per card the mouse sweeps across on its way
+            // somewhere else.
+            guard inside, onPreview != nil else { return }
+            warmer = Task {
+                try? await Task.sleep(for: .milliseconds(140))
+                guard !Task.isCancelled else { return }
+                AttachmentFiles.shared.warm(attachment)
+            }
+        }
+        .onDisappear { warmer?.cancel() }
         // A previewable card looks exactly like a download-only one, so the
         // tooltip is the only place "this opens" is ever said.
         .help(onPreview == nil ? attachment.filename : "\(attachment.filename) — click to preview")

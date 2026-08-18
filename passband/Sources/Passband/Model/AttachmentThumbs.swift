@@ -86,10 +86,16 @@ final class AttachmentThumbs {
     /// Resolve one image attachment at column size. Images only: a PDF's first
     /// page is a recognition aid at tile size, not something the thread pastes
     /// across its full width.
+    ///
+    /// This is also the ONE resolve that keeps the bytes it downloaded. A picture
+    /// big enough to render in the column is a picture somebody is about to click,
+    /// and the original is already in hand — see AttachmentFiles. The 38pt tile
+    /// path deliberately does not: it runs for every attachment in a mailbox walk,
+    /// and staging hundreds of files would evict the handful worth holding.
     @discardableResult
     func resolveInline(_ attachment: Attachment) async -> Tile {
         await inlineMemo.resolve(attachment.id) {
-            await Self.fetch(attachment, .image, maxPixel: Self.inlinePixel)
+            await Self.fetch(attachment, .image, maxPixel: Self.inlinePixel, keepBytes: true)
         }
     }
 
@@ -97,13 +103,20 @@ final class AttachmentThumbs {
 
     /// Bytes -> rasterized tile. Every failure is a negative cache entry, not a
     /// retry loop: a PDF that CoreGraphics refuses once will refuse forever.
-    private static func fetch(_ attachment: Attachment, _ source: Source, maxPixel: Int) async
-        -> Tile
-    {
+    private static func fetch(
+        _ attachment: Attachment, _ source: Source, maxPixel: Int, keepBytes: Bool = false
+    ) async -> Tile {
         guard
             let fetched = try? await APIClient.shared.fetchAttachment(
                 attachment.id, fallbackName: attachment.filename)
         else { return .blank }
+
+        // Before the rasterize, not after: the file is what a click needs, and it
+        // should be on disk from the earliest moment it can be.
+        if keepBytes {
+            AttachmentFiles.shared.keep(
+                id: attachment.id, bytes: fetched.bytes, filename: fetched.filename)
+        }
 
         let bytes = fetched.bytes
         let png = await Task.detached(priority: .utility) { () -> Data? in

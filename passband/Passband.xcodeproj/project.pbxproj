@@ -44,6 +44,7 @@
 		37323F67BEB78A71E32524ED /* Concurrency.swift in Sources */ = {isa = PBXBuildFile; fileRef = E1C033DDA02DD344F437F943 /* Concurrency.swift */; };
 		37BD268312E51B58C631C8AC /* APIClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = 613B9741AD84024778FA8204 /* APIClient.swift */; };
 		39808BC8E64BACBC8B8DCB4F /* ReadReceipt.swift in Sources */ = {isa = PBXBuildFile; fileRef = 759702EBD03C1CECFD041E57 /* ReadReceipt.swift */; };
+		3D971F09C7234C3DDB9B4534 /* AttachmentFiles.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9369773169CED1C1EFD48EB0 /* AttachmentFiles.swift */; };
 		3DE29A8C29C7B5A426EB8122 /* AuthArrival.swift in Sources */ = {isa = PBXBuildFile; fileRef = FE241E317BA5B3B4D25B892E /* AuthArrival.swift */; };
 		3E13EF7C34DE299091467239 /* ImageFill.swift in Sources */ = {isa = PBXBuildFile; fileRef = CE514B2862480E62EB8936A3 /* ImageFill.swift */; };
 		3E86ED3B31C4CFD8E08695DF /* AttachmentThumbs.swift in Sources */ = {isa = PBXBuildFile; fileRef = BE85FBF58B14F2DC27FC16FB /* AttachmentThumbs.swift */; };
@@ -90,6 +91,7 @@
 		6600E4461801FE513807F25F /* SentRow.swift in Sources */ = {isa = PBXBuildFile; fileRef = EA2D959F49735AD9EDD13910 /* SentRow.swift */; };
 		67346BF359F4EC51B15E6C27 /* AskBar.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4D74815E3375EAC96A4841CF /* AskBar.swift */; };
 		67BAF2D0252EDA5EB6767C8B /* SettingsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3BE1E84810E523707C4E2CC5 /* SettingsView.swift */; };
+		690907684E5BA64D7992F2C1 /* AttachmentFiles.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9369773169CED1C1EFD48EB0 /* AttachmentFiles.swift */; };
 		6E3508C04D3ED8B28A8C4B54 /* TriageFixPalette.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1DD819E65C2460A88F79805 /* TriageFixPalette.swift */; };
 		6F3982A3598CCC296C35C2E6 /* WireTypes.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6C9F46E8DA615783DD2BEAF6 /* WireTypes.swift */; };
 		6FFB126258C28AC3F2E63D01 /* Motion.swift in Sources */ = {isa = PBXBuildFile; fileRef = 30406C6A67318CD0CE71C1FF /* Motion.swift */; };
@@ -317,6 +319,7 @@
 		89A44DCD12D99794B8DF43B0 /* AuthView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AuthView.swift; sourceTree = "<group>"; };
 		8DAF25E856CCAD8284AAA131 /* AttachmentKinds.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AttachmentKinds.swift; sourceTree = "<group>"; };
 		92398A24BE2068AEBF3FA312 /* UpdateRow.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = UpdateRow.swift; sourceTree = "<group>"; };
+		9369773169CED1C1EFD48EB0 /* AttachmentFiles.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AttachmentFiles.swift; sourceTree = "<group>"; };
 		992EA99CCF93A2EA929D6E3B /* SidePanel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SidePanel.swift; sourceTree = "<group>"; };
 		9B11AE47A064BB58DD81A6DB /* ActionLayer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ActionLayer.swift; sourceTree = "<group>"; };
 		9E5E8356451742599F7D7A2A /* MobileAuthView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MobileAuthView.swift; sourceTree = "<group>"; };
@@ -504,6 +507,7 @@
 				613B9741AD84024778FA8204 /* APIClient.swift */,
 				37716282CFABFF5910677BBC /* APIError.swift */,
 				6D18C66DBE79E1F7D55CD6DD /* AppStore.swift */,
+				9369773169CED1C1EFD48EB0 /* AttachmentFiles.swift */,
 				BE85FBF58B14F2DC27FC16FB /* AttachmentThumbs.swift */,
 				FE241E317BA5B3B4D25B892E /* AuthArrival.swift */,
 				568C9AF22D9B24934BF2B39D /* BackgroundAuthWatch.swift */,
@@ -783,6 +787,7 @@
 				67346BF359F4EC51B15E6C27 /* AskBar.swift in Sources */,
 				F38B78086DC5EBF798FFE3A1 /* Assistant.swift in Sources */,
 				D5DB123B615F58369EAE3B7F /* AsyncMemo.swift in Sources */,
+				3D971F09C7234C3DDB9B4534 /* AttachmentFiles.swift in Sources */,
 				F4D434105490FF1F19B89986 /* AttachmentKinds.swift in Sources */,
 				22E02ADE42C027FF43AC6665 /* AttachmentStrip.swift in Sources */,
 				B5D62B99FA378656F0BCF7DD /* AttachmentThumbs.swift in Sources */,
@@ -888,6 +893,7 @@
 				0C61CFFF1751AC0250DBE8C8 /* AppStore.swift in Sources */,
 				41353103B9D24E161228B692 /* Assistant.swift in Sources */,
 				DD6D172FDE2BDF162F554498 /* AsyncMemo.swift in Sources */,
+				690907684E5BA64D7992F2C1 /* AttachmentFiles.swift in Sources */,
 				4E721B91AEB73F8E8B0AAFE8 /* AttachmentKinds.swift in Sources */,
 				5A8A0E6E45A1AF07A426F4A1 /* AttachmentPreviewiOS.swift in Sources */,
 				AA1FDE44601AF70AA151D912 /* AttachmentStrip.swift in Sources */,
