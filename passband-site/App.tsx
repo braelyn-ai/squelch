@@ -4,6 +4,7 @@ import {
   useRef,
   useState,
   type FormEvent,
+  type MouseEvent,
   type PointerEvent,
 } from "react";
 
@@ -122,56 +123,24 @@ const styles = {
     textAlign: "center",
     padding: "0 1.5rem",
   },
-  card: {
+  // The mark and the wordmark become a way home once the page is in its
+  // waitlist state, and stay inert text before that: a link to the page you
+  // are already on is not a link.
+  homeLink: {
     display: "flex",
     flexDirection: "column",
     alignItems: "center",
     gap: "1rem",
-    padding: "1.25rem 1.5rem 1.5rem",
-    borderRadius: "1rem",
-    background: "rgba(255, 255, 255, 0.055)",
-    border: "1px solid rgba(255, 255, 255, 0.11)",
-  },
-  cardLabel: {
-    fontSize: "0.72rem",
-    fontWeight: 600,
-    letterSpacing: "0.12em",
-    textTransform: "uppercase",
-    color: "#8a8a90",
-  },
-  cardCopy: {
-    margin: 0,
-    maxWidth: "22rem",
-    color: "#b8b8bd",
-    fontSize: "0.95rem",
-    lineHeight: 1.5,
-    textAlign: "center",
-  },
-  // A COLUMN, not a row. The join button is the same piece of hardware the
-  // landing page leads with, and that button is far too tall to stand beside a
-  // text field without one of the two looking wrong.
-  waitlistForm: {
-    display: "flex",
-    flexDirection: "column",
-    alignSelf: "stretch",
-    gap: "0.55rem",
-  },
-  waitlistInput: {
-    padding: "0.55rem 0.8rem",
-    borderRadius: "0.6rem",
-    border: "1px solid rgba(255, 255, 255, 0.14)",
-    background: "rgba(255, 255, 255, 0.04)",
-    color: "#f5f5f7",
-    fontSize: "0.95rem",
-    fontFamily: "inherit",
-    width: "100%",
-    boxSizing: "border-box",
+    textDecoration: "none",
   },
   status: {
     margin: 0,
-    color: "#b8b8bd",
+    maxWidth: "26rem",
+    color: "#8a8a90",
     fontSize: "0.9rem",
+    lineHeight: 1.5,
     textAlign: "center",
+    padding: "0 1.5rem",
   },
   // The line under the button, for the people the button is not for: anyone
   // holding an invite already, who would otherwise find the homepage a dead
@@ -349,15 +318,105 @@ const CTA_CSS = `
   z-index: 0;
   width: 100%;
   height: 100%;
+  /* Ground, never a target. Inside the rig it lies across the address field,
+     and a canvas that swallowed the click would leave the field unfocusable. */
+  pointer-events: none;
 }
 .pb-cta-arrow,
 .pb-cta-label { position: relative; z-index: 1; }
 .pb-cta-arrow { transition: transform 0.4s cubic-bezier(0.2, 0.8, 0.2, 1); }
 .pb-cta:hover .pb-cta-arrow,
 .pb-cta:focus-visible .pb-cta-arrow { transform: translateX(3px); }
-/* The submit button in the waitlist card spans its field, so the meter under
-   the label is the full width of the form rather than a stub in the middle. */
-.pb-cta-wide { display: flex; width: 100%; margin-top: 0; }
+/* THE RIG: the email field and the join button as ONE piece of machined
+   hardware rather than a form on a card.
+   The card that used to be here was a translucent rounded rectangle with a
+   hairline white border, which is the single most templated component on the
+   web and belonged to no part of this page. This page has exactly one material
+   in it: the dark brushed ground of the button above, edged in the icon's
+   brass. So the waitlist is built out of THAT, with a slot cut in it for the
+   address. The rig owns the material and the enclosure; the button inside it
+   keeps only its meter and its label. */
+.pb-rig {
+  position: relative;
+  isolation: isolate;
+  display: flex;
+  align-items: stretch;
+  width: min(28rem, 100%);
+  margin-top: 0.65rem;
+  border-radius: 0.9rem;
+  overflow: hidden;
+  background: linear-gradient(180deg, #1e1e22, #131315);
+  border: 1px solid rgba(${BRASS}, 0.22);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.07),
+    0 12px 30px rgba(0, 0, 0, 0.5);
+  transition: border-color 0.4s ease, box-shadow 0.4s ease;
+}
+/* One lit state for the whole instrument, driven by the field inside it:
+   focusing the input is the same event as arming the button, so lighting only
+   the half under the cursor would say the two are separate things. */
+.pb-rig:hover,
+.pb-rig:focus-within {
+  border-color: rgba(${BRASS}, 0.62);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.14),
+    0 0 34px -6px rgba(${BRASS}, 0.45),
+    0 16px 38px rgba(0, 0, 0, 0.55);
+}
+/* The same machined top edge the standalone button wears. */
+.pb-rig::before {
+  content: "";
+  position: absolute;
+  inset: 0 0 auto;
+  height: 1px;
+  z-index: 2;
+  opacity: 0.45;
+  background: linear-gradient(90deg, transparent, rgba(${BRASS}, 0.8), transparent);
+  transition: opacity 0.4s ease;
+}
+.pb-rig:hover::before,
+.pb-rig:focus-within::before { opacity: 1; }
+/* The slot. No border and no ground of its own: it is an opening in the rig,
+   not a control sitting on one. Its padding matches the button's exactly, so
+   the address and the label sit on the same optical line. */
+.pb-rig-field {
+  position: relative;
+  z-index: 1;
+  flex: 1 1 auto;
+  min-width: 0;
+  padding: 0.9rem 1.1rem 1.3rem;
+  border: 0;
+  outline: none;
+  background: none;
+  color: #f5f5f7;
+  font-family: inherit;
+  font-size: 0.95rem;
+  line-height: 1.2;
+}
+.pb-rig-field::placeholder { color: #6b6b70; }
+.pb-rig-field:disabled { color: #a9a49a; }
+/* The button, once the rig owns the material: no ground, no shell, no lift.
+   What is left of it is the half that lights up, divided off by one hairline.
+   The lift is dropped deliberately, because a button that rises out of the bar
+   it is set into reads as a part coming loose. */
+.pb-cta-in-rig {
+  flex: none;
+  margin-top: 0;
+  border: 0;
+  border-left: 1px solid rgba(${BRASS}, 0.18);
+  border-radius: 0;
+  background: none;
+  box-shadow: none;
+}
+.pb-cta-in-rig::before { display: none; }
+.pb-cta-in-rig:hover,
+.pb-cta-in-rig:focus-visible {
+  transform: none;
+  box-shadow: none;
+  border-color: rgba(${BRASS}, 0.35);
+}
+/* Drawn inside, because the rig clips anything outside it. */
+.pb-cta-in-rig:focus-visible { outline-offset: -3px; }
 /* In flight. The meter keeps running (the request is the thing being waited
    on) but the hardware stops answering the pointer. */
 .pb-cta[disabled] { cursor: progress; color: #a9a49a; }
@@ -365,6 +424,7 @@ const CTA_CSS = `
 .pb-cta[disabled]:hover .pb-cta-arrow { transform: none; }
 .pb-cta[disabled]:hover { border-color: rgba(${BRASS}, 0.22); box-shadow:
   inset 0 1px 0 rgba(255, 255, 255, 0.07), 0 12px 30px rgba(0, 0, 0, 0.5); }
+.pb-cta-in-rig[disabled]:hover { box-shadow: none; border-color: rgba(${BRASS}, 0.18); }
 @media (prefers-reduced-motion: reduce) {
   .pb-cta,
   .pb-cta-arrow { transition-duration: 0.01ms; }
@@ -619,10 +679,18 @@ function Arrow() {
 // a thing worth holding before there is a mailbox behind it: the door here is
 // the list, and the download waits at the end of the invite flow, where it is
 // the next thing somebody actually needs.
-function JoinButton() {
+//
+// STILL AN ANCHOR with a real `href`, even though the click is handled: it is a
+// link to a URL that exists, so cmd-click, middle-click, and "copy link" all
+// have to keep meaning what they mean.
+function JoinButton({
+  onClick,
+}: {
+  onClick: (event: MouseEvent<HTMLAnchorElement>) => void;
+}) {
   const { chrome, handlers } = useMeter();
   return (
-    <a className="pb-cta" href="/waitlist" {...handlers}>
+    <a className="pb-cta" href={WAITLIST_PATH} onClick={onClick} {...handlers}>
       {chrome}
       <span className="pb-cta-label">join the waitlist</span>
       <Arrow />
@@ -630,27 +698,25 @@ function JoinButton() {
   );
 }
 
-// The same hardware as a form submit, spanning the field above it. `busy` is
-// the request in flight: the meter keeps running, because that is the part that
-// is honestly still happening, and the button stops answering the pointer.
+// The rig's submit half. NO METER OF ITS OWN: the rig carries one meter across
+// its whole width, so this is the label and the divider and nothing else.
+// Squeezed into a button this narrow the meter read as a squiggle rather than
+// an instrument, and it had nothing to say about the half of the bar where the
+// typing happens.
+//
+// `busy` is the request in flight. The rig's meter keeps running, because that
+// is the part that is honestly still happening; the button stops answering.
 function SubmitButton({ busy }: { busy: boolean }) {
-  const { chrome, handlers } = useMeter();
   return (
-    <button
-      className="pb-cta pb-cta-wide"
-      type="submit"
-      disabled={busy}
-      {...handlers}
-    >
-      {chrome}
+    <button className="pb-cta pb-cta-in-rig" type="submit" disabled={busy}>
       <span className="pb-cta-label">{busy ? "sending" : "join"}</span>
       {!busy && <Arrow />}
     </button>
   );
 }
 
-// Same corner links on every React page, so /waitlist reads as a sibling of
-// the homepage rather than a detour off the site.
+// Same corner links in both of the page's states, so joining the list never
+// reads as having left the site.
 function CornerLinks() {
   return (
     <>
@@ -671,38 +737,6 @@ function CornerLinks() {
   );
 }
 
-export function App() {
-  return (
-    <main style={styles.page}>
-      <FakeInbox />
-      <div style={styles.frost} />
-      <div style={styles.content}>
-        {/* The mark on its own, no tile: the page is already a dark field, so
-            the icon's ground would just be a lighter rectangle sitting on it. */}
-        <img
-          src="/mark.svg"
-          alt="Passband"
-          width={180}
-          height={98}
-        />
-        <h1 style={styles.title}>Passband</h1>
-        <p style={styles.tagline}>fuck email. lets make it bearable</p>
-        <JoinButton />
-        {/* The second door, for the people the button is not for. Muted, and
-            a line rather than a button, because there is one primary action on
-            this page and this is not it. */}
-        <p style={styles.note}>
-          already have an invite?{" "}
-          <a style={styles.noteLink} href={SIGNUP_URL}>
-            set up your mailbox
-          </a>
-        </p>
-      </div>
-      <CornerLinks />
-    </main>
-  );
-}
-
 // The control plane answers 200 for a fresh address and for one already on the
 // list, so this page can never become a membership oracle.
 const WAITLIST_URL = "https://signup.passband.app/waitlist";
@@ -712,7 +746,18 @@ const WAITLIST_URL = "https://signup.passband.app/waitlist";
 // device, or who lost it and kept the code.
 const SIGNUP_URL = "https://signup.passband.app";
 
-export function WaitlistPage() {
+// The path the waitlist state answers to. A real URL, deep-linkable and
+// shareable, even though reaching it from the homepage never loads a document.
+const WAITLIST_PATH = "/waitlist";
+
+// The waitlist, as a state of the homepage rather than a page of its own.
+//
+// It renders into the SAME SLOT the tagline and the button occupy, which is
+// what makes the swap sit still: the mark, the wordmark, the corner links and
+// the line underneath never move, and one line of copy changes its words while
+// the button becomes the rig.
+function Waitlist() {
+  const { chrome, handlers } = useMeter();
   const [email, setEmail] = useState("");
   const [state, setState] = useState<"idle" | "busy" | "done" | "error">("idle");
 
@@ -734,76 +779,121 @@ export function WaitlistPage() {
     }
   };
 
+  // WHAT ARRIVES AND WHAT IS AT THE END OF IT, which is the only thing still
+  // unanswered once somebody is on the list, and where the client lives now.
+  if (state === "done") {
+    return (
+      <>
+        <p style={styles.tagline}>you're on the list.</p>
+        <p style={styles.status}>
+          the invite lands by email when a spot opens. it walks you through
+          setup, and the app is waiting at the end of it.
+        </p>
+      </>
+    );
+  }
+
+  return (
+    <>
+      <p style={styles.tagline}>
+        we run the daemon for you. your invite lands by email.
+      </p>
+      <form className="pb-rig" onSubmit={submit} {...handlers}>
+        {chrome}
+        <input
+          className="pb-rig-field"
+          type="email"
+          name="email"
+          required
+          autoComplete="email"
+          placeholder="you@example.com"
+          aria-label="email address"
+          // The button that opened this is gone from under the cursor, so the
+          // field takes the focus it left behind: press join, start typing.
+          autoFocus
+          value={email}
+          disabled={state === "busy"}
+          onChange={(event) => setEmail(event.target.value)}
+        />
+        <SubmitButton busy={state === "busy"} />
+      </form>
+      {state === "error" && (
+        <p style={{ ...styles.status, color: "#d8a39a" }}>
+          that didn't go through. give it a second and try again.
+        </p>
+      )}
+    </>
+  );
+}
+
+export function App() {
+  // THE WAITLIST IS A STATE OF THIS PAGE, not a document of its own. It was a
+  // second page at /waitlist, and clicking through re-parsed the bundle and
+  // re-rolled the random inbox behind the frost, so the one thing on screen
+  // that should never move flickered on every click. The URL still changes, so
+  // the link stays real and the back button still goes back; nothing remounts.
+  const [joining, setJoining] = useState(
+    () => location.pathname === WAITLIST_PATH,
+  );
+
+  // The browser's own history is the source of truth, so back and forward land
+  // where they should rather than leaving the page arguing with its address.
+  useEffect(() => {
+    const sync = () => setJoining(location.pathname === WAITLIST_PATH);
+    addEventListener("popstate", sync);
+    return () => removeEventListener("popstate", sync);
+  }, []);
+
+  const go =
+    (path: string, next: boolean) => (event: MouseEvent<HTMLAnchorElement>) => {
+      // Anything but a plain left click is asking for a new document: a new
+      // tab, a new window, a saved link. Let the browser have those.
+      if (
+        event.metaKey ||
+        event.ctrlKey ||
+        event.shiftKey ||
+        event.altKey ||
+        event.button !== 0
+      ) {
+        return;
+      }
+      event.preventDefault();
+      history.pushState(null, "", path);
+      setJoining(next);
+    };
+
+  // The mark on its own, no tile: the page is already a dark field, so the
+  // icon's ground would just be a lighter rectangle sitting on it.
+  const masthead = (
+    <>
+      <img src="/mark.svg" alt="Passband" width={180} height={98} />
+      <h1 style={styles.title}>Passband</h1>
+    </>
+  );
+
   return (
     <main style={styles.page}>
       <FakeInbox />
       <div style={styles.frost} />
       <div style={styles.content}>
-        <a
-          href="/"
-          style={{
-            display: "flex",
-            flexDirection: "column",
-            alignItems: "center",
-            gap: "1rem",
-            textDecoration: "none",
-          }}
-        >
-          <img
-            src="/mark.svg"
-            alt="Passband"
-            width={180}
-            height={98}
-          />
-          <h1 style={styles.title}>Passband</h1>
-        </a>
-        {/* THE WHOLE CARD TURNS OVER ON SUCCESS, pitch included. Leaving the
-            pitch standing above the confirmation left the card selling the list
-            to somebody who had just joined it, and saying "your invite lands by
-            email" twice in four lines. What replaces it is the only thing still
-            unanswered at that point: what arrives, and what is at the end of
-            it, which is where the client lives now. */}
-        <section style={{ ...styles.card, marginTop: "0.5rem" }}>
-          {state === "done" ? (
-            <>
-              <span style={styles.cardLabel}>you're on the list</span>
-              <p style={styles.cardCopy}>
-                the invite lands by email when a spot opens. it walks you
-                through setup, and the app is waiting at the end of it.
-              </p>
-            </>
-          ) : (
-            <>
-              <span style={styles.cardLabel}>hosted beta</span>
-              <p style={styles.cardCopy}>
-                we run the daemon for you. join the list and your invite lands
-                by email.
-              </p>
-              <form style={styles.waitlistForm} onSubmit={submit}>
-                <input
-                  style={styles.waitlistInput}
-                  type="email"
-                  name="email"
-                  required
-                  autoComplete="email"
-                  placeholder="you@example.com"
-                  aria-label="email address"
-                  value={email}
-                  disabled={state === "busy"}
-                  onChange={(event) => setEmail(event.target.value)}
-                />
-                <SubmitButton busy={state === "busy"} />
-              </form>
-            </>
-          )}
-          {state === "error" && (
-            <p style={{ ...styles.status, color: "#d8a39a" }}>
-              that didn't go through. give it a second and try again.
-            </p>
-          )}
-        </section>
-        {/* Same second door as the homepage, for somebody who followed the
-            join link with a code already sitting in their inbox. */}
+        {joining ? (
+          <a href="/" onClick={go("/", false)} style={styles.homeLink}>
+            {masthead}
+          </a>
+        ) : (
+          masthead
+        )}
+        {joining ? (
+          <Waitlist />
+        ) : (
+          <>
+            <p style={styles.tagline}>fuck email. lets make it bearable</p>
+            <JoinButton onClick={go(WAITLIST_PATH, true)} />
+          </>
+        )}
+        {/* The second door, for the people the button is not for. Muted, and a
+            line rather than a button, because there is one primary action here
+            and this is not it. */}
         <p style={styles.note}>
           already have an invite?{" "}
           <a style={styles.noteLink} href={SIGNUP_URL}>
