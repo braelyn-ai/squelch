@@ -6,14 +6,12 @@
 // NSSavePanel: the human chooses a destination in Files and the bytes go there.
 // The bytes are held in a value the exporter owns and nowhere else.
 //
-// PREVIEW is QuickLook rather than a PDFView in a card. That is a deliberate
-// substitution, not a shortcut: QLPreviewController is what a phone user already
-// knows (pinch to zoom, page scrubber, the share sheet) and it needs no chrome
-// of our own, whereas the Mac's fixed 820x520 preview card is a shape a 393pt
-// screen has no room for. QuickLook wants a file URL, so the fetched bytes are
-// written to a per-preview directory under the app's caches and that directory
-// is torn down when the sheet closes — the same lifetime the Mac's in-memory
-// PDFDocument has.
+// PREVIEW is QuickLook, the same renderer the Mac drives — only the presentation
+// differs, and that difference is the point. QLPreviewController fills a sheet
+// and brings the gestures a phone user already has (pinch to zoom, the page
+// scrubber, the share sheet); the Mac gets QLPreviewPanel, a floating window a
+// 393pt screen has nowhere to put. Staging is shared: Lib/StagedAttachment.swift
+// writes the bytes to a file, because QuickLook reads files.
 
 import QuickLook
 import SwiftUI
@@ -41,34 +39,6 @@ struct AttachmentFile: FileDocument {
 }
 
 // MARK: - preview
-
-/// A fetched attachment staged on disk for QuickLook, and the staging directory
-/// it owns. `cleanUp()` is the whole security contract: mail attachments are not
-/// left lying in the caches after the sheet that showed them is gone.
-struct StagedAttachment: Identifiable {
-    let id: Int
-    let url: URL
-    let directory: URL
-
-    /// Write `bytes` into a directory unique to this preview, named so QuickLook
-    /// picks the right renderer from the extension.
-    static func stage(id: Int, bytes: Data, filename: String) throws -> StagedAttachment {
-        let directory = FileManager.default.temporaryDirectory
-            .appendingPathComponent("preview-\(UUID().uuidString)", isDirectory: true)
-        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-        // The server-supplied filename is used for its EXTENSION and is never
-        // joined as a path: a name carrying separators would otherwise decide
-        // where the write lands.
-        let safe = (filename as NSString).lastPathComponent
-        let url = directory.appendingPathComponent(safe.isEmpty ? "attachment" : safe)
-        try bytes.write(to: url, options: .atomic)
-        return StagedAttachment(id: id, url: url, directory: directory)
-    }
-
-    func cleanUp() {
-        try? FileManager.default.removeItem(at: directory)
-    }
-}
 
 /// QuickLook over one staged file. No navigation of its own — the sheet is the
 /// container, and QuickLook brings its own toolbar.

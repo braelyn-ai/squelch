@@ -45,6 +45,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // was not running is delivered the moment a delegate exists, and a
         // center without one drops it.
         Notifier.shared.install()
+        // Attachment bytes staged for Quick Look are torn down when the panel
+        // closes; this is the sweep for the ones a crash or a hard quit stranded.
+        StagedAttachment.purgeRoot()
         Analytics.start()
         // The boot view never passes through route(to:), so its screen event
         // is recorded here or not at all.

@@ -219,6 +219,8 @@ final class KeyRegistry {
 // of the events is AppKit, and on a platform without one the registry simply
 // never gets asked: bindings register into the void until a twin exists.
 #if os(macOS)
+    import QuickLookUI
+
     // MARK: - NSEvent bridge
 
     /// Translate an AppKit key event into the browser-style key names bindings are
@@ -281,6 +283,12 @@ final class KeyRegistry {
         func install() {
             guard monitor == nil else { return }
             monitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
+                // Quick Look's panel is one of OUR windows, so a LOCAL monitor
+                // sees its keys first. Stand down for it entirely: Escape,
+                // Space and the arrows are the panel's while it is up, and a
+                // thread binding that consumed one would leave the human with
+                // no way out of a window this app did not draw.
+                if event.window is QLPreviewPanel { return event }
                 guard let like = KeyNames.eventLike(event) else { return event }
                 // The input guard: typing into a text field suppresses single-letter
                 // bindings unless the binding opts in.

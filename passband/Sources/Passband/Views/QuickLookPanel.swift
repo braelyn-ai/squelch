@@ -1,0 +1,392 @@
+// THE MAC'S PREVIEW IS THE SYSTEM'S. Space-bar Quick Look — the same panel
+// Finder opens — instead of a card this app draws. It zooms out of the card that
+// was clicked, arrows between the rest of the message's attachments, and brings
+// its own zoom, rotate, share and "Open with Preview". What it replaced was two
+// hand-rolled sheets, a PDFView card and an ImageIO card, each with its own
+// scrim, its own clamped 820x520 frame and its own Esc, between them able to
+// render exactly two file types.
+//
+// THREE THINGS ARE LOAD-BEARING:
+//
+//   1. THE RESPONDER CHAIN IS THE API. QLPreviewPanel is a process-wide
+//      singleton that asks the FIRST RESPONDER who is driving it — there is no
+//      delegate you simply hand it. SwiftUI has no responder to offer, so the
+//      strip plants a view behind its cards that draws nothing, swallows no
+//      clicks, and becomes first responder on the way in. That is also what
+//      settles which of a thread's many strips owns the panel: the one that was
+//      clicked.
+//   2. QUICK LOOK READS FILES, and the files come from AttachmentFiles — which
+//      usually already has them, because rendering a photo in the column stages
+//      the original on its way past and a hover warms everything else. That is
+//      the difference between a panel that opens with the picture in it and one
+//      that opens empty and fills in. When the cache does miss, the fetch is
+//      lazy (opening one photo must not download the other eleven), the item
+//      previews blank until it lands, and `refreshCurrentPreviewItem()` fills
+//      it in. This view deletes no files: the cache owns their lifetime.
+//   3. THE PANEL IS ONE OF OUR WINDOWS, so the app's global key monitor sees its
+//      Escape before it does and would eat it. KeyMonitor stands down for the
+//      panel explicitly — see Keys/KeyDispatch.swift.
+
+#if os(macOS)
+
+    import AppKit
+    import QuickLookUI
+    import SwiftUI
+
+    /// One attachment as Quick Look sees it. A CLASS, because the URL arrives
+    /// after the panel is already showing the item: the panel holds this object
+    /// and re-reads `previewItemURL` when told to refresh.
+    final class QuickLookItem: NSObject, QLPreviewItem {
+        let attachment: Attachment
+        var staged: StagedAttachment?
+
+        init(_ attachment: Attachment) { self.attachment = attachment }
+
+        var previewItemURL: URL? { staged?.url }
+        /// The mail filename, not the staging directory's: the human named this
+        /// file, and the UUID above it is our bookkeeping.
+        var previewItemTitle: String? { attachment.filename }
+    }
+
+    /// The strip's foothold in the responder chain, and the panel's data source
+    /// once it has one.
+    final class QuickLookHostView: NSView {
+        /// Everything in this strip a click can open, in display order, so the
+        /// panel's arrows walk the message's attachments the way the eye does.
+        private(set) var items: [QuickLookItem] = []
+        /// Where each attachment's clickable rect sits IN THIS VIEW'S OWN
+        /// coordinates. SwiftUI measures them in a named space pinned to this
+        /// view's frame, and `isFlipped` is what lets them be used as measured.
+        var sourceFrames: [Int: CGRect] = [:]
+        /// How a failed fetch gets said out loud — the toast belongs to the
+        /// store, which is a SwiftUI thing this view has no handle on.
+        var onError: ((String) -> Void)?
+
+        private var pendingIndex = 0
+        private var fetching: Set<Int> = []
+        /// Who was typing before the preview opened. This view takes first
+        /// responder to drive the panel and has to give it back, or the composer
+        /// the human was mid-sentence in never gets its caret returned.
+        private weak var previousResponder: NSResponder?
+        /// Set across the reload that only asks the panel HOW MANY items there
+        /// are. See `present(_:on:)`.
+        private var counting = false
+
+        // Top-left origin, matching SwiftUI, so a measured rect needs no flip.
+        override var isFlipped: Bool { true }
+        override var acceptsFirstResponder: Bool { true }
+        // It sits BEHIND the cards. A background view that answered hit tests
+        // would swallow the clicks of every card it covers.
+        override func hitTest(_ point: NSPoint) -> NSView? { nil }
+
+        // MARK: - contents
+
+        /// Rebuild the item list only when the attachments actually changed.
+        /// Rebuilding on every re-render would hand the panel fresh objects and
+        /// drop the URLs already staged into the old ones.
+        func setAttachments(_ attachments: [Attachment]) {
+            guard attachments.map(\.id) != items.map(\.attachment.id) else { return }
+            items = attachments.map(QuickLookItem.init)
+            pendingIndex = min(pendingIndex, max(items.count - 1, 0))
+            // A panel showing THIS strip is now holding a list that changed
+            // under it — a poller refresh landed while it was open. Left alone
+            // it keeps asking for an index that may no longer exist and draws
+            // nothing; there is no notification it reads on its own.
+            guard let panel = livePanel() else { return }
+            guard !items.isEmpty else {
+                panel.orderOut(nil)
+                return
+            }
+            present(min(panel.currentPreviewItemIndex, items.count - 1), on: panel)
+        }
+
+        /// The shared panel, but only when it is up and driven by THIS strip.
+        private func livePanel() -> QLPreviewPanel? {
+            guard QLPreviewPanel.sharedPreviewPanelExists(),
+                let panel = QLPreviewPanel.shared(),
+                panel.isVisible, panel.dataSource === self
+            else { return nil }
+            return panel
+        }
+
+        // MARK: - opening
+
+        func open(_ attachment: Attachment) {
+            guard let index = items.firstIndex(where: { $0.attachment.id == attachment.id })
+            else { return }
+            pendingIndex = index
+            // BEFORE the panel opens, not after. When the bytes are already on
+            // disk — the column rendered this picture, or a hover warmed it —
+            // this puts the URL in place synchronously, so the panel's very first
+            // read has one and the empty state is never drawn at all.
+            stage(index)
+            // Then this, because the panel reads the responder chain the moment
+            // it is asked to appear — and remember who had it, because a preview
+            // is a detour and the caret goes back where it was.
+            if let window, window.firstResponder !== self {
+                // Inherit the chain rather than pointing at another strip's
+                // invisible host: an attachment opened in one message and then
+                // in another must still give the caret back to whatever the
+                // human was actually typing in.
+                previousResponder =
+                    (window.firstResponder as? QuickLookHostView)?.previousResponder
+                    ?? window.firstResponder
+            }
+            window?.makeFirstResponder(self)
+
+            guard let panel = QLPreviewPanel.shared() else { return }
+            if panel.isVisible {
+                // Already up on some other strip's attachment: hand it over
+                // rather than opening a second one. There is only ever one panel.
+                // If it switches, `beginPreviewPanelControl` has already put the
+                // index here; if it was ALREADY ours, nothing was called and
+                // this is what moves it.
+                panel.updateController()
+                if livePanel() != nil, items.indices.contains(index) {
+                    panel.currentPreviewItemIndex = index
+                }
+            } else {
+                // Calls back into beginPreviewPanelControl, which is where the
+                // data source and the starting index get set.
+                panel.makeKeyAndOrderFront(nil)
+            }
+        }
+
+        // The three below come from an informal NSObject category, so Swift sees
+        // them as nonisolated even though Quick Look only ever calls them from
+        // the main thread — it is driving AppKit windows from AppKit's own
+        // machinery. `assumeIsolated` is that fact written down rather than a
+        // hop, which would land after the panel has already read what it asked.
+
+        override func acceptsPreviewPanelControl(_ panel: QLPreviewPanel!) -> Bool { true }
+
+        override func beginPreviewPanelControl(_ panel: QLPreviewPanel!) {
+            MainActor.assumeIsolated {
+                panel.dataSource = self
+                panel.delegate = self
+                present(pendingIndex, on: panel)
+            }
+        }
+
+        override func endPreviewPanelControl(_ panel: QLPreviewPanel!) {
+            MainActor.assumeIsolated {
+                // Give the caret back whatever happened; `restoreResponder` is a
+                // no-op unless this view still holds it.
+                restoreResponder()
+                // The rest only if the panel is still OURS. AppKit does not
+                // document whether a handover between two strips ends the old
+                // controller before or after it begins the new one, and an end
+                // that ran second would wipe the data source the other strip had
+                // just installed and drop the pin it had just taken.
+                guard panel.dataSource === self else { return }
+                panel.dataSource = nil
+                panel.delegate = nil
+                unpin()
+            }
+        }
+
+        /// Point the panel at `index` and make it re-read the list.
+        ///
+        /// TWO RELOADS, with the index between them. `reloadData` asks the data
+        /// source for the item it is about to show AND its neighbours, measured
+        /// from `currentPreviewItemIndex` — which on a panel opening for the
+        /// first time still reads 0. Reloading once and then moving the index
+        /// therefore downloads the first two attachments in the strip before it
+        /// touches the eighth one somebody clicked. Setting the index first is
+        /// not an option either: out of range raises, and the panel does not
+        /// know the count until it has reloaded once.
+        ///
+        /// So: reload for the COUNT with staging suspended, move the index,
+        /// reload for the ITEMS. Correct whether the panel answers a reload
+        /// synchronously or defers it — by the time a deferred callback lands,
+        /// the index it measures from is already the right one.
+        private func present(_ index: Int, on panel: QLPreviewPanel) {
+            guard items.indices.contains(index) else { return }
+            counting = true
+            panel.reloadData()
+            panel.currentPreviewItemIndex = index
+            counting = false
+            panel.reloadData()
+        }
+
+        // MARK: - staging
+
+        /// Put one item's file in place, fetching it only if the cache has none.
+        private func stage(_ index: Int) {
+            guard !counting, items.indices.contains(index) else { return }
+            let item = items[index]
+            let id = item.attachment.id
+
+            // A file this item held may have been evicted while the panel walked
+            // past it. Drop the stale URL rather than preview a deleted path.
+            if item.staged != nil, AttachmentFiles.shared.cached(id) == nil { item.staged = nil }
+
+            // The whole point: usually already there, and this returns having
+            // done no work and started no request.
+            if let file = AttachmentFiles.shared.cached(id) {
+                item.staged = file
+                return
+            }
+            guard !fetching.contains(id) else { return }
+            fetching.insert(id)
+            Task { @MainActor in
+                defer { fetching.remove(id) }
+                do {
+                    item.staged = try await AttachmentFiles.shared.file(for: item.attachment)
+                } catch is CancellationError {
+                    return
+                } catch {
+                    onError?(errText(error, "preview failed"))
+                    return
+                }
+                // Only nudge the panel if it is still ours and still looking at
+                // this item — an arrow key during the fetch means the human has
+                // moved on and a refresh would yank them back.
+                guard QLPreviewPanel.sharedPreviewPanelExists(),
+                    let panel = QLPreviewPanel.shared(),
+                    panel.isVisible, panel.dataSource === self,
+                    panel.currentPreviewItemIndex == index
+                else { return }
+                panel.refreshCurrentPreviewItem()
+            }
+        }
+
+        /// Let the cache have its file back. The host deletes NOTHING: the files
+        /// belong to AttachmentFiles, which is also what makes reopening the same
+        /// picture instant and what makes the panel's own "Open with Preview"
+        /// safe — the file it handed to another app is still there.
+        private func unpin() {
+            AttachmentFiles.shared.pinned = nil
+        }
+
+        /// Hand first responder back to whoever had it before the preview. Only
+        /// when this view still holds it: another strip taking the panel makes
+        /// ITSELF first responder, and stealing it back would fight over the
+        /// caret rather than return it.
+        private func restoreResponder() {
+            defer { previousResponder = nil }
+            guard let window, window.firstResponder === self else { return }
+            window.makeFirstResponder(previousResponder)
+        }
+
+        // MARK: - teardown
+
+        override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            if window == nil { detachFromPanel() }
+        }
+
+        /// Let go of the panel. `dataSource` and `delegate` are UNOWNED, so a
+        /// host that goes away while the panel is still pointing at it leaves the
+        /// panel holding a dead object.
+        func detachFromPanel() {
+            guard QLPreviewPanel.sharedPreviewPanelExists(),
+                let panel = QLPreviewPanel.shared(),
+                panel.dataSource === self
+            else { return }
+            panel.dataSource = nil
+            panel.delegate = nil
+            if panel.isVisible { panel.orderOut(nil) }
+            unpin()
+            restoreResponder()
+        }
+    }
+
+    // MARK: - data source
+
+    extension QuickLookHostView: @preconcurrency QLPreviewPanelDataSource {
+        func numberOfPreviewItems(in panel: QLPreviewPanel!) -> Int { items.count }
+
+        func previewPanel(_ panel: QLPreviewPanel!, previewItemAt index: Int) -> QLPreviewItem! {
+            guard items.indices.contains(index) else { return nil }
+            // The panel asks for what it is about to show, and for the neighbours
+            // it would show next. Staging exactly that window is what keeps
+            // opening one photo from downloading the other eleven while still
+            // making the arrow keys feel instant.
+            if abs(index - panel.currentPreviewItemIndex) <= 1 { stage(index) }
+            // Whatever is on screen is off limits to the cache's eviction.
+            if index == panel.currentPreviewItemIndex {
+                AttachmentFiles.shared.pinned = items[index].attachment.id
+            }
+            return items[index]
+        }
+    }
+
+    // MARK: - delegate
+
+    extension QuickLookHostView: @preconcurrency QLPreviewPanelDelegate {
+        /// Where the panel zooms out of. `.zero` is the graceful answer for an
+        /// item whose card we cannot place — the panel fades in instead.
+        func previewPanel(
+            _ panel: QLPreviewPanel!, sourceFrameOnScreenFor item: QLPreviewItem!
+        ) -> NSRect {
+            guard let item = item as? QuickLookItem,
+                let frame = sourceFrames[item.attachment.id],
+                // An inline image whose decode failed draws an EmptyView and
+                // still reports its geometry, so its rect is a 0x0 one at some
+                // arbitrary spot. That is not a card to zoom out of; it is the
+                // same "we cannot place this" the fade is for.
+                !frame.isEmpty,
+                let window
+            else { return .zero }
+            return window.convertToScreen(convert(frame, to: nil))
+        }
+
+        /// The art the zoom carries. The thumbnail cache already holds exactly
+        /// what the card is painting, so the picture flies rather than a blank.
+        func previewPanel(
+            _ panel: QLPreviewPanel!, transitionImageFor item: QLPreviewItem!,
+            contentRect: UnsafeMutablePointer<NSRect>!
+        ) -> Any! {
+            guard let item = item as? QuickLookItem else { return nil }
+            let id = item.attachment.id
+            let tile = AttachmentThumbs.shared.cachedInline(id) ?? AttachmentThumbs.shared.cached(id)
+            guard case .art(let image)? = tile else { return nil }
+            return image
+        }
+    }
+
+    // MARK: - SwiftUI
+
+    /// The handle SwiftUI holds onto: a strip keeps one in `@State` and calls
+    /// `open` from a tap, which is the only thing it ever needs from AppKit.
+    @MainActor
+    final class QuickLookLauncher {
+        fileprivate weak var host: QuickLookHostView?
+
+        nonisolated init() {}
+
+        func open(_ attachment: Attachment) { host?.open(attachment) }
+    }
+
+    /// Plants the host view in the strip's background. Zero chrome by design:
+    /// everything visible belongs to the panel.
+    struct QuickLookHost: NSViewRepresentable {
+        let attachments: [Attachment]
+        let sourceFrames: [Int: CGRect]
+        let launcher: QuickLookLauncher
+        let onError: (String) -> Void
+
+        func makeNSView(context: Context) -> QuickLookHostView {
+            let view = QuickLookHostView()
+            configure(view)
+            return view
+        }
+
+        func updateNSView(_ view: QuickLookHostView, context: Context) {
+            configure(view)
+        }
+
+        private func configure(_ view: QuickLookHostView) {
+            launcher.host = view
+            view.setAttachments(attachments)
+            view.sourceFrames = sourceFrames
+            view.onError = onError
+        }
+
+        static func dismantleNSView(_ view: QuickLookHostView, coordinator: Coordinator) {
+            MainActor.assumeIsolated { view.detachFromPanel() }
+        }
+    }
+
+#endif  // os(macOS)
