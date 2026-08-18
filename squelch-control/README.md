@@ -17,6 +17,8 @@ Where the code comes from, when the waitlist is configured (the trio in the
 table below; unset, none of it is mounted and both URLs are a 404):
 
 ```
+browser  ── GET  /  ──────────► "No invite code? Join the waitlist",
+                                linking to <WAITLIST_ORIGIN>/waitlist
 site     ── POST /waitlist ──► one row per address, same 200 for a duplicate
 operator ── GET  /admin ──────► token login, then the list
          ── POST /admin/approve ──► mint an invite, email it through Resend
@@ -35,6 +37,14 @@ the query string reaches the edge's access log, the recipient's history, and any
 proxy between them, and a live code sits in all three until it is redeemed or
 lapses. It is a deliberate trade for the click, taken 2026-08-14, bounded by the
 code being single use. A parameter not shaped like a code renders an empty field.
+
+The "join the waitlist" link closes the loop from the other end: a person with
+no code could not get one from the page that demands it. It is built from
+`SQUELCH_CONTROL_WAITLIST_ORIGIN` (the same origin the CORS answer names, so the
+link and the form it leads to cannot drift apart) and is rendered on every signup
+page: prefilled or not, refused or not. Making it conditional on either would
+turn its presence into an answer about the code in the URL. With the waitlist
+unconfigured the form links nowhere.
 
 The admin POSTs take a `SameSite=Strict` session cookie AND a same-origin
 `Origin`/`Sec-Fetch-Site`, because "same site" includes every sibling
@@ -130,7 +140,7 @@ Everything is validated at startup and a bad value is a refusal to boot.
 | `SQUELCH_CONTROL_ADMIN_TOKEN` | trio | The operator's password for `/admin`, where waitlist rows are approved. At least 32 characters: `openssl rand -base64 32`. With the two below it is all-or-nothing: all three set mounts the waitlist and admin routes, none set leaves them unmounted (a 404, not a 403), anything partial refuses to boot. |
 | `SQUELCH_CONTROL_RESEND_API_KEY` | trio | Resend sending key, used for the one call that mails an approved applicant their invite. Printable ASCII, no spaces. Mint it sending-only and domain-restricted. |
 | `SQUELCH_CONTROL_INVITE_FROM` | trio | The `From:` invites are sent as, e.g. `Passband <invites@passband.app>`. Must be an address on a domain **verified at Resend** or every send is refused. |
-| `SQUELCH_CONTROL_WAITLIST_ORIGIN` | no | The one browser origin allowed to post the public waitlist form, echoed as `Access-Control-Allow-Origin` on that route only. Default `https://passband.app`. Only meaningful with the trio above set; set alone it refuses to boot. |
+| `SQUELCH_CONTROL_WAITLIST_ORIGIN` | no | The one browser origin allowed to post the public waitlist form, echoed as `Access-Control-Allow-Origin` on that route only, and the origin the signup page's "join the waitlist" link is built from (`<origin>/waitlist`). Default `https://passband.app`. Only meaningful with the trio above set; set alone it refuses to boot. |
 | `SQUELCH_CONTROL_TRUSTED_PROXY_HOPS` | no | How many proxies write `X-Forwarded-For` in front of this listener. `0` (default) meters the TCP peer, which behind a platform edge means one shared rate-limit bucket. Set `1` on Railway. |
 | `SQUELCH_CONTROL_LOG` | no | `tracing` filter. Default `info`. |
 
@@ -242,7 +252,12 @@ is `deploy/hosted/PRODUCTION.md`.
 ## Notes on the surface
 
 - No JavaScript, no external assets, `default-src 'none'` CSP, `no-store`, and
-  `X-Frame-Options: DENY` on every page.
+  `X-Frame-Options: DENY` on every page. The Passband masthead in the top left
+  is subject to that rather than an exception to it: the mark is an inline
+  `<svg>` (markup, not a fetch, so `img-src` stays `'none'`) and the wordmark's
+  serif is whatever the reader's platform has, because there is no webfont here
+  either. It is not a link; the one honest destination would be the marketing
+  site, and that is a door out of a signup, not a masthead.
 - Per-route rate limits: the form is metered like a page, `POST /signup` is
   tight (it is the one route where a stranger can guess at a secret), and
   `/oauth/callback` is the most generous, because refusing it destroys a consent

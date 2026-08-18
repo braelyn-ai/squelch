@@ -151,12 +151,12 @@ const RANDOM_BYTES: usize = 32;
 /// used", "expired", "held by another signup", "revoked", and "not even shaped
 /// like a code", because anything that tells those apart is an oracle for the
 /// code space.
-const INVITE_REFUSED: &str = "That invite code is not usable. Check it and try again.";
+const INVITE_REFUSED: &str = "That invite code is not usable.";
 
 /// What a claimed label says, whichever authority reported it. Both this
 /// control plane's record and the warden's answer produce it, so a person
 /// cannot tell which of the two knows about an address.
-const LABEL_TAKEN: &str = "That address is already taken. Pick another one.";
+const LABEL_TAKEN: &str = "That address is already taken.";
 
 /// What every failure of a pending session says on the callback. Expired,
 /// missing, tampered, and state-mismatched are one answer for the same reason.
@@ -240,7 +240,35 @@ pub async fn signup_form(State(state): State<ControlState>, RawQuery(query): Raw
         .map(|code| code.chars().take(MAX_FIELD).collect::<String>())
         .filter(|code| invites::is_plausible(code))
         .unwrap_or_default();
-    pages::signup_form(&state.config().base_domain, "", &invite, None)
+    pages::signup_form(
+        &state.config().base_domain,
+        waitlist_url(&state).as_deref(),
+        "",
+        &invite,
+        None,
+    )
+}
+
+/// Where the form sends somebody who has no invite code, or `None` on a
+/// deployment that has no waitlist to send them to.
+///
+/// STILL UNCONDITIONAL NOW THAT THE EMAILED LINK PREFILLS THE FIELD. Rendering
+/// it only when `?invite=` was absent would look like a tidy improvement and
+/// would put back the oracle it was written to avoid: whether the link is on
+/// the page would start answering something about the code in the URL. It is on
+/// every signup page, prefilled or not, refused or not.
+///
+/// Read from `config.waitlist` rather than [`ControlState::waitlist`]: that
+/// accessor also requires the Resend client, because the paths that MAIL an
+/// invite need both. This is a link on a page, and a deployment whose sender is
+/// misconfigured should still show the way to the list rather than quietly drop
+/// the only route a person without a code has.
+fn waitlist_url(state: &ControlState) -> Option<String> {
+    state
+        .config()
+        .waitlist
+        .as_ref()
+        .map(crate::config::WaitlistConfig::join_url)
 }
 
 /// `POST /signup` — validate, open a session, and send the user to Google.
@@ -250,9 +278,18 @@ pub async fn signup(State(state): State<ControlState>, body: Bytes) -> Response 
     let raw_invite = field(&body, "invite");
 
     // The form is re-rendered on every refusal with both fields echoed, so a
-    // person fixes one thing rather than retyping everything.
+    // person fixes one thing rather than retyping everything. The waitlist link
+    // rides along with it, because "that code is not usable" is exactly the
+    // moment somebody discovers they do not have a working one.
+    let waitlist = waitlist_url(&state);
     let reject = |error: &str, label: &str| {
-        pages::signup_form(&config.base_domain, label, &raw_invite, Some(error))
+        pages::signup_form(
+            &config.base_domain,
+            waitlist.as_deref(),
+            label,
+            &raw_invite,
+            Some(error),
+        )
     };
 
     let label = match labels::parse(&raw_label) {

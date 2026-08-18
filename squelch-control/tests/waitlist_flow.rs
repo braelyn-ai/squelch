@@ -1026,3 +1026,51 @@ async fn a_throttled_answer_is_still_readable_from_the_site() {
     );
     assert_eq!(header_of(&headers, header::VARY), "origin");
 }
+
+/// THE LOOP THE SIGNUP FORM USED TO LEAVE OPEN. The form demands an invite
+/// code and had no way to get one; a person without a code could only guess at
+/// the field or close the tab. The page now links to the waitlist, built from
+/// the same origin the CORS answer names, so the link and the form it leads to
+/// cannot drift apart at deploy time.
+#[tokio::test]
+async fn the_signup_page_sends_someone_with_no_code_to_the_waitlist() {
+    let h = Harness::new().await;
+    let (status, _, body) = h.get("/", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        body.contains(&format!(r#"href="{ORIGIN}/waitlist""#)),
+        "{body}"
+    );
+    assert!(body.contains("No invite code?"), "{body}");
+}
+
+/// The same link on a refusal, and that is the point of it being unconditional:
+/// its presence is not an answer about the code that was just typed. A refused
+/// signup is exactly when somebody discovers they do not have a working code,
+/// and this is the one page that can tell them where to get one.
+#[tokio::test]
+async fn a_refused_invite_still_shows_the_way_to_the_waitlist() {
+    let h = Harness::new().await;
+    let (status, _, body) = h
+        .post_form("/signup", "invite=ZZZZ-ZZZZ&label=ada".to_string(), None)
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("not usable"), "{body}");
+    assert!(
+        body.contains(&format!(r#"href="{ORIGIN}/waitlist""#)),
+        "{body}"
+    );
+}
+
+/// With the feature off there is no waitlist to join, so the form links
+/// nowhere rather than to a page that answers 404. Same reason the admin door
+/// is not mounted on that deployment: a link to a thing that does not exist is
+/// worse than no link.
+#[tokio::test]
+async fn an_unconfigured_deployment_links_to_no_waitlist_at_all() {
+    let h = Harness::without_waitlist().await;
+    let (status, _, body) = h.get("/", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(!body.contains("waitlist"), "{body}");
+    assert!(!body.contains("No invite code"), "{body}");
+}
