@@ -180,6 +180,22 @@ const MARK: &str = concat!(
 /// link-free also keeps it free of configuration, which is what lets the shell
 /// carry it rather than every call site having to pass an origin down.
 fn page(status: StatusCode, title: &str, body: &str) -> Response {
+    render(status, title, body, "")
+}
+
+/// The same shell on the OPERATOR'S surface: the landing page's dark ground in
+/// both palettes, its mark, its type, and none of its selling. See the
+/// `body.console` block in the stylesheet for what that means and why the
+/// colours are restated there rather than inherited from the dark media query.
+///
+/// The three pages behind the admin token, and nothing else. A signup page is
+/// read once by somebody deciding whether to hand over their mail; this is read
+/// every day by one person who already decided.
+fn console(status: StatusCode, title: &str, body: &str) -> Response {
+    render(status, title, body, r#" class="console""#)
+}
+
+fn render(status: StatusCode, title: &str, body: &str, body_class: &str) -> Response {
     let title = escape_html(title);
     let html = format!(
         r#"<!doctype html>
@@ -296,15 +312,82 @@ a.button {{ display: inline-block; margin: 0.25rem 0 1.25rem; padding: 0.65rem 1
   .card {{ background: rgba(255, 255, 255, 0.055); border-color: rgba(255, 255, 255, 0.11); }}
   .alt, details {{ border-color: rgba(255, 255, 255, 0.11); }}
 }}
+/* THE OPERATOR'S SURFACE.
+   The landing page's ground, its mark and its type, and none of its selling: no
+   hero, no accent hardware, no motion. This is a page somebody reads in columns
+   and presses in a hurry, so it takes the dark field from that page and leaves
+   behind everything built to persuade.
+   ALWAYS DARK, in both palettes, exactly as the landing page is: nobody has a
+   light-mode Passband to match it to. That is why every colour the dark media
+   query above sets is RESTATED here instead of being inherited from it, which
+   would leave this page reading as warm paper for anybody whose OS is light. */
+body.console {{ background: #0f0f10; color: #f5f5f7; }}
+/* Wider ONLY when there is a board to lay out, the same way the base sheet
+   above widens for a table. The login door is one field, and a credential
+   stretched across fifty-four rems reads as a page that lost its layout. */
+body.console main:has(table) {{ max-width: 54rem; }}
+body.console .muted, body.console .hint, body.console th {{ color: #8a8a90; }}
+body.console code, body.console .code {{ background: rgba(255, 255, 255, 0.07); }}
+body.console :is(input[type=text], input[type=password], input[type=email]) {{
+  background: rgba(255, 255, 255, 0.04); border-color: rgba(255, 255, 255, 0.14); }}
+body.console button {{ background: #f5f5f7; color: #0f0f10; }}
+body.console button.quiet {{ background: none; color: #f5f5f7;
+  border-color: rgba(255, 255, 255, 0.2); }}
+body.console button.quiet:hover {{ border-color: rgba(255, 255, 255, 0.45); }}
+body.console :is(th, td) {{ border-bottom-color: rgba(255, 255, 255, 0.09); }}
+body.console .stop {{ border-left-color: #f2b8b5; }}
+/* The board says its own size, so the operator does not count rows to learn it. */
+body.console h1 {{ margin-bottom: 0; }}
+body.console .tally {{ color: #8a8a90; font-size: 0.9rem; margin: 0.3rem 0 2.5rem; }}
+/* Section headings as CONSOLE LABELS rather than document headings. This page
+   is three lists, not three chapters, and a heading that competes with the
+   addresses under it is a heading in the way. */
+body.console h2 {{ font-size: 0.72rem; font-weight: 600; text-transform: uppercase;
+  letter-spacing: 0.12em; color: #8a8a90; margin: 2.75rem 0 0.6rem; }}
+body.console h2 + .hint {{ margin: -0.2rem 0 1rem; }}
+/* THE COLUMNS ARE THE WHOLE POINT. The address is what gets read, so it takes
+   the width and the ink. The date and the button are looked at only after a row
+   has been picked, so they shrink to their contents and stay out of the scan:
+   `width: 1%` with nowrap is how a table is told to give a column exactly what
+   it needs and not one pixel more. It is also what stops a date breaking across
+   two lines in the middle of `2026-08-14`, which is what the narrow reading
+   column used to do to every row on the board. */
+body.console :is(td, th) {{ padding: 0.6rem 1.1rem 0.6rem 0; }}
+body.console td.who {{ color: #f5f5f7; }}
+body.console td.when {{ width: 1%; white-space: nowrap; color: #8a8a90;
+  font-size: 0.85rem; font-variant-numeric: tabular-nums; }}
+body.console :is(td.act, th:last-child) {{ width: 1%; white-space: nowrap;
+  text-align: right; padding-right: 0; }}
+/* THE ONE ROW THAT IS WRONG: approved, and nobody was told. Every other button
+   in a row is bordered rather than filled, so this is the only filled one among
+   them and the eye lands on it. (The direct-invite form at the foot of the page
+   is filled too, and should be: it is a form's submit, not one of forty
+   identical row actions, and it competes with nothing above it.) */
+body.console .flag {{ display: inline-block; margin-right: 0.6rem;
+  padding: 0.12rem 0.55rem; border-radius: 999px; color: #f2b8b5;
+  border: 1px solid rgba(242, 184, 181, 0.35);
+  font-size: 0.72rem; font-weight: 600; letter-spacing: 0.06em;
+  text-transform: uppercase; }}
+/* The direct invite: field and button on one row, at the foot of the board.
+   It used to sit BETWEEN the two lists, which split the one thing this page is
+   for (reading down a list of people) into two halves either side of a form. */
+body.console .invite {{ display: flex; gap: 0.5rem; max-width: 34rem; }}
+body.console .invite input {{ margin: 0; }}
+body.console .invite button {{ flex: none; }}
+/* A label the screen reader gets and the layout does not. The heading above the
+   row and the placeholder in it are enough on screen; neither is a label. */
+body.console .sr {{ position: absolute; width: 1px; height: 1px; overflow: hidden;
+  clip-path: inset(50%); white-space: nowrap; }}
 </style>
 </head>
-<body><main><header class="brand">{mark}<span class="wordmark">Passband</span></header>
+<body{body_class}><main><header class="brand">{mark}<span class="wordmark">Passband</span></header>
 {body}</main></body>
 </html>
 "#,
         title = title,
         mark = MARK,
         body = body,
+        body_class = body_class,
     );
     (
         status,
@@ -584,7 +667,7 @@ pub fn admin_login(error: Option<&str>) -> Response {
     } else {
         StatusCode::OK
     };
-    page(
+    console(
         status,
         "Passband admin",
         &format!(
@@ -613,7 +696,7 @@ pub fn admin_login(error: Option<&str>) -> Response {
 /// `report` arrives already filtered by [`crate::admin`] and is escaped here
 /// too: the rule is that nothing is interpolated raw.
 pub fn admin_cross_origin(expected: &str, report: &str) -> Response {
-    page(
+    console(
         StatusCode::FORBIDDEN,
         "Passband admin",
         &format!(
@@ -650,11 +733,16 @@ pub fn admin_page(
         .iter()
         .map(|r| {
             format!(
-                r#"<tr><td>{email}</td><td class="muted">{joined}</td><td>{action}</td></tr>
+                r#"<tr><td class="who">{email}</td><td class="when">{joined}</td><td class="act">{action}</td></tr>
 "#,
                 email = escape_html(&r.email),
                 joined = day(r.created_at),
-                action = action_form("/admin/approve", r.id, "Approve and email invite", false),
+                // "Approve", not "Approve and email invite". The long label was
+                // the only disclosure that pressing it sends mail, and it paid
+                // for that by repeating three words down every row of the board
+                // in the loudest thing on the page. The sentence above the table
+                // says it once, and the button is a word.
+                action = action_form("/admin/approve", r.id, "Approve", true),
             )
         })
         .collect();
@@ -670,11 +758,14 @@ pub fn admin_page(
                 Some(at) => format!(
                     r#"<span class="muted">Invited {}</span> {}"#,
                     day(at),
-                    action_form("/admin/send", r.id, "Send fresh invite", true),
+                    action_form("/admin/send", r.id, "Re-send", true),
                 ),
+                // A PILL, not the `.stop` rule. `.stop` is a left border meant
+                // for a whole paragraph, and inline beside a button it drew a
+                // stray red tick that ran into the label next to it.
                 None => format!(
-                    r#"<span class="stop">email not sent</span> {}"#,
-                    action_form("/admin/send", r.id, "Send new invite", false),
+                    r#"<span class="flag">email not sent</span>{}"#,
+                    action_form("/admin/send", r.id, "Send invite", false),
                 ),
             };
             let approved_on = r
@@ -682,7 +773,7 @@ pub fn admin_page(
                 .map(|at| format!("<br>approved {}", day(at)))
                 .unwrap_or_default();
             format!(
-                r#"<tr><td>{email}</td><td class="muted">joined {joined}{approved_on}</td><td>{outcome}</td></tr>
+                r#"<tr><td class="who">{email}</td><td class="when">joined {joined}{approved_on}</td><td class="act">{outcome}</td></tr>
 "#,
                 email = escape_html(&r.email),
                 joined = day(r.created_at),
@@ -690,30 +781,32 @@ pub fn admin_page(
         })
         .collect();
 
-    page(
+    console(
         StatusCode::OK,
         "Waitlist",
         &format!(
             r#"<h1>Waitlist</h1>
+<p class="tally">{waiting_count} waiting, {approved_count} approved recently</p>
 {error_html}
-<h2>Waiting ({waiting_count})</h2>
+<h2>Waiting</h2>
+<p class="hint">Approving mints one invite code and emails it. The code works
+once and expires in {ttl} days.</p>
 {waiting_table}
+<h2>Approved recently</h2>
+{history_table}
 <h2>Invite someone directly</h2>
-<form method="post" action="/admin/invite">
-<label for="email">Email address</label>
+<form class="invite" method="post" action="/admin/invite">
+<label class="sr" for="email">Email address</label>
 <input type="email" id="email" name="email" placeholder="them@example.com"
   autocomplete="off" autocapitalize="off" spellcheck="false" required>
 <button type="submit">Mint and email an invite</button>
 </form>
-<p class="muted">They do not have to be on the list. The address lands under
-Approved below, with the same re-send button as everybody else.</p>
-<h2>Approved recently</h2>
-{history_table}
-<p class="muted">Approving mints one invite code and emails it. The code works
-once and expires in {ttl} days. Nothing can read it back out of here, so a code
-that was lost is replaced rather than resent.</p>"#,
+<p class="hint">They do not have to be on the list. The address lands under
+Approved above, with the same re-send button as everybody else. Nothing here can
+read a code back out, so a lost invite is replaced rather than resent.</p>"#,
             error_html = stop_note(error),
             waiting_count = pending.len(),
+            approved_count = approved.len(),
             waiting_table = table(
                 r#"<th>Email</th><th>Joined</th><th></th>"#,
                 &waiting,
@@ -1041,8 +1134,10 @@ mod tests {
         assert!(page.contains(r#"name="email""#), "{page}");
         assert!(page.contains("Mint and email an invite"), "{page}");
         assert!(page.contains("input[type=email]"), "{page}");
-        // Both palettes, or it is an unstyled box in one of them.
-        assert_eq!(page.matches("input[type=email]").count(), 2, "{page}");
+        // Both palettes, or it is an unstyled box in one of them, plus the
+        // console surface, which restates every colour rather than inheriting
+        // the dark media query (see the `body.console` block).
+        assert_eq!(page.matches("input[type=email]").count(), 3, "{page}");
         assert!(!page.contains("<script"), "{page}");
     }
 
@@ -1052,18 +1147,24 @@ mod tests {
     async fn an_unsent_invite_says_so_and_offers_the_button() {
         let sent = body_of(admin_page(&[], &[row(1, "ada@example.com", true)], None)).await;
         assert!(sent.contains("Invited 2026-01-01"), "{sent}");
-        assert!(sent.contains("Send fresh invite"), "{sent}");
+        assert!(sent.contains("Re-send"), "{sent}");
+        // Quiet: this row is fine, and the button is only there for somebody
+        // who lost the mail.
+        assert!(sent.contains(r#"<button type="submit" class="quiet">"#), "{sent}");
         assert!(!sent.contains("email not sent"), "{sent}");
 
         let failed = body_of(admin_page(&[], &[row(1, "ada@example.com", false)], None)).await;
         assert!(
-            failed.contains(r#"<span class="stop">email not sent</span>"#),
+            failed.contains(r#"<span class="flag">email not sent</span>"#),
             "{failed}"
         );
-        assert!(failed.contains("Send new invite"), "{failed}");
+        assert!(failed.contains("Send invite"), "{failed}");
+        // Loud, and the only row action on the board that is: this one is asking
+        // to be pressed.
+        assert!(!failed.contains(r#"class="quiet""#), "{failed}");
 
         let waiting = body_of(admin_page(&[row(1, "ada@example.com", false)], &[], None)).await;
-        assert!(waiting.contains("Approve and email invite"), "{waiting}");
+        assert!(waiting.contains(">Approve</button>"), "{waiting}");
         assert!(waiting.contains(r#"name="id" value="1""#), "{waiting}");
         assert!(waiting.contains(r#"action="/admin/approve""#), "{waiting}");
         // No JavaScript on this page either: a button that acts is a form.
