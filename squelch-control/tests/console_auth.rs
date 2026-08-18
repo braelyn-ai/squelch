@@ -967,7 +967,11 @@ async fn no_console_refusal_offers_the_signup_form() {
         );
         assert!(!body.contains("Start again"), "{name}: {body}");
         assert!(!body.contains("invite"), "{name}: {body}");
-        assert!(!body.contains("signup"), "{name}: {body}");
+        // The ROUTE, not the word. Every page on this server renders through the
+        // one shell in `pages::page`, stylesheet and all, so a bare "signup"
+        // match is really a match on whatever that stylesheet's comments happen
+        // to say today. What must never appear here is a way to reach the form.
+        assert!(!body.contains("/signup"), "{name} routes to signup: {body}");
     }
 
     // The two that know which console this was link back to it, which is the
