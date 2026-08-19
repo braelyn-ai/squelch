@@ -2273,6 +2273,41 @@ mod tests {
     }
 
     #[test]
+    fn cjk_charsets_survive_ingest() {
+        // QQ mail (and most Chinese/Japanese senders) encode headers as GBK/
+        // GB2312 encoded-words and bodies as raw GBK. The decoders for those
+        // charsets live behind mail-parser's `full_encoding` feature — WITHOUT
+        // it every such header and body ingests as U+FFFD per character, which
+        // the client renders as "??". This test is the tripwire for that
+        // feature being dropped from the workspace dependency.
+        //
+        // The base64 runs are GBK bytes: xOO6ww== is 你好, xOO6w8rAvec= is
+        // 你好世界.
+        let eml = "From: =?gb2312?B?xOO6ww==?= <821715717@qq.com>\r\n\
+                   To: me@example.com\r\n\
+                   Subject: =?gb2312?B?xOO6w8rAvec=?=\r\n\
+                   Date: Thu, 17 Jul 2026 06:31:00 +0000\r\n\
+                   MIME-Version: 1.0\r\n\
+                   Content-Type: text/plain; charset=gb2312\r\n\
+                   Content-Transfer-Encoding: base64\r\n\
+                   \r\n\
+                   xOO6w8rAvec=\r\n";
+        let f = raw(1, "g-gbk", eml, false);
+        let t = ingest(&f, &Stage1Config::default(), Utc::now(), |_| false);
+        assert_eq!(t.message.from_name.as_deref(), Some("你好"));
+        assert_eq!(t.message.subject, "你好世界");
+        assert!(
+            t.message.body.contains("你好世界"),
+            "gb2312 body must decode, got: {:?}",
+            t.message.body
+        );
+        assert!(
+            !t.message.from_name.as_deref().unwrap_or("").contains('\u{fffd}'),
+            "a replacement character means the charset decoder is gone"
+        );
+    }
+
+    #[test]
     fn attachments_extracted_with_caps_and_cid_inline() {
         // A real multipart/mixed with: a text body (NOT an attachment), a pdf, a
         // png, a cid-inline png (no filename), and an oversized octet-stream part
