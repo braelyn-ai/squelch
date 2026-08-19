@@ -300,6 +300,74 @@ when you want to choose the ORDER — reconcile the least important label, watch
 the pod come back, run `drift` on it again — and fleet `drift` tells you how
 long the list is without touching anything.
 
+**A reconcile can be stopped by its own caller, and that is the usual way one
+dies partway.** The warden's reconcile runs inside the request handler, so the
+work is tied to the connection: when the client gives up, reqwest drops the
+connection, axum drops the handler future, and the warden stops mid-operation
+with no terminal log line, because the code that would write one never runs.
+Which window it stops in is a coin flip on how fast the old pod releases its
+`ReadWriteOnce` volume. Land after the apply and kube brings the pod up on its
+own and nobody notices; land before it and the mailbox is down until somebody
+finishes the job. On 2026-08-19 two tenants were reconciled minutes apart, both
+printed the same error, and only one of them was still serving afterwards.
+
+Two consequences to hold on to:
+
+1. **The warden's log is the record of what happened, not the CLI's answer.**
+   The line that settles it is
+
+   ```sh
+   kubectl -n warden logs deploy/squelch-warden | grep -E 'tenant=<label>($| )'
+   ```
+
+   and `kubectl -n tenants get deploy <label>` says which side of the apply it
+   stopped on. A `NotFound` there is a mailbox that is down right now.
+
+   **Both obvious spellings of that grep are wrong, and one of them cost us the
+   incident.** The warden logs through `tracing_subscriber::fmt()`'s default
+   format, which writes the message first and the fields after it, so
+   `tenant=<label>` is usually the LAST token on the line and a
+   `grep "tenant=<label> "` matches nothing. That is not theoretical: the line
+   that reported the mailbox down on 2026-08-19 was
+
+   ```
+   WARN squelch_warden::provision: a tenant with no workload and no cancellation
+   on record; a job that did not finish left it down tenant=ellie
+   ```
+
+   and a trailing-space match would have skipped straight past it. Dropping the
+   space instead over-matches, because labels share prefixes: `tenant=ellie`
+   also finds `ellie-atuin`, and prefix matching already sent somebody to the
+   wrong tenant once during that incident. End of line or a following space are
+   the two ways a label actually ends, so match both and neither more. The same
+   regex is baked into the CLI's own timeout message.
+2. **The two failures say different things and are not interchangeable.**
+   `did not answer in time and may still be working` means the call landed and
+   the warden may be working on it this second — do not retry blind, go read the
+   log. `could not be reached` means the call never landed and nothing was
+   started. Until 2026-08-19 both printed the second message, which is why that
+   incident was read as "nothing happened" and left alone for eight minutes.
+
+`reconcile` gets its own ten-minute client budget for this reason
+(`RECONCILE_TIMEOUT` in `squelch-control/src/config.rs`); everything else,
+`drift` included, keeps 30 seconds. Ten minutes covers `2 * ready_timeout` plus
+the applies for any `SQUELCH_WARDEN_READY_TIMEOUT_SECS` up to about 300, and
+nothing checks that pairing for you — `control` cannot see the warden's
+configuration. **Raise that constant if you ever raise the ready timeout above
+300.** To run one on your own budget instead of the CLI's:
+
+```sh
+TOKEN=$(kubectl -n warden get secret squelch-warden -o jsonpath='{.data.token}' | base64 -d)
+WARDEN_URL=https://warden.passband.app
+curl -sS -X POST -m 600 -H "Authorization: Bearer $TOKEN" \
+  "$WARDEN_URL/v1/tenants/<label>/reconcile"
+```
+
+Detaching the work from the connection — a `202` and a status route to poll, or a
+handler that is not dropped when the caller goes away — is the real fix and is
+tracked as issue #91. Until it lands, every reconcile is a call somebody has to
+stay on the line for.
+
 **A reconcile that died in its own delete/apply window** leaves the tenant
 reading `stopped`, because for that moment it has no Deployment. Wait for the
 old pod to finish terminating and run the same `reconcile` again: it resumes
@@ -646,6 +714,12 @@ Deployment is missing. The roller will not finish somebody else's half-done
 repair unattended, so it names the tenant and leaves it. `squelch-control
 reconcile <label>` is the finish.
 
+This is the shape a reconcile the CLI hung up on leaves behind, and the roller
+naming it is often the first anyone hears of it — the operator who ran the
+command was told the provisioning service could not be reached and had no reason
+to look. See "Shipping a tenant-shape change" above for why the client's answer
+is not the record and what the two failure messages mean.
+
 A closed account never appears here, and the SERVICE is why: a teardown takes
 it before the Deployment, so a tenant with no workload and no Service is a
 cancellation (marked or, for the ones that predate the marker, inferred) and
@@ -939,6 +1013,16 @@ would happily stream over the real history.
   `reconcile` does when, and only when, a foreign manager is found, and it is
   why that path rolls the pod (and waits for the old one to release the RWO
   volume first) when an ordinary converge would not have.
+- **A reconcile is still tied to the caller's connection** (issue #91). The
+  warden runs the whole delete-wait-apply-wait inside the request handler, so a
+  client that hangs up takes the work with it: axum drops the handler future and
+  the warden stops mid-operation, possibly with a tenant's Deployment already
+  deleted. The ten-minute client budget and the honest timeout message make that
+  much less likely and much more legible, but neither one makes the warden
+  finish. The fix is a `202` with a status route to poll, or a handler the
+  runtime does not drop when the connection goes; it changes the wire shape and
+  wants its own design pass. Until then, nothing about the warden's job should
+  depend on whether an operator's terminal is still listening, and it does.
 - **`/mcp` bearer auth** — the hosted MVP routes around it (tenant Ingresses
   publish `/client`, `/console` and `/t` only). Real auth is required before the
   agent door is ever served from the internet, and until then the console's MCP
