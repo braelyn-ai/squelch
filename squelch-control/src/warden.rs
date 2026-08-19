@@ -103,10 +103,32 @@ pub enum WardenError {
     /// The label is interpolated because the check is useless without it, and
     /// it is safe to interpolate because every route validates it against
     /// [`crate::labels`] before the socket is opened.
+    ///
+    /// THE `($| )` ALTERNATION IS LOAD-BEARING; DO NOT "SIMPLIFY" IT to a
+    /// trailing space. The warden logs through `tracing_subscriber::fmt()`'s
+    /// default format, which writes the message first and the fields after it,
+    /// so `tenant=<label>` is very often the LAST token on the line. The line
+    /// that reported the 2026-08-19 outage was exactly that shape:
+    ///
+    /// ```text
+    /// WARN squelch_warden::provision: a tenant with no workload and no
+    /// cancellation on record; a job that did not finish left it down tenant=ellie
+    /// ```
+    ///
+    /// A `"tenant=ellie "` match drops every one of those. Matching the bare
+    /// label instead drops nothing and catches too much: labels share prefixes
+    /// (`ellie` is inside `ellie-atuin`), and during that same incident a
+    /// prefix match on another tool sent the operator to the wrong tenant. End
+    /// of line or a following space is the pair of cases that are actually the
+    /// end of the label.
+    ///
+    /// The command is the LAST thing in the message, unquoted, with the regex
+    /// in single quotes: somebody reads this mid-incident and selects to end of
+    /// line, and nothing they paste should need thinking about.
     #[error(
-        "the provisioning service did not answer in time and may still be working: check \
-         `kubectl -n warden logs deploy/squelch-warden | grep \"tenant={label} \"` before \
-         assuming nothing happened"
+        "the provisioning service did not answer in time and may still be working; read the \
+         warden's log before retrying or assuming nothing happened: \
+         kubectl -n warden logs deploy/squelch-warden | grep -E 'tenant={label}($| )'"
     )]
     TimedOut { label: String },
     /// 401/403. A deployment misconfiguration, and one worth shouting about:
@@ -1494,7 +1516,15 @@ mod tests {
             said.contains("kubectl -n warden logs deploy/squelch-warden"),
             "{said}"
         );
-        assert!(said.contains("tenant=ellie "), "{said}");
+        // The alternation, not a trailing space. `tenant=` is usually the last
+        // token on a warden log line, so `"tenant=ellie "` silently drops the
+        // lines that matter most - including the one that reported the
+        // 2026-08-19 outage. A bare `tenant=ellie` would match `ellie-atuin`.
+        assert!(said.contains("grep -E 'tenant=ellie($| )'"), "{said}");
+        assert!(!said.contains("tenant=ellie "), "{said}");
+        // The command runs to the end of the line, so it can be selected and
+        // pasted without picking up prose or a stray quote.
+        assert!(said.ends_with("grep -E 'tenant=ellie($| )'"), "{said}");
         // The sentence this variant exists to stop saying.
         assert!(!said.contains("could not be reached"), "{said}");
     }

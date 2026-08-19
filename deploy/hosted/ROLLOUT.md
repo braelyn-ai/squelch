@@ -255,9 +255,13 @@ Two different failures, two different messages, and they mean opposite things:
   first, then look at the object:
 
   ```sh
-  kubectl -n warden logs deploy/squelch-warden | grep "tenant=<label> "
+  kubectl -n warden logs deploy/squelch-warden | grep -E 'tenant=<label>($| )'
   kubectl -n tenants get deploy <label>     # NotFound means it stopped mid-recreate
   ```
+
+  The `($| )` is not decoration and a trailing space will not do instead. See
+  PRODUCTION.md, "Shipping a tenant-shape change", for the two ways the obvious
+  greps are wrong.
 
   Once the old pod is gone, running the same `reconcile` again resumes rather
   than refusing (see PRODUCTION.md, "A reconcile that died in its own

@@ -315,9 +315,32 @@ Two consequences to hold on to:
 
 1. **The warden's log is the record of what happened, not the CLI's answer.**
    The line that settles it is
-   `kubectl -n warden logs deploy/squelch-warden | grep "tenant=<label> "`, and
-   `kubectl -n tenants get deploy <label>` says which side of the apply it
+
+   ```sh
+   kubectl -n warden logs deploy/squelch-warden | grep -E 'tenant=<label>($| )'
+   ```
+
+   and `kubectl -n tenants get deploy <label>` says which side of the apply it
    stopped on. A `NotFound` there is a mailbox that is down right now.
+
+   **Both obvious spellings of that grep are wrong, and one of them cost us the
+   incident.** The warden logs through `tracing_subscriber::fmt()`'s default
+   format, which writes the message first and the fields after it, so
+   `tenant=<label>` is usually the LAST token on the line and a
+   `grep "tenant=<label> "` matches nothing. That is not theoretical: the line
+   that reported the mailbox down on 2026-08-19 was
+
+   ```
+   WARN squelch_warden::provision: a tenant with no workload and no cancellation
+   on record; a job that did not finish left it down tenant=ellie
+   ```
+
+   and a trailing-space match would have skipped straight past it. Dropping the
+   space instead over-matches, because labels share prefixes: `tenant=ellie`
+   also finds `ellie-atuin`, and prefix matching already sent somebody to the
+   wrong tenant once during that incident. End of line or a following space are
+   the two ways a label actually ends, so match both and neither more. The same
+   regex is baked into the CLI's own timeout message.
 2. **The two failures say different things and are not interchangeable.**
    `did not answer in time and may still be working` means the call landed and
    the warden may be working on it this second — do not retry blind, go read the
