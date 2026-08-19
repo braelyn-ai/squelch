@@ -22,6 +22,7 @@
 		0D35FE1914DBB68CAB817177 /* TriageTargets.swift in Sources */ = {isa = PBXBuildFile; fileRef = 74A0D0F666787312F4991788 /* TriageTargets.swift */; };
 		0FE1B2AACB4D13002E0F5381 /* GroupEditor.swift in Sources */ = {isa = PBXBuildFile; fileRef = F8FF235DC1DB2B57F7C06220 /* GroupEditor.swift */; };
 		120F38E19705221A8EAA5ECF /* SidePanel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 992EA99CCF93A2EA929D6E3B /* SidePanel.swift */; };
+		13068136E70BA1E4AD4A9709 /* PushRegistration.swift in Sources */ = {isa = PBXBuildFile; fileRef = 083E104C0BABF65C4BB44673 /* PushRegistration.swift */; };
 		1627BFF43F50B50F6F5C606A /* ThreadStyleLedger.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9C92A36DDD1B4FF9A1BD99B0 /* ThreadStyleLedger.swift */; };
 		16B0C0F30C085FB37AB94D2A /* APIError.swift in Sources */ = {isa = PBXBuildFile; fileRef = 37716282CFABFF5910677BBC /* APIError.swift */; };
 		16E483911006F01000C2CEC8 /* ConnectView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4D6D7D083F3A7242DB7EB186 /* ConnectView.swift */; };
@@ -302,6 +303,7 @@
 		06A50E65F84872DFA0504B96 /* DraftSaver.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DraftSaver.swift; sourceTree = "<group>"; };
 		06AB2FB92191FC4913C38FFF /* ThreadMinimap.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ThreadMinimap.swift; sourceTree = "<group>"; };
 		070286D5016F78C93DC49070 /* Opener.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Opener.swift; sourceTree = "<group>"; };
+		083E104C0BABF65C4BB44673 /* PushRegistration.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PushRegistration.swift; sourceTree = "<group>"; };
 		0AFCAEC0D83E0E01D0074CE7 /* WhatsNewCard.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WhatsNewCard.swift; sourceTree = "<group>"; };
 		10544C7DF8CDBA851AF0D9D8 /* Actions.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Actions.swift; sourceTree = "<group>"; };
 		12468DFB107CC662204BCE84 /* MobileRootView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MobileRootView.swift; sourceTree = "<group>"; };
@@ -770,6 +772,7 @@
 			children = (
 				12468DFB107CC662204BCE84 /* MobileRootView.swift */,
 				F714235A8E6F4742ABF772B3 /* PassbandiOSApp.swift */,
+				083E104C0BABF65C4BB44673 /* PushRegistration.swift */,
 			);
 			path = App;
 			sourceTree = "<group>";
@@ -1097,6 +1100,7 @@
 				7379C8366D649A8F25C27826 /* Prefs.swift in Sources */,
 				334CF29FAF59FE56B41E581B /* ProcessMode.swift in Sources */,
 				7362D6064FE828BD80A2AEDA /* ProcessView.swift in Sources */,
+				13068136E70BA1E4AD4A9709 /* PushRegistration.swift in Sources */,
 				822AC7C019AE85919C9B4181 /* QuickLookPanel.swift in Sources */,
 				79BB8595545903AE279A319C /* Quotes.swift in Sources */,
 				A252756AF0D9655F2C1477B7 /* Ranking.swift in Sources */,
@@ -1155,6 +1159,8 @@
 		4C262313ABCF23A19F63DCDE /* Release */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
+				APS_ENVIRONMENT = development;
+				"APS_ENVIRONMENT[config=Release]" = production;
 				ASSETCATALOG_COMPILER_APPICON_NAME = Passband;
 				CODE_SIGN_ENTITLEMENTS = Sources/PassbandiOS/PassbandiOS.entitlements;
 				CODE_SIGN_IDENTITY = "-";
@@ -1275,6 +1281,8 @@
 		BCFB8BCC8F084F480F8E5C00 /* Debug */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
+				APS_ENVIRONMENT = development;
+				"APS_ENVIRONMENT[config=Release]" = production;
 				ASSETCATALOG_COMPILER_APPICON_NAME = Passband;
 				CODE_SIGN_ENTITLEMENTS = Sources/PassbandiOS/PassbandiOS.entitlements;
 				CODE_SIGN_IDENTITY = "-";

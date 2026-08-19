@@ -2,12 +2,7 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-	<!-- DELIBERATELY EMPTY. iOS sandboxes unconditionally and asks no
-	     entitlement for an outbound network client, and the bearer token goes
-	     into this app's own default keychain access group — naming a
-	     `keychain-access-groups` here would demand a provisioning profile that
-	     grants it, which an ad-hoc simulator build does not have, and every
-	     SecItem call would fail with -34018 instead.
-	     Add entries only when a capability actually needs one. -->
+	<key>aps-environment</key>
+	<string>$(APS_ENVIRONMENT)</string>
 </dict>
 </plist>

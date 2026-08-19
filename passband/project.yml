@@ -169,6 +169,8 @@ targets:
         # target above. CFBundleURLTypes (passband://) lives there, not here.
         INFOPLIST_FILE: Sources/PassbandiOS/Info.plist
         CODE_SIGN_ENTITLEMENTS: Sources/PassbandiOS/PassbandiOS.entitlements
+        APS_ENVIRONMENT: development
+        APS_ENVIRONMENT[config=Release]: production
         # The passband-ios-* tag overrides this in CI; it exists so an untagged local
         # build never claims a version ahead of what TestFlight actually has.
         MARKETING_VERSION: "0.0.2"
