@@ -55,7 +55,7 @@ spec:
           # is the renderer, and a roller on an older one renders older tenants.
           # An image is a pod-spec field, so it is the one value the ConfigMap
           # cannot hold for both of them.
-          image: ghcr.io/braelyn-ai/squelch-warden:daemon-0.0.1
+          image: ghcr.io/braelyn-ai/squelch-warden:daemon-0.0.2
           imagePullPolicy: IfNotPresent
           ports:
             - name: http

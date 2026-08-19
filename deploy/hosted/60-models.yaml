@@ -45,7 +45,7 @@ spec:
     - name: seed
       # Any image with a shell and tar. The squelchd image is the one already
       # pulled on this node; substitute your tag.
-      image: ghcr.io/braelyn-ai/squelchd:daemon-0.0.1
+      image: ghcr.io/braelyn-ai/squelchd:daemon-0.0.2
       command: ["/bin/sh", "-c", "sleep 3600"]
       volumeMounts:
         - name: models
