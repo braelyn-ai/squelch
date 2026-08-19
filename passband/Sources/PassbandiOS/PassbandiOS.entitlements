@@ -2,7 +2,20 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
+	<!-- Development against the sandbox APNs host, production once signed for
+	     TestFlight or the store. The value comes from the build setting so the
+	     two configurations cannot drift apart in a hand-edited plist. -->
 	<key>aps-environment</key>
 	<string>$(APS_ENVIRONMENT)</string>
+	<!-- This is the app's OWN default keychain group, named explicitly so the
+	     notification extension can join it: the extension is handed an account
+	     id by a push and reads that account's bearer to fetch what the mail
+	     says. Naming the group the app already writes to is what makes this a
+	     no-op for existing installs — every stored credential stays exactly
+	     where it is, with no migration and nobody signed out. -->
+	<key>keychain-access-groups</key>
+	<array>
+		<string>$(AppIdentifierPrefix)app.passband.client.ios</string>
+	</array>
 </dict>
 </plist>
