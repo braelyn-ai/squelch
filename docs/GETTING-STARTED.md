@@ -327,5 +327,5 @@ no such restriction, which is why the client works without this.
 - Mail database and credentials: the `squelch-data` volume at `/data`.
 - Back up that volume, not the container.
 - Upgrades: `docker compose pull && docker compose up -d`. Pin a version tag
-  (`ghcr.io/braelyn-ai/squelchd:daemon-0.0.1`) instead of `latest` if you would
+  (`ghcr.io/braelyn-ai/squelchd:daemon-0.0.2`) instead of `latest` if you would
   rather upgrades be deliberate — released tags carry the `daemon-` prefix.
