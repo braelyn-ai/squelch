@@ -123,6 +123,7 @@ fallbacks and log a one-line deprecation note to stderr — migrate off them.
 | `SQUELCH_MCP_ALLOWED_HOSTS` | yes behind a proxy | loopback only | Comma-separated extra Host values for the agent door's DNS-rebinding guard, additive to `localhost,127.0.0.1,::1`. Set to your `*.ts.net` name or `/mcp` returns 403. |
 | `SQUELCH_BIND` | no | `127.0.0.1:8848` | `squelchd serve` bind address (both doors). |
 | `SQUELCH_API_HTTP` | no | `127.0.0.1:8849` | Standalone `squelch-api` dev bin bind address. |
+| `SQUELCH_METRICS_BIND` | no | — | Opens a SECOND listener carrying exactly `GET /metrics` (Prometheus text) and `GET /healthz` (`200` once sync is running and embedder init has settled, `503` before). Both are plaintext and unauthenticated by design, so bind it to loopback or a private interface — never a public one. Unset, no such port is opened. |
 | `SQUELCH_MCP_HTTP` | no | — | Standalone `squelch-mcp` bin: set to switch from stdio to HTTP (address or empty for the loopback default). |
 | `SQUELCH_CRED_BACKEND` | no | `keyring` (macOS) / `file` (Linux) | `keyring` or `file`. |
 | `SQUELCH_CREDENTIALS_PATH` | no | `~/.config/squelch/credentials.json` | Used only by the `file` backend. |
@@ -134,6 +135,10 @@ fallbacks and log a one-line deprecation note to stderr — migrate off them.
 
 The DNS-rebinding allow-list is read once when the agent door is constructed, so
 both `squelchd serve` and the standalone `squelch-mcp --http` honor it identically.
+
+`/healthz` answers a different question from "the port accepts": the doors bind
+before startup finishes, deliberately, so that a first-run model download cannot
+make them unreachable. Point a supervisor's probe at it rather than at 8848.
 
 The relay variables are the iOS push path and are entirely optional: the relay
 never sees mail content — only an event id and a collapse id — and with

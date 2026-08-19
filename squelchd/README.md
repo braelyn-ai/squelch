@@ -1,6 +1,6 @@
 # squelchd
 
-The daemon. One process that hosts everything: the Gmail sync loop and a single HTTP server mounting both doors — the agent door (`/mcp`) and the human door (`/client/*`). This crate sits at the top of the workspace: it depends on `squelch-core`, `squelch-mcp`, and `squelch-api`; nothing depends on it.
+The daemon. One process that hosts everything: the Gmail sync loop and a single HTTP server mounting both doors — the agent door (`/mcp`) and the human door (`/client/*`) — plus the owner's console at `/console`, which `/` redirects to. This crate sits at the top of the workspace: it depends on `squelch-core`, `squelch-mcp`, and `squelch-api`; nothing depends on it.
 
 ## Subcommands
 
@@ -34,8 +34,36 @@ Config comes from `~/.config/squelch/config.toml` (override with `--config`) plu
 | `SQUELCH_DB_PATH` | SQLite path | `~/.local/share/squelch/squelch.db` |
 | `SQUELCH_POLL_SECS` | Gmail poll interval | `45` |
 | `SQUELCH_MCP_ALLOWED_HOSTS` | extra Host values when fronted by a proxy | — |
+| `SQUELCH_METRICS_BIND` | second listener serving `GET /metrics` and `GET /healthz` | unset (no port opened) |
+| `SQUELCH_CRED_BACKEND` | `keyring` or `file` | `keyring` on macOS, `file` on Linux |
+| `SQUELCH_CREDENTIALS_PATH` | where the `file` backend writes, mode 0600 | `~/.config/squelch/credentials.json` |
 
 The listener defaults to loopback and never silently widens. To expose it beyond the machine, front it with a reverse proxy (e.g. `tailscale serve --bg 8848`) and set `SQUELCH_MCP_ALLOWED_HOSTS`.
+
+### Metrics and readiness
+
+`SQUELCH_METRICS_BIND` (e.g. `127.0.0.1:9464`) opens a second listener with exactly
+two routes on it. `GET /metrics` is Prometheus text: sync timestamps, Gmail error
+counts, LLM spend, store sizes. `GET /healthz` is one word out of two — `200` once
+the sync engine is running and embedder init has settled, `503` before that and
+again if either stops — because the doors bind before the daemon has finished
+starting, so that a first-run model download cannot make them unreachable, which is
+exactly why "the port accepts" answers a different question than "it is serving".
+
+Both are **plaintext and unauthenticated by design**: a scrape credential sitting in
+a Prometheus config is its own problem, and `/healthz` says nothing about the mailbox
+behind it. Bind it to loopback or a private interface, never a public one. Unset, the
+daemon opens no such port at all.
+
+### The console
+
+`serve` also hosts a small server-rendered console at `/console` for the person who
+owns this daemon: what the mailbox is doing, and which devices may reach it. A
+session there is not a new credential type — signing in claims a `squelchd pair`
+code exactly as an app does, and the `sqd_` token it returns rides as an HttpOnly
+cookie verified by the same check the bearer path runs. The browser shows up in
+`token list` as `console` and `token revoke <id>` ends the session. No JavaScript, no
+external asset, `default-src 'none'`.
 
 ### Carrier polling
 
