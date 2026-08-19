@@ -68,3 +68,11 @@ run_suite email-images \
 run_suite minimap-geometry \
   Sources/Passband/Lib/MinimapGeometry.swift \
   Tests/MinimapGeometryTests.swift
+
+# The banking card's recency window (issue #82): 24h or since-last-open,
+# whichever reaches further back. Platform rides along for the notification
+# names the lifecycle plumbing observes.
+run_suite sitrep-window \
+  Sources/Passband/Lib/Platform.swift \
+  Sources/Passband/Lib/SitrepWindow.swift \
+  Tests/SitrepWindowTests.swift
