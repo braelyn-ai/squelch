@@ -200,7 +200,33 @@ pub async fn page(State(state): State<ControlState>, headers: HeaderMap) -> Resp
     dashboard(&state, None)
 }
 
-/// `POST /admin/login` — present the token, get a twelve-hour session.
+/// `POST /admin/logout` — end this session deliberately.
+///
+/// IT EXISTS BECAUSE THE SESSION GOT LONG. At twelve hours the browser signed
+/// itself out by lunchtime and a button would have been decoration; at thirty
+/// days ([`cookie::ADMIN_COOKIE_TTL_SECS`]) the only way off a machine that is
+/// not yours would have been rotating the admin token in Railway, which signs
+/// out every other browser too. This is the small exit, and the token rotation
+/// stays the big one.
+///
+/// NO ADMIN CHECK, deliberately: it clears the cookie and renders the door
+/// either way. Refusing to sign out a session that is already dead would be a
+/// refusal with nothing behind it, and answering the same way for a live
+/// session and an expired one says nothing about which was presented.
+///
+/// The origin check stays, because a POST that clears an operator's session
+/// from another site's page is a nuisance somebody else can cause.
+pub async fn logout(State(state): State<ControlState>, headers: HeaderMap) -> Response {
+    if state.config().waitlist.is_none() {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    if !same_origin(&state, &headers) {
+        return cross_origin(&state, &headers);
+    }
+    clearing(&state, pages::admin_signed_out())
+}
+
+/// `POST /admin/login` — present the token, open a session.
 pub async fn login(State(state): State<ControlState>, headers: HeaderMap, body: Bytes) -> Response {
     let config = state.config();
     let Some(waitlist) = config.waitlist.as_ref() else {
@@ -573,7 +599,12 @@ fn dashboard(state: &ControlState, error: Option<&str>) -> Response {
 /// What an action with no live session gets: the door, a 401, and the stale
 /// cookie cleared so the browser stops presenting it.
 fn signed_out(state: &ControlState) -> Response {
-    let mut resp = pages::admin_login(Some(SIGNED_OUT));
+    clearing(state, pages::admin_login(Some(SIGNED_OUT)))
+}
+
+/// The same cookie clear on a page that is NOT a refusal. Both doors have to
+/// drop the cookie, and only one of them is bad news.
+fn clearing(state: &ControlState, mut resp: Response) -> Response {
     let cleared = cookie::clear_admin_cookie(!state.config().is_insecure());
     if let Ok(value) = header::HeaderValue::from_str(&cleared) {
         resp.headers_mut().append(header::SET_COOKIE, value);

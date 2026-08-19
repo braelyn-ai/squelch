@@ -382,6 +382,9 @@ body.console .done {{ color: var(--brand); border-color: rgba(124, 200, 235, 0.3
 body.console .invite {{ display: flex; gap: 0.5rem; max-width: 34rem; }}
 body.console .invite input {{ margin: 0; }}
 body.console .invite button {{ flex: none; }}
+/* The way out, at the foot of the board and quiet: it is the rarest press on
+   this page, and the session is long enough now that it needed to exist at all. */
+body.console .signout {{ margin: 2.75rem 0 0.6rem; }}
 /* A label the screen reader gets and the layout does not. The heading above the
    row and the placeholder in it are enough on screen; neither is a label. */
 body.console .sr {{ position: absolute; width: 1px; height: 1px; overflow: hidden;
@@ -675,19 +678,34 @@ pub fn admin_login(error: Option<&str>) -> Response {
     } else {
         StatusCode::OK
     };
+    admin_door(status, &stop_note(error))
+}
+
+/// The door after a DELIBERATE sign out, which is not a refusal and must not be
+/// dressed as one.
+///
+/// A 200 and a quiet note, where [`admin_login`] would answer 401 with a red
+/// banner. The rule that function states still holds and this is the other half
+/// of it: a 200 carrying "not accepted" is a lie to everything that reads status
+/// codes, and so is a 401 for a request that did exactly what was asked.
+pub fn admin_signed_out() -> Response {
+    admin_door(StatusCode::OK, r#"<p class="hint">Signed out.</p>"#)
+}
+
+/// The form both doors show, with whatever note belongs above it.
+fn admin_door(status: StatusCode, note: &str) -> Response {
     console(
         status,
         "Passband admin",
         &format!(
             r#"<h1>Passband admin</h1>
-{error_html}
+{note}
 <form method="post" action="/admin/login">
 <label for="token">Admin token</label>
 <input type="password" id="token" name="token" autocomplete="current-password"
   autocapitalize="off" spellcheck="false" required>
 <button type="submit">Sign in</button>
-</form>"#,
-            error_html = stop_note(error),
+</form>"#
         ),
     )
 }
@@ -837,11 +855,17 @@ once and expires in {ttl} days.</p>
 <p class="hint">They do not have to be on the list. The address lands under
 Approved above and is tracked from there like everybody else. Nothing here can
 read a code back out, so a lost invite is replaced rather than resent, and a
-code that was already spent is not replaced at all.</p>"#,
+code that was already spent is not replaced at all.</p>
+<form class="signout" method="post" action="/admin/logout">
+<button type="submit" class="quiet">Sign out</button>
+</form>
+<p class="hint">This session lasts {session_days} days. Signing out ends it on
+this browser; rotating the admin token ends it everywhere.</p>"#,
             error_html = stop_note(error),
             waiting_count = pending.len(),
             approved_count = approved.len(),
             accepted_count = approved.iter().filter(|r| r.accepted_at.is_some()).count(),
+            session_days = crate::cookie::ADMIN_COOKIE_TTL_SECS / (24 * 60 * 60),
             waiting_table = table(
                 r#"<th>Email</th><th>Joined</th><th></th>"#,
                 &waiting,
@@ -1212,10 +1236,13 @@ mod tests {
     async fn an_unsent_invite_says_so_and_offers_the_button() {
         let sent = body_of(admin_page(&[], &[row(1, "ada@example.com", true)], None)).await;
         assert!(sent.contains("Invited 2026-01-01"), "{sent}");
-        assert!(sent.contains("Re-send"), "{sent}");
         // Quiet: this row is fine, and the button is only there for somebody
-        // who lost the mail.
-        assert!(sent.contains(r#"<button type="submit" class="quiet">"#), "{sent}");
+        // who lost the mail. Matched WITH its label, because the board carries
+        // a quiet sign-out button of its own at the foot.
+        assert!(
+            sent.contains(r#"<button type="submit" class="quiet">Re-send</button>"#),
+            "{sent}"
+        );
         assert!(!sent.contains("email not sent"), "{sent}");
 
         let failed = body_of(admin_page(&[], &[row(1, "ada@example.com", false)], None)).await;
@@ -1223,10 +1250,13 @@ mod tests {
             failed.contains(r#"<span class="flag">email not sent</span>"#),
             "{failed}"
         );
-        assert!(failed.contains("Send invite"), "{failed}");
         // Loud, and the only row action on the board that is: this one is asking
-        // to be pressed.
-        assert!(!failed.contains(r#"class="quiet""#), "{failed}");
+        // to be pressed. No `class="quiet"` on THIS button, which is what the
+        // label in the match is for.
+        assert!(
+            failed.contains(r#"<button type="submit">Send invite</button>"#),
+            "{failed}"
+        );
 
         let waiting = body_of(admin_page(&[row(1, "ada@example.com", false)], &[], None)).await;
         assert!(waiting.contains(">Approve</button>"), "{waiting}");
@@ -1271,6 +1301,41 @@ mod tests {
             waiting_on_them.contains("0 of those signed up"),
             "{waiting_on_them}"
         );
+    }
+
+    /// A DELIBERATE SIGN OUT IS NOT A REFUSAL. The session runs for a month
+    /// now, so ending one on a borrowed machine had to become a press rather
+    /// than a trip to Railway to rotate the token; and the page that press lands
+    /// on answers 200, because the request did exactly what was asked. The
+    /// expired-session door is the 401, and still says so.
+    #[tokio::test]
+    async fn signing_out_is_a_200_and_being_thrown_out_is_a_401() {
+        let out = admin_signed_out();
+        assert_eq!(out.status(), StatusCode::OK);
+        let html = document_of(out).await;
+        assert!(html.contains("Signed out."), "{html}");
+        // The door, not a dead end: the way back in is on it.
+        assert!(html.contains(r#"action="/admin/login""#), "{html}");
+        // Not dressed as a refusal.
+        assert!(!html.contains(r#"class="stop""#), "{html}");
+
+        assert_eq!(
+            admin_login(Some("Your admin session has ended.")).status(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(admin_login(None).status(), StatusCode::OK);
+    }
+
+    /// The exit is ON the board, and it is a form, because a link cannot carry
+    /// the same-origin POST every other admin action on this page is held to.
+    #[tokio::test]
+    async fn the_board_carries_the_way_out() {
+        let html = document_of(admin_page(&[], &[], None)).await;
+        assert!(html.contains(r#"action="/admin/logout""#), "{html}");
+        assert!(html.contains("Sign out"), "{html}");
+        // The page states its own lifetime rather than leaving the operator to
+        // discover it by being signed out.
+        assert!(html.contains("This session lasts 30 days"), "{html}");
     }
 
     /// The door names nothing that is behind it, and a refusal is a 401 rather
