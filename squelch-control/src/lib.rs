@@ -179,6 +179,7 @@ pub fn router(state: ControlState) -> Router {
         .route("/admin/invite", post(admin::invite))
         .route("/admin/approve", post(admin::approve))
         .route("/admin/send", post(admin::send))
+        .route("/admin/logout", post(admin::logout))
         .layer(DefaultBodyLimit::max(handlers::MAX_BODY))
         .layer(middleware::from_fn_with_state(
             state.clone(),
