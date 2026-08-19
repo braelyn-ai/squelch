@@ -59,11 +59,53 @@ pub const MAX_TRUSTED_PROXY_HOPS: usize = 8;
 /// thing that decides whether a signup session is ours.
 pub const MIN_COOKIE_KEY_BYTES: usize = 32;
 
-/// Budget for every outbound call this service makes: the token exchange, the
-/// profile lookup, and each warden request. All are one small round trip, and
-/// an unbounded one would pin a request task for as long as the far end cared
+/// Budget for the outbound calls that are one small round trip: the token
+/// exchange, the profile lookup, and every warden request EXCEPT reconcile.
+/// An unbounded one would pin a request task for as long as the far end cared
 /// to hold it.
+///
+/// Sized for a signup, which is what every call on this budget is part of. The
+/// one operator call that legitimately runs for minutes has its own, below;
+/// see [`RECONCILE_TIMEOUT`] for what happened the day it did not.
 pub const OUTBOUND_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Budget for `POST /v1/tenants/{label}/reconcile` alone, applied per request
+/// on top of [`OUTBOUND_TIMEOUT`]'s client. `drift` is a read and stays on the
+/// short one; this is the only call that writes to a cluster and waits.
+///
+/// WHAT IT HAS TO OUTLAST. A reconcile against a Deployment another field
+/// manager owns fields on cannot converge in place, because server-side apply
+/// never takes a field back. The warden deletes the Deployment, waits for the
+/// old pod to release its ReadWriteOnce volume, applies five objects, and waits
+/// for a ready replica. Both of those waits are bounded by the WARDEN's
+/// `SQUELCH_WARDEN_READY_TIMEOUT_SECS`, 180 seconds each by default, so the
+/// operation's honest ceiling is around six minutes against a 30-second budget
+/// that could never see the end of it.
+///
+/// WHAT BREAKS IF IT IS TOO SHORT, and this is not hypothetical. On 2026-08-19
+/// `squelch-control reconcile ellie` gave up at 30 seconds in the window
+/// between the delete and the apply. reqwest dropped the connection, axum
+/// dropped the handler future, and the warden stopped where it stood with that
+/// tenant's Deployment already gone; the mailbox was down for eight minutes.
+/// Until the warden's work is detached from the caller's connection (issue #91,
+/// fix 3) a client timeout does not merely mis-report a slow reconcile, it
+/// ABORTS one, so this number is the difference between a recreate that
+/// finishes and one that stops halfway.
+///
+/// WHY A FIXED NUMBER rather than one derived from the wait it must outlast:
+/// `ready_timeout` is the warden's own configuration, read from the warden's
+/// environment inside the cluster, and nothing on this wire reports it. This
+/// process cannot see it, so the relationship is an INVARIANT MAINTAINED BY
+/// HAND: ten minutes stays comfortably above `2 * ready_timeout` plus the
+/// applies for any `SQUELCH_WARDEN_READY_TIMEOUT_SECS` up to about 300. The
+/// warden accepts values as high as 900. If one is ever configured above 300,
+/// RAISE THIS WITH IT, or the operator is back to aborting reconciles
+/// mid-recreate with no sign that anything was interrupted.
+///
+/// It is also the `-m 600` on the escape-hatch curl in
+/// `deploy/hosted/ROLLOUT.md`, which exists for exactly this call. The two are
+/// the same number so an operator working around the CLI gets the same budget.
+pub const RECONCILE_TIMEOUT: Duration = Duration::from_secs(600);
 
 /// Minimum Bifrost admin-credential length (the whole `username:password`),
 /// the same bar the warden holds its own bearer to: below this the credential
