@@ -56,6 +56,65 @@ async fn registration_requires_the_bearer() {
     assert!(h.store.list_devices(h.acct).unwrap().is_empty());
 }
 
+/// The routing tag round-trips to the row the pusher reads, and a
+/// re-registration under a different account moves it: what the client last
+/// said is what a push must be stamped with.
+#[tokio::test]
+async fn the_tag_reaches_the_row_the_pusher_reads() {
+    let h = harness(|_, _| {});
+    let tag = "3F2A9C1E-7B44-4D0A-9E21-8C5B6D0F1A32";
+
+    let resp = h
+        .app
+        .clone()
+        .oneshot(post(
+            "/client/devices",
+            json!({ "token": DEV_A, "tag": tag }),
+            true,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let stored = h.store.list_devices(h.acct).unwrap();
+    assert_eq!(stored[0].tag.as_deref(), Some(tag));
+
+    // The tag is NOT echoed back: the response describes the row, and the
+    // client already knows what it sent.
+    let view = body_json(resp).await;
+    assert!(view.get("tag").is_none());
+
+    // Re-registering without one clears it rather than leaving a stale tag
+    // pointing at an account this device may no longer hold.
+    let resp = h
+        .app
+        .clone()
+        .oneshot(post("/client/devices", json!({ "token": DEV_A }), true))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(h.store.list_devices(h.acct).unwrap()[0].tag, None);
+}
+
+/// A tag carrying the pusher's own delimiter is refused at the door, not
+/// stored and split apart later.
+#[tokio::test]
+async fn a_tag_that_could_forge_an_event_id_is_refused() {
+    let h = harness(|_, _| {});
+
+    let resp = h
+        .app
+        .clone()
+        .oneshot(post(
+            "/client/devices",
+            json!({ "token": DEV_A, "tag": "acct:999" }),
+            true,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert!(h.store.list_devices(h.acct).unwrap().is_empty());
+}
+
 /// Register, read back through the store, unregister. The response describes the
 /// row WITHOUT echoing the token.
 #[tokio::test]
@@ -127,7 +186,7 @@ async fn register_then_unregister_round_trips() {
 #[tokio::test]
 async fn the_token_travels_in_the_body_not_the_path() {
     let h = harness(|_, _| {});
-    h.store.upsert_device(h.acct, DEV_A, "ios").unwrap();
+    h.store.upsert_device(h.acct, DEV_A, "ios", None).unwrap();
 
     // The request line of the real call mentions no token at all.
     let req = unregister(DEV_A, true);
@@ -140,7 +199,7 @@ async fn the_token_travels_in_the_body_not_the_path() {
     assert!(h.store.list_devices(h.acct).unwrap().is_empty());
 
     // A token in the path is a 405/404, never a working endpoint.
-    h.store.upsert_device(h.acct, DEV_A, "ios").unwrap();
+    h.store.upsert_device(h.acct, DEV_A, "ios", None).unwrap();
     let req = authed("DELETE", &format!("/client/devices/{DEV_A}"));
     let resp = h.app.oneshot(req).await.unwrap();
     assert!(

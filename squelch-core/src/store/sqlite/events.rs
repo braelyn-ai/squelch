@@ -31,8 +31,9 @@ fn map_device(r: &rusqlite::Row<'_>) -> rusqlite::Result<Device> {
         account_id: r.get(1)?,
         token: r.get(2)?,
         platform: r.get(3)?,
-        created_at: dt(r, 4)?,
-        last_registered_at: dt(r, 5)?,
+        tag: r.get(4)?,
+        created_at: dt(r, 5)?,
+        last_registered_at: dt(r, 6)?,
     })
 }
 
@@ -124,6 +125,7 @@ impl SqliteStore {
         account_id: AccountId,
         token: &str,
         platform: &str,
+        tag: Option<&str>,
     ) -> Result<Device> {
         let conn = self.lock()?;
         let now = Utc::now().to_rfc3339();
@@ -136,13 +138,14 @@ impl SqliteStore {
         // changes 0 rows, and that is reported rather than swallowed — returning
         // the other account's row would be worse than the rebind.
         let changed = conn.execute(
-            "INSERT INTO devices(account_id, token, platform, created_at, last_registered_at)
-             VALUES(?1,?2,?3,?4,?4)
+            "INSERT INTO devices(account_id, token, platform, tag, created_at, last_registered_at)
+             VALUES(?1,?2,?3,?4,?5,?5)
              ON CONFLICT(token) DO UPDATE SET
                  platform=excluded.platform,
+                 tag=excluded.tag,
                  last_registered_at=excluded.last_registered_at
              WHERE devices.account_id = excluded.account_id",
-            params![account_id, token, platform, now],
+            params![account_id, token, platform, tag, now],
         )?;
         if changed == 0 {
             // States the RULE, never the token: this string reaches the human
@@ -152,7 +155,7 @@ impl SqliteStore {
             ));
         }
         let device = conn.query_row(
-            "SELECT id, account_id, token, platform, created_at, last_registered_at
+            "SELECT id, account_id, token, platform, tag, created_at, last_registered_at
              FROM devices WHERE token = ?1",
             params![token],
             map_device,
@@ -163,7 +166,7 @@ impl SqliteStore {
     pub(super) fn list_devices(&self, account_id: AccountId) -> Result<Vec<Device>> {
         let conn = self.lock()?;
         let mut stmt = conn.prepare(
-            "SELECT id, account_id, token, platform, created_at, last_registered_at
+            "SELECT id, account_id, token, platform, tag, created_at, last_registered_at
              FROM devices WHERE account_id = ?1 ORDER BY id ASC",
         )?;
         let out = stmt

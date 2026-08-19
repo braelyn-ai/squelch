@@ -85,6 +85,10 @@ pub(super) fn migrate(conn: &Connection) -> Result<()> {
     // the composer can show, or closing one silently drops recipients.
     add_column_if_missing(conn, "drafts", "cc_addr", "TEXT NOT NULL DEFAULT ''")?;
     add_column_if_missing(conn, "drafts", "bcc_addr", "TEXT NOT NULL DEFAULT ''")?;
+    // The push routing tag. NULL on every pre-existing row and NOT backfilled:
+    // nothing here can know which account a device filed itself under, and the
+    // client re-registers (tag included) on its next foreground.
+    add_column_if_missing(conn, "devices", "tag", "TEXT")?;
     // Per-property triage reasons (JSON object). NULL on pre-existing rows.
     add_column_if_missing(conn, "triage", "field_reasons", "TEXT")?;
 

@@ -275,6 +275,10 @@ pub struct Device {
     pub token: String,
     /// Free-form platform tag; `ios` today.
     pub platform: String,
+    /// Opaque client-minted label naming the account this device registered
+    /// under, stamped onto every push sent here so the receiver can tell which
+    /// mailbox an event id belongs to. `None` for a client that never sent one.
+    pub tag: Option<String>,
     pub created_at: DateTime<Utc>,
     /// Refreshed on every re-registration — iOS re-hands its token each launch,
     /// so this, not `created_at`, is the liveness signal.
@@ -1535,7 +1539,17 @@ pub trait Store: Send + Sync {
     /// A token registered to ANOTHER account is refused with
     /// [`CoreError::InvalidInput`] and nothing is written — re-registration must
     /// never silently repoint a device's pushes at a different account.
-    fn upsert_device(&self, account_id: AccountId, token: &str, platform: &str) -> Result<Device>;
+    ///
+    /// `tag` is overwritten on every re-registration, including back to `None`:
+    /// it describes where this device currently files the account, and a stale
+    /// one would route a push at a mailbox the phone has since forgotten.
+    fn upsert_device(
+        &self,
+        account_id: AccountId,
+        token: &str,
+        platform: &str,
+        tag: Option<&str>,
+    ) -> Result<Device>;
 
     /// Every registered device for the account, oldest first — a stable order, so
     /// a push fan-out and its response array line up reproducibly.
