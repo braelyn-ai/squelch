@@ -1545,6 +1545,17 @@ pub async fn get_stats(State(state): State<ApiState>) -> Result<impl IntoRespons
     // relay (hosted, gateway configured) or 404 (self-host, BYOK in the app).
     // Always present so a client reads an answer, not absence.
     body["assistant_relay"] = json!(state.assistant().is_some());
+    // Capability flag for the app: whether this daemon understands
+    // `forward_of_message_id` on POST /client/actions/send.
+    //
+    // IT MUST BE A FLAG BECAUSE THE FIELD FAILS SILENTLY. `SendBody` takes it
+    // with `#[serde(default)]`, so a daemon predating forwarding IGNORES the key
+    // rather than rejecting it: the request becomes a bare cold send of the
+    // user's note, with the original nowhere in it and nothing in the response
+    // saying so. The client gates the forward composer on this flag, so that
+    // never happens quietly. Always present, so a client reads an answer rather
+    // than absence — an old daemon omits the key, which is the `false` case.
+    body["forwarding"] = json!(true);
     Ok(Json(body))
 }
 
@@ -2449,6 +2460,74 @@ async fn guard_verdict(
     None
 }
 
+/// Everything that happens AFTER a send's bytes are built: the Gmail call, and
+/// the bookkeeping on either side of it.
+///
+/// ONE copy, shared by the reply/new path and the forward path. The two had
+/// already drifted — the reply answered `thread_id.or(sent.thread_id)` and the
+/// forward answered `sent.thread_id`, which are the same answer only for as long
+/// as a forward's `thread_id` stays `None` — and that is the cheap kind of drift
+/// that a second reader has no way to spot as deliberate.
+///
+/// Parameterized by the four things that genuinely differ:
+/// - `thread_id`: `Some` threads a reply onto its parent. A FORWARD PASSES
+///   `None`, which is what makes it a new conversation.
+/// - `resolve`: the parent message a successful reply marks handled. A forward
+///   passes `None` — passing a message on to someone else is not handling it,
+///   and the attention row is the only place the user's own outstanding action
+///   is remembered.
+/// - `outcome`: the audit detail (`ok`, `ok:reply_all:N`, `ok:forward`).
+/// - `tracker` / `draft_id`: this send's minted pixel and the draft it consumes.
+///
+/// THE ORDER IS THE CONTRACT: resolve, discard the draft, audit the outcome,
+/// echo, link the tracker, answer. Everything after the audit line is
+/// bookkeeping that CANNOT fail the request — the mail has already left. The
+/// reply path's bytes, audit rows and response body are what they were before
+/// this extraction; the existing reply tests are the proof.
+#[allow(clippy::too_many_arguments)]
+async fn finish_send(
+    state: &ApiState,
+    client: &GmailWriteClient,
+    raw: &[u8],
+    thread_id: Option<String>,
+    resolve: Option<i64>,
+    outcome: String,
+    tracker: Option<(String, String)>,
+    draft_id: Option<i64>,
+    target: Option<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    match client.send(raw, thread_id.as_deref()).await {
+        Ok(sent) => {
+            if let Some(id) = resolve {
+                resolve_done(state, id).await;
+            }
+            if let Some(draft_id) = draft_id {
+                discard_sent_draft(state, draft_id).await;
+            }
+            audit_action(state, "send", target.clone(), &outcome).await;
+            let echo_message_id = echo_sent(state, client, target, &sent).await;
+            if let (Some((token, _)), Some(message_id)) = (&tracker, echo_message_id) {
+                link_tracker(state, token, message_id).await;
+            }
+            // A send with no thread of its own — a cold send, or a forward —
+            // falls back to the thread Gmail just created, so the client can
+            // open what it just sent.
+            Ok(Json(json!({
+                "status": "sent",
+                "echo_message_id": echo_message_id,
+                "thread_id": thread_id.or(sent.thread_id),
+            })))
+        }
+        Err(e) => {
+            if let Some((token, _)) = &tracker {
+                discard_tracker(state, token, target.clone()).await;
+            }
+            audit_action(state, "send", target, "failed:gmail").await;
+            Err(write_error(&e))
+        }
+    }
+}
+
 pub async fn action_send(
     State(state): State<ApiState>,
     Json(body): Json<SendBody>,
@@ -2649,46 +2728,26 @@ pub async fn action_send(
         }
     };
 
-    match client.send(&raw, thread_id.as_deref()).await {
-        Ok(sent) => {
-            // A cold send has no target row to resolve.
-            if let Some(id) = body.reply_to_message_id {
-                resolve_done(&state, id).await;
-            }
-            if let Some(draft_id) = body.draft_id {
-                discard_sent_draft(&state, draft_id).await;
-            }
-            // A reply-all is the one send that reaches N people; the ledger
-            // says so, with the recipient count, instead of a plain "ok".
-            let outcome = if body.reply_all {
-                format!("ok:reply_all:{}", copied + 1)
-            } else {
-                "ok".to_string()
-            };
-            audit_action(&state, "send", target.clone(), &outcome).await;
-            // The mail is away; everything below is bookkeeping that cannot fail
-            // the request.
-            let echo_message_id = echo_sent(&state, &client, target, &sent).await;
-            if let (Some((token, _)), Some(message_id)) = (&tracker, echo_message_id) {
-                link_tracker(&state, token, message_id).await;
-            }
-            // A cold send falls back to the thread Gmail just created, so the
-            // client can open it.
-            let thread = thread_id.or(sent.thread_id);
-            Ok(Json(json!({
-                "status": "sent",
-                "echo_message_id": echo_message_id,
-                "thread_id": thread,
-            })))
-        }
-        Err(e) => {
-            if let Some((token, _)) = &tracker {
-                discard_tracker(&state, token, target.clone()).await;
-            }
-            audit_action(&state, "send", target, "failed:gmail").await;
-            Err(write_error(&e))
-        }
-    }
+    // A reply-all is the one send that reaches N people; the ledger says so,
+    // with the recipient count, instead of a plain "ok".
+    let outcome = if body.reply_all {
+        format!("ok:reply_all:{}", copied + 1)
+    } else {
+        "ok".to_string()
+    };
+    finish_send(
+        &state,
+        &client,
+        &raw,
+        thread_id,
+        // A cold send has no target row to resolve.
+        body.reply_to_message_id,
+        outcome,
+        tracker,
+        body.draft_id,
+        target,
+    )
+    .await
 }
 
 /// The largest original a forward will carry, in DECODED RFC822 bytes.
@@ -2714,12 +2773,13 @@ fn forward_raw_too_large(len: usize) -> bool {
 /// Shape: read the original's raw bytes with the write token, guard what they
 /// contain, compose, send UNTHREADED. Two invariants earn their own sentences:
 ///
-/// - FORWARDING IS THE CLASSIC EXFIL SHAPE, so the original's own text goes
-///   through the same guard the note does, and `override_guard` is the ceremony's
-///   second act rather than a formality. What is scanned is what is SENT: the
-///   scan runs on the parse of the raw fetch, never on the stored row, because
-///   the stored body is a sanitized, flattened memory of the message and the
-///   bytes on the wire are the original.
+/// - FORWARDING IS THE CLASSIC EXFIL SHAPE, so the original's own text — its
+///   text bodies, an html-to-text view of its html, and the contents of every
+///   `text/*` attachment — goes through the same guard the note does, and
+///   `override_guard` is the ceremony's second act rather than a formality. What
+///   is scanned is what is SENT: the scan runs on the parse of the raw fetch,
+///   never on the stored row, because the stored body is a sanitized, flattened
+///   memory of the message and the bytes on the wire are the original.
 /// - The fetch failing is LOUD (502), like reply-all's audience read: what is
 ///   forwarded IS the request, so there is nothing to degrade to.
 async fn forward_send(
@@ -2789,10 +2849,32 @@ async fn forward_send(
         .as_deref()
         .map(mail_parser::decoders::html::html_to_text)
         .unwrap_or_default();
+    //
+    // AND SO ARE TEXT ATTACHMENTS. A PEM key pasted into `notes.txt` and dragged
+    // onto a mail is the same exfil shape as one pasted into the body — arguably
+    // the more natural one — and scanning only the bodies let it through while
+    // this code called forwarding the classic exfil shape. Every `text/*` part
+    // is scanned as text, and so is every `message/*` part — an attached email
+    // ("see the thread below") is plain RFC822 text carrying whatever its bodies
+    // carried. mail-parser has already transcoded text parts to UTF-8, so the
+    // lossy conversion below only ever fires on genuinely broken bytes.
+    // BINARY PARTS STAY UNSCANNED (a key inside a zip or an `id_rsa` with no
+    // text mime passes): the guard is a seatbelt against the accident, not a DLP
+    // boundary, and it is overridable by design.
     let mut kinds = note_kinds;
+    let attachment_text: Vec<String> = original
+        .attachments
+        .iter()
+        .filter(|a| {
+            let mime = a.mime.to_ascii_lowercase();
+            mime.starts_with("text/") || mime.starts_with("message/")
+        })
+        .map(|a| String::from_utf8_lossy(&a.data).into_owned())
+        .collect();
     for kind in guard::scan_kinds(&original.text)
         .into_iter()
         .chain(guard::scan_kinds(&html_text))
+        .chain(attachment_text.iter().flat_map(|t| guard::scan_kinds(t)))
     {
         if !kinds.contains(&kind) {
             kinds.push(kind);
@@ -2837,37 +2919,21 @@ async fn forward_send(
         }
     };
 
-    // NO threadId: a forward opens a new conversation rather than filing the
-    // user's "look at this" inside the correspondence it came out of.
-    match client.send(&raw, None).await {
-        Ok(sent) => {
-            // NO `resolve_done`: passing a message on to someone else is not
-            // handling it, and the attention row is the only place the user's
-            // own outstanding action is remembered.
-            if let Some(draft_id) = body.draft_id {
-                discard_sent_draft(state, draft_id).await;
-            }
-            audit_action(state, "send", target.clone(), "ok:forward").await;
-            // The mail is away; everything below is bookkeeping that cannot fail
-            // the request.
-            let echo_message_id = echo_sent(state, client, target, &sent).await;
-            if let (Some((token, _)), Some(message_id)) = (&tracker, echo_message_id) {
-                link_tracker(state, token, message_id).await;
-            }
-            Ok(Json(json!({
-                "status": "sent",
-                "echo_message_id": echo_message_id,
-                "thread_id": sent.thread_id,
-            })))
-        }
-        Err(e) => {
-            if let Some((token, _)) = &tracker {
-                discard_tracker(state, token, target.clone()).await;
-            }
-            audit_action(state, "send", target, "failed:gmail").await;
-            Err(write_error(&e))
-        }
-    }
+    // NO threadId and NO resolve: a forward opens a new conversation rather than
+    // filing the user's "look at this" inside the correspondence it came out of,
+    // and passing a message on is not handling it. Both are the `None`s below.
+    finish_send(
+        state,
+        client,
+        &raw,
+        None,
+        None,
+        "ok:forward".to_string(),
+        tracker,
+        body.draft_id,
+        target,
+    )
+    .await
 }
 
 // --- GET /client/messages/{id}/reply_recipients ------------------------------

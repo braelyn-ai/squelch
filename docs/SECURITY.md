@@ -444,20 +444,32 @@ scans the ORIGINAL as well as the note, unions the kinds and issues ONE 422 / on
 and about to be composed, never on the stored row: the stored body is a sanitized,
 flattened memory of the message and the bytes on the wire are the original.
 
-*Exactly what is scanned* on a forward: the sender's typed note, **and** the
-original's decoded text bodies — every part in mail-parser's `text_body` list, plus
-an html-to-text conversion of its `html_body` view. Both views are needed because
-when a `text/plain` part exists mail-parser never converts the html alternative down,
-so an alternative whose text half is innocuous and whose html half carries the key
-would otherwise ship unread. Two known limits, stated rather than implied: **attachment
-bytes are not scanned** (a key in an attached `id_rsa` passes), and **html attribute
-values are not scanned** (the converter yields visible text, so a secret inside an
-`href` or a `data-` attribute survives). The guard is a seatbelt against the accident,
-not a DLP boundary against a determined sender — it is overridable by design.
+*Exactly what is scanned* on a forward: the sender's typed note, the original's
+decoded text bodies — every part in mail-parser's `text_body` list — an html-to-text
+conversion of its `html_body` view, **and** the contents of every `text/*` and
+`message/*` attachment part. Both body views are needed because when a `text/plain`
+part exists mail-parser never converts the html alternative down, so an alternative
+whose text half is innocuous and whose html half carries the key would otherwise ship
+unread. The text attachments are scanned because a PEM key pasted into `notes.txt`
+and dragged onto a mail is the same exfiltration shape as one pasted into the body —
+arguably the more natural one — and mail-parser has already transcoded each such part
+to UTF-8, so reading it as text costs nothing; `message/*` parts (an attached email,
+a bounce report) are plain RFC822 text and are read the same way. Two known limits,
+stated rather than implied: **attachment bytes under any other mime are not scanned**
+(a key inside a zip, or an `id_rsa` carrying an `application/octet-stream` mime,
+passes), and **html attribute values are not scanned** (the converter yields visible
+text, so a secret inside an `href` or a `data-` attribute survives). The guard is a seatbelt against the accident, not a DLP
+boundary against a determined sender — it is overridable by design.
 
 **Forwarded HTML goes out verbatim, trackers included.** The original's markup is
-embedded as it arrived (the only edit is stripping `<meta charset=…>` tags that would
-contradict the part's own `charset="UTF-8"`), which means the ORIGINAL sender's
+embedded as it arrived (the only edit is stripping the `<meta>` tags that DECLARE a
+charset — a `charset` attribute or the `http-equiv="Content-Type"` spelling — which
+would contradict the part's own `charset="UTF-8"`; a `<meta>` that merely mentions the
+word survives). The forward's two body parts then ship
+`Content-Transfer-Encoding: quoted-printable`, which is an encoding rather than an
+edit: a stranger's newsletter html is routinely one line far past RFC 5322's 998-octet
+limit, and re-emitting it raw put illegal lines and raw 8-bit bytes on the wire. It
+decodes back byte-for-byte at the far end. All of which means the ORIGINAL sender's
 tracking pixels are re-armed and will fire toward whoever the forward is addressed to.
 This is deliberate and matches every mainstream mail client: passband strips trackers
 out of what it RENDERS to its user, not out of what its user chooses to pass on.
