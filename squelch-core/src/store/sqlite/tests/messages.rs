@@ -64,6 +64,60 @@ fn ingest_message_persists_attachments_and_thread_view_carries_them() {
 }
 
 #[test]
+fn cid_inline_part_carries_its_content_id_to_the_thread_view() {
+    // The whole point of the column: the body keeps <img src="cid:logo@squelch">,
+    // so the attachment row that fills it has to be findable BY that token.
+    use crate::config::Stage1Config;
+    let (store, acct) = store();
+
+    let eml = "From: S <s@ex.com>\r\n\
+               To: me@example.com\r\n\
+               Subject: newsletter\r\n\
+               Date: Mon, 7 Jul 2026 10:00:00 +0000\r\n\
+               MIME-Version: 1.0\r\n\
+               Content-Type: multipart/related; boundary=\"B\"\r\n\
+               \r\n\
+               --B\r\nContent-Type: text/html\r\n\r\n\
+               <p><img src=\"cid:logo@squelch\"></p>\r\n\
+               --B\r\nContent-Type: image/png\r\n\
+               Content-ID: <logo@squelch>\r\n\
+               Content-Disposition: inline\r\n\
+               Content-Transfer-Encoding: base64\r\n\r\naW5saW5l\r\n\
+               --B\r\nContent-Type: application/pdf\r\n\
+               Content-Disposition: attachment; filename=\"doc.pdf\"\r\n\
+               Content-Transfer-Encoding: base64\r\n\r\nSGVsbG8=\r\n\
+               --B--\r\n";
+    let fetched = crate::sync::ingest::RawFetched {
+        account_id: acct,
+        gmail_msg_id: "g-cid".into(),
+        gmail_thread_id: Some("t-cid".into()),
+        raw: eml.as_bytes().to_vec(),
+        internal_date: Some(Utc::now()),
+        is_sent: false,
+        account_addr: "me@example.com".into(),
+    };
+    let t = crate::sync::ingest::ingest(&fetched, &Stage1Config::default(), Utc::now(), |_| false);
+    store.ingest_message(&t).unwrap();
+
+    let view = store.thread_view_with_html(acct, "t-cid").unwrap();
+    let atts = &view.messages[0].attachments;
+    assert_eq!(atts.len(), 2, "inline image + pdf");
+    let inline = atts
+        .iter()
+        .find(|a| a.mime == "image/png")
+        .expect("inline image row");
+    assert_eq!(inline.content_id.as_deref(), Some("logo@squelch"));
+    let pdf = atts
+        .iter()
+        .find(|a| a.filename == "doc.pdf")
+        .expect("pdf row");
+    assert!(
+        pdf.content_id.is_none(),
+        "a real attachment carries no cid to resolve"
+    );
+}
+
+#[test]
 fn double_attached_identical_file_cannot_kill_ingest() {
     // REMOTE INGEST DoS: two parts with the SAME filename and size violate
     // the UNIQUE key, which must collapse to one row rather than roll back

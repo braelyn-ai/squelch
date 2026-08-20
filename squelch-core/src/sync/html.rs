@@ -11,11 +11,12 @@ use ammonia::Builder;
 
 /// Sanitize an untrusted HTML email body into a storage-safe fragment. Pure (no
 /// I/O). Kept: formatting/table tags with their presentational layout attributes
-/// (`width`/`align`/`bgcolor`/…), `<img src>`, `<a href>` limited to
-/// http/https/mailto, `<style>` blocks with their CSS verbatim, and
+/// (`width`/`align`/`bgcolor`/…), `<img src>` (including the `cid:` reference to
+/// an inline part of this same message), `<a href>` limited to http/https/mailto,
+/// `<style>` blocks with their CSS verbatim, and
 /// `style`/`class`/`id` on any allowed tag. Dropped: `<script>`, `on*` handlers,
 /// form controls, frames/plugins, `<meta>`/`<link>`/`<base>`, and every URL scheme
-/// outside `{http, https, mailto}` (so inline `data:` payloads die too). Full
+/// outside `{http, https, mailto, cid}` (so inline `data:` payloads die too). Full
 /// policy, and the client CSP that is the real boundary for what CSS and images
 /// can fetch: docs/SECURITY.md.
 ///
@@ -26,9 +27,28 @@ use ammonia::Builder;
 pub fn sanitize_email_html(html: &str) -> String {
     let mut builder = Builder::default();
 
-    // Narrow to the three schemes an email body needs; dropping `data:` here is
-    // what kills inlined `data:` image payloads.
-    let url_schemes: HashSet<&str> = ["http", "https", "mailto"].into_iter().collect();
+    // Narrow to the schemes an email body needs; dropping `data:` here is what
+    // kills inlined `data:` image payloads.
+    //
+    // `cid:` is in the set for one reason: it is a POINTER, not a payload. It
+    // names a part of this same message (RFC 2392) and can fetch nothing — no
+    // host, no network, no renderer that resolves it — so admitting it buys an
+    // attacker nothing that a bare `<img>` did not already give them. Dropping it
+    // instead, as ammonia would, silently deletes the `src` and leaves the client
+    // an anonymous `<img>` it cannot pair with any attachment; the reader then
+    // paints a broken box over a photo it is holding the bytes for. The client
+    // rewrites every resolvable one to its own scheme and DELETES the rest before
+    // the body reaches a web view, and the CSP (`img-src` names only that scheme)
+    // is what makes that deletion enforceable rather than merely tidy.
+    //
+    // THAT CLIENT SHIPS FIRST, and the ordering only goes one way. A reader
+    // without the rewrite has no `passband-cid:` in its policy, so a kept
+    // reference is a refused load and WebKit draws the broken box this whole
+    // feature exists to remove — where dropping the `src` at least left an
+    // `<img>` that painted nothing. `body_html` is baked at ingest, so the mail a
+    // new daemon syncs carries those boxes until that reader updates. See
+    // docs/RELEASING.md, "Self-host compatibility".
+    let url_schemes: HashSet<&str> = ["http", "https", "mailto", "cid"].into_iter().collect();
     builder.url_schemes(url_schemes);
 
     // Keep `<style>` blocks with their CSS verbatim (class-styled newsletters are
@@ -126,6 +146,23 @@ mod tests {
         );
         assert!(!out.contains("data:"));
         assert!(out.contains("https://ok/i.png"));
+    }
+
+    #[test]
+    fn cid_src_survives_verbatim_for_the_client_to_resolve() {
+        // The client pairs this token with the attachment row carrying the same
+        // Content-ID. Strip the src and the pairing is gone for good: the tag
+        // that reaches the reader is anonymous, and a stored photo paints as a
+        // broken box. `ftp:` is here as the control — widening the set for `cid:`
+        // must not have opened it to everything.
+        let out = sanitize_email_html(
+            "<img src=\"cid:logo@squelch\" width=\"20\"><img src=\"ftp://h/x.png\">",
+        );
+        assert!(
+            out.contains("src=\"cid:logo@squelch\""),
+            "cid reference must survive intact: {out}"
+        );
+        assert!(!out.contains("ftp:"));
     }
 
     #[test]

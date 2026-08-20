@@ -1,11 +1,14 @@
 // Attachments for the thread viewer, in two registers. IMAGES RENDER INLINE at
 // column width, because "see photo attached" means the photo IS the message and
 // every other mail client shows it — a 38pt chip is a filing cabinet, not a
-// reading surface. Everything then gets a card in the strip below: image
-// thumbnail, PDF page 1, or a file glyph. svg is scriptable so it ALWAYS lands in
-// the file bucket, and the SERVER decides Content-Type, so a mislabeled
-// attachment stays inert. Art resolves through AttachmentThumbs (a card in a
-// LazyVStack would re-download on recycle), authenticated through APIClient.
+// reading surface. Unless the BODY already placed the picture, that is: a photo
+// the html points at with `cid:` is drawn where the sender put it (CidImages),
+// and `inBody` is how this strip is told to stop drawing it a second time.
+// Everything then gets a card in the strip below: image thumbnail, PDF page 1,
+// or a file glyph. svg is scriptable so it ALWAYS lands in the file bucket, and
+// the SERVER decides Content-Type, so a mislabeled attachment stays inert. Art
+// resolves through AttachmentThumbs (a card in a LazyVStack would re-download on
+// recycle), authenticated through APIClient.
 //
 // THE CARDS ARE SHARED; THE TWO VERBS ARE NOT. Saving is a save panel on one
 // platform and a document picker on the other. Previewing is Quick Look on both
@@ -29,6 +32,11 @@ private let stripSpace = "attachment-strip"
 
 struct AttachmentStrip: View {
     let attachments: [Attachment]
+    /// Parts the message body is ALREADY showing, because a `cid:` reference in
+    /// its html resolved to them (CidImages). They keep their card — the name,
+    /// the size, the download and the click-to-open all still live there — and
+    /// lose only the tile above it, which would be the same photo twice.
+    var inBody: Set<Int> = []
 
     @Environment(AppStore.self) private var store
     #if os(macOS)
@@ -59,8 +67,17 @@ struct AttachmentStrip: View {
     }
 
     /// The attachments that also render in the column. Order is the server's, so
-    /// two photos arrive in the order they were attached.
-    private var inlineImages: [Attachment] { attachments.filter(AttachmentKinds.isInline) }
+    /// two photos arrive in the order they were attached. One the body places
+    /// itself is left out: the message put that photo somewhere for a reason,
+    /// and repeating it under the mail is the double-rendering this file's
+    /// inline half was added to avoid, not a second copy of it.
+    private var inlineImages: [Attachment] {
+        attachments.filter { AttachmentKinds.isInline($0) && !inBody.contains($0.id) }
+    }
+
+    /// Ids of the pictures drawn ABOVE the cards, which is what decides who
+    /// registers a Quick Look source rect — see `previewSource`.
+    private var tiled: Set<Int> { Set(inlineImages.map(\.id)) }
 
     var body: some View {
         if !attachments.isEmpty {
@@ -131,9 +148,11 @@ struct AttachmentStrip: View {
                         // An attachment already shown inline registers the
                         // PICTURE as what the panel flies out of, not the chip
                         // beneath it, so there is exactly one source rect per id
-                        // and it is the one the human actually clicked.
-                        .previewSource(
-                            AttachmentKinds.isInline(att) ? nil : att.id, into: $sourceFrames)
+                        // and it is the one the human actually clicked. Read off
+                        // what this strip actually TILED, not off the bucket: a
+                        // photo the body places is inline-eligible and still has
+                        // no tile here, so the card is the only rect it has.
+                        .previewSource(tiled.contains(att.id) ? nil : att.id, into: $sourceFrames)
                     #endif
                 }
             }

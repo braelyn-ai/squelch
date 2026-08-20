@@ -259,7 +259,7 @@ pub struct ClientMessage {
 
 /// One attachment's metadata on the HUMAN DOOR. Carries NO bytes.
 ///
-/// WIRE CONTRACT: `{ id, filename, mime, size, downloadable }`.
+/// WIRE CONTRACT: `{ id, filename, mime, size, downloadable, content_id? }`.
 /// `downloadable == false` means the bytes were never stored (the part exceeded
 /// the ingest cap) and the byte endpoint returns 410 for it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -271,6 +271,14 @@ pub struct ClientAttachment {
     /// Decoded size in bytes (the real part size, whether or not bytes were kept).
     pub size: i64,
     pub downloadable: bool,
+    /// The part's normalized Content-ID (see [`AttachmentInfo::content_id`]) —
+    /// what an `<img src="cid:...">` in the sanitized HTML resolves against, so
+    /// the client can point the tag at this attachment's bytes instead of
+    /// painting a broken image. `None` when the part declared none, and
+    /// structurally ABSENT then: a pre-`content_id` daemon omits the key too, so
+    /// the client cannot tell the two apart and must not try.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_id: Option<String>,
 }
 
 /// A full thread for the HUMAN DOOR (`GET /client/thread/{id}`), carrying
@@ -575,6 +583,11 @@ pub struct AttachmentInfo {
     pub size_bytes: i64,
     /// The decoded bytes, or `None` when the part was over the ingest cap.
     pub data: Option<Vec<u8>>,
+    /// The part's Content-ID, NORMALIZED: whitespace trimmed and one surrounding
+    /// `<...>` pair stripped, so it compares directly against the token in an
+    /// `<img src="cid:...">`. `None` when the part declares none (every real
+    /// attachment) or declares an empty one.
+    pub content_id: Option<String>,
 }
 
 /// One row of the human door's unsubscribe ledger (`GET /client/unsubscribes`).
@@ -732,13 +745,24 @@ mod tests {
                     received_at: Utc::now(),
                     content: "text".into(),
                     html: Some("<p>hi</p>".into()),
-                    attachments: vec![ClientAttachment {
-                        id: 7,
-                        filename: "doc.pdf".into(),
-                        mime: "application/pdf".into(),
-                        size: 1234,
-                        downloadable: true,
-                    }],
+                    attachments: vec![
+                        ClientAttachment {
+                            id: 7,
+                            filename: "doc.pdf".into(),
+                            mime: "application/pdf".into(),
+                            size: 1234,
+                            downloadable: true,
+                            content_id: None,
+                        },
+                        ClientAttachment {
+                            id: 8,
+                            filename: "logo.png".into(),
+                            mime: "image/png".into(),
+                            size: 99,
+                            downloadable: true,
+                            content_id: Some("logo@squelch".into()),
+                        },
+                    ],
                     tier: Some(Tier::PastDue),
                     deadline: None,
                     attention_open: Some(true),
@@ -774,6 +798,19 @@ mod tests {
             v["messages"][0]["attachments"][0]["downloadable"],
             serde_json::json!(true)
         );
+        // content_id rides along on a cid-inline part and is structurally ABSENT
+        // on a part that declared none — the same shape a pre-content_id daemon
+        // sends, which is what lets the client treat both as "no cid".
+        assert_eq!(
+            v["messages"][0]["attachments"][1]["content_id"],
+            serde_json::json!("logo@squelch")
+        );
+        assert!(
+            v["messages"][0]["attachments"][0]
+                .get("content_id")
+                .is_none(),
+            "None content_id must not serialize"
+        );
         assert_eq!(v["messages"][1]["attachments"], serde_json::json!([]));
         // Triage highlight fields: present when set, structurally ABSENT when
         // None (not null) — an old client's strict decoder never sees the keys.
@@ -787,6 +824,15 @@ mod tests {
         // auth_pass is an internal gate for the human door's `sender_known`
         // bit, never a wire field, even when it holds a verdict.
         assert!(v["messages"][0].get("auth_pass").is_none());
+
+        // ...and the key is OPTIONAL inbound too, so a payload minted by a
+        // pre-content_id daemon still decodes.
+        let old: ClientAttachment = serde_json::from_value(serde_json::json!({
+            "id": 7, "filename": "doc.pdf", "mime": "application/pdf",
+            "size": 1234, "downloadable": true
+        }))
+        .expect("attachment without content_id must decode");
+        assert!(old.content_id.is_none());
     }
 
     fn base_update() -> Update {

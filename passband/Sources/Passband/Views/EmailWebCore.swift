@@ -24,6 +24,10 @@ struct EmailWebView: View {
     /// correspondent is allowed to learn the mail was opened. Everyone else is
     /// stripped exactly as before, and the default is the strict one.
     let allowTrackers: Bool
+    /// This message's parts, for the `cid:` references in the body. Empty is a
+    /// real answer, not a missing one: a body with nothing to resolve against
+    /// drops every cid reference it carries, which is what sealed mail wants.
+    let attachments: [Attachment]
 
     @Environment(Prefs.self) private var prefs
     @Environment(AppStore.self) private var store
@@ -43,14 +47,16 @@ struct EmailWebView: View {
     /// `prepared` is seeded from the warm cache HERE: `@State` cannot be assigned
     /// from `body`, and every later hook is a frame too late.
     init(
-        html: String, cacheKey: String? = nil, allowTrackers: Bool = false
+        html: String, cacheKey: String? = nil, allowTrackers: Bool = false,
+        attachments: [Attachment] = []
     ) {
         self.html = html
         self.cacheKey = cacheKey
         self.allowTrackers = allowTrackers
+        self.attachments = attachments
         _prepared = State(
             initialValue: PreparedBodies.shared.get(
-                Prepared.cacheKey(html, allowTrackers)) ?? .empty)
+                Prepared.cacheKey(html, allowTrackers, attachments)) ?? .empty)
     }
 
     struct Prepared: Equatable, Sendable {
@@ -71,8 +77,9 @@ struct EmailWebView: View {
             sourceHash: 0, html: "", trackers: 0, trackersAllowed: false,
             hasRemoteCandidates: false, imageURLs: [])
 
-        static func make(from html: String, allowTrackers: Bool = false) -> Prepared
-        {
+        static func make(
+            from html: String, allowTrackers: Bool = false, attachments: [Attachment] = []
+        ) -> Prepared {
             // The pass runs either way — one regex sweep, and its COUNT is what
             // the badge reports — but a known sender's body keeps its pixels.
             // ORDER MATTERS when it does strip: trackers come out FIRST, so a
@@ -91,12 +98,19 @@ struct EmailWebView: View {
             // repeats has nothing left to fetch, so it must not offer the
             // "load remote images" bar.
             let hasRemoteCandidates = Trackers.hasNetworkImages(deduped)
+            // BETWEEN the two, and it has to be: the dedupe never touches a cid
+            // reference (they are message-specific, not the repeated chrome it
+            // removes), while the proxy must not see what this mints — a
+            // `passband-cid:` src is not http(s), so it would be left alone, but
+            // running before it is what keeps that a fact rather than a
+            // coincidence of ImageProxy's prefix test.
+            let inlined = CidImages.rewrite(html: deduped, attachments: attachments)
             // LAST, after the read above: the rewrite replaces every http(s)
             // image reference with a `passband-img:` one, which those scans would
             // no longer recognise as remote.
-            let proxied = ImageProxy.rewrite(deduped)
+            let proxied = ImageProxy.rewrite(inlined)
             return Prepared(
-                sourceHash: cacheKey(html, allowTrackers),
+                sourceHash: cacheKey(html, allowTrackers, attachments),
                 html: proxied.html,
                 trackers: stripped.blocked,
                 trackersAllowed: allowTrackers,
@@ -106,10 +120,26 @@ struct EmailWebView: View {
 
         /// Tracker policy is part of the identity: the two policies produce
         /// different documents from the same body.
-        static func cacheKey(_ html: String, _ allowTrackers: Bool) -> Int {
+        ///
+        /// So are the PARTS, for the same reason: the cid rewrite resolves
+        /// against them, so one body quoted into two messages carrying different
+        /// attachments prepares into two different documents. Everything the
+        /// rewrite reads is folded in — the id and content-id it matches on, and
+        /// the three fields of the inline gate — because a hit on a stale key
+        /// would paste one message's photo into another's.
+        static func cacheKey(
+            _ html: String, _ allowTrackers: Bool, _ attachments: [Attachment]
+        ) -> Int {
             var hasher = Hasher()
             hasher.combine(html)
             hasher.combine(allowTrackers)
+            for att in attachments {
+                hasher.combine(att.id)
+                hasher.combine(att.content_id)
+                hasher.combine(att.downloadable)
+                hasher.combine(att.mime)
+                hasher.combine(att.size)
+            }
             return hasher.finalize()
         }
     }
@@ -202,8 +232,9 @@ struct EmailWebView: View {
             }
             let source = html
             let allow = allowTrackers
+            let parts = attachments
             let made = await Task.detached(priority: .userInitiated) {
-                Prepared.make(from: source, allowTrackers: allow)
+                Prepared.make(from: source, allowTrackers: allow, attachments: parts)
             }.value
             PreparedBodies.shared.set(key, made)
             guard !Task.isCancelled else { return }
@@ -223,7 +254,7 @@ struct EmailWebView: View {
         }
     }
 
-    private var preparedKey: Int { Prepared.cacheKey(html, allowTrackers) }
+    private var preparedKey: Int { Prepared.cacheKey(html, allowTrackers, attachments) }
     private var rememberedHeight: CGFloat? { cacheKey.flatMap { FrameHeights.shared.get($0) } }
     private var displayHeight: CGFloat {
         height > 0 ? height : (rememberedHeight ?? Self.placeholderHeight)
@@ -305,9 +336,13 @@ enum EmailFrame {
         // LAYER 5: no cookie jar, no persistent storage, nothing survives close.
         config.websiteDataStore = sharedDataStore
         // Images are the ONE resource a body may load, and they ride our handler
-        // rather than WebKit's loader (see ImageProxy); one shared handler keeps
-        // the in-flight bookkeeping in a single place.
+        // rather than WebKit's loader; one shared handler keeps the in-flight
+        // bookkeeping in a single place. TWO schemes reach it: remote art
+        // rewritten by ImageProxy, and this message's own attachment parts
+        // rewritten by CidImages. Both configurations register both — a frame
+        // that knew only one would draw the other's images as broken glyphs.
         config.setURLSchemeHandler(ImageSchemeHandler.shared, forURLScheme: ImageProxy.scheme)
+        config.setURLSchemeHandler(ImageSchemeHandler.shared, forURLScheme: CidProxy.scheme)
 
         // The relay, not the coordinator, is wired to the frame — it outlives
         // every coordinator that borrows it. See FrameRelay.
@@ -625,15 +660,10 @@ final class EmailFrameCoordinator: NSObject {
     /// deliberately OPAQUE white: body copy over a live wallpaper is
     /// unreadable, and mail ships its own colors assuming a white canvas.
     nonisolated static func document(html: String, allowRemote: Bool) -> String {
-        // `passband-img:` and NOT `http: https:` — every remote image was
-        // rewritten to the proxy scheme (ImageProxy), so the network is
-        // reachable only through ImageSchemeHandler and anything the rewrite
-        // missed fails closed; `data:` stays for inline art. This is ALSO the
-        // whole load-on-demand gate: an un-opted message has no
-        // `passband-img:` in its policy, so the document refuses the request
-        // before the handler is reached and nothing downstream re-checks.
-        let imgSrc = allowRemote ? "passband-img: data:" : "data:"
-        let csp = "default-src 'none'; style-src 'unsafe-inline'; img-src \(imgSrc)"
+        // Which schemes an image may come from, and why the two custom ones are
+        // gated differently, is MailCSP's — the policy lives where it can be
+        // asserted without a WebKit process.
+        let csp = MailCSP.policy(allowRemote: allowRemote)
         // A PHONE lays a viewport-less document out at 980 CSS px and then
         // scales the result down to fit, which renders every email at about a
         // third size. Pinning the layout viewport to the frame's own width is

@@ -5135,6 +5135,18 @@ async fn thread_carries_attachment_metadata_and_empty_when_none() {
                 None,
             )
             .unwrap();
+        // ...and a cid-inline image, the part the body's <img src="cid:..."> names.
+        store
+            .insert_inline_attachment(
+                acct,
+                m1,
+                "attachment-3",
+                "image/png",
+                3,
+                Some(b"png"),
+                Some("logo@squelch"),
+            )
+            .unwrap();
         // Thread t2: a message with NO attachments -> [] on the wire.
         let m2 = store
             .upsert_message(&msg(acct, "g2", "t2", "s2", "b2"))
@@ -5163,14 +5175,20 @@ async fn thread_carries_attachment_metadata_and_empty_when_none() {
     assert_eq!(resp.status(), StatusCode::OK);
     let json = body_json(resp).await;
     let atts = &json["messages"][0]["attachments"];
-    assert_eq!(atts.as_array().unwrap().len(), 2);
-    // Ordered by id: pdf first (downloadable), big second (not downloadable).
+    assert_eq!(atts.as_array().unwrap().len(), 3);
+    // Ordered by id: pdf first (downloadable), big second (not downloadable),
+    // the cid-inline image last.
     assert_eq!(atts[0]["filename"], "doc.pdf");
     assert_eq!(atts[0]["mime"], "application/pdf");
     assert_eq!(atts[0]["size"], 5);
     assert_eq!(atts[0]["downloadable"], true);
     assert_eq!(atts[1]["filename"], "big.bin");
     assert_eq!(atts[1]["downloadable"], false);
+    // Only the inline part carries a content_id; on the others the key is absent
+    // entirely, exactly as a daemon predating the field would send it.
+    assert_eq!(atts[2]["content_id"], "logo@squelch");
+    assert!(atts[0].get("content_id").is_none());
+    assert!(atts[1].get("content_id").is_none());
 
     let resp = app
         .oneshot(authed("GET", "/client/thread/t2"))
