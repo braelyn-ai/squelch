@@ -14,10 +14,11 @@ import SwiftUI
 /// Which primary surface the rail is showing. `sitrep` is the abstracted
 /// dashboard (the default on launch); `emails` is the classic band list.
 enum MainView: String, Sendable, Hashable, CaseIterable {
-    case sitrep, emails, auth, rules, audit, usage, settings
+    case sitrep, emails, auth, rules, audit, usage, settings, process
 
     /// The TOP rail group — also the 1..5 number-key mapping. Usage/Settings are
-    /// excluded so that adding them never renumbers 1..5.
+    /// excluded so that adding them never renumbers 1..5. `process` is off the
+    /// rail entirely: its one door is the all-mail header's peer-review chip.
     static let mainViews: [MainView] = [.sitrep, .emails, .auth, .rules, .audit]
     /// The BOTTOM rail group, pinned below a divider.
     static let bottomViews: [MainView] = [.usage, .settings]
@@ -31,6 +32,7 @@ enum MainView: String, Sendable, Hashable, CaseIterable {
         case .audit: "Audit"
         case .usage: "Usage"
         case .settings: "Settings"
+        case .process: "Process"
         }
     }
 
@@ -43,6 +45,7 @@ enum MainView: String, Sendable, Hashable, CaseIterable {
         case .audit: "scroll"
         case .usage: "waveform.path.ecg"
         case .settings: "gearshape"
+        case .process: "checkmark.seal"
         }
     }
 }

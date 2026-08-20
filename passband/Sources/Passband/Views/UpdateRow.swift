@@ -217,24 +217,3 @@ struct UpdateRow: View {
     #endif
 }
 
-/// The header sun/moon theme toggle. Mirrors the `\` keybinding, both routed
-/// through the same Prefs so every mount stays in sync.
-struct ThemeToggle: View {
-    @Environment(Prefs.self) private var prefs
-
-    private var isDark: Bool {
-        switch prefs.theme {
-        case .dark: true
-        case .light: false
-        case .system: Platform.isDarkAppearance
-        }
-    }
-
-    var body: some View {
-        ChromeChip(
-            icon: isDark ? "sun.max" : "moon", font: .system(size: 12),
-            help: "\(isDark ? "light" : "dark") mode (\\)"
-        ) { prefs.flipTheme() }
-        .accessibilityLabel("switch to \(isDark ? "light" : "dark") mode")
-    }
-}

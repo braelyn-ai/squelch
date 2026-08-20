@@ -243,6 +243,7 @@ struct MainShell: View {
         case .audit: RoutedHost(view: .audit) { AuditView() }
         case .usage: UsageView()
         case .settings: SettingsView()
+        case .process: RoutedHost(view: .process) { ProcessView() }
         }
     }
 
