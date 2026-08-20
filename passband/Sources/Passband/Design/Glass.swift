@@ -401,6 +401,19 @@ extension ButtonStyle where Self == TextActionStyle {
         func updateNSView(_ nsView: NSVisualEffectView, context: Context) {}
     }
 
+    /// Window-mode state the LAYOUT reads — today just fullscreen, which is what
+    /// decides whether the title strip above the rail exists at all. Written by
+    /// WindowConfigurator's notification observers, read from view bodies
+    /// (Observation tracks the access); one instance because there is one shell
+    /// window.
+    @Observable @MainActor
+    final class WindowState {
+        static let shared = WindowState()
+        /// True from willEnterFullScreen to willExitFullScreen: no traffic
+        /// lights are on screen, so nothing reserves the strip they live in.
+        var isFullscreen = false
+    }
+
     /// Reaches the hosting NSWindow once, to make it non-opaque (without which the
     /// glass has nothing to sample) and to hide the title bar.
     struct WindowConfigurator: NSViewRepresentable {
@@ -414,6 +427,9 @@ extension ButtonStyle where Self == TextActionStyle {
                 window.titleVisibility = .hidden
                 window.styleMask.insert(.fullSizeContentView)
                 window.isMovableByWindowBackground = true
+                // Restoration can hand the window back already fullscreen,
+                // before any transition our observers could hear.
+                WindowState.shared.isFullscreen = window.styleMask.contains(.fullScreen)
                 Self.hideTitlebarDecoration(in: window)
             }
             return view
@@ -447,6 +463,20 @@ extension ButtonStyle where Self == TextActionStyle {
                 ) { _ in
                     MainActor.assumeIsolated { hideAllDecorations() }
                 }
+            }
+            // THE LAYOUT'S EAR ON FULLSCREEN (see WindowState): "will", not
+            // "did", both ways, so the rail re-shapes as the transition starts
+            // — under the system's own animation — instead of snapping after
+            // it finishes.
+            NotificationCenter.default.addObserver(
+                forName: NSWindow.willEnterFullScreenNotification, object: window, queue: .main
+            ) { _ in
+                MainActor.assumeIsolated { WindowState.shared.isFullscreen = true }
+            }
+            NotificationCenter.default.addObserver(
+                forName: NSWindow.willExitFullScreenNotification, object: window, queue: .main
+            ) { _ in
+                MainActor.assumeIsolated { WindowState.shared.isFullscreen = false }
             }
             // The BUTTONS ONLY on these, not the decoration walk with them: a
             // live resize fires continuously, and re-walking the frame view on
