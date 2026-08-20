@@ -14,7 +14,7 @@
 // r/e/d/v/f are inert rather than acting on a row they have no meaning for.
 //
 // AND A LENS OVER THE INBOX: the reminder filter, which swaps the rows for mail
-// that is parked (`H`) and waiting to come back. A lens rather than a fourth
+// that is parked (`h`) and waiting to come back. A lens rather than a fourth
 // page because it is not a place you navigate to — the first Escape sheds it and
 // you are back on the mail you were reading. Its rows come from their own cache
 // for one reason worth stating: every one of them is `done`, so the ordinary
@@ -375,7 +375,7 @@ struct EmailsView: View {
                     icon: reminders ? "bell.fill" : "bell",
                     font: .system(size: 12),
                     tone: reminders ? Palette.accent : Palette.inkFaint,
-                    help: "mail with pending reminders (H sets one)"
+                    help: "mail with pending reminders (h sets one)"
                 ) { store.reminderFilter.toggle() }
                 .accessibilityLabel(reminders ? "showing pending reminders" : "pending reminders")
             }
@@ -466,10 +466,9 @@ struct EmailsView: View {
             },
             KeyBinding("e", "done") { resolveSelected() },
             KeyBinding("d", "done") { resolveSelected() },
-            // Capital H, matched before the case-folding pass, so it never
-            // collides with a lowercase binding. On the lens it reschedules the
-            // row it is already showing — the palette is the same either way.
-            KeyBinding("H", "remind me later") {
+            // On the lens it reschedules the row it is already showing — the
+            // palette is the same either way.
+            KeyBinding("h", "remind me later") {
                 guard triageable, let u = selected else { return }
                 store.openRemind(
                     RemindTarget(

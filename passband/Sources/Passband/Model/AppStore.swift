@@ -270,7 +270,7 @@ struct TriageFixTarget: Sendable, Equatable {
     var category: String??
 }
 
-/// The email currently being scheduled by the `H` palette.
+/// The email currently being scheduled by the `h` palette.
 ///
 /// Identifiable rather than Equatable (the shape TriageFixTarget takes) because
 /// it carries a callback: the reader has to advance its queue after a reminder
@@ -282,7 +282,7 @@ struct RemindTarget: Identifiable, Sendable {
     var sender: String
     var subject: String
     /// The reminder ALREADY on this row, when this is a reschedule. Shown so a
-    /// second `H` reads as "moving it" rather than as setting a first one.
+    /// second `h` reads as "moving it" rather than as setting a first one.
     var remindAt: String?
     /// Called after the reminder is set, on the surface that opened the
     /// palette. The reader uses it to walk its queue the way `e`/`d` do.

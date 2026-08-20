@@ -1,4 +1,4 @@
-// REMIND PALETTE — `H` on a focused email: say when, hit Enter, and the mail
+// REMIND PALETTE — `h` on a focused email: say when, hit Enter, and the mail
 // leaves now and comes back then.
 //
 // EVERY ROW STATES ITS ABSOLUTE TIME. This is the one palette in the app whose
@@ -80,7 +80,7 @@ struct RemindPalette: View {
                 .lineLimit(1)
                 .help("\(target.sender) · \(target.subject)")
             Spacer(minLength: 4)
-            // WHAT IT IS SET TO NOW, when there is one. A second `H` is a move,
+            // WHAT IT IS SET TO NOW, when there is one. A second `h` is a move,
             // not a first booking, and the row you are moving off is the one
             // fact the list itself cannot show.
             if let current = target.remindAt, !current.isEmpty {

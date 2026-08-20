@@ -64,7 +64,7 @@ enum Actions {
     /// ABSOLUTE `detail` ("tomorrow 9:00 AM") rather than the words that were
     /// typed: the one thing the confirmation has to answer is when this comes
     /// back, and "next week" does not answer it.
-    /// Takes a message id rather than a row because the reader can press `H` on
+    /// Takes a message id rather than a row because the reader can press `h` on
     /// mail it never had an `AttentionUpdate` for (a thread opened from search
     /// has no queue). The row is looked up where it exists, and where it does
     /// not the parked list is simply invalidated instead of guessed at.
@@ -77,7 +77,7 @@ enum Actions {
     /// exact bug the return value exists to prevent.
     static func remind(_ messageId: Int, at date: Date, label: String) async -> Bool {
         let row = store.update(id: messageId)
-        // The stamp this is moving OFF, read BEFORE the call: a second `H` on
+        // The stamp this is moving OFF, read BEFORE the call: a second `h` on
         // already-parked mail is a reschedule, and after the POST the row's own
         // remind_at is the new one. See the undo below.
         let prior = Fmt.date(row?.remind_at)

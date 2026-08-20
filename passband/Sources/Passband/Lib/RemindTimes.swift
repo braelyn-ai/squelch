@@ -1,4 +1,4 @@
-// What "remind me…" resolves to. The `H` palette types into this and picks a
+// What "remind me…" resolves to. The `h` palette types into this and picks a
 // row; the row's `date` is what gets stamped on the server.
 //
 // EVERY ROW SHOWS ITS ABSOLUTE TIME. A reminder is a promise about the future,
