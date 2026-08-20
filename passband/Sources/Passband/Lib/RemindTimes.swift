@@ -6,11 +6,12 @@
 // the label is what you typed and the `detail` is when it actually fires. A
 // suggestion nobody can read back is not a suggestion, it is a guess.
 //
-// THREE SOURCES, IN ORDER OF HOW MUCH WE KNOW. The quick picks are words this
-// app owns and resolves exactly; the relative parser handles "in N units"; and
-// NSDataDetector is the open world underneath both. The detector is only asked
-// when neither of the first two answered — it would otherwise re-guess a word
-// we already resolved and hand back a near-duplicate an hour off.
+// FOUR SOURCES, IN ORDER OF HOW MUCH WE KNOW. The quick picks are words this
+// app owns and resolves exactly; the relative parser handles "in N units"; the
+// ordinal parser handles "the 24th"; and NSDataDetector is the open world
+// underneath them all. The detector is only asked when none of the closed
+// sources answered — it would otherwise re-guess a word we already resolved
+// and hand back a near-duplicate an hour off.
 //
 // Pure Foundation, network-free, and every date computed through the INJECTED
 // `now`/`calendar` so the whole thing is assertable (see RemindTimesTests).
@@ -165,12 +166,15 @@ enum RemindTimes {
 
         let rel = relative(query, now: now, calendar: calendar)
         add(rel)
+        let ord = ordinal(query, now: now, calendar: calendar)
+        add(ord)
 
-        // The open world, asked last and only when the closed one had no exact
-        // answer. Both guards matter: "mon" is ours, and "in 2 hours" is the
-        // relative parser's — letting the detector also answer either would put
-        // a second, subtly different row under the one that was already right.
-        if rel == nil, !hits.contains(where: { $0.score >= exactScore }) {
+        // The open world, asked last and only when no closed source had an
+        // exact answer. Every guard matters: "mon" is the picks', "in 2 hours"
+        // is the relative parser's, "the 24th" is the ordinal's — letting the
+        // detector also answer any of them would put a second, subtly different
+        // row under the one that was already right.
+        if rel == nil, ord == nil, !hits.contains(where: { $0.score >= exactScore }) {
             for hit in detected(query, now: now, calendar: calendar) { add(hit) }
         }
         return out
@@ -289,7 +293,73 @@ enum RemindTimes {
             detail: detail(date, now: now, calendar: calendar))
     }
 
+    // MARK: - "the 24th"
+
+    /// A bare day of the month: "the 24th", "on the 3rd", "24th", "the 24".
+    /// Resolves to the NEXT time that day comes around at 09:00 — this month
+    /// while it is still ahead, else the next — and a month that lacks the day
+    /// (the 31st, asked in April) is skipped, not clamped, because "the 31st"
+    /// does not mean the 30th.
+    ///
+    /// A bare number without the article or the suffix is refused: "24" could
+    /// be an hour, a count, half of something longer — the "the" or the "th" is
+    /// what commits it to being a day of the month.
+    private static func ordinal(_ query: String, now: Date, calendar: Calendar) -> RemindHit? {
+        var text = query.trimmingCharacters(in: .whitespaces).lowercased()
+        if text.hasPrefix("on ") { text = String(text.dropFirst(3)) }
+        let hadArticle = text.hasPrefix("the ")
+        if hadArticle { text = String(text.dropFirst(4)) }
+        text = text.trimmingCharacters(in: .whitespaces)
+
+        var digits = ""
+        var rest = Substring(text)
+        while let c = rest.first, c.isNumber {
+            digits.append(c)
+            rest = rest.dropFirst()
+        }
+        let suffix = rest.trimmingCharacters(in: .whitespaces)
+        guard let day = Int(digits), (1...31).contains(day) else { return nil }
+        switch suffix {
+        case "st", "nd", "rd", "th": break
+        case "" where hadArticle: break
+        default: return nil
+        }
+
+        // `.strict` is the skip-not-clamp above; `after: now` is what makes
+        // "the 24th" mean this month until 9am on the 24th has gone by, and
+        // the next month from then on.
+        guard
+            let date = calendar.nextDate(
+                after: now,
+                matching: DateComponents(day: day, hour: 9, minute: 0, second: 0),
+                matchingPolicy: .strict)
+        else { return nil }
+        return RemindHit(
+            label: "the \(day)\(ordinalSuffix(day))", date: date,
+            detail: detail(date, now: now, calendar: calendar))
+    }
+
+    private static func ordinalSuffix(_ day: Int) -> String {
+        switch day % 100 {
+        case 11, 12, 13: return "th"
+        default:
+            switch day % 10 {
+            case 1: return "st"
+            case 2: return "nd"
+            case 3: return "rd"
+            default: return "th"
+            }
+        }
+    }
+
     // MARK: - the open world
+
+    /// THE ONE EXPENSIVE OBJECT HERE, built once: constructing an NSDataDetector
+    /// compiles the whole data-detectors grammar and costs more than everything
+    /// else this file does per keystroke put together. Matching on a shared
+    /// detector is documented thread-safe (it is an NSRegularExpression).
+    private static let dateDetector = try? NSDataDetector(
+        types: NSTextCheckingResult.CheckingType.date.rawValue)
 
     /// Anything the system's own date parser recognises: "aug 30", "next
     /// tuesday 3pm", "9/2 at noon".
@@ -297,10 +367,7 @@ enum RemindTimes {
         let text = query.trimmingCharacters(in: .whitespaces)
         // Two characters cannot be a date, and asking anyway turns every first
         // keystroke into a detector run.
-        guard text.count >= 3,
-            let detector = try? NSDataDetector(
-                types: NSTextCheckingResult.CheckingType.date.rawValue)
-        else { return [] }
+        guard text.count >= 3, let detector = dateDetector else { return [] }
 
         let ns = text as NSString
         // A BARE DATE IS NOT A TIME. "aug 30" names a day, and the detector
@@ -398,17 +465,37 @@ enum RemindTimes {
         return "\(format(date, template: template, calendar: calendar)), \(time)"
     }
 
+    /// Built formatters, kept: a DateFormatter is milliseconds to construct and
+    /// this runs once per ROW per keystroke, which made formatter construction
+    /// most of the palette's typing latency. Keyed by everything that changes
+    /// the output; the lock is held across the format call too, because a
+    /// DateFormatter is not safe to share mid-format.
+    nonisolated(unsafe) private static var formatters: [String: DateFormatter] = [:]
+    private static let formattersLock = NSLock()
+
     /// Locale-shaped rendering of a skeleton, through the INJECTED calendar —
     /// a formatter reading `Calendar.current` would make every assertion here
     /// depend on the machine it ran on.
     private static func format(_ date: Date, template: String, calendar: Calendar) -> String {
         let locale = calendar.locale ?? .current
-        let formatter = DateFormatter()
-        formatter.calendar = calendar
-        formatter.timeZone = calendar.timeZone
-        formatter.locale = locale
-        formatter.dateFormat =
-            DateFormatter.dateFormat(fromTemplate: template, options: 0, locale: locale) ?? template
+        let key =
+            "\(template)|\(locale.identifier)|\(calendar.timeZone.identifier)|\(calendar.identifier)"
+        formattersLock.lock()
+        defer { formattersLock.unlock() }
+        let formatter: DateFormatter
+        if let cached = formatters[key] {
+            formatter = cached
+        } else {
+            let built = DateFormatter()
+            built.calendar = calendar
+            built.timeZone = calendar.timeZone
+            built.locale = locale
+            built.dateFormat =
+                DateFormatter.dateFormat(fromTemplate: template, options: 0, locale: locale)
+                ?? template
+            formatters[key] = built
+            formatter = built
+        }
         // ICU separates the AM/PM marker with a NARROW NO-BREAK SPACE. It is
         // invisible, it is not the space anyone types, and it makes two
         // identical-looking strings compare unequal — so it never leaves here.

@@ -23,16 +23,28 @@ struct RemindPalette: View {
     @Namespace private var paletteGlass
     @FocusState private var focused: Bool
 
-    private var hits: [RemindHit] { RemindTimes.match(query, now: opened) }
+    /// The rows on screen. STATE, not a computed property: SwiftUI reads a
+    /// computed one several times per render, and every read re-ran the whole
+    /// engine. One recompute per thing that can actually change the answer —
+    /// typing, opening, re-pinning the clock — is the palette's entire typing
+    /// latency, so that is all it gets.
+    @State private var hits: [RemindHit] = []
 
     var body: some View {
         surface
             .keyContext(.modal)
             .keyBindings(.modal, bindings)
-            .onAppear { focused = true }
-            .onChange(of: hits.count) { _, count in
-                selection = max(0, min(selection, max(0, count - 1)))
+            .onAppear {
+                focused = true
+                refreshHits()
             }
+    }
+
+    /// Re-run the engine against the pinned clock, keeping the cursor inside
+    /// the new list.
+    private func refreshHits() {
+        hits = RemindTimes.match(query, now: opened)
+        selection = max(0, min(selection, max(0, hits.count - 1)))
     }
 
     @ViewBuilder
@@ -108,7 +120,10 @@ struct RemindPalette: View {
             .padding(.horizontal, 16)
             .padding(.top, 4)
             .padding(.bottom, 12)
-            .onChange(of: query) { _, _ in selection = 0 }
+            .onChange(of: query) { _, _ in
+                selection = 0
+                refreshHits()
+            }
     }
 
     private var list: some View {
@@ -211,6 +226,9 @@ struct RemindPalette: View {
             opened = Date()
             selection = 0
             busy = false
+            // `hits` is state now, so moving the clock does nothing until the
+            // engine is re-asked.
+            refreshHits()
             return
         }
         let ok = await Actions.remind(target.messageId, at: hit.date, label: hit.detail)

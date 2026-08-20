@@ -29,6 +29,7 @@ struct RemindTimesTests {
         namedWeekdaysNeverMeanToday()
         theWeekendIsTwoDays()
         detailNamesTheAbsoluteTime()
+        ordinalDaysComeAroundAgain()
         duplicatesCollapse()
 
         if failures > 0 {
@@ -274,6 +275,40 @@ struct RemindTimesTests {
         for h in RemindTimes.match("", now: now, calendar: cal) {
             equal(h.detail.isEmpty, false, "\(h.label) states its time")
         }
+    }
+
+    /// "the 24th" is the next 24th at 09:00: this month while it is still
+    /// ahead, next month once it has gone by — and a month without the day is
+    /// skipped, never clamped to a nearby one.
+    static func ordinalDaysComeAroundAgain() {
+        // The 19th of August at 14:30: the 24th is still ahead this month.
+        equal(hit("the 24th", "the 24th")?.date, moment(2026, 8, 24, 9), "still ahead = this month")
+        // The 3rd has gone by, so it means September's.
+        equal(hit("the 3rd", "the 3rd")?.date, moment(2026, 9, 3, 9), "gone by = next month")
+        // Article and suffix are each enough on their own; the label always
+        // renders the full ordinal so the row reads back as a date.
+        equal(hit("24th", "the 24th")?.date, moment(2026, 8, 24, 9), "bare suffix works")
+        equal(hit("the 24", "the 24th")?.date, moment(2026, 8, 24, 9), "bare article works")
+        equal(hit("on the 24th", "the 24th")?.date, moment(2026, 8, 24, 9), "'on the' works")
+        // Today's own number: 9am is already past at 14:30, so it means next
+        // month — but asked before 9am it still means today.
+        equal(hit("the 19th", "the 19th")?.date, moment(2026, 9, 19, 9), "today past 9am = next month")
+        equal(
+            hit("the 19th", "the 19th", now: moment(2026, 8, 19, 8))?.date,
+            moment(2026, 8, 19, 9), "today before 9am = today")
+        // Skip-not-clamp: asked in April, "the 31st" is May 31, not April 30.
+        equal(
+            hit("the 31st", "the 31st", now: moment(2026, 4, 10, 12))?.date,
+            moment(2026, 5, 31, 9), "a month without the day is skipped")
+        // A bare number commits to nothing and is refused.
+        equal(
+            RemindTimes.match("24", now: now, calendar: cal).contains {
+                $0.date == moment(2026, 8, 24, 9)
+            }, false, "a bare '24' is not a day of the month")
+        // The ordinal silences the detector: one row, not a near-duplicate.
+        equal(
+            RemindTimes.match("the 24th", now: now, calendar: cal).count, 1,
+            "the closed answer stands alone")
     }
 
     /// Two sources naming the same minute are one row.
