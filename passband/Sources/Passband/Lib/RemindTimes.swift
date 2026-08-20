@@ -43,8 +43,12 @@ enum RemindTimes {
         case afterHours(Int)
         /// A wall-clock hour on the day N days from today.
         case dayAt(days: Int, hour: Int)
-        /// The next occurrence of a weekday (1 = Sunday) at a wall-clock hour.
+        /// The next occurrence of a weekday (1 = Sunday) at a wall-clock hour,
+        /// searched from TOMORROW: a named weekday never means today.
         case weekdayAt(weekday: Int, hour: Int)
+        /// The nearest weekend morning still ahead — its own recipe because the
+        /// weekend is TWO days and `weekdayAt` can only name one of them.
+        case weekend(hour: Int)
         /// A wall-clock hour on the same day-of-month N months out.
         case monthAt(months: Int, hour: Int)
     }
@@ -74,7 +78,7 @@ enum RemindTimes {
             label: "tomorrow evening", recipe: .dayAt(days: 1, hour: 18),
             aliases: ["tomorrow night", "tmrw evening", "tmrw night"]),
         QuickPick(
-            label: "this weekend", recipe: .weekdayAt(weekday: 7, hour: 9),
+            label: "this weekend", recipe: .weekend(hour: 9),
             aliases: ["weekend", "saturday", "sat"]),
         QuickPick(
             label: "next week", recipe: .weekdayAt(weekday: 2, hour: 9),
@@ -182,15 +186,48 @@ enum RemindTimes {
             guard let day = calendar.date(byAdding: .day, value: days, to: now) else { return nil }
             return at(hour, on: day, calendar: calendar)
         case .weekdayAt(let weekday, let hour):
-            return calendar.nextDate(
-                after: now,
-                matching: DateComponents(hour: hour, minute: 0, second: 0, weekday: weekday),
-                matchingPolicy: .nextTime)
+            return nextWeekday(weekday, hour: hour, now: now, calendar: calendar)
+        case .weekend(let hour):
+            // THE WEEKEND IS TWO DAYS, and which of them is still ahead depends
+            // on where inside it you are asking from. A plain "next Saturday"
+            // match cannot say that: asked on a Saturday afternoon it steps
+            // clean over the Sunday sitting right there and lands a week out.
+            let weekday = calendar.component(.weekday, from: now)
+            if weekday == 7 || weekday == 1 {
+                // Still before the hour on a weekend day: it is today.
+                if let today = at(hour, on: now, calendar: calendar), today > now { return today }
+                // Saturday, past it: Sunday is the rest of this weekend.
+                if weekday == 7 {
+                    guard let tomorrow = calendar.date(byAdding: .day, value: 1, to: now)
+                    else { return nil }
+                    return at(hour, on: tomorrow, calendar: calendar)
+                }
+                // Sunday, past it: this weekend is over, so the next one.
+            }
+            return nextWeekday(7, hour: hour, now: now, calendar: calendar)
         case .monthAt(let months, let hour):
             guard let month = calendar.date(byAdding: .month, value: months, to: now)
             else { return nil }
             return at(hour, on: month, calendar: calendar)
         }
+    }
+
+    /// The next `weekday` (1 = Sunday) at `hour`, searched from the START OF
+    /// TOMORROW.
+    ///
+    /// Not from `now`, which is the whole point: `nextDate` matches LATER THE
+    /// SAME DAY, so "next week" asked on a Monday at 08:30 resolves to 09:00
+    /// that same morning — a next week that fires in thirty minutes, on mail
+    /// that just left the inbox. Tomorrow is the earliest day a named weekday
+    /// can honestly mean.
+    private static func nextWeekday(
+        _ weekday: Int, hour: Int, now: Date, calendar: Calendar
+    ) -> Date? {
+        guard let tomorrow = calendar.date(byAdding: .day, value: 1, to: now) else { return nil }
+        return calendar.nextDate(
+            after: calendar.startOfDay(for: tomorrow),
+            matching: DateComponents(hour: hour, minute: 0, second: 0, weekday: weekday),
+            matchingPolicy: .nextTime)
     }
 
     /// A wall-clock hour on the calendar day `day` falls in.
@@ -299,8 +336,16 @@ enum RemindTimes {
 
     private static func hasTimeToken(_ text: String) -> Bool {
         if text.contains(":") { return true }
-        for token in text.lowercased().split(whereSeparator: { !$0.isLetter && !$0.isNumber }) {
-            if timeWords.contains(String(token)) { return true }
+        // Apostrophes are ERASED rather than treated as separators: splitting on
+        // one turns "o'clock" into "o" and "clock", and neither half is a time
+        // word. Both the typed one and the one autocorrect substitutes.
+        let flat =
+            text.lowercased()
+            .replacingOccurrences(of: "'", with: "")
+            .replacingOccurrences(of: "\u{2019}", with: "")
+        let tokens = flat.split(whereSeparator: { !$0.isLetter && !$0.isNumber }).map(String.init)
+        for (i, token) in tokens.enumerated() {
+            if timeWords.contains(token) { return true }
             if token == "am" || token == "pm" { return true }
             // "3pm", "1130pm" — a NUMBER carrying the marker. A word that
             // merely ends in one ("spam", "program") does not.
@@ -308,6 +353,19 @@ enum RemindTimes {
                 token.dropLast(2).allSatisfy(\.isNumber)
             {
                 return true
+            }
+            // "at 8", "at 17" — the preposition is what makes a bare number an
+            // hour, and the detector reads it that way too. Without this the
+            // 09:00 snap overwrites an hour the user typed in so many words,
+            // while the row's label still shows the words. The number has to
+            // stand alone and be a real hour: "at 2099" is a year.
+            if token == "at", i + 1 < tokens.count {
+                let next = tokens[i + 1]
+                if next.count <= 2, next.allSatisfy(\.isNumber), let hour = Int(next),
+                    hour >= 0, hour <= 23
+                {
+                    return true
+                }
             }
         }
         return false

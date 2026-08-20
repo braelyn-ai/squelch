@@ -3384,6 +3384,130 @@ async fn reminder_on_unknown_or_sealed_message_is_404() {
 }
 
 #[tokio::test]
+async fn reminder_on_the_users_own_sent_mail_is_404() {
+    // Sent mail carries a triage row, so the endpoint would happily stamp one —
+    // onto a message every listing filters out, where the reminder could never
+    // be seen or cancelled and firing it would surface nothing. Same answer as
+    // sealed, for the same reason.
+    let Harness { app, store, acct } = harness(|store, acct| {
+        store
+            .upsert_message(&sent_msg(acct, "g-sent", "t1", "what I wrote", "a@b.com"))
+            .unwrap();
+    });
+    let sent_id = store.thread_view(acct, "t1").unwrap().messages[0].id;
+    store
+        .set_triage(
+            sent_id,
+            acct,
+            0,
+            Tier::Noise,
+            Sensitivity::Normal,
+            None,
+            "",
+            "",
+            None,
+        )
+        .unwrap();
+
+    let resp = app
+        .oneshot(authed_json(
+            "POST",
+            &format!("/client/updates/{sent_id}/reminder"),
+            serde_json::json!({
+                "remind_at": (chrono::Utc::now() + chrono::Duration::days(1)).to_rfc3339()
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    assert!(
+        store
+            .attention_updates(acct, reminder_window(), None, None, None, true)
+            .unwrap()
+            .is_empty(),
+        "nothing was scheduled"
+    );
+}
+
+#[tokio::test]
+async fn a_reminder_on_old_mail_survives_the_default_updates_window() {
+    // THE DEFAULT WINDOW IS 30 DAYS and the pick is "next month": the schedule,
+    // the band and the flat listing must all keep showing a two-month-old row
+    // the user personally asked to see again, over the handler's own default
+    // `since` (no query parameter here — that is the point).
+    let Harness { app, store, acct } = harness(|store, acct| {
+        let old = store
+            .upsert_message(&squelch_core::types::NewMessage {
+                received_at: chrono::Utc::now() - chrono::Duration::days(60),
+                ..msg(acct, "g-old", "t-old", "the thing you parked", "body")
+            })
+            .unwrap();
+        store
+            .set_triage(
+                old,
+                acct,
+                0,
+                Tier::Noise,
+                Sensitivity::Normal,
+                None,
+                "",
+                "",
+                None,
+            )
+            .unwrap();
+    });
+    let id = store.thread_view(acct, "t-old").unwrap().messages[0].id;
+
+    let set = app
+        .clone()
+        .oneshot(authed_json(
+            "POST",
+            &format!("/client/updates/{id}/reminder"),
+            serde_json::json!({
+                "remind_at": (chrono::Utc::now() + chrono::Duration::days(1)).to_rfc3339()
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(set.status(), StatusCode::OK);
+
+    let ids_of = |body: Value| -> Vec<i64> {
+        body["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|u| u["id"].as_i64().unwrap())
+            .collect()
+    };
+    let schedule = app
+        .clone()
+        .oneshot(authed("GET", "/client/updates?reminders=pending"))
+        .await
+        .unwrap();
+    assert_eq!(ids_of(body_json(schedule).await), vec![id]);
+
+    // Fired, it is in the standing band, in the header count, and in the flat
+    // listing — all three read over the same default window.
+    store
+        .fire_due_reminders(acct, chrono::Utc::now() + chrono::Duration::days(2))
+        .unwrap();
+    let standing = app
+        .clone()
+        .oneshot(authed("GET", "/client/updates?band=standing"))
+        .await
+        .unwrap();
+    assert_eq!(ids_of(body_json(standing).await), vec![id]);
+    let flat = app
+        .clone()
+        .oneshot(authed("GET", "/client/updates"))
+        .await
+        .unwrap();
+    assert_eq!(ids_of(body_json(flat).await), vec![id]);
+    let stats = app.oneshot(authed("GET", "/client/stats")).await.unwrap();
+    assert_eq!(body_json(stats).await["bands"]["standing"], 1);
+}
+
+#[tokio::test]
 async fn clear_reminder_endpoint_is_idempotent() {
     let Harness { app, store, acct } = harness(|store, acct| {
         seed_one_signal(store, acct, "g1", "t1", "hi");

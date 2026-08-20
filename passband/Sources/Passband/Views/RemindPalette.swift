@@ -190,16 +190,34 @@ struct RemindPalette: View {
         ]
     }
 
-    /// Set it, close, and hand back to whoever opened us.
+    /// Set it. Then, and only on a stamp that actually landed, close and hand
+    /// back to whoever opened us.
     ///
-    /// The palette closes on the way OUT of `Actions.remind` rather than before
-    /// it: the row is leaving optimistically either way, and a palette that
-    /// vanished before a 400 came back would leave the user with a toast and
-    /// nothing to retype into.
+    /// THE PALETTE STAYS OPEN ON FAILURE, with what you typed still in it. The
+    /// close and the caller's `onScheduled` (the reader walks to the next email
+    /// on it) are the app saying the reminder took, and running that
+    /// choreography over a 400 leaves the user watching the mail leave while a
+    /// toast says it did not. So both hang off `Actions.remind`'s answer.
     private func apply(_ hit: RemindHit) async {
         guard !busy else { return }
         busy = true
-        await Actions.remind(target.messageId, at: hit.date, label: hit.detail)
+        // THE PINNED CLOCK'S ESCAPE HATCH. `opened` is deliberately frozen so
+        // the list cannot re-rank itself under the cursor between keystrokes —
+        // which also means a palette left open long enough holds rows that have
+        // since gone by, and the daemon 400s a reminder set in the past. Rather
+        // than submit that, re-pin the clock and let the list re-resolve: the
+        // same words now mean a time that is still ahead.
+        guard hit.date > Date() else {
+            opened = Date()
+            selection = 0
+            busy = false
+            return
+        }
+        let ok = await Actions.remind(target.messageId, at: hit.date, label: hit.detail)
+        guard ok else {
+            busy = false
+            return
+        }
         onClose()
         target.onScheduled?()
     }

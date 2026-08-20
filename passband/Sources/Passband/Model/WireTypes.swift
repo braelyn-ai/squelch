@@ -224,6 +224,11 @@ struct ClientMessage: Codable, Sendable, Identifiable, Hashable, SenderStringCon
     /// daemon, which reads as unknown — the strict side. Governs the reader's
     /// tracker strip: see `allowsTrackers`.
     var sender_known: Bool?
+    /// Whether the USER sent this one. ABSENT on a pre-sent-flag daemon, which
+    /// reads as unknown rather than as inbound — a nil here must not make the
+    /// reader treat a reply as somebody else's mail. Picks which message in a
+    /// thread a reminder lands on: see ThreadViewer's `H`.
+    var is_sent: Bool?
 
     var attachmentList: [Attachment] { attachments ?? [] }
 

@@ -962,3 +962,184 @@ fn reminders_do_not_cross_accounts() {
         vec![my_row]
     );
 }
+
+#[test]
+fn a_reminder_outlives_the_recency_window() {
+    // THE FEATURE'S CORE PROMISE, against the window that would have killed it
+    // on day 30: `since` here is the handler's own default (now - 30d), and the
+    // mail is two months old — exactly the "remind me next month" case. Without
+    // the exemption the schedule stops listing it, and the fired reminder
+    // reopens a row no band, no count and no page can show.
+    let (store, acct) = store();
+    let since = Utc::now() - chrono::Duration::days(30);
+    let old = ingest_normal(
+        &store,
+        acct,
+        "g-old",
+        "t-old",
+        Tier::Noise,
+        0,
+        Utc::now() - chrono::Duration::days(60),
+    );
+    assert!(
+        all_updates(&store, acct, since).is_empty(),
+        "the window still holds for mail nobody scheduled"
+    );
+
+    // (a) the pending lens lists it, 60-day-old receipt date and all.
+    store
+        .set_reminder(acct, old, Utc::now() + chrono::Duration::days(2))
+        .unwrap();
+    assert_eq!(pending_ids(&store, acct, since), vec![old]);
+
+    // (b) once it fires: in the standing LIST and in the header COUNT, which is
+    // the pair that has to agree row for row.
+    store
+        .fire_due_reminders(acct, Utc::now() + chrono::Duration::days(3))
+        .unwrap();
+    assert_eq!(standing_ids(&store, acct, since), vec![old]);
+    assert_eq!(store.stats(acct, since).unwrap().bands.standing, 1);
+
+    // (c) and the flat listing (no band) carries it too — the page the user
+    // lands on after the reminder brings it back.
+    assert_eq!(
+        all_updates(&store, acct, since)
+            .iter()
+            .map(|u| u.update.id)
+            .collect::<Vec<_>>(),
+        vec![old]
+    );
+}
+
+#[test]
+fn a_reminder_cannot_be_set_on_the_users_own_sent_mail() {
+    // Sent mail carries a triage row (neutral, tier=noise) and every listing
+    // filters `m.is_sent = 0`, so a reminder on one would be unreachable
+    // forever. Same indistinguishability rule as sealed: no row, no `true`.
+    let (store, acct) = store();
+    let since = Utc::now() - chrono::Duration::days(30);
+    let sent = triaged(acct, "g-sent", "t1").is_sent(true).seed(&store);
+    let inbound = triaged(acct, "g-in", "t1").importance(80).seed(&store);
+
+    let due = Utc::now() + chrono::Duration::days(1);
+    assert!(
+        !store.set_reminder(acct, sent, due).unwrap(),
+        "the user's own message reads as missing"
+    );
+    // NOTHING happened: not the stamp, not the thread-wide done sweep that
+    // would have resolved the real, inbound half of the conversation.
+    assert_eq!(raw_triage(&store, sent), ("new".to_string(), None));
+    assert_eq!(raw_triage(&store, inbound), ("new".to_string(), None));
+    assert!(pending_ids(&store, acct, since).is_empty());
+    assert!(
+        store
+            .fire_due_reminders(acct, Utc::now() + chrono::Duration::days(2))
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn the_schedule_lists_every_reminder_even_two_in_one_thread() {
+    // A SCHEDULE LISTS ONE ROW PER REMINDER, not one per conversation: the
+    // band's thread collapse would hide the second one where it can neither be
+    // seen nor cancelled, while it still comes due.
+    let (store, acct) = store();
+    let since = Utc::now() - chrono::Duration::days(30);
+    let first = ingest_normal(&store, acct, "g1", "thr", Tier::Signal, 80, Utc::now());
+    let second = ingest_normal(&store, acct, "g2", "thr", Tier::Signal, 70, Utc::now());
+
+    store
+        .set_reminder(acct, first, Utc::now() + chrono::Duration::days(1))
+        .unwrap();
+    store
+        .set_reminder(acct, second, Utc::now() + chrono::Duration::days(4))
+        .unwrap();
+    assert_eq!(
+        pending_ids(&store, acct, since),
+        vec![first, second],
+        "both siblings are on the schedule, soonest first"
+    );
+
+    // And cancelling one leaves the other exactly where it was.
+    assert!(store.clear_reminder(acct, first).unwrap());
+    assert_eq!(pending_ids(&store, acct, since), vec![second]);
+
+    // The bands still collapse the thread to one row — this is a schedule
+    // exemption, not a change to the bands.
+    store
+        .fire_due_reminders(acct, Utc::now() + chrono::Duration::days(5))
+        .unwrap();
+    assert_eq!(standing_ids(&store, acct, since).len(), 1);
+}
+
+#[test]
+fn resolving_a_fired_reminder_spends_it_for_good() {
+    // The fired stamp holds a row in standing at ANY tier, so it must not
+    // survive the user answering it: fire -> done -> reopen would otherwise put
+    // a noise-tier newsletter back in the standing band forever, every single
+    // time the row is ever reopened.
+    let (store, acct) = store();
+    let since = Utc::now() - chrono::Duration::days(30);
+    let noise = ingest_normal(&store, acct, "g1", "t1", Tier::Noise, 0, Utc::now());
+
+    store
+        .set_reminder(acct, noise, Utc::now() - chrono::Duration::minutes(1))
+        .unwrap();
+    store.fire_due_reminders(acct, Utc::now()).unwrap();
+    assert_eq!(standing_ids(&store, acct, since), vec![noise], "it fired");
+
+    store
+        .set_attention_status(acct, noise, AttentionStatus::Done)
+        .unwrap();
+    assert!(all_updates(&store, acct, since)[0].reminded_at.is_none());
+
+    // The undo path: the row comes back, the spent reminder does not.
+    store
+        .set_attention_status(acct, noise, AttentionStatus::Open)
+        .unwrap();
+    assert!(
+        standing_ids(&store, acct, since).is_empty(),
+        "a reopened row is judged on its tier again, not on a spent reminder"
+    );
+    assert_eq!(store.stats(acct, since).unwrap().bands.standing, 0);
+}
+
+#[test]
+fn re_arming_clears_the_fired_stamp_on_the_whole_thread() {
+    // The done sweep is thread-wide, and so is the clearing: a sibling left
+    // wearing an old fired stamp sits in the standing band while the thread is
+    // supposedly parked until the new date.
+    let (store, acct) = store();
+    let since = Utc::now() - chrono::Duration::days(30);
+    let first = ingest_normal(&store, acct, "g1", "thr", Tier::Noise, 0, Utc::now());
+    let sibling = ingest_normal(&store, acct, "g2", "thr", Tier::Noise, 0, Utc::now());
+
+    // The sibling's reminder fires, then the user re-parks the thread off the
+    // other message.
+    store
+        .set_reminder(acct, sibling, Utc::now() - chrono::Duration::minutes(1))
+        .unwrap();
+    store.fire_due_reminders(acct, Utc::now()).unwrap();
+    store
+        .set_reminder(acct, first, Utc::now() + chrono::Duration::days(3))
+        .unwrap();
+
+    assert!(
+        standing_ids(&store, acct, since).is_empty(),
+        "the whole thread is parked, siblings included"
+    );
+
+    // And the sibling's spent stamp is really gone, not merely hidden behind
+    // its `done`: reopening it (undo, or the next reminder firing on the thread)
+    // must not drag a noise-tier row back into standing on a reminder that was
+    // already answered.
+    store
+        .set_attention_status(acct, sibling, AttentionStatus::Open)
+        .unwrap();
+    assert!(
+        standing_ids(&store, acct, since).is_empty(),
+        "a re-armed thread carries no leftover fired stamp"
+    );
+    assert_eq!(store.stats(acct, since).unwrap().bands.standing, 0);
+}

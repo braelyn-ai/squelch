@@ -25,6 +25,9 @@ struct RemindTimesTests {
         relativeUnits()
         relativeRejectsNonsense()
         bareDateSnapsToNine()
+        statedHoursSurviveTheSnap()
+        namedWeekdaysNeverMeanToday()
+        theWeekendIsTwoDays()
         detailNamesTheAbsoluteTime()
         duplicatesCollapse()
 
@@ -186,6 +189,78 @@ struct RemindTimesTests {
         } else {
             equal(false, true, "the detector found the timed date")
         }
+    }
+
+    /// An hour the user actually typed is never snapped to 09:00 — including
+    /// the two shapes that read as bare dates token-wise: "at 8" (the
+    /// preposition is what makes the number an hour) and "5 o'clock" (the
+    /// apostrophe splits the word in half).
+    ///
+    /// `now` is deliberately WAY in the past. NSDataDetector resolves against
+    /// the system clock, which no injection reaches, so "aug 30 at 5" is a
+    /// future instant for eleven months of the year and a dropped row for the
+    /// twelfth. An old `now` keeps the drop-if-past filter out of the way, and
+    /// the hour is what these cases are about.
+    static func statedHoursSurviveTheSnap() {
+        let system = Calendar.current
+        let longAgo = moment(2000, 1, 1, 0, calendar: system)
+        func hour(_ query: String) -> Int? {
+            guard let h = RemindTimes.match(query, now: longAgo, calendar: system).first
+            else { return nil }
+            return system.component(.hour, from: h.date)
+        }
+        equal(hour("tomorrow at 8"), 8, "'at 8' is 8am, not the 09:00 default")
+        equal(hour("friday at 17"), 17, "'at 17' is the 24h hour it says")
+        equal(hour("aug 30 at 5"), 17, "'at 5' keeps whatever the detector read it as")
+        // Which 5 the detector picks (05:00 or 17:00) depends on the real clock
+        // it reads, and neither is this test's business: what matters is that
+        // the 5 the user said is still in there rather than snapped to 9.
+        equal(hour("5 o'clock").map { $0 % 12 }, 5, "o'clock survives the apostrophe")
+        // The other half of the contract, unchanged: a date with no time in it
+        // still gets the morning, and a marked hour still passes through.
+        equal(hour("aug 30"), 9, "a bare date still snaps to 09:00")
+        equal(hour("aug 30 3pm"), 15, "and a stated 3pm is still 3pm")
+    }
+
+    /// "next week" picked on a Monday morning means NEXT Monday. Matching
+    /// forward from `now` would find 09:00 the same morning — a reminder
+    /// thirty minutes out, on mail that just left the inbox.
+    static func namedWeekdaysNeverMeanToday() {
+        let mondayEarly = moment(2026, 8, 24, 8, 30)  // Monday
+        equal(
+            hit("", "next week", now: mondayEarly)?.date, moment(2026, 8, 31, 9),
+            "Monday 08:30 → next Monday, not today at 9")
+        equal(
+            RemindTimes.match("mon", now: mondayEarly, calendar: cal).first?.date,
+            moment(2026, 8, 31, 9), "and typing the day says the same thing")
+        // Later the same Monday resolves identically: the rule is the day, not
+        // the hour it happens to be.
+        equal(
+            hit("", "next week", now: moment(2026, 8, 24, 14))?.date, moment(2026, 8, 31, 9),
+            "Monday afternoon → next Monday too")
+    }
+
+    /// A weekend is Saturday AND Sunday, and the pick has to offer whichever
+    /// half is still ahead of you.
+    static func theWeekendIsTwoDays() {
+        // Typed rather than read off the empty menu: standing INSIDE the
+        // weekend, the pick and "tomorrow morning" can name the same 9am, and
+        // the one-row-per-minute rule then keeps whichever was declared first.
+        // The resolution is what is under test, not which label won the bucket.
+        func weekend(_ now: Date) -> Date? {
+            RemindTimes.match("weekend", now: now, calendar: cal).first?.date
+        }
+        // Aug 22 2026 is a Saturday, the 23rd a Sunday.
+        equal(weekend(moment(2026, 8, 22, 8)), moment(2026, 8, 22, 9), "Saturday before 9 → today")
+        equal(
+            weekend(moment(2026, 8, 22, 10)), moment(2026, 8, 23, 9),
+            "Saturday at 10 → Sunday, not a week out")
+        equal(weekend(moment(2026, 8, 23, 8)), moment(2026, 8, 23, 9), "Sunday before 9 → today")
+        equal(
+            weekend(moment(2026, 8, 23, 12)), moment(2026, 8, 29, 9),
+            "Sunday afternoon → the weekend is over, so the next Saturday")
+        // And from outside it, the unchanged answer: the coming Saturday.
+        equal(weekend(now), moment(2026, 8, 22, 9), "Wednesday → the Saturday ahead")
     }
 
     /// Every row states when it fires. This is the promise the palette makes.

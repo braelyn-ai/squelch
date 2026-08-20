@@ -74,6 +74,18 @@ struct ThreadViewer: View {
     /// The NEWEST message is what `u` acts on (the server derives the sender
     /// from it) and whose from_addr keys the record lookup.
     private var newest: ClientMessage? { messages.last }
+    /// What `H` parks: the newest message the user did NOT send.
+    ///
+    /// Not the selected one, which in a replied thread is typically your own
+    /// reply — and a reminder on your own sent mail is a reminder on mail no
+    /// listing will ever show, so the daemon answers those with a 404. A thread
+    /// that is nothing BUT your own mail (sent, no answer back yet) falls back
+    /// to the selected message and lets the daemon have the last word. `nil`
+    /// reads as inbound on purpose: an older daemon sends no flag at all, and a
+    /// missing one has to leave the key working exactly as it did.
+    private var remindable: ClientMessage? {
+        messages.last { $0.is_sent != true } ?? messages[safe: index]
+    }
     /// trim().lowercased() mirrors the server's canonical `sender`.
     private var newestSender: String? {
         newest.map { $0.from_addr.trimmingCharacters(in: .whitespaces).lowercased() }
@@ -781,7 +793,7 @@ struct ThreadViewer: View {
             // way: KeyDispatch matches EXACT case before it folds, so the two
             // never reach each other.
             KeyBinding("H", "remind + next") {
-                guard let thread, let m = messages[safe: index] else { return }
+                guard let thread, let m = remindable else { return }
                 store.openRemind(
                     RemindTarget(
                         messageId: m.id, sender: m.from_addr, subject: thread.subject,

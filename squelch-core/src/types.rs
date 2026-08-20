@@ -263,6 +263,14 @@ pub struct ClientMessage {
     /// The stage-1 one-line summary — the highlight's tooltip.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub one_line: Option<String>,
+    /// The user's own copy in the thread. ALWAYS on the wire (a plain bool,
+    /// defaulting to false for a row an older daemon serialized) because the
+    /// reader needs it on every message, not just the interesting ones: an
+    /// action aimed at "the message" — remind me about this, reply to this —
+    /// must land on inbound mail, and a thread ends on the user's own reply
+    /// often enough that aiming at the last message would aim at themselves.
+    #[serde(default)]
+    pub is_sent: bool,
     /// The stored `messages.auth_pass` (see [`NewMessage::auth_pass`]). NOT on
     /// the wire: it exists so `get_thread` can gate the read-time `sender_known`
     /// bit on it, and the client already receives that derived answer.
@@ -757,6 +765,7 @@ mod tests {
                     attention_open: Some(true),
                     one_line: Some("bill is 12 days past due".into()),
                     auth_pass: Some(true),
+                    is_sent: false,
                 },
                 ClientMessage {
                     id: 2,
@@ -771,6 +780,7 @@ mod tests {
                     attention_open: None,
                     one_line: None,
                     auth_pass: None,
+                    is_sent: true,
                 },
             ],
         };
@@ -800,6 +810,10 @@ mod tests {
         // auth_pass is an internal gate for the human door's `sender_known`
         // bit, never a wire field, even when it holds a verdict.
         assert!(v["messages"][0].get("auth_pass").is_none());
+        // `is_sent` is the opposite: ALWAYS on the wire, both ways, because the
+        // reader has to aim its actions at inbound mail on every message.
+        assert_eq!(v["messages"][0]["is_sent"], serde_json::json!(false));
+        assert_eq!(v["messages"][1]["is_sent"], serde_json::json!(true));
     }
 
     fn base_update() -> Update {

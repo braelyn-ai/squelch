@@ -26,6 +26,25 @@ fn update_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Update> {
     })
 }
 
+/// The recency window every human-door listing runs under (`?2` is the caller's
+/// `since`), plus the ONE exemption from it: a row carrying a reminder, pending
+/// or fired.
+///
+/// THE WINDOW EXISTS SO OLD MAIL CANNOT RE-LITIGATE ITSELF — a sitrep that
+/// reaches back over the whole corpus is not a sitrep. A reminder is the exact
+/// opposite case: the user pointed at that mail themselves and said "show me
+/// this again", so it has to outlive the window or the feature's core promise
+/// dies on day 30. Without the exemption the pending lens stops listing parked
+/// mail a month after it was RECEIVED (not a month after it was parked), and a
+/// reminder set on older mail — the "next month" pick on a two-month-old
+/// thread — fires into a row that no band, no count and no page will ever show.
+///
+/// Like [`STANDING_BAND`] it lives in ONE place because the list query and the
+/// header's count must agree row for row.
+const WITHIN_WINDOW: &str = "(m.received_at >= ?2
+            OR t.remind_at IS NOT NULL
+            OR t.reminded_at IS NOT NULL)";
+
 /// Membership test for the `standing` band, written against the `triage t` /
 /// `messages m` join that both band sites share. It lives in ONE place because
 /// the list query and the header's count must agree row for row, or the sitrep
@@ -114,7 +133,8 @@ impl SqliteStore {
         let conn = self.lock()?;
         let min = min_importance.unwrap_or(0) as i64;
 
-        // Base predicate: sealed excluded, sent excluded, since/importance window.
+        // Base predicate: sealed excluded, sent excluded, since/importance window
+        // (see WITHIN_WINDOW for why a reminder row is exempt from the `since`).
         // Bands:
         //   standing = dated obligation OR live correspondence, not yet done
         //              (see STANDING_BAND for the definition and its limits)
@@ -122,12 +142,12 @@ impl SqliteStore {
         //   open     = status = 'open'
         // The `status != 'done'` on `new` keeps AUTO-RESOLVED receipts out of the
         // band — a receipt is a record, not new inbox clutter.
-        let mut where_sql = String::from(
+        let mut where_sql = format!(
             "WHERE t.account_id = ?1
                AND t.sensitivity != 'sealed'
                AND m.is_sent = 0
-               AND m.received_at >= ?2
-               AND t.importance >= ?3",
+               AND {WITHIN_WINDOW}
+               AND t.importance >= ?3"
         );
         if let Some(s) = status {
             where_sql.push_str(match s {
@@ -188,6 +208,17 @@ impl SqliteStore {
         // set_attention_status), so the hidden siblings can never pop back in.
         // The thread key falls back to the message id for a blank thread_id, so
         // an unthreaded row can only ever collapse with itself.
+        //
+        // EXCEPT ON THE SCHEDULE, which lists one row per REMINDER: two siblings
+        // of one thread can each carry their own, and collapsing them hides one
+        // behind the other — unseeable and uncancellable, yet still due to fire.
+        // Only the partition key changes; every row keys on itself, so nothing
+        // collapses.
+        let thread_key = if pending_reminders {
+            "'msg-' || m.id"
+        } else {
+            "COALESCE(NULLIF(m.thread_id, ''), 'msg-' || m.id)"
+        };
         let sql = format!(
             "SELECT * FROM (
                SELECT m.id, m.thread_id, t.tier, t.importance, m.from_addr, t.one_line,
@@ -201,7 +232,7 @@ impl SqliteStore {
                       t.remind_at AS remind_at,
                       t.reminded_at AS reminded_at,
                       ROW_NUMBER() OVER (
-                          PARTITION BY COALESCE(NULLIF(m.thread_id, ''), 'msg-' || m.id)
+                          PARTITION BY {thread_key}
                           ORDER BY {inner_order}
                       ) AS rn
                FROM triage t
@@ -301,10 +332,17 @@ impl SqliteStore {
         // band and done becomes whack-a-mole. Reopen (open/new) stays
         // message-scoped: the undo path restores exactly the one row it removed,
         // which is enough to re-surface the thread.
+        //
+        // DONE ALSO RETIRES THE FIRED REMINDER. `reminded_at` is what holds a
+        // row in the standing band at any tier, so a stamp left behind means a
+        // reminder the user answered comes back every time the row is ever
+        // reopened — the reminder fired, it was dealt with, it is spent. Reopen
+        // does not restore it for the same reason: undo restores the row, not
+        // the schedule.
         let n = match status {
             AttentionStatus::Done => conn.execute(
                 "UPDATE triage
-                 SET status = ?1, resolved_at = ?2
+                 SET status = ?1, resolved_at = ?2, reminded_at = NULL
                  WHERE account_id = ?3 AND sensitivity != 'sealed'
                    AND (message_id = ?4 OR message_id IN (
                        SELECT sib.id FROM messages me
@@ -346,10 +384,20 @@ impl SqliteStore {
         // same `false`. `reminded_at` is cleared because a new reminder replaces
         // whatever the old one already said — the two stamps are the pending and
         // fired halves of ONE reminder, never a history.
+        //
+        // AND NOT THE USER'S OWN SENT MAIL, by the same indistinguishability
+        // rule as sealed: sent mail carries a triage row (neutral, tier=noise)
+        // and every listing filters `m.is_sent = 0`, so a reminder stamped on
+        // one would be unreachable forever — it could never be listed, seen or
+        // cancelled, and firing it would surface nothing. No row, no `true`,
+        // and the handler 404s.
         let stamped = tx.execute(
             "UPDATE triage
              SET remind_at = ?1, reminded_at = NULL
-             WHERE account_id = ?2 AND message_id = ?3 AND sensitivity != 'sealed'",
+             WHERE account_id = ?2 AND message_id = ?3 AND sensitivity != 'sealed'
+               AND EXISTS(SELECT 1 FROM messages mm
+                          WHERE mm.account_id = ?2 AND mm.id = ?3
+                            AND mm.is_sent = 0)",
             params![remind_at.to_rfc3339(), account_id, message_id],
         )?;
         if stamped == 0 {
@@ -358,10 +406,13 @@ impl SqliteStore {
         // DEFERRING IS RESOLVING, thread-wide, with the SAME SQL shape as
         // `set_attention_status`'s Done arm and for the same reason: the bands
         // show one row per thread, so leaving a sibling open puts the mail the
-        // user just snoozed straight back in front of them.
+        // user just snoozed straight back in front of them. It clears
+        // `reminded_at` for that same reason — a sibling still wearing an old
+        // fired stamp sits in the standing band while the thread is supposedly
+        // parked until the new date.
         tx.execute(
             "UPDATE triage
-             SET status = 'done', resolved_at = ?1
+             SET status = 'done', resolved_at = ?1, reminded_at = NULL
              WHERE account_id = ?2 AND sensitivity != 'sealed'
                AND (message_id = ?3 OR message_id IN (
                    SELECT sib.id FROM messages me
@@ -506,8 +557,11 @@ impl SqliteStore {
         // the `band` query on attention_updates, or header and list disagree —
         // including its one-row-per-thread collapse, hence DISTINCT thread keys
         // (blank thread_id falls back to the message id, same as the list),
-        // and its received_at window, hence `bands_since` (the list's default
-        // min importance is 0, a no-op, so it is not mirrored here).
+        // and its received_at window, hence `bands_since` AND the same
+        // WITHIN_WINDOW reminder exemption the list runs under — a fired
+        // reminder the header refused to count is a header contradicting its
+        // list (the list's default min importance is 0, a no-op, so it is not
+        // mirrored here).
         // Standing is decided in the subquery, where the `m` join alias the
         // shared expression is written against is still in scope.
         let (standing, new_count, open_count): (i64, i64, i64) = conn.query_row(
@@ -523,7 +577,7 @@ impl SqliteStore {
                        JOIN messages m ON m.id = t.message_id
                        WHERE t.account_id = ?1 AND t.sensitivity != 'sealed'
                          AND m.is_sent = 0
-                         AND m.received_at >= ?2) t"
+                         AND {WITHIN_WINDOW}) t"
             ),
             params![account_id, bands_since.to_rfc3339()],
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),

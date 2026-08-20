@@ -1636,6 +1636,13 @@ final class AppStore {
     private var remindersLoadedAt: Date?
     private var remindersRefresh: Task<Void, Never>?
 
+    /// Counts every optimistic write to the list above. A GET that left before
+    /// one landed is answering a question about a list that no longer exists,
+    /// and its rows are OLDER than the local ones: without this, cancelling a
+    /// reminder while the poll's fetch is in flight puts the row back on screen
+    /// for the rest of the tick, which reads as the cancel not working.
+    private var remindersMutations = 0
+
     var remindersPage: Loadable<[AttentionUpdate]> { reminderRows }
 
     /// Same TTL-plus-join shape as `refreshMail` and `refreshSent`.
@@ -1656,6 +1663,8 @@ final class AppStore {
     }
 
     private func performRemindersRefresh() async {
+        let e = epoch
+        let mutations = remindersMutations
         reminderRows.isLoading = true
         do {
             // `peek` because this page is a REVIEW of things already dealt
@@ -1664,10 +1673,23 @@ final class AppStore {
             // state the row still has left for when the reminder fires.
             let page = try await APIClient.shared.getUpdates(
                 UpdatesParams(limit: Self.mailLimit, remindersPending: true), peek: true)
+            // The rows belong to the account that asked for them. Both exits
+            // below return rather than fall through, so the `isLoading` write
+            // at the bottom is only ever reached by the live epoch: an account
+            // switch mid-fetch would otherwise park A's rows in B's lens, where
+            // Backspace deletes a reminder on B's daemon by colliding id.
+            guard e == epoch else { return }
+            // And to the list as it stood when the fetch left. A cancel that
+            // landed while it was in flight is the newer truth of the two.
+            guard mutations == remindersMutations else {
+                reminderRows.isLoading = false
+                return
+            }
             if page.items != reminderRows.value { reminderRows.value = page.items }
             reminderRows.error = nil
             remindersLoadedAt = Date()
         } catch {
+            guard e == epoch else { return }
             reminderRows.error = errText(error, "load failed")
         }
         reminderRows.isLoading = false
@@ -1680,6 +1702,7 @@ final class AppStore {
     /// The insert keeps the server's own order — remind_at ascending — so the
     /// optimistic list and the next fetch agree on where the row sits.
     func noteReminder(_ update: AttentionUpdate, remindAt: String) {
+        remindersMutations &+= 1
         var row = update
         row.remind_at = remindAt
         row.reminded_at = nil
@@ -1693,6 +1716,7 @@ final class AppStore {
 
     /// Drop a row from the parked list — a cancelled reminder, or an undone one.
     func dropReminder(_ messageId: Int) {
+        remindersMutations &+= 1
         reminderRows.value?.removeAll { $0.id == messageId }
     }
 
