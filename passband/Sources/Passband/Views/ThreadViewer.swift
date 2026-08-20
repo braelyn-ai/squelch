@@ -1105,8 +1105,12 @@ struct ThreadViewer: View {
         unsub = rows.first { $0.sender == newestSender }
     }
 
-    /// Confirmed unsubscribe. 200 -> open the url + toast + refresh the hint.
-    /// 422 -> swap the card to the "no link — block instead?" fallback.
+    /// Confirmed unsubscribe. 200 -> open the url, then LEAVE: the server
+    /// resolved this SENDER's open mail alongside the request (unsubscribing is
+    /// a verdict on them, not on one thread), so the reader departs the way e/d
+    /// does — an email that stays on screen after being dealt with reads as the
+    /// action not having taken. 422 -> swap the card to the "no link — block
+    /// instead?" fallback.
     private func runUnsubscribe() async {
         guard let newest, !confirmBusy else { return }
         confirmBusy = true
@@ -1114,13 +1118,11 @@ struct ThreadViewer: View {
         do {
             let result = try await APIClient.shared.unsubscribe(messageId: newest.id)
             Opener.open(result.url)
-            // The server resolved this SENDER's open mail (unsubscribing is a
-            // verdict on them, not on one thread); drop those rows now rather
-            // than waiting on the poll.
+            // Drop the resolved rows NOW rather than one poll later.
             store.noteSenderResolved(result.sender)
             store.pushToast("opened unsubscribe page — \(result.sender)", .success)
-            await refreshUnsub()
             confirmMode = nil
+            await departAndClose()
         } catch let apiError as APIError where apiError.status == 422 {
             // No http(s) unsubscribe link — offer to block the sender instead.
             confirmMode = .noLink
@@ -1130,7 +1132,8 @@ struct ThreadViewer: View {
         }
     }
 
-    /// No-link fallback: block the EXACT sender.
+    /// No-link fallback: block the EXACT sender — and leave, for the same
+    /// reason unsubscribe does: the rule's sweep resolved this sender's mail.
     private func runBlock() async {
         guard let newestSender, !confirmBusy else { return }
         confirmBusy = true
@@ -1141,10 +1144,26 @@ struct ThreadViewer: View {
             try await Actions.createBlockRule(sender: newestSender, sourceMessageId: newest?.id)
             store.noteSenderResolved(newestSender)
             store.pushToast("blocked \(newestSender)", .success)
+            confirmMode = nil
+            await departAndClose()
         } catch {
             store.pushToast(errText(error, "block failed"), .error)
+            confirmMode = nil
         }
-        confirmMode = nil
+    }
+
+    /// The LEAVING half of done+next, for the actions whose server call already
+    /// resolved the mail (unsubscribe, block): unpin, lift out through the top,
+    /// close. No advance — a verdict on a sender is a stopping point, not a
+    /// step to the next email; anything else of theirs in the queue is done too.
+    private func departAndClose() async {
+        let liftedAt = liftOff()
+        if let newest { await ImageStore.shared.release(messageId: newest.id) }
+        await flightOut(since: liftedAt)
+        // Esc can close the reader while the email is still leaving; a second
+        // close must not fire against whatever surface took its place.
+        guard store.threadId == threadId else { return }
+        store.closeThread()
     }
 
     private func retriageThis() async {
