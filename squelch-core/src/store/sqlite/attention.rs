@@ -32,12 +32,19 @@ fn update_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Update> {
 /// header contradicts the list it heads.
 ///
 /// STANDING IS A PROPERTY, NOT A TIMESTAMP: the band is mail owed the user's
-/// attention — a dated obligation (`past_due`/`deadline`), or live
-/// correspondence: a thread the user has written in, or a sender the user has
-/// written to. A dateless "can you send me the form?" from a real correspondent
-/// is exactly as owed as a bill, and the surfacing clock must never rotate it
-/// out. Because this is a definition over stored rows, widening it is
-/// retroactive: mail already triaged joins the band on the next read.
+/// attention — a dated obligation (`past_due`/`deadline`), a fired reminder, or
+/// live correspondence: a thread the user has written in, or a sender the user
+/// has written to. A dateless "can you send me the form?" from a real
+/// correspondent is exactly as owed as a bill, and the surfacing clock must
+/// never rotate it out. Because this is a definition over stored rows, widening
+/// it is retroactive: mail already triaged joins the band on the next read.
+///
+/// THE REMINDER ARM (`reminded_at IS NOT NULL`) carries no tier test on purpose.
+/// Every other arm infers what the user cares about; this one is the user saying
+/// it outright, so a noise-tier newsletter they asked to see again comes back
+/// exactly as loudly as a past-due bill. It is the fired stamp and not the
+/// pending one because a pending reminder means "not now" — `set_reminder`
+/// marks the thread done precisely to get it out of the bands until it is due.
 ///
 /// What participation deliberately does NOT do: it never unseals anything (the
 /// base predicate's `sensitivity != 'sealed'` is the only gate that matters,
@@ -50,6 +57,7 @@ fn update_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Update> {
 /// harvest but kept verbatim by the per-message Sent ingest, so neither side can
 /// be assumed normalized.
 const STANDING_BAND: &str = "(t.tier IN ('past_due','deadline')
+        OR t.reminded_at IS NOT NULL
         OR (m.thread_id != '' AND EXISTS(
                 SELECT 1 FROM messages s
                 WHERE s.account_id = m.account_id
@@ -101,6 +109,7 @@ impl SqliteStore {
         min_importance: Option<u8>,
         status: Option<AttentionStatus>,
         band: Option<SitrepBand>,
+        pending_reminders: bool,
     ) -> Result<Vec<AttentionUpdate>> {
         let conn = self.lock()?;
         let min = min_importance.unwrap_or(0) as i64;
@@ -137,13 +146,32 @@ impl SqliteStore {
             Some(SitrepBand::Open) => where_sql.push_str(" AND t.status = 'open'"),
             None => {}
         }
+        // THE PENDING-REMINDER LISTING, deliberately orthogonal to `status`: every
+        // row here is done (that is what `set_reminder` does to it), so this is
+        // the one listing that must NOT inherit the bands' "done means gone"
+        // reading. It is a schedule, not a band.
+        if pending_reminders {
+            where_sql.push_str(" AND t.remind_at IS NOT NULL");
+        }
         // The `open` band is the aging one: age*importance floats
         // long-unresolved-and-important items, computed in SQL via julianday so
         // the ordering stays server-side. Other bands sort by importance. The
         // same expression orders WITHIN a thread (below) and BETWEEN the
         // representatives, so the row shown is the one the sort would have put
         // first anyway.
-        let (inner_order, outer_order) = if band == Some(SitrepBand::Open) {
+        //
+        // A pending-reminder listing sorts by DUE DATE instead, and wins over the
+        // aging sort when both are asked for: soonest-first is the only ordering
+        // a schedule can have. It is also what decides whether `?4` is bound at
+        // all, so the two must be read off the SAME flag or the bind count and
+        // the SQL disagree.
+        let age_order = band == Some(SitrepBand::Open) && !pending_reminders;
+        let (inner_order, outer_order) = if pending_reminders {
+            (
+                "t.remind_at ASC, m.received_at DESC",
+                "remind_at ASC, received_at DESC",
+            )
+        } else if age_order {
             (
                 "(julianday(?4) - julianday(m.received_at)) * t.importance DESC, m.received_at DESC",
                 "(julianday(?4) - julianday(received_at)) * importance DESC, received_at DESC",
@@ -170,6 +198,8 @@ impl SqliteStore {
                                AND a.message_id = m.id) AS has_atts,
                       m.from_name AS from_name,
                       m.received_at AS received_at,
+                      t.remind_at AS remind_at,
+                      t.reminded_at AS reminded_at,
                       ROW_NUMBER() OVER (
                           PARTITION BY COALESCE(NULLIF(m.thread_id, ''), 'msg-' || m.id)
                           ORDER BY {inner_order}
@@ -204,9 +234,13 @@ impl SqliteStore {
                     .unwrap_or(AttentionStatus::New),
                 surfaced_at: dt_opt(r, 10)?,
                 resolved_at: dt_opt(r, 11)?,
+                // HUMAN DOOR again: columns 16/17, past the `received_at` (15)
+                // the outer sort needs but no field reads.
+                remind_at: dt_opt(r, 16)?,
+                reminded_at: dt_opt(r, 17)?,
             })
         };
-        let out = if band == Some(SitrepBand::Open) {
+        let out = if age_order {
             stmt.query_map(params![account_id, since.to_rfc3339(), min, now], map_row)?
                 .collect::<std::result::Result<Vec<_>, _>>()?
         } else {
@@ -288,6 +322,116 @@ impl SqliteStore {
             )?,
         };
         Ok(n > 0)
+    }
+
+    /// "Remind me about this at T." Thread-wide done PLUS the stamp, in one
+    /// transaction: a reminder that half-applied would either nag a mail the
+    /// user just deferred or lose the deferral entirely, and both are worse than
+    /// the write failing.
+    ///
+    /// THE STAMP GOES FIRST, and its row count — not the done sweep's — is the
+    /// missing/sealed answer. The sweep is thread-wide, so a sealed target with
+    /// an unsealed sibling would report `true` off a row the caller never named
+    /// while the stamp itself landed nowhere.
+    pub(super) fn set_reminder(
+        &self,
+        account_id: AccountId,
+        message_id: i64,
+        remind_at: DateTime<Utc>,
+    ) -> Result<bool> {
+        let mut conn = self.lock()?;
+        let now = Utc::now().to_rfc3339();
+        let tx = conn.transaction()?;
+        // SECURITY: sealed rows excluded in SQL, so missing and sealed are the
+        // same `false`. `reminded_at` is cleared because a new reminder replaces
+        // whatever the old one already said — the two stamps are the pending and
+        // fired halves of ONE reminder, never a history.
+        let stamped = tx.execute(
+            "UPDATE triage
+             SET remind_at = ?1, reminded_at = NULL
+             WHERE account_id = ?2 AND message_id = ?3 AND sensitivity != 'sealed'",
+            params![remind_at.to_rfc3339(), account_id, message_id],
+        )?;
+        if stamped == 0 {
+            return Ok(false);
+        }
+        // DEFERRING IS RESOLVING, thread-wide, with the SAME SQL shape as
+        // `set_attention_status`'s Done arm and for the same reason: the bands
+        // show one row per thread, so leaving a sibling open puts the mail the
+        // user just snoozed straight back in front of them.
+        tx.execute(
+            "UPDATE triage
+             SET status = 'done', resolved_at = ?1
+             WHERE account_id = ?2 AND sensitivity != 'sealed'
+               AND (message_id = ?3 OR message_id IN (
+                   SELECT sib.id FROM messages me
+                   JOIN messages sib ON sib.account_id = me.account_id
+                                    AND sib.thread_id = me.thread_id
+                   WHERE me.account_id = ?2 AND me.id = ?3
+                     AND me.thread_id != ''))",
+            params![now, account_id, message_id],
+        )?;
+        tx.commit()?;
+        Ok(true)
+    }
+
+    /// Drop a PENDING reminder, leaving everything else exactly where it is.
+    ///
+    /// Deliberately NOT the inverse of [`Self::set_reminder`]: it does not reopen
+    /// the thread (the user may well have meant to resolve it) and it does not
+    /// touch `reminded_at` (clearing a pending reminder says nothing about one
+    /// that already came due). Idempotent — a row with no reminder is a
+    /// successful no-op, so only missing/sealed returns `false`.
+    pub(super) fn clear_reminder(&self, account_id: AccountId, message_id: i64) -> Result<bool> {
+        let conn = self.lock()?;
+        // SECURITY: sealed rows excluded in SQL.
+        let n = conn.execute(
+            "UPDATE triage
+             SET remind_at = NULL
+             WHERE account_id = ?1 AND message_id = ?2 AND sensitivity != 'sealed'",
+            params![account_id, message_id],
+        )?;
+        Ok(n > 0)
+    }
+
+    /// THE SWEEP: every reminder now due, fired in one statement, returning the
+    /// message ids it moved.
+    ///
+    /// The stamp MOVES rather than being copied — `remind_at` NULLs as
+    /// `reminded_at` takes its value — which is what makes this idempotent
+    /// without a cooldown: a fired row no longer matches the predicate, so a
+    /// second tick (or a second daemon) cannot fire it twice. `resolved_at`
+    /// clears alongside the status because a reopened row that still carries a
+    /// resolution timestamp reads as done to everything downstream.
+    ///
+    /// `now` is a parameter, not `Utc::now()`, so a test can hold the clock.
+    pub(super) fn fire_due_reminders(
+        &self,
+        account_id: AccountId,
+        now: DateTime<Utc>,
+    ) -> Result<Vec<i64>> {
+        let conn = self.lock()?;
+        // SECURITY: sealed rows excluded in SQL. A sealed row cannot carry a
+        // reminder in the first place (`set_reminder` refuses it), and the guard
+        // is repeated here anyway because "cannot happen" is not a gate.
+        let mut stmt = conn.prepare(
+            "UPDATE triage
+             SET status = 'open',
+                 resolved_at = NULL,
+                 reminded_at = remind_at,
+                 remind_at = NULL
+             WHERE account_id = ?1
+               AND remind_at IS NOT NULL
+               AND remind_at <= ?2
+               AND sensitivity != 'sealed'
+             RETURNING message_id",
+        )?;
+        let out = stmt
+            .query_map(params![account_id, now.to_rfc3339()], |r| {
+                r.get::<_, i64>(0)
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(out)
     }
 
     pub(super) fn resolve_sender(&self, account_id: AccountId, sender_addr: &str) -> Result<usize> {

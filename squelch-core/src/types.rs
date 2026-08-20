@@ -193,6 +193,19 @@ pub struct AttentionUpdate {
     pub status: AttentionStatus,
     pub surfaced_at: Option<DateTime<Utc>>,
     pub resolved_at: Option<DateTime<Utc>>,
+    /// A PENDING reminder: when the user asked to see this again, `None` when
+    /// they never did or the reminder already fired. HUMAN-DOOR ONLY, like the
+    /// two fields above — a reminder is a statement the user made about their
+    /// own attention, and the agent door serializes the leaner [`Update`], which
+    /// has no place to put it.
+    ///
+    /// Serialized even when `None` (no `skip_serializing_if`, same as
+    /// `surfaced_at`): the client decodes these as optionals and "absent" and
+    /// "null" must not become two different readings of "no reminder".
+    pub remind_at: Option<DateTime<Utc>>,
+    /// A reminder that ALREADY FIRED, `None` until one does. Exactly one of this
+    /// and `remind_at` is ever set: the sweep moves the stamp across.
+    pub reminded_at: Option<DateTime<Utc>>,
 }
 
 /// A single sanitized message body (HTML flattened to text).

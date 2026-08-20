@@ -641,6 +641,10 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
             // AFTER both stages, so it sees each row's FINAL category (Stage-2
             // may have overwritten Stage-1's).
             self.extract_pass().await;
+            // Due reminders, before the re-evaluation pass so a mail that comes
+            // back this tick is already `open` when the sweep looks at the
+            // standing band. Costs one indexed UPDATE and no model spend.
+            self.reminder_pass();
             // LAST, and over OLD rows rather than the ones just ingested: a
             // re-evaluation competes with nothing this cycle, and a row it
             // re-escalates is picked up by the next cycle's Stage-2.
@@ -1511,6 +1515,26 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
             .revisits_schedule(self.account_id, message_id, &planned, now)
         {
             eprintln!("squelch: revisit scheduling failed ({e}); the row will not be re-evaluated");
+        }
+    }
+
+    /// Bring back the mail whose reminders have come due.
+    ///
+    /// The poll tick is the clock: there is no timer per reminder, because a
+    /// reminder is stored state and the daemon may well have been off when the
+    /// moment passed. Whatever is due when the loop next runs fires then, so a
+    /// restart costs punctuality and never a reminder.
+    ///
+    /// Synchronous and infallible from the loop's point of view: one indexed
+    /// UPDATE, and an error is logged and dropped. A store hiccup must not bounce
+    /// the whole sync lifecycle over a feature that will retry in a minute.
+    fn reminder_pass(&self) {
+        match self.store.fire_due_reminders(self.account_id, Utc::now()) {
+            Ok(ids) if !ids.is_empty() => {
+                eprintln!("squelch: {} reminder(s) came due", ids.len())
+            }
+            Ok(_) => {}
+            Err(e) => eprintln!("squelch: reminder sweep failed ({e}); skipping"),
         }
     }
 

@@ -777,6 +777,19 @@ struct ThreadViewer: View {
             },
             KeyBinding("e", "done + next") { Task { await doneAndNext() } },
             KeyBinding("d", "done + next") { Task { await doneAndNext() } },
+            // Capital H. Lowercase `h` above is "previous email" and stays that
+            // way: KeyDispatch matches EXACT case before it folds, so the two
+            // never reach each other.
+            KeyBinding("H", "remind + next") {
+                guard let thread, let m = messages[safe: index] else { return }
+                store.openRemind(
+                    RemindTarget(
+                        messageId: m.id, sender: m.from_addr, subject: thread.subject,
+                        remindAt: store.update(id: m.id)?.remind_at,
+                        // The reader leaves the same way it does on done + next:
+                        // the mail is dealt with, so the walk carries on.
+                        onScheduled: { Task { await remindAndNext() } }))
+            },
             KeyBinding("u", "unsubscribe") { confirmMode = .ask },
             // `r` = reply, and it lives HERE rather than in the composer's own
             // set because it is what opens the composer when there is none. With
@@ -996,6 +1009,31 @@ struct ThreadViewer: View {
         // sleep is the whole reason this works: an offset that is set and
         // cleared inside one update has never been drawn, so there is nothing
         // for the animation to move away from.
+        store.openThread(next.thread_id, queue: queue, entering: edge)
+        try? await Task.sleep(for: .milliseconds(30))
+        withAnimation(Motion.deckCard) { store.threadFlight = .settled }
+    }
+
+    /// The tail of `doneAndNext`, for `H`: the reminder is already set (the
+    /// palette did that, and the row is already gone from the bands), so this is
+    /// only the departure and the walk. Both beats still run — the email leaving
+    /// is what says the reminder took, and a reader that just sat there would
+    /// read as a key that did nothing.
+    private func remindAndNext() async {
+        let queue = store.threadQueue
+        let liftedAt = liftOff()
+        await flightOut(since: liftedAt)
+        // Outlived its own reader (Esc, another surface): do not haul a thread
+        // back onto a page nobody is on.
+        guard store.threadId == threadId else { return }
+
+        guard let cur = queue.firstIndex(where: { $0.thread_id == threadId }),
+            let next = queue[safe: cur + 1]
+        else {
+            store.closeThread()
+            return
+        }
+        let edge: AppStore.ThreadEdge = sameSender(next, queue[cur]) ? .trailing : .bottom
         store.openThread(next.thread_id, queue: queue, entering: edge)
         try? await Task.sleep(for: .milliseconds(30))
         withAnimation(Motion.deckCard) { store.threadFlight = .settled }

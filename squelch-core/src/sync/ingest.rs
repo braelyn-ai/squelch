@@ -2421,7 +2421,14 @@ mod tests {
         assert_eq!(view.messages.len(), 1);
         assert!(view.messages[0].content.contains("noon works"));
         let updates = store
-            .attention_updates(acct, now - chrono::Duration::days(1), None, None, None)
+            .attention_updates(
+                acct,
+                now - chrono::Duration::days(1),
+                None,
+                None,
+                None,
+                false,
+            )
             .unwrap();
         assert!(
             updates.is_empty(),

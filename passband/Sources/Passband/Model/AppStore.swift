@@ -180,7 +180,10 @@ struct RefreshError: Equatable, Sendable {
 
 // MARK: - undo / toasts
 
-enum UndoKind: Sendable { case archive, done, label, ruleDelete }
+/// `remind` is its own kind rather than a flavour of `done`: the forward action
+/// resolves the thread AND schedules its return, so the inverse is two calls,
+/// and "undo_fired kind=done" would count a reminder as a completion.
+enum UndoKind: Sendable { case archive, done, label, ruleDelete, remind }
 
 /// A queued undo. `revert` is the exact inverse call to fire on `u`/toast-click;
 /// the forward action has already gone out.
@@ -265,6 +268,25 @@ struct TriageFixTarget: Sendable, Equatable {
     /// as "unset" — which would claim a fact we never fetched.
     var tier: String??
     var category: String??
+}
+
+/// The email currently being scheduled by the `H` palette.
+///
+/// Identifiable rather than Equatable (the shape TriageFixTarget takes) because
+/// it carries a callback: the reader has to advance its queue after a reminder
+/// lands, and the palette is a global overlay that knows nothing about which
+/// surface opened it.
+struct RemindTarget: Identifiable, Sendable {
+    let id = UUID()
+    var messageId: Int
+    var sender: String
+    var subject: String
+    /// The reminder ALREADY on this row, when this is a reschedule. Shown so a
+    /// second `H` reads as "moving it" rather than as setting a first one.
+    var remindAt: String?
+    /// Called after the reminder is set, on the surface that opened the
+    /// palette. The reader uses it to walk its queue the way `e`/`d` do.
+    var onScheduled: (@MainActor @Sendable () -> Void)?
 }
 
 /// The rule editor's open request. Three shapes: tune (`sender`), create from
@@ -436,6 +458,7 @@ final class AppStore {
     /// gesture: navigate, then compose. One-shot — the viewer clears it.
     var pendingReplyMessageId: Int?
     var triageFix: TriageFixTarget?
+    var remindTarget: RemindTarget?
     var ruleEditor: RuleEditorRequest?
     var processModeOpen = false
     var askBarOpen = false
@@ -975,6 +998,10 @@ final class AppStore {
         mailPages = [:]
         mailLoadedAt = [:]
         mailRefreshes = [:]
+        reminderRows = .loading
+        remindersLoadedAt = nil
+        remindersRefresh = nil
+        reminderFilter = false
         search = SearchSession()
         resolvedIds = []
         selectedId = nil
@@ -995,6 +1022,7 @@ final class AppStore {
         // across a switch would save the old account's rule to the new
         // account's daemon.
         triageFix = nil
+        remindTarget = nil
         ruleEditor = nil
         // Every revert closure targets the old account's daemon.
         undos = []
@@ -1214,8 +1242,8 @@ final class AppStore {
     /// they are ringing would defeat them.
     var modalOverlayOpen: Bool {
         askBarOpen || shortcutsOpen || processModeOpen
-            || triageFix != nil || ruleEditor != nil || !authQueue.isEmpty
-            || tour.wantsBlur
+            || triageFix != nil || remindTarget != nil || ruleEditor != nil
+            || !authQueue.isEmpty || tour.wantsBlur
     }
 
     // MARK: - sitrep zones
@@ -1592,6 +1620,101 @@ final class AppStore {
         sentRows.isLoading = false
     }
 
+    // MARK: - the pending-reminder filter
+
+    /// Whether the all-mail page is narrowed to mail with a reminder waiting.
+    /// A FILTER, not a fourth MailMode: the segments are three pages of mail,
+    /// and this is a lens over one of them that the Escape ladder sheds first.
+    var reminderFilter = false
+
+    /// Parked mail, in its OWN cache for the same reason the sent page has one:
+    /// these rows are all `done`, so `refreshMail`'s pages — which every list
+    /// filters through `resolvedIds` — would hide every one of them the moment
+    /// it was set. Ordered by the DAEMON (remind_at ASC, soonest first), and
+    /// never re-sorted here.
+    private var reminderRows: Loadable<[AttentionUpdate]> = .loading
+    private var remindersLoadedAt: Date?
+    private var remindersRefresh: Task<Void, Never>?
+
+    var remindersPage: Loadable<[AttentionUpdate]> { reminderRows }
+
+    /// Same TTL-plus-join shape as `refreshMail` and `refreshSent`.
+    func refreshReminders(force: Bool = false) async {
+        if !force, let loadedAt = remindersLoadedAt,
+            Date().timeIntervalSince(loadedAt) < Self.mailTTL
+        {
+            return
+        }
+        if let running = remindersRefresh {
+            await running.value
+            if !force { return }
+        }
+        let refresh = Task { await performRemindersRefresh() }
+        remindersRefresh = refresh
+        await refresh.value
+        if remindersRefresh == refresh { remindersRefresh = nil }
+    }
+
+    private func performRemindersRefresh() async {
+        reminderRows.isLoading = true
+        do {
+            // `peek` because this page is a REVIEW of things already dealt
+            // with: showing a parked row is not the app surfacing that mail,
+            // and stamping the seen-ledger here would spend the one "new"
+            // state the row still has left for when the reminder fires.
+            let page = try await APIClient.shared.getUpdates(
+                UpdatesParams(limit: Self.mailLimit, remindersPending: true), peek: true)
+            if page.items != reminderRows.value { reminderRows.value = page.items }
+            reminderRows.error = nil
+            remindersLoadedAt = Date()
+        } catch {
+            reminderRows.error = errText(error, "load failed")
+        }
+        reminderRows.isLoading = false
+    }
+
+    /// Land a reminder on the local rows without waiting for a round trip: the
+    /// row joins (or moves within) the parked list at its new place in the
+    /// queue, and leaves every surface that shows unfinished mail.
+    ///
+    /// The insert keeps the server's own order — remind_at ascending — so the
+    /// optimistic list and the next fetch agree on where the row sits.
+    func noteReminder(_ update: AttentionUpdate, remindAt: String) {
+        var row = update
+        row.remind_at = remindAt
+        row.reminded_at = nil
+        row.status = .done
+        var rows = (reminderRows.value ?? []).filter { $0.id != update.id }
+        let due = Fmt.date(remindAt) ?? .distantFuture
+        let at = rows.firstIndex { (Fmt.date($0.remind_at) ?? .distantFuture) > due } ?? rows.count
+        rows.insert(row, at: at)
+        reminderRows.value = rows
+    }
+
+    /// Drop a row from the parked list — a cancelled reminder, or an undone one.
+    func dropReminder(_ messageId: Int) {
+        reminderRows.value?.removeAll { $0.id == messageId }
+    }
+
+    /// Make the next read of the parked list go to the daemon. For the caller
+    /// that changed a reminder without holding the row it changed.
+    func invalidateReminders() { remindersLoadedAt = nil }
+
+    /// The cached row for a message id, wherever it currently sits. A lookup
+    /// rather than a parameter because the surfaces that act on a message do not
+    /// all hold one: the reader has `ClientMessage`s, and a thread opened from
+    /// search has no queue behind it at all. nil means genuinely uncached, which
+    /// callers treat as "ask the daemon", never as "no such mail".
+    func update(id: Int) -> AttentionUpdate? {
+        for band in [sitrep.standing, sitrep.new, sitrep.open] {
+            if let hit = band.first(where: { $0.id == id }) { return hit }
+        }
+        for mode in MailMode.allCases {
+            if let hit = mailPage(mode).value?.first(where: { $0.id == id }) { return hit }
+        }
+        return reminderRows.value?.first { $0.id == id }
+    }
+
     /// Preload the emails behind the records the columns show, so clicking one
     /// opens instantly.
     private func warmZoneThreads() {
@@ -1783,6 +1906,9 @@ final class AppStore {
 
     func openTriageFix(_ target: TriageFixTarget) { triageFix = target }
     func closeTriageFix() { triageFix = nil }
+
+    func openRemind(_ target: RemindTarget) { remindTarget = target }
+    func closeRemind() { remindTarget = nil }
 
     func openRuleEditor(_ request: RuleEditorRequest) { ruleEditor = request }
     func closeRuleEditor() { ruleEditor = nil }

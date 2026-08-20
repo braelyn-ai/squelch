@@ -220,6 +220,7 @@ fn field_reasons_roundtrip_through_ingest_and_attention_updates() {
             None,
             None,
             None,
+            false,
         )
         .unwrap();
     let u = ups.iter().find(|u| u.update.id == id).expect("row present");
@@ -278,6 +279,7 @@ fn predating_triage_row_reads_back_as_none() {
             None,
             None,
             None,
+            false,
         )
         .unwrap();
     let u = ups.iter().find(|u| u.update.id == mid).unwrap();

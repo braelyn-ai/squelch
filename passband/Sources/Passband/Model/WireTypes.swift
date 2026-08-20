@@ -164,8 +164,21 @@ struct AttentionUpdate: Codable, Sendable, Identifiable, Hashable {
     var status: AttentionStatus
     var surfaced_at: String?
     var resolved_at: String?
+    /// A PENDING reminder: when the daemon will pull this back into the bands.
+    /// Non-nil implies the row is done — setting a reminder resolves the thread
+    /// — so a row carrying one is not "unfinished", it is parked. HUMAN DOOR
+    /// ONLY: the agent door never serves either of these fields, which is why
+    /// both are optional rather than merely nullable.
+    var remind_at: String?
+    /// A reminder that FIRED, cleared the next time the row is resolved. It is
+    /// what re-enters the standing band regardless of tier: a reminder is the
+    /// user declaring the mail owed attention, and that outranks a verdict.
+    var reminded_at: String?
 
     var hasAttachments: Bool { has_attachments ?? false }
+
+    /// Whether a reminder is waiting to fire on this row.
+    var hasPendingReminder: Bool { !(remind_at ?? "").isEmpty }
 }
 
 /// The wire calls the address `sender` here and `from_addr` everywhere else, so
@@ -946,6 +959,12 @@ struct UpdatesParams: Sendable {
     var band: Band?
     var limit: Int?
     var cursor: String?
+    /// Narrow to rows with a PENDING reminder, soonest first. Named for the
+    /// flag rather than the query value (`reminders=pending`) because unlike
+    /// every field above it, it is a filter with its own ORDER: the server
+    /// sorts these by remind_at, not by arrival, and it serves done rows —
+    /// which every other read here would have excluded.
+    var remindersPending: Bool
 
     init(
         since: String? = nil,
@@ -954,7 +973,8 @@ struct UpdatesParams: Sendable {
         status: AttentionStatus? = nil,
         band: Band? = nil,
         limit: Int? = nil,
-        cursor: String? = nil
+        cursor: String? = nil,
+        remindersPending: Bool = false
     ) {
         self.since = since
         self.min_importance = min_importance
@@ -963,5 +983,6 @@ struct UpdatesParams: Sendable {
         self.band = band
         self.limit = limit
         self.cursor = cursor
+        self.remindersPending = remindersPending
     }
 }

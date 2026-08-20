@@ -1,0 +1,236 @@
+// REMIND PALETTE — `H` on a focused email: say when, hit Enter, and the mail
+// leaves now and comes back then.
+//
+// EVERY ROW STATES ITS ABSOLUTE TIME. This is the one palette in the app whose
+// pick is a promise about the future, and "next week" is a different Monday
+// depending on which day you asked — so the words you typed sit on the left and
+// the instant they resolve to sits on the right, on every row, always. The
+// suggestion engine underneath (RemindTimes) is pure and asserted; this file is
+// only the surface.
+
+import SwiftUI
+
+struct RemindPalette: View {
+    let target: RemindTarget
+    let onClose: () -> Void
+
+    @State private var query = ""
+    @State private var selection = 0
+    @State private var busy = false
+    /// Pinned when the palette opens: every row is scored against ONE clock, so
+    /// a list cannot re-rank itself under the cursor between keystrokes.
+    @State private var opened = Date()
+    @Namespace private var paletteGlass
+    @FocusState private var focused: Bool
+
+    private var hits: [RemindHit] { RemindTimes.match(query, now: opened) }
+
+    var body: some View {
+        surface
+            .keyContext(.modal)
+            .keyBindings(.modal, bindings)
+            .onAppear { focused = true }
+            .onChange(of: hits.count) { _, count in
+                selection = max(0, min(selection, max(0, count - 1)))
+            }
+    }
+
+    @ViewBuilder
+    private var surface: some View {
+        #if os(macOS)
+            OverlayScrim(alignment: .top, topInset: 110, onDismiss: onClose) {
+                GlassEffectContainer(spacing: 8) {
+                    palette
+                        .frame(width: 560)
+                        .passbandGlass(
+                            .pane, cornerRadius: 20, tint: Palette.glassTintStrong,
+                            id: "remind", in: paletteGlass)
+                        .shadow(color: .black.opacity(0.32), radius: 46, y: 20)
+                }
+            }
+        #else
+            palette
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+                .background(Palette.canvas.ignoresSafeArea())
+                .presentationDetents([.large])
+        #endif
+    }
+
+    private var palette: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            header
+            input
+            Divider().overlay(Palette.hairline)
+            list
+            footer
+        }
+    }
+
+    private var header: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "bell.badge")
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundStyle(Palette.accent)
+            Text(rescheduling ? "Move the reminder" : "Remind me")
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundStyle(Palette.ink)
+            Text(target.subject)
+                .font(Typo.micro)
+                .foregroundStyle(Palette.inkFaintest)
+                .lineLimit(1)
+                .help("\(target.sender) · \(target.subject)")
+            Spacer(minLength: 4)
+            // WHAT IT IS SET TO NOW, when there is one. A second `H` is a move,
+            // not a first booking, and the row you are moving off is the one
+            // fact the list itself cannot show.
+            if let current = target.remindAt, !current.isEmpty {
+                Text("now \(Fmt.remindChip(current))")
+                    .font(Typo.micro)
+                    .foregroundStyle(Palette.inkDim)
+                    .fixedSize()
+            }
+        }
+        .padding(.horizontal, 16)
+        .padding(.top, 14)
+        .padding(.bottom, 8)
+    }
+
+    private var rescheduling: Bool { !(target.remindAt ?? "").isEmpty }
+
+    private var input: some View {
+        TextField("remind when...", text: $query)
+            .textFieldStyle(.plain)
+            .font(.system(size: 15))
+            .foregroundStyle(Palette.ink)
+            .focused($focused)
+            .autocorrectionDisabled()
+            .disabled(busy)
+            .padding(.horizontal, 16)
+            .padding(.top, 4)
+            .padding(.bottom, 12)
+            .onChange(of: query) { _, _ in selection = 0 }
+    }
+
+    private var list: some View {
+        ScrollViewReader { proxy in
+            ScrollView {
+                LazyVStack(spacing: 1) {
+                    if hits.isEmpty {
+                        Text(
+                            "no time in “\(query)”. try a day (\"friday\", \"aug 30\"), a wait (\"in 3 hours\") or leave it empty for the usual ones."
+                        )
+                        .font(Typo.micro)
+                        .foregroundStyle(Palette.inkFaintest)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(14)
+                    } else {
+                        ForEach(Array(hits.enumerated()), id: \.element.id) { i, hit in
+                            RemindRow(
+                                hit: hit, selected: i == selection,
+                                onHover: { selection = i },
+                                onPick: { Task { await apply(hit) } })
+                            .id(hit.id)
+                            .disabled(busy)
+                        }
+                    }
+                }
+                .padding(.horizontal, 8)
+                .padding(.vertical, 6)
+            }
+            .frame(maxHeight: 300)
+            .onChange(of: selection) { _, i in
+                guard let hit = hits[safe: i] else { return }
+                withAnimation(.easeOut(duration: 0.1)) { proxy.scrollTo(hit.id, anchor: .center) }
+            }
+        }
+    }
+
+    private var footer: some View {
+        HStack(spacing: 4) {
+            #if os(macOS)
+                Kbd("↑"); Kbd("↓")
+                Text("pick").font(Typo.micro).foregroundStyle(Palette.inkFaintest)
+                Text("·").foregroundStyle(Palette.inkFaintest)
+                Kbd("↵")
+                Text("set").font(Typo.micro).foregroundStyle(Palette.inkFaintest)
+                Text("·").foregroundStyle(Palette.inkFaintest)
+                Kbd("esc")
+                Text("cancel").font(Typo.micro).foregroundStyle(Palette.inkFaintest)
+            #else
+                Text("tap to set").font(Typo.micro).foregroundStyle(Palette.inkFaintest)
+            #endif
+            Spacer()
+            // The half of this that is not obvious: the mail goes away NOW.
+            Text("marks it done until then")
+                .font(Typo.micro)
+                .foregroundStyle(Palette.accent.opacity(0.8))
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 10)
+        .overlay(alignment: .top) { Hairline() }
+    }
+
+    /// allowInInput is REQUIRED, not polish: the palette autofocuses its field,
+    /// so the `editing && !allowInInput` guard would drop every binding — and
+    /// Escape would fall through to whatever binds it underneath, meaning
+    /// cancelling would NAVIGATE the app.
+    private var bindings: [KeyBinding] {
+        [
+            KeyBinding("Escape", "cancel", allowInInput: true) { onClose() },
+            KeyBinding("ArrowDown", "next", allowInInput: true) {
+                selection = min(hits.count - 1, selection + 1)
+            },
+            KeyBinding("ArrowUp", "prev", allowInInput: true) {
+                selection = max(0, selection - 1)
+            },
+            KeyBinding("Enter", "set reminder", allowInInput: true) {
+                if let hit = hits[safe: selection] { Task { await apply(hit) } }
+            },
+        ]
+    }
+
+    /// Set it, close, and hand back to whoever opened us.
+    ///
+    /// The palette closes on the way OUT of `Actions.remind` rather than before
+    /// it: the row is leaving optimistically either way, and a palette that
+    /// vanished before a 400 came back would leave the user with a toast and
+    /// nothing to retype into.
+    private func apply(_ hit: RemindHit) async {
+        guard !busy else { return }
+        busy = true
+        await Actions.remind(target.messageId, at: hit.date, label: hit.detail)
+        onClose()
+        target.onScheduled?()
+    }
+}
+
+private struct RemindRow: View {
+    let hit: RemindHit
+    let selected: Bool
+    let onHover: () -> Void
+    let onPick: () -> Void
+
+    var body: some View {
+        // hoverFill off for the same reason the triage palette turns it off:
+        // the pointer MOVES the selection here, so the selection fill already
+        // follows it and a hover wash under it would double up.
+        ListRow(
+            selected: selected, tint: Palette.accent, hPadding: 10, vPadding: 7,
+            hoverFill: false, onHoverChange: { if $0 { onHover() } }, action: onPick
+        ) { _, _ in
+            HStack(spacing: 10) {
+                Text(hit.label)
+                    .font(.system(size: 13, weight: .medium))
+                    .foregroundStyle(Palette.ink)
+                    .lineLimit(1)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                // THE ANSWER, on every row without exception.
+                Text(hit.detail)
+                    .font(Typo.micro)
+                    .foregroundStyle(Palette.accent.opacity(0.85))
+                    .fixedSize()
+            }
+        }
+    }
+}

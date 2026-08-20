@@ -381,6 +381,16 @@ struct SitrepView: View {
                         messageId: u.id, sender: u.sender, subject: u.one_line,
                         tier: .some(u.tier.rawValue)))
             },
+            // Capital H, and the lowercase pass never sees it: KeyDispatch tries
+            // an EXACT match before folding case, so this cannot be reached by a
+            // bare `h` bound anywhere else.
+            KeyBinding("H", "remind me later") {
+                guard eyesActionable, let u = reachable[safe: cursor.index] else { return }
+                store.openRemind(
+                    RemindTarget(
+                        messageId: u.id, sender: u.sender, subject: u.one_line,
+                        remindAt: u.remind_at))
+            },
             // The one verb here that is NOT about a highlighted row: a new message
             // needs nothing selected, so it skips the `eyesActionable` guard.
             KeyBinding("c", "new message") { store.openComposeNew() },
