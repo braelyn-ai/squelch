@@ -1,12 +1,19 @@
 // WHAT A WINDOWED ZONE SHOWS: the last 24 hours, or everything since the user
-// last had the app open — whichever reaches further back. Without a window the
+// last SAW the zone — whichever reaches further back. Without a window the
 // banking card held its latest 8 rows forever, some a week stale (issue #82).
 //
-// "Last open" is PER-DEVICE on purpose (Prefs' charter: view state, not account
-// state): the stamp is written when the app resigns active, and the cutoff is
-// recomputed only when it becomes active again — never mid-session, so a row on
-// screen cannot evaporate while the user is looking at it. A crash or force-quit
-// loses one stamp update, which errs toward showing MORE, the safe direction.
+// The seen-stamp belongs to the SURFACE, not the app. The zone reports its own
+// lifecycle (the Mac mounts it on the sitrep page, the phone on the Quick Look
+// tab — one zone, so both platforms get the right signal for free), and the
+// stamp advances only while one is on screen: at appearance, at disappearance,
+// and when the app resigns active or terminates WITH one showing. A session
+// spent entirely in Mail clears nothing, because nothing was seen.
+//
+// Per-device on purpose (Prefs' charter: view state, not account state), and the
+// cutoff is recomputed only when the app becomes active — never mid-session, so
+// a row on screen cannot evaporate while the user is looking at it. A crash or
+// force-quit loses at most one stamp update, which errs toward showing MORE, the
+// safe direction.
 
 import Foundation
 import Observation
@@ -16,15 +23,20 @@ import Observation
 final class SitrepWindow {
     static let shared = SitrepWindow()
 
-    /// The floor: rows younger than this always show, however recently the app
-    /// was open.
+    /// The floor: rows younger than this always show, however recently the zone
+    /// was seen.
     nonisolated static let floorInterval: TimeInterval = 24 * 3600
 
-    private nonisolated static let stampKey = "passband.sitrep.lastActive"
+    private nonisolated static let stampKey = "passband.sitrep.lastSeen"
 
     /// Rows at or after this instant are in the window. Frozen between
     /// activations — see the header.
     private(set) var cutoff: Date
+
+    /// How many windowed zones are on screen right now. A count, not a flag:
+    /// the sitrep lays the zone out differently per width and a layout switch
+    /// can overlap the two mounts.
+    private var visibleSurfaces = 0
 
     private let defaults = UserDefaults.standard
 
@@ -36,18 +48,20 @@ final class SitrepWindow {
         // First access may come after the launch activation already fired, so
         // the initial cutoff is computed here rather than waiting for the next
         // notification.
-        cutoff = Self.cutoff(now: Date(), lastActive: Self.storedStamp(defaults))
+        cutoff = Self.cutoff(now: Date(), lastSeen: Self.storedStamp(defaults))
         observers.append(
             NotificationCenter.default.addObserver(
                 forName: Platform.didBecomeActiveNotification, object: nil, queue: .main
             ) { _ in
                 Task { @MainActor in SitrepWindow.shared.recompute() }
             })
+        // Resigning active is a seen-moment only when a zone is showing:
+        // cmd-tabbing away from the Mail tab says nothing about banking.
         observers.append(
             NotificationCenter.default.addObserver(
                 forName: Platform.didResignActiveNotification, object: nil, queue: .main
             ) { _ in
-                Task { @MainActor in SitrepWindow.shared.stamp() }
+                Task { @MainActor in SitrepWindow.shared.stampIfSurfaceShowing() }
             })
         // ⌘Q from the foreground can terminate without ever resigning active,
         // and losing the whole session's stamp would replay the week on the
@@ -60,16 +74,30 @@ final class SitrepWindow {
                 // hop to the next runloop turn never runs. willTerminate is
                 // delivered on the main thread, so the assumeIsolated is honest.
                 MainActor.assumeIsolated {
-                    // ONLY when the app dies frontmost. A logout or shutdown
-                    // also terminates an app that has sat inactive for days,
-                    // and an unconditional stamp would swallow everything since
-                    // the resign stamp — mail the user never had on screen.
-                    // When inactive, the resign stamp already tells the truth.
-                    guard Platform.isAppActive else { return }
-                    UserDefaults.standard.set(
-                        Date().timeIntervalSince1970, forKey: SitrepWindow.stampKey)
+                    // ONLY when the app dies frontmost with a zone showing. A
+                    // logout or shutdown also terminates an app that has sat
+                    // backgrounded for days with the sitrep still mounted, and
+                    // an unconditional stamp would swallow everything since the
+                    // last true sighting.
+                    SitrepWindow.shared.stampIfSurfaceShowing(requireActive: true)
                 }
             })
+    }
+
+    // MARK: - the seen-signal
+
+    /// A windowed zone landed on screen. The rows it is about to render are
+    /// being seen right now.
+    func surfaceAppeared() {
+        visibleSurfaces += 1
+        stamp()
+    }
+
+    /// The zone left the screen — the last moment it was seen, which is the
+    /// truthful stamp for a sitrep that sat open all afternoon.
+    func surfaceDisappeared() {
+        stamp()
+        visibleSurfaces = max(0, visibleSurfaces - 1)
     }
 
     /// Whether a row's timestamp is in the window. `nil` (unparseable) is IN:
@@ -80,13 +108,13 @@ final class SitrepWindow {
 
     // MARK: - the rule, pure for tests
 
-    /// The earlier of (now − 24h) and the last-active stamp; no stamp (first
+    /// The earlier of (now − 24h) and the last-seen stamp; no stamp (first
     /// run) leaves the floor alone, which is also what clears a backlog that
     /// predates the window existing.
-    nonisolated static func cutoff(now: Date, lastActive: Date?) -> Date {
+    nonisolated static func cutoff(now: Date, lastSeen: Date?) -> Date {
         let floor = now.addingTimeInterval(-floorInterval)
-        guard let lastActive else { return floor }
-        return min(floor, lastActive)
+        guard let lastSeen else { return floor }
+        return min(floor, lastSeen)
     }
 
     nonisolated static func admits(_ date: Date?, cutoff: Date) -> Bool {
@@ -97,7 +125,13 @@ final class SitrepWindow {
     // MARK: - lifecycle plumbing
 
     private func recompute() {
-        cutoff = Self.cutoff(now: Date(), lastActive: Self.storedStamp(defaults))
+        cutoff = Self.cutoff(now: Date(), lastSeen: Self.storedStamp(defaults))
+    }
+
+    private func stampIfSurfaceShowing(requireActive: Bool = false) {
+        guard visibleSurfaces > 0 else { return }
+        if requireActive, !Platform.isAppActive { return }
+        stamp()
     }
 
     private func stamp() {

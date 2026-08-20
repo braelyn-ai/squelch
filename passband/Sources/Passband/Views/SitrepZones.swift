@@ -330,7 +330,7 @@ private struct CarrierBadge: View {
 /// balance the extractor pulled).
 ///
 /// WINDOWED, not capped: the card shows the last 24 hours, or everything since
-/// the app was last open, whichever reaches further back (SitrepWindow). The
+/// this zone was last SEEN, whichever reaches further back (SitrepWindow). The
 /// old fixed "latest 8" held week-old rows forever — issue #82.
 struct BankingZone: View {
     @Environment(AppStore.self) private var store
@@ -399,6 +399,13 @@ struct BankingZone: View {
             }
         }
         .task { await store.refreshZones() }
+        // THE SEEN-SIGNAL. The stamp belongs to this zone, not to the app: the
+        // Mac mounts it on the sitrep page, the phone on the Quick Look tab, and
+        // a session spent entirely in Mail must not clear a card nobody looked
+        // at. Appearance and disappearance are both reported — the window's
+        // clearing rides on them.
+        .onAppear { SitrepWindow.shared.surfaceAppeared() }
+        .onDisappear { SitrepWindow.shared.surfaceDisappeared() }
     }
 
     private func institutionLabel(_ r: BankingRecord) -> String {

@@ -1,5 +1,5 @@
 // The banking card's window rule (issue #82): the last 24 hours, or everything
-// since the app was last open, whichever reaches further back. These exercise
+// since the zone was last seen, whichever reaches further back. These exercise
 // the pure statics — the lifecycle plumbing (notifications, UserDefaults) is
 // deliberately out of reach of a headless suite, which is why the rule is
 // factored to take its inputs as arguments.
@@ -30,20 +30,20 @@ struct SitrepWindowTests {
         // First run: no stamp has ever been written, so the floor alone decides
         // — which is also what clears a pre-window backlog on update day.
         expect(
-            SitrepWindow.cutoff(now: now, lastActive: nil) == now.addingTimeInterval(-day),
+            SitrepWindow.cutoff(now: now, lastSeen: nil) == now.addingTimeInterval(-day),
             "no stamp falls back to the 24h floor")
 
         // Away for three days: the whole gap shows, once.
         let threeDays = now.addingTimeInterval(-3 * day)
         expect(
-            SitrepWindow.cutoff(now: now, lastActive: threeDays) == threeDays,
+            SitrepWindow.cutoff(now: now, lastSeen: threeDays) == threeDays,
             "a stamp older than the floor wins (show the gap)")
 
         // A quick app switch minutes ago must not collapse the window below
         // the floor.
         let justLeft = now.addingTimeInterval(-300)
         expect(
-            SitrepWindow.cutoff(now: now, lastActive: justLeft)
+            SitrepWindow.cutoff(now: now, lastSeen: justLeft)
                 == now.addingTimeInterval(-day),
             "a fresh stamp never narrows the window under 24h")
 
@@ -51,7 +51,7 @@ struct SitrepWindowTests {
         // empty card.
         let future = now.addingTimeInterval(3600)
         expect(
-            SitrepWindow.cutoff(now: now, lastActive: future)
+            SitrepWindow.cutoff(now: now, lastSeen: future)
                 == now.addingTimeInterval(-day),
             "a future stamp cannot push the cutoff past the floor")
     }
