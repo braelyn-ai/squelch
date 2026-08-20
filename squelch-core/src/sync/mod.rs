@@ -629,6 +629,11 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
             // bounce the whole lifecycle, and a mailbox stuck in that retry loop
             // should still have a fresh unread count for the human door.
             self.refresh_inbox_unread().await;
+            // BEFORE the walk too, and for the same reason: the sweep is purely
+            // local — one indexed UPDATE, no Gmail, no model spend — so hanging
+            // it off a call that can Err would let a bad credential or a Gmail
+            // outage starve it for as long as the outage lasts.
+            self.reminder_pass();
             self.poll_once().await?;
             // THE freshness stamp for a healthy daemon: `run()` only records one
             // on its way out, and a mailbox that polls happily for a month never
@@ -1511,6 +1516,34 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
             .revisits_schedule(self.account_id, message_id, &planned, now)
         {
             eprintln!("squelch: revisit scheduling failed ({e}); the row will not be re-evaluated");
+        }
+    }
+
+    /// Bring back the mail whose reminders have come due.
+    ///
+    /// The poll tick is the clock: there is no timer per reminder, because a
+    /// reminder is stored state and the daemon may well have been off when the
+    /// moment passed. Whatever is due when the loop next runs fires then, so a
+    /// restart costs punctuality and never a reminder.
+    ///
+    /// A CREDENTIAL OUTAGE COSTS NO MORE THAN A RESTART DOES, which is why the
+    /// loop runs this AHEAD of `poll_once` rather than after it: nothing here
+    /// talks to Gmail, so a mailbox stuck retrying an `invalid_grant` — or a
+    /// weekend of Gmail being down — must not be what swallows Saturday's
+    /// reminder. It still lands before `revisit_pass`, so a mail that comes back
+    /// this tick is already `open` when the re-evaluation sweep reads the
+    /// standing band.
+    ///
+    /// Synchronous and infallible from the loop's point of view: one indexed
+    /// UPDATE, and an error is logged and dropped. A store hiccup must not bounce
+    /// the whole sync lifecycle over a feature that will retry in a minute.
+    fn reminder_pass(&self) {
+        match self.store.fire_due_reminders(self.account_id, Utc::now()) {
+            Ok(ids) if !ids.is_empty() => {
+                eprintln!("squelch: {} reminder(s) came due", ids.len())
+            }
+            Ok(_) => {}
+            Err(e) => eprintln!("squelch: reminder sweep failed ({e}); skipping"),
         }
     }
 
@@ -2780,7 +2813,7 @@ mod tests {
     use super::*;
     use crate::config::Stage1Config;
     use crate::store::SqliteStore;
-    use crate::types::{Disposition, Tier, TriageAxis};
+    use crate::types::{Disposition, NewMessage, Tier, TriageAxis};
 
     /// REGRESSION GUARD: the shipments section must NOT age rows out on the
     /// shared Stage-2 clock. A 30-day-old order confirmation is exactly what the
@@ -4519,5 +4552,80 @@ mod tests {
             .unwrap()
             .expect("zero is an answer");
         assert_eq!((zeroed.messages, zeroed.threads), (0, 0));
+    }
+
+    #[tokio::test]
+    async fn a_gmail_outage_cannot_starve_the_reminder_sweep() {
+        // THE SWEEP IS LOCAL, so it runs AHEAD of the walk. A tick that bounces
+        // — an expired credential, a Gmail outage — takes everything after
+        // `poll_once` with it, and a reminder hung off the far side of that call
+        // would sit unfired for as long as the outage lasts: a weekend of Gmail
+        // being down means Saturday's reminder never arrives.
+        let (store, acct) = store_at_cursor(Some(100));
+        let mid = store
+            .upsert_message(&NewMessage {
+                account_id: acct,
+                gmail_msg_id: "g-parked".into(),
+                thread_id: "t-parked".into(),
+                from_addr: "alice@friends.com".into(),
+                from_name: None,
+                subject: "the thing you parked".into(),
+                received_at: Utc::now() - ChronoDuration::days(1),
+                snippet: String::new(),
+                body: "body".into(),
+                body_html: None,
+                is_sent: false,
+                to_addrs: None,
+                list_unsubscribe: None,
+                list_unsub_one_click: false,
+                auth_pass: None,
+            })
+            .unwrap();
+        store
+            .set_triage(
+                mid,
+                acct,
+                0,
+                Tier::Noise,
+                crate::types::Sensitivity::Normal,
+                None,
+                "",
+                "",
+                None,
+            )
+            .unwrap();
+        store
+            .set_reminder(acct, mid, Utc::now() - ChronoDuration::minutes(1))
+            .unwrap();
+
+        // Gmail is down for this mailbox: the INBOX walk 500s, so the tick
+        // returns Err and the loop hands it to the caller's backoff.
+        let g = MockGmail::default();
+        g.history(LABEL_INBOX, LabelHistory::broken());
+        let base = serve_mock(g.clone()).await;
+        let (_tx, mut shutdown) = tokio::sync::watch::channel(false);
+        assert!(
+            engine(store.clone(), acct, &base)
+                .poll_loop(&mut shutdown)
+                .await
+                .is_err(),
+            "the poll itself failed, which is the whole premise"
+        );
+
+        // ...and the reminder fired anyway.
+        let rows = store
+            .attention_updates(
+                acct,
+                Utc::now() - ChronoDuration::days(30),
+                None,
+                None,
+                None,
+                false,
+            )
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].status, crate::types::AttentionStatus::Open);
+        assert!(rows[0].remind_at.is_none(), "the pending stamp MOVED");
+        assert!(rows[0].reminded_at.is_some(), "it came back on time");
     }
 }

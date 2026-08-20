@@ -74,6 +74,18 @@ struct ThreadViewer: View {
     /// The NEWEST message is what `u` acts on (the server derives the sender
     /// from it) and whose from_addr keys the record lookup.
     private var newest: ClientMessage? { messages.last }
+    /// What `h` parks: the newest message the user did NOT send.
+    ///
+    /// Not the selected one, which in a replied thread is typically your own
+    /// reply — and a reminder on your own sent mail is a reminder on mail no
+    /// listing will ever show, so the daemon answers those with a 404. A thread
+    /// that is nothing BUT your own mail (sent, no answer back yet) falls back
+    /// to the selected message and lets the daemon have the last word. `nil`
+    /// reads as inbound on purpose: an older daemon sends no flag at all, and a
+    /// missing one has to leave the key working exactly as it did.
+    private var remindable: ClientMessage? {
+        messages.last { $0.is_sent != true } ?? messages[safe: index]
+    }
     /// trim().lowercased() mirrors the server's canonical `sender`.
     private var newestSender: String? {
         newest.map { $0.from_addr.trimmingCharacters(in: .whitespaces).lowercased() }
@@ -758,7 +770,11 @@ struct ThreadViewer: View {
             },
             // ⌘[ = back, same as Esc — the viewer is a page you navigated into.
             KeyBinding("[", "back", meta: true) { store.closeThread() },
-            KeyBinding("h", "prev email") { stepQueue(-1) },
+            // The vim pair lost its left half: `h` means "remind" on every
+            // surface of the app, and one letter that parks mail on two pages
+            // and steps backward on a third would be a misfire on the exact key
+            // where a misfire costs an email. ArrowLeft still steps back; `l`
+            // stays because nothing else wants it.
             KeyBinding("l", "next email") { stepQueue(1) },
             KeyBinding("ArrowLeft", "prev email") { stepQueue(-1) },
             KeyBinding("ArrowRight", "next email") { stepQueue(1) },
@@ -814,6 +830,19 @@ struct ThreadViewer: View {
             },
             KeyBinding("e", "done + next") { Task { await doneAndNext() } },
             KeyBinding("d", "done + next") { Task { await doneAndNext() } },
+            // Plain `h`, the same key as every other surface — it took "prev
+            // email"'s key (see the queue block above), because a verb cannot
+            // be the app's one shifted letter.
+            KeyBinding("h", "remind + next") {
+                guard let thread, let m = remindable else { return }
+                store.openRemind(
+                    RemindTarget(
+                        messageId: m.id, sender: m.from_addr, subject: thread.subject,
+                        remindAt: store.update(id: m.id)?.remind_at,
+                        // The reader leaves the same way it does on done + next:
+                        // the mail is dealt with, so the walk carries on.
+                        onScheduled: { Task { await remindAndNext() } }))
+            },
             KeyBinding("u", "unsubscribe") { confirmMode = .ask },
             // `r` = reply, and it lives HERE rather than in the composer's own
             // set because it is what opens the composer when there is none. With
@@ -1033,6 +1062,31 @@ struct ThreadViewer: View {
         // sleep is the whole reason this works: an offset that is set and
         // cleared inside one update has never been drawn, so there is nothing
         // for the animation to move away from.
+        store.openThread(next.thread_id, queue: queue, entering: edge)
+        try? await Task.sleep(for: .milliseconds(30))
+        withAnimation(Motion.deckCard) { store.threadFlight = .settled }
+    }
+
+    /// The tail of `doneAndNext`, for `h`: the reminder is already set (the
+    /// palette did that, and the row is already gone from the bands), so this is
+    /// only the departure and the walk. Both beats still run — the email leaving
+    /// is what says the reminder took, and a reader that just sat there would
+    /// read as a key that did nothing.
+    private func remindAndNext() async {
+        let queue = store.threadQueue
+        let liftedAt = liftOff()
+        await flightOut(since: liftedAt)
+        // Outlived its own reader (Esc, another surface): do not haul a thread
+        // back onto a page nobody is on.
+        guard store.threadId == threadId else { return }
+
+        guard let cur = queue.firstIndex(where: { $0.thread_id == threadId }),
+            let next = queue[safe: cur + 1]
+        else {
+            store.closeThread()
+            return
+        }
+        let edge: AppStore.ThreadEdge = sameSender(next, queue[cur]) ? .trailing : .bottom
         store.openThread(next.thread_id, queue: queue, entering: edge)
         try? await Task.sleep(for: .milliseconds(30))
         withAnimation(Motion.deckCard) { store.threadFlight = .settled }

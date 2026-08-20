@@ -349,7 +349,7 @@ impl SqliteStore {
         // just unhighlighted.
         let mut stmt = conn.prepare(
             "SELECT m.id, m.from_addr, m.from_name, m.received_at, m.body, m.body_html,
-                    t.tier, t.deadline, t.status, t.one_line, m.auth_pass
+                    t.tier, t.deadline, t.status, t.one_line, m.auth_pass, m.is_sent
              FROM messages m
              LEFT JOIN triage t ON t.message_id = m.id
              WHERE m.account_id=?1 AND m.thread_id=?2
@@ -375,6 +375,10 @@ impl SqliteStore {
                     attention_open: r.get::<_, Option<String>>(8)?.map(|s| s != "done"),
                     one_line: r.get::<_, Option<String>>(9)?.filter(|s| !s.is_empty()),
                     auth_pass: r.get::<_, Option<bool>>(10)?,
+                    // The thread carries the user's own replies (that is what
+                    // makes it a conversation); the reader is where "which of
+                    // these is mine" gets answered.
+                    is_sent: r.get::<_, i64>(11)? != 0,
                 })
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;

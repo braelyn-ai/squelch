@@ -785,8 +785,16 @@ impl Store for SqliteStore {
         min_importance: Option<u8>,
         status: Option<AttentionStatus>,
         band: Option<SitrepBand>,
+        pending_reminders: bool,
     ) -> Result<Vec<AttentionUpdate>> {
-        self.attention_updates(account_id, since, min_importance, status, band)
+        self.attention_updates(
+            account_id,
+            since,
+            min_importance,
+            status,
+            band,
+            pending_reminders,
+        )
     }
 
     fn mark_surfaced(&self, account_id: AccountId, message_ids: &[i64]) -> Result<usize> {
@@ -800,6 +808,23 @@ impl Store for SqliteStore {
         status: AttentionStatus,
     ) -> Result<bool> {
         self.set_attention_status(account_id, message_id, status)
+    }
+
+    fn set_reminder(
+        &self,
+        account_id: AccountId,
+        message_id: i64,
+        remind_at: DateTime<Utc>,
+    ) -> Result<bool> {
+        self.set_reminder(account_id, message_id, remind_at)
+    }
+
+    fn clear_reminder(&self, account_id: AccountId, message_id: i64) -> Result<bool> {
+        self.clear_reminder(account_id, message_id)
+    }
+
+    fn fire_due_reminders(&self, account_id: AccountId, now: DateTime<Utc>) -> Result<Vec<i64>> {
+        self.fire_due_reminders(account_id, now)
     }
 
     fn resolve_sender(&self, account_id: AccountId, sender_addr: &str) -> Result<usize> {

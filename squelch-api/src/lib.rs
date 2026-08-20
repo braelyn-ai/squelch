@@ -78,6 +78,14 @@ fn client_router(state: ApiState) -> Router {
             "/client/updates/{message_id}/status",
             post(handlers::set_update_status),
         )
+        // "Remind me about this later." Human door only, like every write: it is
+        // the user scheduling their own attention, and the agent door gets no
+        // say in when the user is shown something. POST sets (and re-sets, one
+        // reminder per message), DELETE un-schedules.
+        .route(
+            "/client/updates/{message_id}/reminder",
+            post(handlers::set_update_reminder).delete(handlers::clear_update_reminder),
+        )
         .route("/client/refresh", post(handlers::refresh_now))
         .route("/client/thread/{thread_id}", get(handlers::get_thread))
         .route("/client/attachments/{id}", get(handlers::get_attachment))

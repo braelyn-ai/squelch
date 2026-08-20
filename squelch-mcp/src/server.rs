@@ -564,7 +564,7 @@ mod tests {
 
         // The normal row is now surfaced+open; the sealed row is untouched.
         let rows = store
-            .attention_updates(acct, since, None, None, None)
+            .attention_updates(acct, since, None, None, None, false)
             .unwrap();
         assert_eq!(rows.len(), 1, "sealed never surfaces");
         assert_eq!(rows[0].update.id, nid);

@@ -2988,6 +2988,7 @@ async fn updates_stamp_once_and_carry_prestamp_surfaced_at() {
             None,
             None,
             None,
+            false,
         )
         .unwrap();
     let first_stamp = after[0].surfaced_at.expect("surfaced_at now set");
@@ -3004,6 +3005,7 @@ async fn updates_stamp_once_and_carry_prestamp_surfaced_at() {
             None,
             None,
             None,
+            false,
         )
         .unwrap();
     assert_eq!(
@@ -3032,7 +3034,7 @@ async fn peek_returns_the_same_rows_without_stamping_the_ledger() {
 
     // ...and the ledger is untouched: nothing was actually shown to anyone.
     let after_peek = store
-        .attention_updates(acct, window(), None, None, None)
+        .attention_updates(acct, window(), None, None, None, false)
         .unwrap();
     assert_eq!(after_peek.len(), 2);
     for u in &after_peek {
@@ -3049,7 +3051,7 @@ async fn peek_returns_the_same_rows_without_stamping_the_ledger() {
     let resp2 = app.oneshot(authed("GET", "/client/updates")).await.unwrap();
     assert_eq!(resp2.status(), StatusCode::OK);
     let after_normal = store
-        .attention_updates(acct, window(), None, None, None)
+        .attention_updates(acct, window(), None, None, None, false)
         .unwrap();
     for u in &after_normal {
         assert!(u.surfaced_at.is_some(), "normal fetch stamps surfaced_at");
@@ -3186,6 +3188,7 @@ async fn dismiss_and_reopen_endpoint() {
             None,
             Some(AttentionStatus::Done),
             None,
+            false,
         )
         .unwrap();
     assert_eq!(done.len(), 1);
@@ -3258,6 +3261,359 @@ async fn dismiss_sealed_message_is_404() {
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }
 
+// --- reminders: "remind me about this later" over HTTP ----------------------
+
+/// The listing window the reminder tests read over.
+fn reminder_window() -> chrono::DateTime<chrono::Utc> {
+    chrono::Utc::now() - chrono::Duration::days(30)
+}
+
+#[tokio::test]
+async fn reminder_endpoint_defers_the_thread_and_schedules_its_return() {
+    let Harness { app, store, acct } = harness(|store, acct| {
+        seed_one_signal(store, acct, "g1", "t1", "hi");
+    });
+    let id = store.search(acct, "hi", 10, 0).unwrap()[0].id;
+    let due = chrono::Utc::now() + chrono::Duration::days(2);
+
+    let resp = app
+        .clone()
+        .oneshot(authed_json(
+            "POST",
+            &format!("/client/updates/{id}/reminder"),
+            serde_json::json!({ "remind_at": due.to_rfc3339() }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    assert_eq!(body["message_id"], id);
+    assert_eq!(body["remind_at"], due.to_rfc3339());
+
+    // DEFERRING IS RESOLVING: one round trip both hides the mail and schedules
+    // it, and the listing carries the pending stamp back.
+    let rows = store
+        .attention_updates(acct, reminder_window(), None, None, None, false)
+        .unwrap();
+    assert_eq!(rows[0].status, AttentionStatus::Done);
+    assert!(rows[0].resolved_at.is_some());
+    assert_eq!(rows[0].remind_at.unwrap().timestamp(), due.timestamp());
+    assert!(rows[0].reminded_at.is_none());
+
+    let audit = store.list_audit(acct, 10).unwrap();
+    assert!(audit.iter().any(|a| a.action == "set_reminder"));
+}
+
+#[tokio::test]
+async fn reminder_rejects_a_past_or_unparseable_date() {
+    // A past date is a client bug, not a reminder that fires immediately: the
+    // sweep would fire it on the next tick, turning a timezone mistake into mail
+    // reappearing for no visible reason.
+    let Harness { app, store, acct } = harness(|store, acct| {
+        seed_one_signal(store, acct, "g1", "t1", "hi");
+    });
+    let id = store.search(acct, "hi", 10, 0).unwrap()[0].id;
+
+    for bad in [
+        (chrono::Utc::now() - chrono::Duration::hours(1)).to_rfc3339(),
+        "next tuesday".to_string(),
+    ] {
+        let resp = app
+            .clone()
+            .oneshot(authed_json(
+                "POST",
+                &format!("/client/updates/{id}/reminder"),
+                serde_json::json!({ "remind_at": bad }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "rejected: {bad}");
+    }
+    // And nothing was scheduled.
+    assert!(
+        store
+            .attention_updates(acct, reminder_window(), None, None, None, true)
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn reminder_on_unknown_or_sealed_message_is_404() {
+    // A sealed row must be invisible to the reminder endpoints, exactly as it is
+    // to the status one: missing and sealed are the same answer.
+    let Harness { app, store, acct } = harness(|store, acct| {
+        let s = store
+            .upsert_message(&msg(acct, "g1", "t1", "code", "123456"))
+            .unwrap();
+        store
+            .set_triage(
+                s,
+                acct,
+                90,
+                Tier::Noise,
+                Sensitivity::Sealed,
+                Some(SealedKind::Otp),
+                "",
+                "",
+                None,
+            )
+            .unwrap();
+    });
+    let sealed_id = store.sealed_messages(acct).unwrap()[0].id;
+    let due = (chrono::Utc::now() + chrono::Duration::days(1)).to_rfc3339();
+
+    for id in [sealed_id, 999] {
+        let set = app
+            .clone()
+            .oneshot(authed_json(
+                "POST",
+                &format!("/client/updates/{id}/reminder"),
+                serde_json::json!({ "remind_at": due }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(set.status(), StatusCode::NOT_FOUND);
+        let clear = app
+            .clone()
+            .oneshot(authed("DELETE", &format!("/client/updates/{id}/reminder")))
+            .await
+            .unwrap();
+        assert_eq!(clear.status(), StatusCode::NOT_FOUND);
+    }
+}
+
+#[tokio::test]
+async fn reminder_on_the_users_own_sent_mail_is_404() {
+    // Sent mail carries a triage row, so the endpoint would happily stamp one —
+    // onto a message every listing filters out, where the reminder could never
+    // be seen or cancelled and firing it would surface nothing. Same answer as
+    // sealed, for the same reason.
+    let Harness { app, store, acct } = harness(|store, acct| {
+        store
+            .upsert_message(&sent_msg(acct, "g-sent", "t1", "what I wrote", "a@b.com"))
+            .unwrap();
+    });
+    let sent_id = store.thread_view(acct, "t1").unwrap().messages[0].id;
+    store
+        .set_triage(
+            sent_id,
+            acct,
+            0,
+            Tier::Noise,
+            Sensitivity::Normal,
+            None,
+            "",
+            "",
+            None,
+        )
+        .unwrap();
+
+    let resp = app
+        .oneshot(authed_json(
+            "POST",
+            &format!("/client/updates/{sent_id}/reminder"),
+            serde_json::json!({
+                "remind_at": (chrono::Utc::now() + chrono::Duration::days(1)).to_rfc3339()
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    assert!(
+        store
+            .attention_updates(acct, reminder_window(), None, None, None, true)
+            .unwrap()
+            .is_empty(),
+        "nothing was scheduled"
+    );
+}
+
+#[tokio::test]
+async fn a_reminder_on_old_mail_survives_the_default_updates_window() {
+    // THE DEFAULT WINDOW IS 30 DAYS and the pick is "next month": the schedule,
+    // the band and the flat listing must all keep showing a two-month-old row
+    // the user personally asked to see again, over the handler's own default
+    // `since` (no query parameter here — that is the point).
+    let Harness { app, store, acct } = harness(|store, acct| {
+        let old = store
+            .upsert_message(&squelch_core::types::NewMessage {
+                received_at: chrono::Utc::now() - chrono::Duration::days(60),
+                ..msg(acct, "g-old", "t-old", "the thing you parked", "body")
+            })
+            .unwrap();
+        store
+            .set_triage(
+                old,
+                acct,
+                0,
+                Tier::Noise,
+                Sensitivity::Normal,
+                None,
+                "",
+                "",
+                None,
+            )
+            .unwrap();
+    });
+    let id = store.thread_view(acct, "t-old").unwrap().messages[0].id;
+
+    let set = app
+        .clone()
+        .oneshot(authed_json(
+            "POST",
+            &format!("/client/updates/{id}/reminder"),
+            serde_json::json!({
+                "remind_at": (chrono::Utc::now() + chrono::Duration::days(1)).to_rfc3339()
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(set.status(), StatusCode::OK);
+
+    let ids_of = |body: Value| -> Vec<i64> {
+        body["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|u| u["id"].as_i64().unwrap())
+            .collect()
+    };
+    let schedule = app
+        .clone()
+        .oneshot(authed("GET", "/client/updates?reminders=pending"))
+        .await
+        .unwrap();
+    assert_eq!(ids_of(body_json(schedule).await), vec![id]);
+
+    // Fired, it is in the standing band, in the header count, and in the flat
+    // listing — all three read over the same default window.
+    store
+        .fire_due_reminders(acct, chrono::Utc::now() + chrono::Duration::days(2))
+        .unwrap();
+    let standing = app
+        .clone()
+        .oneshot(authed("GET", "/client/updates?band=standing"))
+        .await
+        .unwrap();
+    assert_eq!(ids_of(body_json(standing).await), vec![id]);
+    let flat = app
+        .clone()
+        .oneshot(authed("GET", "/client/updates"))
+        .await
+        .unwrap();
+    assert_eq!(ids_of(body_json(flat).await), vec![id]);
+    let stats = app.oneshot(authed("GET", "/client/stats")).await.unwrap();
+    assert_eq!(body_json(stats).await["bands"]["standing"], 1);
+}
+
+#[tokio::test]
+async fn clear_reminder_endpoint_is_idempotent() {
+    let Harness { app, store, acct } = harness(|store, acct| {
+        seed_one_signal(store, acct, "g1", "t1", "hi");
+    });
+    let id = store.search(acct, "hi", 10, 0).unwrap()[0].id;
+    app.clone()
+        .oneshot(authed_json(
+            "POST",
+            &format!("/client/updates/{id}/reminder"),
+            serde_json::json!({ "remind_at": (chrono::Utc::now() + chrono::Duration::days(1)).to_rfc3339() }),
+        ))
+        .await
+        .unwrap();
+
+    // Twice: the second call is a no-op the caller cannot distinguish, because
+    // its intent ("no reminder on this") is already true.
+    for _ in 0..2 {
+        let resp = app
+            .clone()
+            .oneshot(authed("DELETE", &format!("/client/updates/{id}/reminder")))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        assert_eq!(body["message_id"], id);
+        assert_eq!(body["cleared"], true);
+    }
+
+    let rows = store
+        .attention_updates(acct, reminder_window(), None, None, None, false)
+        .unwrap();
+    assert!(rows[0].remind_at.is_none(), "un-scheduled");
+    assert_eq!(
+        rows[0].status,
+        AttentionStatus::Done,
+        "clearing a reminder is not an undo"
+    );
+}
+
+#[tokio::test]
+async fn pending_reminder_listing_is_soonest_first_and_never_stamps() {
+    let Harness { app, store, acct } = harness(|store, acct| {
+        seed_one_signal(store, acct, "g1", "t1", "soon");
+        seed_one_signal(store, acct, "g2", "t2", "later");
+        seed_one_signal(store, acct, "g3", "t3", "unscheduled");
+    });
+    let id_of = |subj: &str| store.search(acct, subj, 10, 0).unwrap()[0].id;
+    let (soon, later) = (id_of("soon"), id_of("later"));
+
+    for (id, days) in [(later, 9), (soon, 1)] {
+        let resp = app
+            .clone()
+            .oneshot(authed_json(
+                "POST",
+                &format!("/client/updates/{id}/reminder"),
+                serde_json::json!({
+                    "remind_at": (chrono::Utc::now() + chrono::Duration::days(days)).to_rfc3339()
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    let resp = app
+        .clone()
+        .oneshot(authed("GET", "/client/updates?reminders=pending"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let items = body_json(resp).await["items"].clone();
+    let ids: Vec<i64> = items
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|u| u["id"].as_i64().unwrap())
+        .collect();
+    assert_eq!(ids, vec![soon, later], "the schedule is soonest-first");
+    // DONE ROWS INCLUDED: every row here is done by construction, so this is the
+    // one listing where done must not mean gone.
+    assert!(
+        items
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|u| u["status"] == "done" && !u["remind_at"].is_null())
+    );
+
+    // AND IT NEVER STAMPS: these are deferred rows the user is reviewing the
+    // schedule of, not mail being shown to them.
+    let rows = store
+        .attention_updates(acct, reminder_window(), None, None, None, true)
+        .unwrap();
+    assert!(
+        rows.iter().all(|u| u.surfaced_at.is_none()),
+        "the schedule read leaves the seen-ledger alone"
+    );
+
+    // An unknown value is a 400, never a silent full listing.
+    let bogus = app
+        .oneshot(authed("GET", "/client/updates?reminders=bogus"))
+        .await
+        .unwrap();
+    assert_eq!(bogus.status(), StatusCode::BAD_REQUEST);
+}
+
 #[tokio::test]
 async fn archive_success_resolves_target_to_done() {
     let (base, handle) = mock_gmail(1).await;
@@ -3285,6 +3641,7 @@ async fn archive_success_resolves_target_to_done() {
             None,
             Some(AttentionStatus::Done),
             None,
+            false,
         )
         .unwrap();
     assert_eq!(done.len(), 1);
@@ -3795,6 +4152,7 @@ async fn an_inferred_squelch_never_resolves_the_senders_open_mail() {
             None,
             Some(AttentionStatus::Done),
             None,
+            false,
         )
         .unwrap();
     assert!(
@@ -3856,6 +4214,7 @@ async fn a_literal_auto_squelch_is_inferred_and_never_resolves_open_mail() {
             None,
             Some(AttentionStatus::Done),
             None,
+            false,
         )
         .unwrap();
     assert!(
@@ -4371,6 +4730,7 @@ async fn unsubscribe_resolves_the_source_email_to_done() {
             None,
             Some(AttentionStatus::Done),
             None,
+            false,
         )
         .unwrap();
     assert!(
@@ -4447,6 +4807,7 @@ async fn squelch_rule_with_source_message_resolves_it_surface_does_not() {
             None,
             Some(AttentionStatus::Done),
             None,
+            false,
         )
         .unwrap();
     assert!(
@@ -4506,6 +4867,7 @@ async fn an_explicit_squelch_without_sweep_resolves_nothing() {
             None,
             Some(AttentionStatus::Done),
             None,
+            false,
         )
         .unwrap();
     assert!(
@@ -4627,6 +4989,7 @@ async fn sweep_resolves_by_sender_and_a_wildcard_resolves_only_the_source() {
             None,
             Some(AttentionStatus::Done),
             None,
+            false,
         )
         .unwrap();
     let is_done = |id: i64| done.iter().any(|u| u.update.id == id);
@@ -6389,6 +6752,7 @@ async fn forward_success_sends_a_new_conversation_carrying_the_original() {
             None,
             Some(squelch_core::types::AttentionStatus::Done),
             None,
+            false,
         )
         .unwrap();
     assert!(

@@ -381,6 +381,13 @@ struct SitrepView: View {
                         messageId: u.id, sender: u.sender, subject: u.one_line,
                         tier: .some(u.tier.rawValue)))
             },
+            KeyBinding("h", "remind me later") {
+                guard eyesActionable, let u = reachable[safe: cursor.index] else { return }
+                store.openRemind(
+                    RemindTarget(
+                        messageId: u.id, sender: u.sender, subject: u.one_line,
+                        remindAt: u.remind_at))
+            },
             // The one verb here that is NOT about a highlighted row: a new message
             // needs nothing selected, so it skips the `eyesActionable` guard.
             KeyBinding("c", "new message") { store.openComposeNew() },

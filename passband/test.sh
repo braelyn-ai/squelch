@@ -93,3 +93,11 @@ run_suite sitrep-window \
   Sources/Passband/Lib/Platform.swift \
   Sources/Passband/Lib/SitrepWindow.swift \
   Tests/SitrepWindowTests.swift
+
+# What "remind me…" resolves to. Foundation only, and every date computed
+# through an injected now/calendar — which is the whole reason it is testable:
+# a reminder is only ever wrong LATER, so the arithmetic has to be pinned here
+# rather than discovered by an email that never came back.
+run_suite remind-times \
+  Sources/Passband/Lib/RemindTimes.swift \
+  Tests/RemindTimesTests.swift

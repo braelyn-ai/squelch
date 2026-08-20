@@ -141,6 +141,13 @@ pub struct UpdatesQuery {
     status: Option<String>,
     /// Server-side sitrep bucket: standing|new|open.
     band: Option<String>,
+    /// THE REMINDER SCHEDULE: `pending` narrows to mail with a reminder still
+    /// owed, soonest-first. Deliberately not a `band` value — every row in it is
+    /// `done` (setting a reminder resolves the thread), so it composes with the
+    /// other filters rather than sitting alongside them, and it is the one
+    /// listing that never stamps the seen-ledger: a schedule the user is
+    /// reviewing is not the mail being shown to them.
+    reminders: Option<String>,
     limit: Option<u32>,
     cursor: Option<String>,
     /// READ WITHOUT SURFACING. Default false, so every existing client keeps the
@@ -180,17 +187,34 @@ pub async fn get_updates(
                 .ok_or_else(|| ApiError::bad_request("band must be one of: standing, new, open"))?,
         ),
     };
+    // One accepted value, and an unknown one is a 400 rather than a silent
+    // full listing: a client asking for the schedule and quietly getting the
+    // whole mailbox back is the worst possible failure mode for this parameter.
+    let pending_reminders = match q.reminders.as_deref() {
+        None => false,
+        Some("pending") => true,
+        Some(_) => return Err(ApiError::bad_request("reminders must be: pending")),
+    };
     let since = q
         .since
         .unwrap_or_else(|| Utc::now() - chrono::Duration::days(DEFAULT_UPDATES_WINDOW_DAYS));
     let min_importance = q.min_importance;
-    let peek = q.peek;
+    // A pending-reminder listing NEVER stamps, whatever `peek` says. Its rows are
+    // deferred mail the user is reviewing the schedule of; stamping them surfaced
+    // would report as seen exactly the mail they asked not to be shown yet.
+    let peek = q.peek || pending_reminders;
 
     let items = store_call(&state, move |store, account_id| {
-        // attention_updates excludes sealed rows in SQL. status/band filter
-        // server-side; tier and pagination apply over the ranked slice here.
-        let mut all =
-            store.attention_updates(account_id, since, min_importance, status_filter, band)?;
+        // attention_updates excludes sealed rows in SQL. status/band/reminders
+        // filter server-side; tier and pagination apply over the ranked slice here.
+        let mut all = store.attention_updates(
+            account_id,
+            since,
+            min_importance,
+            status_filter,
+            band,
+            pending_reminders,
+        )?;
         if let Some(t) = tier_filter {
             all.retain(|u| u.update.tier == t);
         }
@@ -259,6 +283,78 @@ pub async fn set_update_status(
     Ok(Json(
         json!({ "status": status.as_str(), "message_id": message_id }),
     ))
+}
+
+// --- POST/DELETE /client/updates/{message_id}/reminder ----------------------
+
+#[derive(Debug, Deserialize)]
+pub struct ReminderBody {
+    /// When to bring this mail back, RFC3339. Any offset is accepted and
+    /// normalized to UTC — the client owns the user's timezone, the store does
+    /// not.
+    remind_at: String,
+}
+
+/// "Remind me about this at T." Also marks the thread done: deferring mail is
+/// resolving it until the date arrives, so one round trip both hides it and
+/// schedules its return.
+pub async fn set_update_reminder(
+    State(state): State<ApiState>,
+    Path(message_id): Path<i64>,
+    Json(body): Json<ReminderBody>,
+) -> Result<impl IntoResponse, ApiError> {
+    let remind_at = DateTime::parse_from_rfc3339(&body.remind_at)
+        .map(|d| d.with_timezone(&Utc))
+        .map_err(|_| ApiError::bad_request("remind_at must be an RFC3339 timestamp"))?;
+    // A PAST DATE IS A CLIENT BUG, not a reminder that fires immediately: the
+    // sweep would fire it on the next tick, so accepting it silently turns a
+    // timezone mistake into mail reappearing for no visible reason.
+    if remind_at <= Utc::now() {
+        return Err(ApiError::bad_request("remind_at must be in the future"));
+    }
+
+    let updated = store_call(&state, move |store, account_id| {
+        store.set_reminder(account_id, message_id, remind_at)
+    })
+    .await?;
+    if !updated {
+        // Missing OR sealed => NotFound, keeping the two indistinguishable.
+        return Err(ApiError::not_found());
+    }
+
+    // Audited; the timestamp is the user's own scheduling decision, not content.
+    audit_action(
+        &state,
+        "set_reminder",
+        Some(message_id.to_string()),
+        &remind_at.to_rfc3339(),
+    )
+    .await;
+
+    Ok(Json(
+        json!({ "message_id": message_id, "remind_at": remind_at.to_rfc3339() }),
+    ))
+}
+
+/// Un-schedule a pending reminder. Idempotent: a message with no reminder is a
+/// 200, because the caller's intent ("no reminder on this") is already true.
+/// Deliberately does NOT reopen the thread — undoing the deferral is what the
+/// status route is for.
+pub async fn clear_update_reminder(
+    State(state): State<ApiState>,
+    Path(message_id): Path<i64>,
+) -> Result<impl IntoResponse, ApiError> {
+    let cleared = store_call(&state, move |store, account_id| {
+        store.clear_reminder(account_id, message_id)
+    })
+    .await?;
+    if !cleared {
+        return Err(ApiError::not_found());
+    }
+
+    audit_action(&state, "clear_reminder", Some(message_id.to_string()), "").await;
+
+    Ok(Json(json!({ "message_id": message_id, "cleared": true })))
 }
 
 // --- POST /client/refresh ---------------------------------------------------

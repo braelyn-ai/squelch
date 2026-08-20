@@ -69,6 +69,7 @@ enum Analytics {
     private static let allowedEvents: Set<String> = [
         "$screen", "Application Opened", "Application Backgrounded",
         "email_archived", "email_done", "email_reopened", "email_labeled",
+        "email_remind",
         "block_rule_created", "compose_opened", "compose_send",
         "thread_opened", "undo_fired", "assistant_asked",
         "triage_corrected", "triage_digest", "rule_created", "rule_deleted",
@@ -84,7 +85,7 @@ enum Analytics {
     /// detail. `full` adds the remaining action verbs (`compose_opened`,
     /// `email_labeled`) — the "which actions are used" layer.
     private static let minimalEvents: Set<String> = [
-        "email_archived", "email_done", "email_reopened",
+        "email_archived", "email_done", "email_reopened", "email_remind",
         "block_rule_created", "compose_send", "thread_opened",
         "undo_fired", "assistant_asked",
         "triage_corrected", "triage_digest", "rule_created", "rule_deleted",
@@ -105,7 +106,7 @@ enum Analytics {
             // compose_send / compose_opened
             "new", "reply", "sent", "guard_blocked", "forbidden", "failure",
             // undo_fired kinds
-            "archive", "done", "label", "ruleDelete",
+            "archive", "done", "label", "ruleDelete", "remind",
             // triage_corrected axes and wire values — the daemon's closed
             // TriageAxis::allowed vocabulary, mirrored in TriageTargets.
             "tier", "category", "sensitivity",

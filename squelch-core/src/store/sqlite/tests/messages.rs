@@ -195,6 +195,34 @@ fn auth_pass_round_trips_through_the_thread_view_and_self_heals_on_re_upsert() {
 }
 
 #[test]
+fn the_thread_view_says_which_messages_are_the_users_own() {
+    // The reader aims its actions — remind me about this, reply to this — at
+    // INBOUND mail, and a conversation ends on the user's own reply often
+    // enough that "the last message" would aim at themselves. So `is_sent`
+    // rides on every message, always present on the wire.
+    let (store, acct) = store();
+    let at = |n: i64| Utc::now() - chrono::Duration::minutes(10 - n);
+    triaged(acct, "g-in", "t-mine")
+        .received_at(at(1))
+        .seed(&store);
+    triaged(acct, "g-out", "t-mine")
+        .received_at(at(2))
+        .from("me@example.com")
+        .is_sent(true)
+        .upsert(&store);
+
+    let view = store.thread_view_with_html(acct, "t-mine").unwrap();
+    assert_eq!(
+        view.messages.iter().map(|m| m.is_sent).collect::<Vec<_>>(),
+        vec![false, true]
+    );
+    // A plain bool, never absent: an old client decoding it gets `false`, which
+    // is the safe reading (aim at it) rather than a missing key.
+    let wire = serde_json::to_value(&view.messages[0]).unwrap();
+    assert_eq!(wire["is_sent"], serde_json::Value::Bool(false));
+}
+
+#[test]
 fn attachment_bytes_guards_sealed_overcap_and_unknown() {
     let (store, acct) = store();
 
@@ -274,6 +302,7 @@ fn field_reasons_roundtrip_through_ingest_and_attention_updates() {
             None,
             None,
             None,
+            false,
         )
         .unwrap();
     let u = ups.iter().find(|u| u.update.id == id).expect("row present");
@@ -332,6 +361,7 @@ fn predating_triage_row_reads_back_as_none() {
             None,
             None,
             None,
+            false,
         )
         .unwrap();
     let u = ups.iter().find(|u| u.update.id == mid).unwrap();
