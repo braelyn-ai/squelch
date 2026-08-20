@@ -216,16 +216,22 @@ struct ThreadViewer: View {
 
     // MARK: - chrome
 
-    /// A Mac reads the whole header on ONE line: subject left, actions right,
-    /// the subject taking whatever width the actions leave. A phone has no such
-    /// width — four text buttons beside a subject would squeeze it to an
-    /// ellipsis — so the same pieces stack, the actions under the line they act
-    /// on, and leaving belongs to the navigation bar above rather than to a
-    /// button of our own.
+    /// A Mac reads the whole header as the shared TOP BAR: the subject sits on
+    /// the traffic lights' line the way every page title does, the participants
+    /// ride to its right, and the actions take the far end. The subject pays
+    /// for the fixed strip with truncation — one line, ellipsized — and the
+    /// full text stays a copy-click away. A phone has no such width — four
+    /// text buttons beside a subject would squeeze it to an ellipsis — so the
+    /// same pieces stack, the actions under the line they act on, and leaving
+    /// belongs to the navigation bar above rather than to a button of our own.
     private var header: some View {
         #if os(macOS)
-            HStack(alignment: .firstTextBaseline, spacing: 14) {
-                titleBlock
+            HStack(alignment: .firstTextBaseline, spacing: 12) {
+                subjectLine(lines: 1)
+                if !participantLine.isEmpty {
+                    participantsText
+                }
+                Spacer(minLength: 12)
                 actions
                 Button { store.closeThread() } label: {
                     HStack(spacing: 4) {
@@ -235,14 +241,10 @@ struct ThreadViewer: View {
                 }
                 .buttonStyle(.textAction)
             }
-            .padding(.horizontal, 22)
-            // PADDING, not the shared `TopBar.height`, and the one header in the
-            // app that keeps its own: a subject can wrap to two lines and carries
-            // a participant line under it, so a fixed bar height would either
-            // squash it or hold empty air for the threads that don't wrap. The
-            // subject still lands on the window buttons' line, which is what the
-            // bar was for.
-            .padding(.vertical, 13)
+            // These metrics match every other page's bar: the reader's rule
+            // ends on the line the rail's top edge is cut to.
+            .padding(.horizontal, 24)
+            .frame(height: TopBar.height)
             .overlay(alignment: .bottom) { Hairline() }
         #else
             VStack(alignment: .leading, spacing: 10) {
@@ -259,41 +261,53 @@ struct ThreadViewer: View {
         #endif
     }
 
-    private var titleBlock: some View {
-        VStack(alignment: .leading, spacing: 3) {
-            HStack(alignment: .firstTextBaseline, spacing: 8) {
-                // The subject IS the copy affordance — no icon earns a
-                // place in this header for a once-in-a-while verb.
-                Button {
-                    if let subject = thread?.subject, !subject.isEmpty {
-                        Clip.copy(subject, flashing: $subjectCopied)
-                    }
-                } label: {
-                    Text(thread?.subject ?? "…")
-                        .font(Typo.serif(19, weight: .medium))
-                        .foregroundStyle(Palette.ink)
-                        .lineLimit(2)
-                        .contentShape(Rectangle())
-                }
-                .buttonStyle(.plain)
-                .help("copy subject")
-                if subjectCopied {
-                    Text("copied!")
-                        .font(Typo.micro)
-                        .foregroundStyle(Palette.positive)
-                        .transition(.opacity)
+    #if !os(macOS)
+        private var titleBlock: some View {
+            VStack(alignment: .leading, spacing: 3) {
+                subjectLine(lines: 2)
+                if !participantLine.isEmpty {
+                    participantsText
                 }
             }
-            .animation(.easeOut(duration: 0.18), value: subjectCopied)
-            if !participantLine.isEmpty {
-                Text(participantLine)
-                    .font(Typo.rowSub)
-                    .foregroundStyle(Palette.inkFaint)
-                    .lineLimit(1)
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+    #endif
+
+    /// The subject IS the copy affordance — no icon earns a place in this
+    /// header for a once-in-a-while verb. `lines` is the platform's call: one
+    /// inside the Mac's fixed bar, two in the phone's stacked block.
+    private func subjectLine(lines: Int) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: 8) {
+            Button {
+                if let subject = thread?.subject, !subject.isEmpty {
+                    Clip.copy(subject, flashing: $subjectCopied)
+                }
+            } label: {
+                Text(thread?.subject ?? "…")
+                    .font(Typo.serif(19, weight: .medium))
+                    .foregroundStyle(Palette.ink)
+                    .lineLimit(lines)
                     .truncationMode(.tail)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .help("copy subject")
+            if subjectCopied {
+                Text("copied!")
+                    .font(Typo.micro)
+                    .foregroundStyle(Palette.positive)
+                    .transition(.opacity)
             }
         }
-        .frame(maxWidth: .infinity, alignment: .leading)
+        .animation(.easeOut(duration: 0.18), value: subjectCopied)
+    }
+
+    private var participantsText: some View {
+        Text(participantLine)
+            .font(Typo.rowSub)
+            .foregroundStyle(Palette.inkFaint)
+            .lineLimit(1)
+            .truncationMode(.tail)
     }
 
     /// EVERY ACTION HERE NEEDS THE THREAD: they act on its newest message and
