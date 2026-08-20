@@ -31,6 +31,11 @@ struct Detector {
     /// Concrete, reader-addressed OTP codes. These seal even past the marketing
     /// guard — a genuine code leak is the highest-stakes miss.
     otp_code: Vec<Regex>,
+    /// A code standing alone on its own line, which is how a big rendered
+    /// `<h1>482913</h1>` flattens: no adjacent "code" word for [`Self::otp_code`]
+    /// to anchor on. Too weak to seal alone (order numbers), so it counts as a
+    /// concrete code only alongside auth phrasing — see [`detect_sealed`].
+    code_line: Vec<Regex>,
     /// Marketing / newsletter markers. When these fire, topical auth mentions are
     /// ignored: an auth vendor's newsletter discusses 2FA/SSO/magic-links as
     /// PRODUCTS, and a real auth email is transactional, never a blast.
@@ -86,6 +91,10 @@ fn detector() -> &'static Detector {
             rx(r"\bemail verification\b"),
             rx(r"\bactivate your account\b"),
             rx(r"\bverification (link|email|request)\b"),
+            // Brand-in-the-middle login verification ("Verify your PostHog
+            // login") — the exact subject the 2026-08-20 miss wore.
+            rx(r"\b(verify|confirm) your\b.{0,40}\b(login|log[-\s]?in|sign[-\s]?in|signin|device)\b"),
+            rx(r"\bconfirm (it'?s|it is|that'?s) you\b"),
         ],
         security_sender: vec![
             rx(r"^(security|secure|donotreply|do[-_.]?not[-_.]?reply|no[-_.]?reply|alerts?|account|notify|notifications?)@"),
@@ -104,7 +113,15 @@ fn detector() -> &'static Detector {
             rx(r"\b\d{4,8}\s+is your\b"),
             rx(r"\byour code is\b"),
             rx(r"\benter (this|the following) code\b"),
+            // "Use the following code to verify your identity" — a code is
+            // present by construction, so these belong in the guard-overriding
+            // battery: transactional auth mail routinely carries a
+            // "you're receiving this email because…" footer that would
+            // otherwise veto the seal as marketing.
+            rx(r"\buse (this|the)( following)? code\b"),
+            rx(r"\b(the )?code below\b"),
         ],
+        code_line: vec![rx(r"(?m)^\s*\d{4,8}\s*$")],
         marketing: vec![
             rx(r"\bunsubscribe\b"),
             rx(r"\bview (this )?(email|message)?\s*in (your )?browser\b"),
@@ -126,6 +143,15 @@ pub fn detect_sealed(input: &SealInput) -> Option<SealedKind> {
     // A concrete reader-addressed code always seals — it wins over the marketing
     // guard below, because a leaked code is the highest-stakes miss.
     if any(&d.otp_code, &hay) {
+        return Some(SealedKind::Otp);
+    }
+    // A bare code on its own line is concrete too, but only with auth phrasing
+    // somewhere in the mail: alone it is any order number. This also wins over
+    // the marketing guard — the phrasing may be exactly what the guard would
+    // have vetoed ("verify your login" + footer), and the code is still real.
+    if any(&d.code_line, &[input.body])
+        && (any(&d.otp, &hay) || any(&d.magic_link, &hay) || any(&d.verification, &hay))
+    {
         return Some(SealedKind::Otp);
     }
 
@@ -345,6 +371,58 @@ mod tests {
                 "auth-vendor newsletter wrongly sealed: {f:?} {s:?}"
             );
         }
+    }
+
+    /// The 2026-08-20 miss: a login-code email whose transactional footer
+    /// tripped the marketing guard, whose code rendered as a bare line no
+    /// `otp_code` pattern anchored on, and whose subject put the brand between
+    /// "your" and "login". It reached Stage-1 as normal mail and was buried as
+    /// noise. Every arm of the shape must seal on its own now.
+    #[test]
+    fn posthog_shaped_login_code_seals() {
+        // The full shape: brandy subject + "use the following code" + bare
+        // code line + receiving-this-email footer.
+        assert_eq!(
+            detect_sealed(&inp_from(
+                "noreply@posthog.com",
+                "Verify your PostHog login",
+                "Are you who you say you are? Just checking! Use the following \
+                 code to verify your identity.\n482913\nYou're receiving this \
+                 email because a login was attempted.",
+            )),
+            Some(SealedKind::Otp),
+        );
+        // Bare code line + auth phrasing, still under a marketing-shaped footer.
+        assert_eq!(
+            detect_sealed(&inp_from(
+                "noreply@posthog.com",
+                "Verify your PostHog login",
+                "Confirm it's you.\n551204\nYou're receiving this email because \
+                 someone tried to log in.",
+            )),
+            Some(SealedKind::Otp),
+        );
+        // Subject alone (image-only body must still seal).
+        assert_eq!(
+            detect_sealed(&inp_from(
+                "noreply@posthog.com",
+                "Verify your PostHog login",
+                "",
+            )),
+            Some(SealedKind::Verification),
+        );
+    }
+
+    #[test]
+    fn bare_digit_lines_alone_do_not_seal() {
+        // An order number on its own line, no auth phrasing: not auth mail.
+        assert_eq!(
+            detect_sealed(&inp(
+                "Your order shipped",
+                "Order number\n448201\nYour package is on the way.",
+            )),
+            None,
+        );
     }
 
     #[test]
