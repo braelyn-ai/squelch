@@ -157,10 +157,23 @@ struct MainShell: View {
             if let threadId = store.threadId {
                 HStack(spacing: 0) {
                     // THE RAIL STAYS: the reader insets past it instead of
-                    // covering it, so 1..5 stay clickable while you read.
-                    Color.clear
-                        .frame(width: SidebarRail.railWidth)
-                        .allowsHitTesting(false)
+                    // covering it, so 1..5 stay clickable while you read. The
+                    // TITLE STRIP above it is the one exception: it takes the
+                    // reader's own backdrop, so the top bar reads as one bar
+                    // in the reader's colour instead of seaming where the
+                    // page's ground meets the reader's at the rail's edge.
+                    VStack(spacing: 0) {
+                        // Not in fullscreen: the rail itself runs to the true
+                        // top there (no traffic lights, no strip), and this
+                        // would paint the reader's ground over it.
+                        if !WindowState.shared.isFullscreen {
+                            ReaderBackdrop()
+                                .frame(height: TopBar.height)
+                        }
+                        Color.clear
+                    }
+                    .frame(width: SidebarRail.railWidth)
+                    .allowsHitTesting(false)
                     // THE READER'S FLIGHT, and it is a plain offset: the email
                     // you finished is lifted out through the top, the next one
                     // is put one window away and walked in. ThreadViewer moves

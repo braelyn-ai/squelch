@@ -118,9 +118,7 @@ struct ThreadViewer: View {
 
     var body: some View {
         ZStack {
-            Rectangle()
-                .fill(Palette.readerBackground.opacity(0.97))
-                .background(.regularMaterial)
+            ReaderBackdrop()
                 .ignoresSafeArea()
 
             column
@@ -1200,6 +1198,20 @@ struct ThreadViewer: View {
         } catch {
             store.pushToast(errText(error, "debug fetch failed"), .error)
         }
+    }
+}
+
+// MARK: - backdrop
+
+/// The reader's ground, in ONE place: RootView paints the same backdrop over
+/// the title strip above the rail while a thread is open — the strip the
+/// reader's inset leaves uncovered — and the two must never drift, or the top
+/// bar seams at the rail's edge again.
+struct ReaderBackdrop: View {
+    var body: some View {
+        Rectangle()
+            .fill(Palette.readerBackground.opacity(0.97))
+            .background(.regularMaterial)
     }
 }
 
