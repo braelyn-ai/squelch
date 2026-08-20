@@ -57,10 +57,18 @@ final class SitrepWindow {
                 forName: Platform.willTerminateNotification, object: nil, queue: .main
             ) { _ in
                 // Directly, not via a Task: the process is on its way out and a
-                // hop to the next runloop turn never runs. The write is a
-                // UserDefaults set, safe from any thread.
-                UserDefaults.standard.set(
-                    Date().timeIntervalSince1970, forKey: SitrepWindow.stampKey)
+                // hop to the next runloop turn never runs. willTerminate is
+                // delivered on the main thread, so the assumeIsolated is honest.
+                MainActor.assumeIsolated {
+                    // ONLY when the app dies frontmost. A logout or shutdown
+                    // also terminates an app that has sat inactive for days,
+                    // and an unconditional stamp would swallow everything since
+                    // the resign stamp — mail the user never had on screen.
+                    // When inactive, the resign stamp already tells the truth.
+                    guard Platform.isAppActive else { return }
+                    UserDefaults.standard.set(
+                        Date().timeIntervalSince1970, forKey: SitrepWindow.stampKey)
+                }
             })
     }
 
