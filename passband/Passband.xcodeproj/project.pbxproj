@@ -34,6 +34,7 @@
 		26C5B834CA3DF63D12F9AAC4 /* Avatar.swift in Sources */ = {isa = PBXBuildFile; fileRef = BC0ADC18AA758296235E8F59 /* Avatar.swift */; };
 		2785F1AA75B655313673E0D0 /* Trackers.swift in Sources */ = {isa = PBXBuildFile; fileRef = EEFA34554013DFB615774309 /* Trackers.swift */; };
 		2AE0CB107FAB86784BE5C0F4 /* Updater.swift in Sources */ = {isa = PBXBuildFile; fileRef = D179CAC9853B13A5FBFD968E /* Updater.swift */; };
+		2B851E8B41A22C1E6FA86CC4 /* SitrepWindow.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5B7D3E42C4E6495943239602 /* SitrepWindow.swift */; };
 		2F363EB80C61955DE11D0702 /* TourOverlay.swift in Sources */ = {isa = PBXBuildFile; fileRef = 627B000AA2D3694B771F50B0 /* TourOverlay.swift */; };
 		3036D5EBC31C8F05D10AAC8E /* MinimapGeometry.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EF8CFFF47055FF070BD9E8F /* MinimapGeometry.swift */; };
 		30B0B95981F83062CAD29D3F /* ReadReceipt.swift in Sources */ = {isa = PBXBuildFile; fileRef = 759702EBD03C1CECFD041E57 /* ReadReceipt.swift */; };
@@ -57,6 +58,7 @@
 		41FB0841236D3A9D6928F28C /* SidePanel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 992EA99CCF93A2EA929D6E3B /* SidePanel.swift */; };
 		42B14F1B7A46FE2A0B7E9772 /* PassbandApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 389673F8FDDB51FC4830D9D2 /* PassbandApp.swift */; };
 		42D3E80C99FEE7FA7C6D3CF0 /* Typography.swift in Sources */ = {isa = PBXBuildFile; fileRef = B1E784321EA909951CA347A7 /* Typography.swift */; };
+		45E3185440F05D41CF616B8D /* SitrepWindow.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5B7D3E42C4E6495943239602 /* SitrepWindow.swift */; };
 		4836A3C84F0310D8E5E60FCB /* UpdateVerbs.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6895E072B54D7FEA646D6903 /* UpdateVerbs.swift */; };
 		4A484A26530C0131828B0A16 /* Loadable.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A74374DEAEE21CDF9A5067D /* Loadable.swift */; };
 		4A6FA53C127DAD99FB5AF300 /* SenderIdentity.swift in Sources */ = {isa = PBXBuildFile; fileRef = E4C2C545E14D926E28E48DE6 /* SenderIdentity.swift */; };
@@ -303,6 +305,7 @@
 		582A0094F147273BA003C4B6 /* ImageWarmer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ImageWarmer.swift; sourceTree = "<group>"; };
 		5883BA424612265657845246 /* Format.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Format.swift; sourceTree = "<group>"; };
 		5A1CE9442DCA54FF7863D7C5 /* AttachmentPreviewiOS.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AttachmentPreviewiOS.swift; sourceTree = "<group>"; };
+		5B7D3E42C4E6495943239602 /* SitrepWindow.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SitrepWindow.swift; sourceTree = "<group>"; };
 		5F62561CEB4911BA0E72FEDD /* ThreadPrefetch.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ThreadPrefetch.swift; sourceTree = "<group>"; };
 		5FCD987D800267801D7B4DFE /* ConnectionHealth.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ConnectionHealth.swift; sourceTree = "<group>"; };
 		613B9741AD84024778FA8204 /* APIClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = APIClient.swift; sourceTree = "<group>"; };
@@ -477,6 +480,7 @@
 				D4382469FC056D0CD54B22F3 /* Raster.swift */,
 				E4C2C545E14D926E28E48DE6 /* SenderIdentity.swift */,
 				DA80DD18A355200FB6274585 /* Sessions.swift */,
+				5B7D3E42C4E6495943239602 /* SitrepWindow.swift */,
 				2CEB46442CC9ABC798040928 /* StagedAttachment.swift */,
 				EEFA34554013DFB615774309 /* Trackers.swift */,
 				74A0D0F666787312F4991788 /* TriageTargets.swift */,
@@ -866,6 +870,7 @@
 				DE7473541B0436222CDBFC6D /* SidebarRail.swift in Sources */,
 				FB0306D6A270C6C086EF253F /* SitrepPoller.swift in Sources */,
 				22511E51CB7D38C82320FE21 /* SitrepView.swift in Sources */,
+				2B851E8B41A22C1E6FA86CC4 /* SitrepWindow.swift in Sources */,
 				61E6D7AA7EB53F8AEE04063C /* SitrepZones.swift in Sources */,
 				91F318BC5570E8048D351984 /* StagedAttachment.swift in Sources */,
 				EA0F7FADC742BF00778433BF /* SubjectText.swift in Sources */,
@@ -979,6 +984,7 @@
 				41FB0841236D3A9D6928F28C /* SidePanel.swift in Sources */,
 				811AE61DFEA4A6D99E9AFE40 /* SitrepPoller.swift in Sources */,
 				DBAF51D466CF5A747261E363 /* SitrepView.swift in Sources */,
+				45E3185440F05D41CF616B8D /* SitrepWindow.swift in Sources */,
 				B6F86A1B7C9CECBF25C347FA /* SitrepZones.swift in Sources */,
 				36AF6616DDF139B04CF8782F /* StagedAttachment.swift in Sources */,
 				C47E10D8934D830B5018DC8B /* SubjectText.swift in Sources */,

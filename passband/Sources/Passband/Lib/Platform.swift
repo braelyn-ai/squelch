@@ -69,6 +69,20 @@ enum Platform {
         #endif
     }
 
+    // MARK: - state
+
+    /// Whether the app is frontmost (macOS) / foreground-active (iOS) RIGHT
+    /// NOW. For the places that hear a process-wide notification and need to
+    /// know whether it is about a foreground app — a view reads scenePhase.
+    @MainActor
+    static var isAppActive: Bool {
+        #if os(macOS)
+            NSApp?.isActive ?? false
+        #else
+            UIApplication.shared.applicationState == .active
+        #endif
+    }
+
     // MARK: - appearance
 
     /// Whether the system is drawing DARK right now. Only for the places that
