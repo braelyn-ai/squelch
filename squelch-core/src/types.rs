@@ -234,6 +234,15 @@ pub struct ClientMessage {
     /// GET /client/attachments/{id}. HUMAN-DOOR ONLY, like `html`.
     #[serde(default)]
     pub attachments: Vec<ClientAttachment>,
+    /// The stored `messages.is_sent`: `true` only for the user's OWN outbound
+    /// copy of this message (what `ingest_sent` commits), `false` for anything
+    /// received. The reader uses it to right-align the user's side of the
+    /// conversation, so it is ALWAYS on the wire as a plain bool — never
+    /// skipped — and a client that never learns about it simply ignores the key.
+    /// This is the ONLY type that carries it: the agent door's
+    /// [`SanitizedMessage`] is untouched.
+    #[serde(default)]
+    pub is_sent: bool,
     /// This message's OWN triage verdict, for in-thread attention highlighting:
     /// the band shows one row per thread, so the reader is where "which message
     /// is the reason" gets answered. All optional — absent on a pre-highlight
@@ -739,6 +748,7 @@ mod tests {
                         size: 1234,
                         downloadable: true,
                     }],
+                    is_sent: false,
                     tier: Some(Tier::PastDue),
                     deadline: None,
                     attention_open: Some(true),
@@ -753,6 +763,7 @@ mod tests {
                     content: "plain".into(),
                     html: None,
                     attachments: vec![],
+                    is_sent: true,
                     tier: None,
                     deadline: None,
                     attention_open: None,
@@ -784,6 +795,10 @@ mod tests {
             "None tier must not serialize"
         );
         assert!(v["messages"][1].get("attention_open").is_none());
+        // is_sent is NEVER skipped: the reader aligns every bubble on it, so
+        // both polarities are on the wire as plain bools.
+        assert_eq!(v["messages"][0]["is_sent"], serde_json::json!(false));
+        assert_eq!(v["messages"][1]["is_sent"], serde_json::json!(true));
         // auth_pass is an internal gate for the human door's `sender_known`
         // bit, never a wire field, even when it holds a verdict.
         assert!(v["messages"][0].get("auth_pass").is_none());

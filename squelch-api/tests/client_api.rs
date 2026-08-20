@@ -6008,6 +6008,50 @@ async fn thread_view_marks_sent_to_senders_known_and_strangers_not() {
 }
 
 #[tokio::test]
+async fn thread_view_flags_the_users_own_sent_copies() {
+    // WIRE CONTRACT: `is_sent` is a plain bool on EVERY message of the thread,
+    // true only for the account's own outbound copy. The reader right-aligns
+    // the user's bubbles on it, so a missing key is not an acceptable "false".
+    let Harness { app, .. } = harness(|store, acct| {
+        store
+            .upsert_message(&msg(acct, "g-in", "t1", "lunch?", "what they wrote"))
+            .unwrap();
+        store
+            .upsert_message(&sent_msg(
+                acct,
+                "g-out",
+                "t1",
+                "Re: lunch?",
+                "Alice <alice@example.com>",
+            ))
+            .unwrap();
+    });
+
+    let resp = app
+        .oneshot(authed("GET", "/client/thread/t1"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+    let msgs = json["messages"].as_array().unwrap();
+    assert_eq!(msgs.len(), 2);
+    for m in msgs {
+        assert!(
+            m["is_sent"].is_boolean(),
+            "every message answers is_sent: {m}"
+        );
+    }
+    let is_sent = |gmail_subject: &str| -> Value {
+        msgs.iter()
+            .find(|m| m["content"] == gmail_subject)
+            .unwrap_or_else(|| panic!("{gmail_subject} missing from the thread"))["is_sent"]
+            .clone()
+    };
+    assert_eq!(is_sent("what they wrote"), Value::Bool(false));
+    assert_eq!(is_sent("what I wrote"), Value::Bool(true));
+}
+
+#[tokio::test]
 async fn thread_view_sender_known_needs_a_sent_message_not_merely_contact_row() {
     use squelch_core::store::ContactEntry;
     let Harness { app, .. } = harness(|store, acct| {

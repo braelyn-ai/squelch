@@ -141,6 +141,32 @@ fn auth_pass_round_trips_through_the_thread_view_and_self_heals_on_re_upsert() {
 }
 
 #[test]
+fn thread_view_carries_is_sent_per_message() {
+    // The reader right-aligns on this bit, so a mixed thread must answer it
+    // message by message, not thread-wide.
+    let (store, acct) = store();
+    let at = |n: i64| Utc::now() - chrono::Duration::minutes(10 - n);
+
+    triaged(acct, "g-in", "t-sent")
+        .received_at(at(1))
+        .upsert(&store);
+    triaged(acct, "g-out", "t-sent")
+        .received_at(at(2))
+        .from("me@example.com")
+        .is_sent(true)
+        .to_addrs("Alice <alice@example.com>")
+        .upsert(&store);
+
+    let view = store.thread_view_with_html(acct, "t-sent").unwrap();
+    let got: Vec<bool> = view.messages.iter().map(|m| m.is_sent).collect();
+    assert_eq!(
+        got,
+        vec![false, true],
+        "oldest-first: received, then the reply"
+    );
+}
+
+#[test]
 fn attachment_bytes_guards_sealed_overcap_and_unknown() {
     let (store, acct) = store();
 

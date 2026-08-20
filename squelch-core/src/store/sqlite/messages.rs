@@ -347,7 +347,7 @@ impl SqliteStore {
         // just unhighlighted.
         let mut stmt = conn.prepare(
             "SELECT m.id, m.from_addr, m.from_name, m.received_at, m.body, m.body_html,
-                    t.tier, t.deadline, t.status, t.one_line, m.auth_pass
+                    t.tier, t.deadline, t.status, t.one_line, m.auth_pass, m.is_sent
              FROM messages m
              LEFT JOIN triage t ON t.message_id = m.id
              WHERE m.account_id=?1 AND m.thread_id=?2
@@ -365,6 +365,8 @@ impl SqliteStore {
                     content: r.get(4)?,
                     html: r.get(5)?,
                     attachments: Vec::new(), // filled below, once `stmt` is gone
+                    // NOT NULL DEFAULT 0 in the schema, so every row answers.
+                    is_sent: r.get::<_, i64>(11)? != 0,
                     tier: r
                         .get::<_, Option<String>>(6)?
                         .as_deref()

@@ -341,6 +341,10 @@ pub async fn triage_debug(
 /// One message of the served thread: the store's [`ClientMessage`] verbatim,
 /// flattened, plus the read-time known-sender bit. Flattened rather than nested
 /// so every field a client already decodes keeps its place on the wire.
+///
+/// Stored per-message facts ride through the flatten untouched — `is_sent`, the
+/// bit the reader right-aligns the user's own bubbles on, among them; only
+/// fields COMPUTED at read time are declared here.
 #[derive(Debug, Serialize)]
 struct ThreadMessageView {
     #[serde(flatten)]
