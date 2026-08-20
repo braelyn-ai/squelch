@@ -388,9 +388,11 @@ roll the carrier promptly.
   one in TestFlight.
 - **Railway:** each service's dashboard can redeploy the previous deployment;
   for repo-connected services, revert the commit on `main`.
-- **Control DB** (`/data/control.sqlite3` on Railway) has no backups today.
-  A migration that corrupts it has no restore path. Treat control-plane
-  schema changes with the same one-way-door respect as tenant schemas.
+- **Control DB** is the project's Railway Postgres service. Railway keeps its
+  own backups of managed Postgres, which is more restore path than the old
+  volume file ever had — but a migration that corrupts data still deserves
+  the same one-way-door respect as tenant schemas: verify against a copy
+  before shipping schema changes.
 
 ## Known gaps (fix or at least know)
 

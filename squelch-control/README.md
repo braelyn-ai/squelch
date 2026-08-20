@@ -130,7 +130,7 @@ Everything is validated at startup and a bad value is a refusal to boot.
 | `SQUELCH_CONTROL_COOKIE_KEY` | **yes** | HMAC key for the signup cookie. base64 or hex, at least 32 bytes decoded. `openssl rand -base64 48`. |
 | `SQUELCH_CONTROL_WARDEN_URL` | **yes** | The warden's base URL, e.g. `https://warden.passband.app` (product domain, same reasoning as the public URL). |
 | `SQUELCH_CONTROL_WARDEN_TOKEN` | **yes** | Bearer presented to the warden. Must match `SQUELCH_WARDEN_TOKEN` in the cluster. |
-| `SQUELCH_CONTROL_DB_PATH` | no | Control store. Default `/data/control.sqlite3`. |
+| `SQUELCH_CONTROL_DATABASE_URL` | **yes** | The control store's Postgres URL. Falls back to `DATABASE_URL`, so a Railway service that references the Postgres service the default way needs no second variable — set it to `${{Postgres.DATABASE_URL}}` (the **private** URL; the store speaks no TLS, which private networking is for). No default: a database URL cannot be guessed. |
 | `SQUELCH_CONTROL_BIFROST_URL` | pair | The Bifrost LLM gateway's governance origin, `https://` only. With the token below it is all-or-nothing: both set mints a per-tenant virtual key at signup, neither set provisions keyless tenants, anything partial (including a budget or model list on their own) refuses to boot. |
 | `SQUELCH_CONTROL_BIFROST_ADMIN_TOKEN` | pair | The gateway admin's `username:password`, sent as HTTP Basic on every governance call (a session bearer expires after 30 days and does not belong here). Exactly one `:` between two nonempty halves, at least 32 characters total. It can mint unbounded LLM spend; treat it like the warden bearer. |
 | `SQUELCH_CONTROL_LLM_BUDGET_USD` | no | Monthly USD budget stamped on each minted triage key. Default `5.00`. Only meaningful with the gateway pair set; set alone it refuses to boot. |
@@ -169,6 +169,8 @@ squelch-control llm revoke <label>        # revoke the recorded key and forget i
 squelch-control drift                     # what has been changed on every tenant's workload
 squelch-control drift <label>             # ...on one. Exits 1 when anything has drifted
 squelch-control reconcile <label>         # converge ONE tenant back onto the warden's render
+squelch-control import-sqlite <path>      # one-time cutover: copy the legacy SQLite store into
+                                          # Postgres, ids preserved. Refuses a non-empty target
 ```
 
 Invite codes are Crockford `XXXX-XXXX-XXXX-XXXX` (80 bits), stored only as a
@@ -229,6 +231,21 @@ the tenant its key, never the signup), and rotates one that has a key already;
 rotation prints the old key's id, which stays live in Bifrost until revoked
 there. Key **values** are never printed, stored, or logged — only ids are.
 
+## Tests need a real Postgres
+
+The store is Postgres, so its tests refuse to run against anything else — a
+fake would test the fake. Each test creates (and later reaps) its own
+throwaway schema, so one local instance serves the whole parallel suite:
+
+```sh
+docker run -d --name squelch-pg -e POSTGRES_PASSWORD=postgres -p 5432:5432 postgres:16
+export SQUELCH_TEST_PG_URL=postgres://postgres:postgres@localhost:5432/postgres
+cargo test -p squelch-control
+```
+
+Unset, the tests panic with this same remedy rather than skipping: a suite
+that can be silently skipped is a suite CI could silently skip too.
+
 ## Deploying to Railway
 
 A **separate Railway service** off this same repo, alongside the APNs relay
@@ -247,7 +264,10 @@ so that is step 1:
    image with the variable set correctly, which is a green deploy serving the
    wrong binary and no error anywhere. Setting the variable as well is harmless;
    it is just not what makes this work.
-2. Attach a volume mounted at `/data` for the control store.
+2. Add a Railway Postgres service to the project and set
+   `SQUELCH_CONTROL_DATABASE_URL = ${{Postgres.DATABASE_URL}}` on this service.
+   (The `/data` volume is only a transition artifact: it holds the pre-Postgres
+   SQLite file until `import-sqlite` has run once, then it is retired.)
 3. Set every required variable from the table above.
 4. Add the custom domain for the signup surface (`signup.passband.app` — the
    product domain, never the tenant base domain) and point a CNAME at the
