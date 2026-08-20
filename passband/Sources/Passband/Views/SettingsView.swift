@@ -508,6 +508,10 @@ struct YouSection: View {
 /// Remote images: "Always" renders them in every email, "On demand" blocks them
 /// at the frame CSP until the reader opts in per message. Tracking pixels are
 /// stripped either way — see docs/SECURITY.md.
+///
+/// Threads: the shape the reader draws a conversation in, as a DEFAULT. Nothing
+/// is detected — a thread switched by hand keeps its own answer and stops
+/// following this.
 struct MailSection: View {
     @Environment(Prefs.self) private var prefs
 
@@ -521,6 +525,14 @@ struct MailSection: View {
             }
             SettingsHint(
                 "Tracking pixels are removed either way, and images load with no referrer.")
+            InlineRow(key: "threads") {
+                GlassSegmented(
+                    options: ThreadStyle.allCases.map { ($0, $0.label) },
+                    selection: $prefs.threadStyle)
+            }
+            SettingsHint(
+                "Email stacks every message as its own card. Chat draws the thread as bubbles, with the ones you sent on the right. Any thread can be switched on its own while you read it (b)."
+            )
         }
     }
 }

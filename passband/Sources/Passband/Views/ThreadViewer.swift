@@ -23,9 +23,17 @@ struct ThreadViewer: View {
     @Environment(AppStore.self) private var store
     @Environment(Prefs.self) private var prefs
 
+    /// Computed, not stored: a stored property here would drag the memberwise
+    /// initializer down to `private` with it.
+    private var styles: ThreadStyleLedger { .shared }
+
     @State private var thread: ClientThreadView?
     @State private var error: String?
     @State private var loading = true
+    /// HOW THIS THREAD IS DRAWN, resolved once per thread rather than per row:
+    /// this thread's own answer if it has ever been given one, else the global
+    /// default. Held in state so the toggle can flip it under the reader.
+    @State private var style: ThreadStyle = .classic
     /// Selected message: j/k move it, click selects, the rail highlights it.
     @State private var index = 0
     /// Existing unsubscribe record for THIS thread's sender; drives the header
@@ -149,6 +157,13 @@ struct ThreadViewer: View {
             await refreshOpens()
         }
         .task(id: newestSender) { await refreshUnsub() }
+        // The default changed in Settings while this thread is open. A thread
+        // that has been switched by hand keeps what it was told — that is the
+        // whole point of an override — so only the ones following the default
+        // follow it here.
+        .onChange(of: prefs.threadStyle) { _, now in
+            if styles.style(threadId) == nil { style = now }
+        }
         // NEW MAIL IN THIS VERY THREAD, from the poll that heard about it.
         // `onChange` rather than `.task(id:)`: a task keyed on the token would
         // also fire on mount, refetching the thread `load()` is already
@@ -359,6 +374,21 @@ struct ThreadViewer: View {
                 .help("dev: reset this email's LLM verdicts and re-run triage")
             }
 
+            // The style switch names the style you are one press AWAY from, so
+            // the button says where it takes you rather than where you are.
+            Button { toggleStyle() } label: {
+                HStack(spacing: 4) {
+                    #if os(macOS)
+                        Kbd("b")
+                    #endif
+                    Image(systemName: style.flipped.symbol)
+                        .font(.system(size: 10, weight: .semibold))
+                    Text(style.flipped.actionLabel).font(Typo.micro)
+                }
+            }
+            .buttonStyle(.textAction)
+            .help(style.flipped.actionHelp)
+
             Button { openSenderRule() } label: {
                 HStack(spacing: 4) {
                     // The key chip is the Mac's promise that a key does this.
@@ -416,7 +446,7 @@ struct ThreadViewer: View {
                         LazyVStack(alignment: .leading, spacing: 0) {
                             ForEach(Array(messages.enumerated()), id: \.element.id) { i, m in
                                 MessageCard(
-                                    message: m, selected: i == index, ruled: i > 0,
+                                    message: m, style: style, selected: i == index, ruled: i > 0,
                                     opens: opens[m.id] ?? []
                                 ) {
                                     index = i
@@ -599,13 +629,18 @@ struct ThreadViewer: View {
     /// holding still is the whole job.
     private func mapEstimate(_ m: ClientMessage) -> CGFloat {
         MinimapGeometry.estimate(
-            text: m.content, html: m.html, attachments: m.attachmentList.count)
+            text: m.content, html: m.html, attachments: m.attachmentList.count, style: style)
     }
 
     /// The mail's measure. The dismissible gutter is defined as the complement
     /// of it, so the two can never drift apart — and the inline composer pins
     /// itself to the same measure, so the reply sits under the column it answers.
     static let columnWidth: CGFloat = 900
+
+    /// The widest a chat bubble is ever drawn. Narrower than the column on
+    /// purpose: what makes a conversation readable as one is the empty margin
+    /// opposite each side, and a bubble that fills the measure has none.
+    static let bubbleWidth: CGFloat = 620
 
     /// The mail's own inset. A phone is narrower than the column will ever be,
     /// so the padding IS the measure there and it matches the header above it.
@@ -801,6 +836,9 @@ struct ThreadViewer: View {
                 openReplyAll()
                 return true
             },
+            // `b` = the shape of the thread, cards or bubbles. Manual and
+            // per-thread: nothing here guesses which conversation is which.
+            KeyBinding("b", "chat / email style") { toggleStyle() },
             // `t` = tune sender rule, same as on a list row: one verb, one key
             // everywhere. The target differs (the thread's sender rather than the
             // selected row's) but that is the only sender in view here. This
@@ -819,6 +857,20 @@ struct ThreadViewer: View {
     private func stepMessage(_ delta: Int) {
         guard !messages.isEmpty else { return }
         index = min(newestIndex, max(0, index + delta))
+    }
+
+    /// `b` and the header button, which are the same flip. The answer is kept
+    /// for THIS thread only — unless it agrees with the global default, in
+    /// which case the thread holds no opinion worth storing and goes back to
+    /// following whatever Settings says next.
+    private func toggleStyle() {
+        let next = style.flipped
+        style = next
+        if next == prefs.threadStyle {
+            styles.clear(threadId)
+        } else {
+            styles.set(threadId, next)
+        }
     }
 
     /// The rule composer for THIS thread's sender — the same request shape `t`
@@ -1034,6 +1086,8 @@ struct ThreadViewer: View {
         map.forget()
         newestHeight = 0
         landed = false
+        // THIS thread's answer, or the default for every thread that has none.
+        style = styles.style(threadId) ?? prefs.threadStyle
         // Fresh prefetch hit → render it and skip the round-trip entirely (the
         // cache is at most 60s old; e/d/refresh paths repopulate it).
         if let cached = ThreadPrefetch.shared.cached(threadId) {
@@ -1178,8 +1232,15 @@ struct ThreadViewer: View {
 /// information around a frame that already clips itself round, paid on every
 /// message in a surface whose whole job is reading. Messages are divided by a
 /// hairline and marked by a rule, and the mail is the only thing with edges.
+///
+/// THE CHAT STYLE CHANGES THE ARRANGEMENT AND NOTHING ELSE. The same avatar,
+/// the same attention chip, the same read receipt, the same web frame and the
+/// same quoted-history collapse — moved into a caption over a bubble on the
+/// sender's own side. The rails stay where they are in both, because they are
+/// what j/k moves and a navigation affordance that jumps sides is no affordance.
 private struct MessageCard: View {
     let message: ClientMessage
+    let style: ThreadStyle
     let selected: Bool
     /// The first message needs no divider above it: that is the top of the
     /// document, not a seam between two messages.
@@ -1189,45 +1250,27 @@ private struct MessageCard: View {
     let opens: [MessageOpen]
     let onSelect: () -> Void
 
+    /// Which side of the conversation this is. Only the chat style asks.
+    private var mine: Bool { message.fromMe }
+    private var side: HorizontalAlignment { mine ? .trailing : .leading }
+    private var edge: Alignment { mine ? .trailing : .leading }
+
     var body: some View {
-        VStack(alignment: .leading, spacing: 9) {
-            HStack(spacing: 9) {
-                Avatar(sender: message.senderString, size: 24)
-                Text(SenderCache.resolved(message.senderString).displayName)
-                    .font(.system(size: 13, weight: .semibold))
-                    .foregroundStyle(Palette.ink)
-                Spacer(minLength: 8)
-                // THE ATTENTION MARK: this message's own unresolved standing-tier
-                // verdict — the reason the thread surfaced. Same chip grammar as
-                // the list rows, so the mark reads as "that row, this message".
-                if message.needsAttention {
-                    let chip = Fmt.deadlineChip(message.deadline)
-                    Chip(
-                        text: chip?.text ?? "needs attention",
-                        tone: (chip?.overdue ?? false) ? Palette.danger : Palette.warn,
-                        filled: chip?.overdue ?? false
-                    )
-                    .help(message.one_line ?? "this message put the thread in for-your-eyes")
-                }
-                ReadReceiptMark(opens: opens)
-                Text(Fmt.dateTime(message.received_at))
-                    .font(Typo.num(11))
-                    .foregroundStyle(Palette.inkFaintest)
+        Group {
+            switch style {
+            case .classic: card
+            case .bubbles: bubble
             }
-
-            if let html = message.html, !html.isEmpty {
-                EmailWebView(
-                    html: html, cacheKey: String(message.id), allowTrackers: message.allowsTrackers)
-            } else {
-                PlainBody(content: message.content)
-            }
-
-            AttachmentStrip(attachments: message.attachmentList)
         }
         // The gutter is reserved whether or not this message is selected, so
-        // j/k moves a rule rather than shifting every body left and right.
+        // j/k moves a rule rather than shifting every body left and right. The
+        // chat style reserves the far side too, or a sent bubble would sit
+        // against an edge its neighbours keep clear of.
         .padding(.leading, 13)
-        .padding(.vertical, 16)
+        .padding(.trailing, style == .bubbles ? 13 : 0)
+        // The divider is what separates two cards; bubbles are separated by the
+        // air between them, so that is what the padding buys there.
+        .padding(.vertical, style == .bubbles ? 5 : 16)
         .frame(maxWidth: .infinity, alignment: .leading)
         // BOTH rules stay mounted and only change opacity. A conditional
         // modifier here would give selected and unselected separate view
@@ -1242,21 +1285,143 @@ private struct MessageCard: View {
             RoundedRectangle(cornerRadius: 1.5, style: .continuous)
                 .fill(message.tier == .pastDue ? Palette.danger : Palette.warn)
                 .frame(width: 3)
-                .padding(.vertical, 11)
+                .padding(.vertical, railInset)
                 .opacity(message.needsAttention && !selected ? 0.75 : 0)
         }
         .overlay(alignment: .leading) {
             RoundedRectangle(cornerRadius: 1.5, style: .continuous)
                 .fill(Palette.accent)
                 .frame(width: 3)
-                .padding(.vertical, 11)
+                .padding(.vertical, railInset)
                 .opacity(selected ? 1 : 0)
         }
+        // ONLY THE CARDS ARE RULED. A hairline between two bubbles would draw a
+        // seam across the gap that is already saying the same thing.
         .overlay(alignment: .top) {
-            Hairline().opacity(ruled ? 1 : 0)
+            Hairline().opacity(ruled && style == .classic ? 1 : 0)
         }
         .contentShape(Rectangle())
         .onTapGesture(perform: onSelect)
+    }
+
+    /// A short message is a short bubble, so the rail cannot be inset as far as
+    /// a card's or there would be nothing left of it to see.
+    private var railInset: CGFloat { style == .bubbles ? 6 : 11 }
+
+    // MARK: - the email card
+
+    private var card: some View {
+        VStack(alignment: .leading, spacing: 9) {
+            HStack(spacing: 9) {
+                Avatar(sender: message.senderString, size: 24)
+                Text(SenderCache.resolved(message.senderString).displayName)
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundStyle(Palette.ink)
+                Spacer(minLength: 8)
+                attentionChip
+                ReadReceiptMark(opens: opens)
+                Text(Fmt.dateTime(message.received_at))
+                    .font(Typo.num(11))
+                    .foregroundStyle(Palette.inkFaintest)
+            }
+
+            mail(fills: true)
+
+            AttachmentStrip(attachments: message.attachmentList)
+        }
+    }
+
+    // MARK: - the chat bubble
+
+    /// The caption over the mail, both hung on the sender's own side. The outer
+    /// frame is the whole measure so the block can be pushed to that side; the
+    /// inner one is the bubble's, and everything inside takes only the width it
+    /// needs — which is what makes a two-word reply a two-word bubble.
+    private var bubble: some View {
+        VStack(alignment: side, spacing: 5) {
+            caption
+            mail(fills: false)
+            AttachmentStrip(attachments: message.attachmentList)
+        }
+        .frame(maxWidth: ThreadViewer.bubbleWidth, alignment: edge)
+        .frame(maxWidth: .infinity, alignment: edge)
+    }
+
+    /// Who and when, small, over the bubble. The avatar is the received side's
+    /// alone — a face beside every one of your own lines is a face you already
+    /// know — and the read receipt is the sent side's, for the same reason it is
+    /// in the card: only a tracked send of yours can have one.
+    private var caption: some View {
+        HStack(spacing: 6) {
+            if !mine {
+                Avatar(sender: message.senderString, size: 17)
+            }
+            Text(SenderCache.resolved(message.senderString).displayName)
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundStyle(Palette.inkDim)
+                .lineLimit(1)
+            attentionChip
+            if mine {
+                ReadReceiptMark(opens: opens)
+            }
+            Text(captionTime)
+                .font(Typo.num(10))
+                .foregroundStyle(Palette.inkFaintest)
+        }
+    }
+
+    /// A caption has room for a clock and not for a calendar, so today's mail
+    /// says the time and everything older keeps the date it needs.
+    private var captionTime: String {
+        Fmt.isToday(message.received_at)
+            ? Fmt.timeOfDay(message.received_at) : Fmt.dateTime(message.received_at)
+    }
+
+    // MARK: - shared parts
+
+    /// THE ATTENTION MARK: this message's own unresolved standing-tier verdict —
+    /// the reason the thread surfaced. Same chip grammar as the list rows, so
+    /// the mark reads as "that row, this message".
+    @ViewBuilder
+    private var attentionChip: some View {
+        if message.needsAttention {
+            let chip = Fmt.deadlineChip(message.deadline)
+            Chip(
+                text: chip?.text ?? "needs attention",
+                tone: (chip?.overdue ?? false) ? Palette.danger : Palette.warn,
+                filled: chip?.overdue ?? false
+            )
+            .help(message.one_line ?? "this message put the thread in for-your-eyes")
+        }
+    }
+
+    /// The mail itself. HTML brings its own bubble: the frame's document is an
+    /// opaque white page with rounded corners already, so the chat style only
+    /// has to hand it a narrower measure. Plain text gets the fill, tinted on
+    /// the user's own side.
+    ///
+    /// The frame key carries the style (see ThreadStyle.frameKey) because a
+    /// document measured at 620 points is not the one a full-width card wants
+    /// back out of the pool.
+    @ViewBuilder
+    private func mail(fills: Bool) -> some View {
+        if let html = message.html, !html.isEmpty {
+            EmailWebView(
+                html: html, cacheKey: style.frameKey(message.id),
+                allowTrackers: message.allowsTrackers)
+        } else if fills {
+            PlainBody(content: message.content)
+        } else {
+            PlainBody(content: message.content, fills: false)
+                .padding(.horizontal, 12)
+                .padding(.vertical, 9)
+                // The same corner the web frame clips itself to, so a plain
+                // reply and an html one are the same shape on the same side.
+                .background(
+                    RoundedRectangle(cornerRadius: 10, style: .continuous)
+                        .fill(mine ? Palette.accentSoft : Palette.hairline)
+                )
+        }
     }
 }
 
@@ -1265,6 +1430,10 @@ private struct MessageCard: View {
 /// conservative — when in doubt the full text renders.
 private struct PlainBody: View {
     let content: String
+    /// Whether the text takes the whole measure it is offered. A card's body IS
+    /// the column, so it does; a bubble is only as wide as what is in it, and a
+    /// flexible frame with no bound is the child's own size.
+    var fills = true
     @State private var open = false
 
     var body: some View {
@@ -1274,7 +1443,7 @@ private struct PlainBody: View {
                 .font(.system(size: 13.5))
                 .foregroundStyle(Palette.ink)
                 .textSelection(.enabled)
-                .frame(maxWidth: .infinity, alignment: .leading)
+                .frame(maxWidth: fills ? .infinity : nil, alignment: .leading)
                 .fixedSize(horizontal: false, vertical: true)
             if let quoted = split.quoted {
                 Button {

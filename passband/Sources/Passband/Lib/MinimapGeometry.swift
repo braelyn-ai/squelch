@@ -41,10 +41,26 @@ enum MinimapGeometry {
     static let longestGuess: CGFloat = 2400
 
     /// Rendered text metrics for the reader's column, near enough for a drawing.
-    private static let charsPerLine: CGFloat = 105
+    /// A chat bubble is the same text through a narrower measure — 620 points
+    /// against the column's 900 — so the same message is more lines of fewer
+    /// characters, and the map has to say so or a switched thread's rail stops
+    /// matching what is under it.
+    private static func charsPerLine(_ style: ThreadStyle) -> CGFloat {
+        switch style {
+        case .classic: 105
+        case .bubbles: 72
+        }
+    }
     private static let lineHeight: CGFloat = 20
     /// Header, sender row, padding, rule: what a message costs before its text.
-    private static let cardChrome: CGFloat = 132
+    /// A bubble spends less: one caption line instead of an avatar row, air
+    /// between bubbles instead of a divider.
+    private static func cardChrome(_ style: ThreadStyle) -> CGFloat {
+        switch style {
+        case .classic: 132
+        case .bubbles: 84
+        }
+    }
     private static let attachmentStrip: CGFloat = 54
     /// Bytes of markup per byte of visible text, for the one case that has to be
     /// counted through the tags. A blunt instrument for a blunt situation.
@@ -60,7 +76,10 @@ enum MinimapGeometry {
     /// guessing, and the rail only draws for a thread of two or more messages,
     /// which is a conversation, which is text. A newsletter is one message in a
     /// thread of its own and has no rail to be wrong about.
-    static func estimate(text: String, html: String? = nil, attachments: Int = 0) -> CGFloat {
+    static func estimate(
+        text: String, html: String? = nil, attachments: Int = 0, style: ThreadStyle = .classic
+    ) -> CGFloat {
+        let charsPerLine = charsPerLine(style)
         var lines: CGFloat = 0
         var run: CGFloat = 0
         var ink = false
@@ -84,7 +103,7 @@ enum MinimapGeometry {
             lines = max(1, (visible / charsPerLine).rounded(.up))
         }
 
-        let body = cardChrome + lines * lineHeight + (attachments > 0 ? attachmentStrip : 0)
+        let body = cardChrome(style) + lines * lineHeight + (attachments > 0 ? attachmentStrip : 0)
         return min(max(body, minimumCard), longestGuess)
     }
 

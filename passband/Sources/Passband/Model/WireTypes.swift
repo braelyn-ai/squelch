@@ -197,6 +197,11 @@ struct ClientMessage: Codable, Sendable, Identifiable, Hashable, SenderStringCon
     var content: String
     var html: String?
     var attachments: [Attachment]?
+    /// True for the user's OWN outbound copy of this message, false for
+    /// anything received. ABSENT on a pre-bubble daemon, which reads as
+    /// unknown — and unknown is drawn as theirs, which is where every message
+    /// sat before the chat style existed.
+    var is_sent: Bool?
     /// This message's OWN triage verdict — ABSENT on a pre-highlight daemon.
     /// Drives the in-thread attention highlight: the bands show one row per
     /// thread, so the reader is where "which message is the reason" is answered.
@@ -213,6 +218,11 @@ struct ClientMessage: Codable, Sendable, Identifiable, Hashable, SenderStringCon
     var sender_known: Bool?
 
     var attachmentList: [Attachment] { attachments ?? [] }
+
+    /// The side of the conversation this message is on, for the chat style.
+    /// `nil` (old daemon) is THEIRS: an unknown side drawn as the user's own
+    /// would right-align somebody else's mail under their name.
+    var fromMe: Bool { is_sent ?? false }
 
     /// Whether this message's tracking pixels may load. Trusted people are
     /// allowed to learn their mail was opened; everyone else is stripped as

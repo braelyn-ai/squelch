@@ -64,7 +64,10 @@ run_suite email-images \
   Tests/EmailImagesTests.swift
 
 # The thread minimap's window math. CoreGraphics only — the rail that draws it
-# is SwiftUI, the arithmetic that aims it is not.
+# is SwiftUI, the arithmetic that aims it is not. ThreadStyle comes along
+# because a bubble is a narrower measure than a card, which the guess has to
+# know; the enum is kept free of SwiftUI and of the account for exactly this.
 run_suite minimap-geometry \
   Sources/Passband/Lib/MinimapGeometry.swift \
+  Sources/Passband/Lib/ThreadStyle.swift \
   Tests/MinimapGeometryTests.swift
