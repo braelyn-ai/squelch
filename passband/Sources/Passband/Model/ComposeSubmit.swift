@@ -46,7 +46,13 @@ enum ComposeSubmit {
                 // Only a reply can widen: `reply_all` names a parent to widen
                 // FROM, so a new message carrying it would be asking the daemon
                 // to derive a recipient set out of nothing.
-                replyAll: c.replyToMessageId != nil && c.replyAll)
+                replyAll: c.replyToMessageId != nil && c.replyAll,
+                // The whole of a forward on the wire: the daemon quotes the
+                // original and re-attaches its files from this id. Never set
+                // beside `reply_to_message_id` — the two are mutually exclusive
+                // server-side, and nothing in the client can produce both (a
+                // composer is opened as one or the other and never converts).
+                forwardOfMessageId: c.forwardOfMessageId)
             capture(c, override, "sent")
             return .sent(result)
         } catch let apiError as APIError where apiError.kind == .guardBlocked {
@@ -66,7 +72,7 @@ enum ComposeSubmit {
         Analytics.capture(
             "compose_send",
             [
-                "kind": c.replyToMessageId == nil ? "new" : "reply",
+                "kind": c.analyticsKind,
                 "outcome": outcome,
                 "override": override,
                 "tracked": c.includeTracker,
@@ -104,5 +110,29 @@ enum ComposeCopy {
         let trimmed = parentSubject.trimmed
         guard !trimmed.isEmpty else { return derivedSubject }
         return trimmed.lowercased().hasPrefix("re:") ? trimmed : "Re: \(trimmed)"
+    }
+
+    /// What a forward is titled — the same mirror `replySubject` is, of the
+    /// daemon's `gmail_write::forward_subject`, which prefixes "Fwd: " exactly
+    /// once. Kept in step for a reason the reply side does not have: the daemon
+    /// only titles a forward itself when the field is ABSENT, and the composer
+    /// opens holding this string, so this is what actually goes out. The two
+    /// must agree or a forwarded forward reads "Fwd: Fwd: …".
+    ///
+    /// `fw:` counts as prefixed alongside `fwd:` — plenty of clients write the
+    /// short form — and both are matched case-insensitively, because no client
+    /// agrees on the capitalization either.
+    ///
+    /// An untitled original stays untitled: "Fwd:" alone, rather than borrowing
+    /// the reply side's "(derived from thread)" stand-in, which would be a lie
+    /// here. Nothing derives this one. THE ONE PLACE the mirror is deliberately
+    /// not byte-identical — the daemon's empty case keeps a trailing space —
+    /// and it is unreachable from here anyway: this string is always sent, so
+    /// the daemon's own titling never runs for a forward the client opened.
+    static func forwardSubject(_ originalSubject: String) -> String {
+        let trimmed = originalSubject.trimmed
+        guard !trimmed.isEmpty else { return "Fwd:" }
+        let lowered = trimmed.lowercased()
+        return lowered.hasPrefix("fwd:") || lowered.hasPrefix("fw:") ? trimmed : "Fwd: \(trimmed)"
     }
 }

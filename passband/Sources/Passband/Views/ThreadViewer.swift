@@ -767,11 +767,36 @@ struct ThreadViewer: View {
                     TriageFixTarget(
                         messageId: m.id, sender: m.from_addr, subject: thread.subject))
             },
-            // The SELECTED message's sender, not the thread's newest: on a
+            // `f` = FORWARD, and only in here. On a list row `f` is still
+            // search-this-sender: a row is a sender you are sizing up, an open
+            // email is a thing you might want to pass on, and the reader is the
+            // only surface where "this message" is unambiguous enough to
+            // forward without asking which one.
+            //
+            // The SELECTED message, not the thread's newest — the same rule `v`
+            // keeps. On a back-and-forth the two differ, and j/k is how you
+            // chose the one in front of you; forwarding something else because
+            // it happened to arrive last would be silently sending the wrong
+            // mail, which no undo covers.
+            //
+            // Into the PANE composer rather than the reader's inline slot: a
+            // forward starts a new thread, so it needs a recipient (nothing
+            // derives one) and a subject line, and the inline reply has neither
+            // field. The two draft slots are independent, so a reply
+            // half-written underneath is untouched.
+            KeyBinding("f", "forward") {
+                guard let m = messages[safe: index] else { return }
+                store.openComposeForward(
+                    messageId: m.id, subject: thread?.subject ?? "",
+                    attachmentCount: m.attachmentList.count)
+            },
+            // `s` = the search `f` used to be, moved rather than dropped: the
+            // sender lookup is worth a key in here, it just is not worth THE
+            // key. The SELECTED message's sender, not the thread's newest: on a
             // back-and-forth the two differ, and the one you are looking at is
             // the one you mean. Search opens as the strip beside the reader, so
             // this does not cost you the email you are reading.
-            KeyBinding("f", "search this sender") {
+            KeyBinding("s", "search this sender") {
                 guard let m = messages[safe: index] else { return }
                 store.openSearch(seed: "from:\(m.from_addr)")
             },
