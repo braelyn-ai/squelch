@@ -125,7 +125,7 @@ final class Prefs {
             Key.developerMode: false,
             Key.tourCompleted: false,
             Key.theme: ThemeChoice.system.rawValue,
-            Key.threadStyle: ThreadStyle.classic.rawValue,
+            Key.threadStyle: ThreadStyleDefault.auto.rawValue,
             Key.notificationSound: NotificationSound.system.rawValue,
             Key.telemetry: TelemetryLevel.full.rawValue,
         ])
@@ -138,7 +138,7 @@ final class Prefs {
         _tourCompleted = defaults.bool(forKey: Key.tourCompleted)
         _theme = ThemeChoice(rawValue: defaults.string(forKey: Key.theme) ?? "") ?? .system
         _threadStyle =
-            ThreadStyle(rawValue: defaults.string(forKey: Key.threadStyle) ?? "") ?? .classic
+            ThreadStyleDefault(rawValue: defaults.string(forKey: Key.threadStyle) ?? "") ?? .auto
         _notificationSound =
             NotificationSound(rawValue: defaults.string(forKey: Key.notificationSound) ?? "")
             ?? .system
@@ -227,11 +227,12 @@ final class Prefs {
         }
     }
 
-    /// How threads are drawn where nothing else has been said. A thread the
-    /// reader has switched by hand keeps its own answer (ThreadStyleLedger) and
-    /// ignores this.
-    private var _threadStyle: ThreadStyle
-    var threadStyle: ThreadStyle {
+    /// How threads are drawn where nothing else has been said — including
+    /// `auto`, which is an instruction to read the thread rather than a style
+    /// (see ThreadStyle.automatic). A thread the reader has switched by hand
+    /// keeps its own answer (ThreadStyleLedger) and ignores this.
+    private var _threadStyle: ThreadStyleDefault
+    var threadStyle: ThreadStyleDefault {
         get { _threadStyle }
         set {
             _threadStyle = newValue

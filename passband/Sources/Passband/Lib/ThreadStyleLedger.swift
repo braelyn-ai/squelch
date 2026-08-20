@@ -1,6 +1,13 @@
 // THE THREADS THE READER HAS ANSWERED THE STYLE QUESTION FOR, and nothing else:
-// a thread with no entry here is drawn the way `Prefs.threadStyle` says, so the
-// global default keeps governing every thread nobody has had an opinion about.
+// a thread with no entry here is drawn the way `Prefs.threadStyle` says, which
+// on Automatic is whatever the thread itself looks like as it opens.
+//
+// AN ENTRY OUTLIVES EVERYTHING BUT THE CAP. There is no un-answering, because
+// the answer it would hand the thread back to is not a constant: Automatic
+// re-reads the thread every open, and one more reply is enough to change its
+// mind. `b` twice is a round trip back to the same pin, not a way out of it.
+// The 500-entry bound in `set` is the one exception: past it, old answers are
+// shed unordered, and a shed thread goes back to following the default.
 //
 // Device-local and per ACCOUNT, the same shape as AuthDecisions and for the same
 // reason: there is no server field for this, and the map is keyed by thread id,
@@ -55,18 +62,6 @@ final class ThreadStyleLedger {
             let stale = next.keys.filter { $0 != threadId }.sorted()
             for k in stale.prefix(next.count - Self.cap) { next.removeValue(forKey: k) }
         }
-        store = next
-        UserDefaults.standard.set(next, forKey: key)
-    }
-
-    /// Forget this thread's opinion, putting it back under the global default.
-    /// What a toggle BACK to the default does: an exception that agrees with the
-    /// rule is not an exception, and keeping it would freeze the thread against
-    /// a later change in Settings.
-    func clear(_ threadId: String) {
-        guard let key = Self.key, store[threadId] != nil else { return }
-        var next = store
-        next.removeValue(forKey: threadId)
         store = next
         UserDefaults.standard.set(next, forKey: key)
     }

@@ -71,3 +71,12 @@ run_suite minimap-geometry \
   Sources/Passband/Lib/MinimapGeometry.swift \
   Sources/Passband/Lib/ThreadStyle.swift \
   Tests/MinimapGeometryTests.swift
+
+# The automatic thread style: a guess about somebody's mail, so it is asserted
+# fixture by fixture rather than reasoned about. Quotes comes along because the
+# length test is fed by the quote splitter — a reply under forty lines of chain
+# is a short message — and both files are pure Foundation for this reason.
+run_suite thread-style \
+  Sources/Passband/Lib/ThreadStyle.swift \
+  Sources/Passband/Lib/Quotes.swift \
+  Tests/ThreadStyleTests.swift

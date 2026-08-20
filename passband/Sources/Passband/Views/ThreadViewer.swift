@@ -160,9 +160,12 @@ struct ThreadViewer: View {
         // The default changed in Settings while this thread is open. A thread
         // that has been switched by hand keeps what it was told — that is the
         // whole point of an override — so only the ones following the default
-        // follow it here.
-        .onChange(of: prefs.threadStyle) { _, now in
-            if styles.style(threadId) == nil { style = now }
+        // follow it here, and they follow it through the guess: switching TO
+        // Automatic has to re-read the thread, not leave it on what the fixed
+        // setting last drew.
+        .onChange(of: prefs.threadStyle) { _, _ in
+            guard styles.style(threadId) == nil else { return }
+            style = resolvedStyle(messages)
         }
         // NEW MAIL IN THIS VERY THREAD, from the poll that heard about it.
         // `onChange` rather than `.task(id:)`: a task keyed on the token would
@@ -551,6 +554,38 @@ struct ThreadViewer: View {
                 .onChange(of: messages.last?.id) { _, _ in
                     proxy.scrollTo(index, anchor: .top)
                 }
+                // A STYLE FLIP IS THE WHOLE COLUMN RELAID OUT UNDER SOMEBODY'S
+                // EYES. Every html message re-measures under the other style's
+                // cache key (see ThreadStyle.frameKey), so for a beat the thread
+                // is a stack of empty placeholders and the message being read is
+                // nowhere near where it was. Nothing else here re-aims: the
+                // landing above only fires for a reader parked on the newest, and
+                // the selection has not moved, so this is the one hand on it.
+                //
+                // A LONGER LEASH than a rail jump, and it holds: those heights
+                // arrive out of a web frame long after the flip, and each one that
+                // lands shifts the target again — so being on target once is not
+                // being finished. A plain-text thread reports nothing late, is on
+                // target from the first check, and is done in three.
+                //
+                // IT AIMS WHERE THE READER IS, not at the selection — the same
+                // distinction `refreshInPlace` makes, for the same reason: a
+                // wheel scroll moves what is on screen without ever touching
+                // the selection, and re-aiming at the selection would use the
+                // flip to yank a wheel reader back to the newest. The selection
+                // itself stays put, so `settle` is told which selection it is
+                // riding under rather than assuming it is the target.
+                //
+                // Only for a thread that has already landed. Before that, the
+                // style is being resolved by the load that is about to land it,
+                // and two hands on the scroll is a fight.
+                .onChange(of: style) { _, _ in
+                    guard landed else { return }
+                    let target = anchorId.flatMap { id in messages.firstIndex { $0.id == id } } ?? index
+                    settle(
+                        on: target, proxy: proxy, tries: 24, every: .milliseconds(40), hold: 3,
+                        under: index)
+                }
             }
         }
     }
@@ -578,13 +613,35 @@ struct ThreadViewer: View {
     /// top of the window, aim again. Bounded, because a thread whose heights
     /// never settle must cost a fifth of a second and not a spin, and abandoned
     /// the moment the selection moves — somebody who has moved on owns the scroll.
-    private func settle(on target: Int, proxy: ScrollViewProxy) {
+    ///
+    /// `hold` is how many checks in a row must find the card on target before the
+    /// loop believes it. One is right for a jump, where arriving IS the job. A
+    /// relayout of the whole column (a style flip) needs more: the first frames
+    /// to re-measure can put the target at the top on their own, and the ones
+    /// still to come would then move it with nobody watching.
+    ///
+    /// `under` is the selection this settle is riding beneath when the target is
+    /// not the selection itself — a style flip anchors on the message on SCREEN,
+    /// which for a wheel reader is not the selected one. The loop is still
+    /// abandoned the moment the selection moves off it, because somebody who has
+    /// moved on owns the scroll; left nil, the target is the selection, as it is
+    /// for every jump.
+    private func settle(
+        on target: Int, proxy: ScrollViewProxy, tries: Int = 8,
+        every: Duration = .milliseconds(25), hold: Int = 1, under selection: Int? = nil
+    ) {
         proxy.scrollTo(target, anchor: .top)
         Task { @MainActor in
-            for _ in 0..<8 {
-                try? await Task.sleep(for: .milliseconds(25))
-                guard index == target else { return }
-                if let frame = map.frames[target], abs(frame.minY) < 2 { return }
+            var steady = 0
+            for _ in 0..<tries {
+                try? await Task.sleep(for: every)
+                guard index == (selection ?? target) else { return }
+                if let frame = map.frames[target], abs(frame.minY) < 2 {
+                    steady += 1
+                    if steady >= hold { return }
+                    continue
+                }
+                steady = 0
                 proxy.scrollTo(target, anchor: .top)
             }
         }
@@ -836,8 +893,9 @@ struct ThreadViewer: View {
                 openReplyAll()
                 return true
             },
-            // `b` = the shape of the thread, cards or bubbles. Manual and
-            // per-thread: nothing here guesses which conversation is which.
+            // `b` = the shape of the thread, cards or bubbles. Per-thread, and
+            // the last word: whatever Settings or the guess said, this is what
+            // this thread is from now on.
             KeyBinding("b", "chat / email style") { toggleStyle() },
             // `t` = tune sender rule, same as on a list row: one verb, one key
             // everywhere. The target differs (the thread's sender rather than the
@@ -860,17 +918,47 @@ struct ThreadViewer: View {
     }
 
     /// `b` and the header button, which are the same flip. The answer is kept
-    /// for THIS thread only — unless it agrees with the global default, in
-    /// which case the thread holds no opinion worth storing and goes back to
-    /// following whatever Settings says next.
+    /// for THIS thread and PINNED THERE, even when it agrees with the default of
+    /// the moment: with Automatic in Settings the default is re-read on every
+    /// open, so a thread left following it would go back to the guess the next
+    /// time a reply changes what the guess says. A reader who has answered the
+    /// question should not be asked it again.
     private func toggleStyle() {
-        let next = style.flipped
-        style = next
-        if next == prefs.threadStyle {
-            styles.clear(threadId)
-        } else {
-            styles.set(threadId, next)
-        }
+        style = style.flipped
+        styles.set(threadId, style)
+    }
+
+    /// HOW THIS THREAD IS DRAWN, in the one order that matters: what the reader
+    /// said about THIS thread, then what Settings says about every thread, and
+    /// only where that says Automatic, what the thread itself looks like.
+    ///
+    /// Answered from the messages that are in hand rather than from the state,
+    /// because the caller is `adopt`, which is holding the thread it is about to
+    /// install and has not installed it yet.
+    private func resolvedStyle(_ messages: [ClientMessage]) -> ThreadStyle {
+        if let pinned = styles.style(threadId) { return pinned }
+        if let fixed = prefs.threadStyle.fixed { return fixed }
+        // The participation veto, asked BEFORE the samples exist: it reads
+        // `is_sent` alone, and the thread that fails it — which is most mail —
+        // should not pay for quote-splitting and markup-scanning every body it
+        // was never going to draw as chat.
+        guard ThreadStyle.participated(messages.map(\.is_sent)) else { return .classic }
+        return ThreadStyle.automatic(messages.map(sample))
+    }
+
+    /// A message reduced to what the guess asks about. The fresh length is the
+    /// message WITHOUT the history it is quoting — the same split PlainBody
+    /// collapses behind the chip, because "how long is this message" and "how
+    /// much of it is this message" are the same question.
+    private func sample(_ m: ClientMessage) -> ThreadStyle.Sample {
+        ThreadStyle.Sample(
+            // `is_sent` and not `fromMe`: the accessor answers the drawing
+            // question, where an unknown side is drawn as theirs. The guess
+            // needs to know it is unknown.
+            fromMe: m.is_sent,
+            freshChars: Quotes.splitText(m.content).visible.count,
+            htmlHeavy: ThreadStyle.htmlHeavy(html: m.html, plain: m.content),
+            sender: m.from_addr)
     }
 
     /// The rule composer for THIS thread's sender — the same request shape `t`
@@ -1086,12 +1174,10 @@ struct ThreadViewer: View {
         map.forget()
         newestHeight = 0
         landed = false
-        // THIS thread's answer, or the default for every thread that has none.
-        style = styles.style(threadId) ?? prefs.threadStyle
         // Fresh prefetch hit → render it and skip the round-trip entirely (the
         // cache is at most 60s old; e/d/refresh paths repopulate it).
         if let cached = ThreadPrefetch.shared.cached(threadId) {
-            adopt(cached)
+            adopt(cached, opening: true)
             error = nil
             loading = false
             return
@@ -1101,16 +1187,22 @@ struct ThreadViewer: View {
         do {
             let view = try await APIClient.shared.getThread(threadId)
             ThreadPrefetch.shared.note(threadId, view)  // instant reopen
-            adopt(view)
+            adopt(view, opening: true)
         } catch {
             self.error = errText(error, "thread load failed")
         }
         loading = false
     }
 
-    /// Take a loaded thread and derive its reader state.
-    private func adopt(_ view: ClientThreadView) {
+    /// Take a loaded thread and derive its reader state. `opening` is true only
+    /// when this is the thread ARRIVING — a refetch under somebody's eyes says
+    /// false, which is what keeps the style from being re-decided while they
+    /// read: the guess reads the messages, a reply changes the messages, and a
+    /// column that redraws itself as chat because an answer landed is a column
+    /// that moved the paragraph somebody was on.
+    private func adopt(_ view: ClientThreadView, opening: Bool = false) {
         thread = view
+        if opening { style = resolvedStyle(view.messages) }
         // LAND ON THE NEWEST. It is last in the stack now, and `tailSpace` is
         // what lets the scroll put it at the top of the window rather than the
         // bottom.
@@ -1135,9 +1227,12 @@ struct ThreadViewer: View {
 
     /// Read receipts for this thread's messages.
     ///
-    /// Every message is asked about rather than only the ones the user sent:
-    /// the wire carries no "this copy is mine" flag, only a TRACKED SEND can
-    /// have opens, and an untracked or inbound id answers with an empty list.
+    /// Every message is asked about rather than only the ones the user sent.
+    /// The wire does carry a "this copy is mine" flag now (`is_sent`), but it is
+    /// ABSENT on an older daemon, and filtering by it there would ask about
+    /// nothing and lose every receipt. Only a TRACKED SEND can have opens, so an
+    /// untracked or inbound id answers with an empty list and costs one entry in
+    /// a request that was being made anyway.
     /// The whole pass is skipped while the daemon has no tracking configured —
     /// then there are no receipts anywhere and this would be pure round-trips.
     private func refreshOpens() async {

@@ -43,7 +43,12 @@ enum Actions {
             // The message leaves the working set: drop its remembered height and
             // unpin its images. The bytes stay on disk — the undo below is five
             // seconds away and re-pins them.
-            FrameHeights.shared.clear(String(u.id))
+            //
+            // EVERY SPELLING OF THE KEY, because the same message has one height
+            // per thread style (ThreadStyle.frameKey: a bubble is measured at a
+            // narrower measure than a card). Clearing one leaves the other to
+            // paint a reopened message at a size nothing on screen is using.
+            for style in ThreadStyle.allCases { FrameHeights.shared.clear(style.frameKey(u.id)) }
             await ImageStore.shared.release(messageId: u.id)
             store.pushUndo(kind: .done, messageId: u.id, label: "done \(u.sender)") {
                 try await APIClient.shared.setStatus(u.id, .open)
