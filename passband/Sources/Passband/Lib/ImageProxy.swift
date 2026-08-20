@@ -236,7 +236,8 @@ enum ImageProxy {
     /// RFC 3986 unreserved, spelled out rather than taken from
     /// `CharacterSet.alphanumerics` — that set admits non-ASCII letters, which
     /// would ride through unencoded and produce a URL that will not parse.
-    private static let unreserved = CharacterSet(
+    /// Shared with CidProxy, which mints its urls under the same rule.
+    static let unreserved = CharacterSet(
         charactersIn:
             "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~")
 

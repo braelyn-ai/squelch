@@ -1275,12 +1275,14 @@ private struct MessageCard: View {
 
             if let html = message.html, !html.isEmpty {
                 EmailWebView(
-                    html: html, cacheKey: String(message.id), allowTrackers: message.allowsTrackers)
+                    html: html, cacheKey: String(message.id),
+                    allowTrackers: message.allowsTrackers,
+                    attachments: message.attachmentList)
             } else {
                 PlainBody(content: message.content)
             }
 
-            AttachmentStrip(attachments: message.attachmentList)
+            AttachmentStrip(attachments: message.attachmentList, inBody: inBodyImages)
         }
         // The gutter is reserved whether or not this message is selected, so
         // j/k moves a rule rather than shifting every body left and right.
@@ -1315,6 +1317,27 @@ private struct MessageCard: View {
         }
         .contentShape(Rectangle())
         .onTapGesture(perform: onSelect)
+    }
+
+    /// The parts the BODY already shows, because a `cid:` reference in the html
+    /// resolved to them — the strip must not paste those a second time under the
+    /// message. Recomputed with the card rather than remembered: the answer is a
+    /// substring probe for bodies with no `cid:` in them at all, which is nearly
+    /// all of them, and the alternative is a second cache to keep in step with
+    /// the prepared one.
+    ///
+    /// It has to read the SAME body the rewrite reads, which is the
+    /// tracker-stripped one under this message's own policy — see
+    /// EmailWebView.Prepared.make. The hidden and 1×1 tests there are blind to
+    /// the scheme, so a `cid:` image the sender hid never reaches the rewrite,
+    /// and counting it here would take the tile away from a photo nothing draws.
+    /// Only a body that actually names a cid pays for the extra pass.
+    private var inBodyImages: Set<Int> {
+        guard let html = message.html, !html.isEmpty,
+            html.range(of: "cid:", options: .caseInsensitive) != nil
+        else { return [] }
+        let body = message.allowsTrackers ? html : Trackers.strip(html).html
+        return CidImages.referencedAttachmentIDs(html: body, attachments: message.attachmentList)
     }
 }
 
