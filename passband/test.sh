@@ -63,6 +63,23 @@ run_suite email-images \
   Sources/Passband/Lib/ImageProxy.swift \
   Tests/EmailImagesTests.swift
 
+# The OTHER image rewrite: `cid:` references to this message's own parts. Pure
+# string and url work, so it builds with the wire type and the buckets it gates
+# on — no WebKit, no daemon. MailCSP rides along because the policy those urls
+# are loaded under is the one line of the reading frame that can be asserted
+# without standing a content process up, and Trackers because it runs FIRST in
+# the real pipeline: what it takes out of a body is what neither answer here may
+# still claim.
+run_suite cid-images \
+  Sources/Passband/Model/WireTypes.swift \
+  Sources/Passband/Lib/AttachmentKinds.swift \
+  Sources/Passband/Lib/HTMLImg.swift \
+  Sources/Passband/Lib/ImageProxy.swift \
+  Sources/Passband/Lib/Trackers.swift \
+  Sources/Passband/Lib/CidImages.swift \
+  Sources/Passband/Lib/MailCSP.swift \
+  Tests/CidImagesTests.swift
+
 # The thread minimap's window math. CoreGraphics only — the rail that draws it
 # is SwiftUI, the arithmetic that aims it is not.
 run_suite minimap-geometry \

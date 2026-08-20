@@ -185,6 +185,12 @@ struct Attachment: Codable, Sendable, Identifiable, Hashable {
     var mime: String
     var size: Int
     var downloadable: Bool
+    /// The part's Content-ID with its angle brackets already off, which is what
+    /// a body's `<img src="cid:…">` names — see CidImages. ABSENT on a daemon
+    /// that predates the field and null for a part that declared none, so it
+    /// stays optional: the client's answer to both is the same, which is to drop
+    /// the reference rather than paint a broken image.
+    var content_id: String?
 }
 
 /// core::types::ClientMessage — the HUMAN-door message shape. `html` is a

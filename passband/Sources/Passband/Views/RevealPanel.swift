@@ -2,7 +2,9 @@
 // holds it in this view's state only, drops it on dismiss — never to disk, never
 // logged, never lifted into the store. HTML renders through the same sandboxed
 // EmailWebView as normal mail, with no cacheKey: nothing about sealed mail is
-// remembered, not even its measured height. See docs/SECURITY.md.
+// remembered, not even its measured height. No attachments either, and that is
+// the answer rather than an omission — a reveal fetches one body and nothing
+// else, so its `cid:` images resolve to nothing and drop. See docs/SECURITY.md.
 
 import SwiftUI
 

@@ -774,6 +774,10 @@ const MESSAGE_ATTACHMENT_TOTAL_CAP_BYTES: usize = 25 * 1024 * 1024;
 /// `attachment-<n>` (1-based part order) when the part declares none; the mime is
 /// the part's declared type, falling back to `application/octet-stream`.
 ///
+/// Each part's `Content-ID` is captured (normalized — see
+/// [`normalize_content_id`]) because it is the ONLY link back from a
+/// `<img src="cid:...">` the sanitizer kept in the body to the bytes that fill it.
+///
 /// This runs for BOTH sealed and non-sealed mail — storage is fine either way;
 /// the byte-serving endpoint is what guards sealed parents.
 pub fn extract_attachments(m: &mail_parser::Message) -> Vec<AttachmentInfo> {
@@ -817,9 +821,26 @@ pub fn extract_attachments(m: &mail_parser::Message) -> Vec<AttachmentInfo> {
             mime,
             size_bytes: size as i64,
             data,
+            content_id: normalize_content_id(part.content_id()),
         });
     }
     out
+}
+
+/// A part's raw `Content-ID` into the token an `<img src="cid:...">` names:
+/// whitespace trimmed and ONE surrounding `<...>` pair stripped, `None` when
+/// nothing is left. mail-parser reads this header with its message-id parser, so
+/// it usually hands back an already-bracketless id, but a broken client's header
+/// falls through that parser verbatim — hence stripping here rather than trusting
+/// the shape.
+fn normalize_content_id(raw: Option<&str>) -> Option<String> {
+    let s = raw?.trim();
+    let s = s
+        .strip_prefix('<')
+        .and_then(|inner| inner.strip_suffix('>'))
+        .unwrap_or(s)
+        .trim();
+    (!s.is_empty()).then(|| s.to_string())
 }
 
 /// Turn raw fetched bytes into a fully-triaged, store-ready message.
@@ -2329,19 +2350,27 @@ mod tests {
         assert_eq!(pdf.mime, "application/pdf");
         assert_eq!(pdf.size_bytes, 5);
         assert_eq!(pdf.data.as_deref(), Some(&b"Hello"[..]));
+        assert!(
+            pdf.content_id.is_none(),
+            "a real attachment declares no Content-ID"
+        );
 
         let png = a.iter().find(|x| x.filename == "pic.png").expect("png");
         assert_eq!(png.mime, "image/png");
         assert_eq!(png.data.as_deref(), Some(&b"world"[..]));
+        assert!(png.content_id.is_none());
 
         // The cid-inline part declares no filename -> attachment-<n> fallback, and
-        // its bytes are kept (inline images are how templates embed logos).
+        // its bytes are kept (inline images are how templates embed logos). Its
+        // Content-ID comes through with the angle brackets gone, which is the form
+        // the body's <img src="cid:logo@squelch"> names it by.
         let inline = a
             .iter()
             .find(|x| x.filename.starts_with("attachment-"))
             .expect("cid inline part included");
         assert_eq!(inline.mime, "image/png");
         assert_eq!(inline.data.as_deref(), Some(&b"inline"[..]));
+        assert_eq!(inline.content_id.as_deref(), Some("logo@squelch"));
 
         // The oversized part keeps its metadata (real size) but drops its bytes.
         let big_att = a.iter().find(|x| x.filename == "big.bin").expect("big");
@@ -2350,6 +2379,29 @@ mod tests {
             big_att.data.is_none(),
             "over-cap attachment stores no bytes"
         );
+    }
+
+    #[test]
+    fn content_id_normalization_strips_one_bracket_pair() {
+        // Whatever the header parser hands back, what lands is the bare token an
+        // <img src="cid:..."> can be compared against.
+        assert_eq!(
+            normalize_content_id(Some("<logo@squelch>")).as_deref(),
+            Some("logo@squelch")
+        );
+        assert_eq!(
+            normalize_content_id(Some("  logo@squelch \r\n")).as_deref(),
+            Some("logo@squelch")
+        );
+        // ONE pair only: an inner bracket is part of the id, however odd.
+        assert_eq!(
+            normalize_content_id(Some("<<weird>>")).as_deref(),
+            Some("<weird>")
+        );
+        // Nothing left after normalizing is the same as never declaring one.
+        assert_eq!(normalize_content_id(Some("<>")), None);
+        assert_eq!(normalize_content_id(Some("   ")), None);
+        assert_eq!(normalize_content_id(None), None);
     }
 
     #[test]
