@@ -234,11 +234,21 @@ pub struct ClientMessage {
     /// GET /client/attachments/{id}. HUMAN-DOOR ONLY, like `html`.
     #[serde(default)]
     pub attachments: Vec<ClientAttachment>,
-    /// The stored `messages.is_sent`: `true` only for the user's OWN outbound
-    /// copy of this message (what `ingest_sent` commits), `false` for anything
-    /// received. The reader uses it to right-align the user's side of the
-    /// conversation, so it is ALWAYS on the wire as a plain bool — never
-    /// skipped — and a client that never learns about it simply ignores the key.
+    /// AUTHORED BY THIS ACCOUNT: `true` when the account itself wrote this
+    /// message — the stored outbound copy, OR a received copy whose `from_addr`
+    /// is the account's own address — and `false` for mail from anyone else.
+    /// The reader uses it to right-align the user's side of the conversation, so
+    /// it is ALWAYS on the wire as a plain bool — never skipped — and a client
+    /// that never learns about it simply ignores the key.
+    ///
+    /// NOT the stored `messages.is_sent` column alone. That column is a
+    /// VISIBILITY flag, sticky to 0 on upsert and deliberately lost to the INBOX
+    /// copy for self-addressed mail (self-Cc, mail to oneself, a group echo), so
+    /// a message the user demonstrably wrote can sit there at 0 forever. The
+    /// human-door thread query therefore ORs it with a case-insensitive
+    /// `from_addr` == account-email match; that OR is the whole difference
+    /// between the column and this field.
+    ///
     /// This is the ONLY type that carries it: the agent door's
     /// [`SanitizedMessage`] is untouched.
     #[serde(default)]

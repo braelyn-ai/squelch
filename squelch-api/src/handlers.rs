@@ -342,9 +342,11 @@ pub async fn triage_debug(
 /// flattened, plus the read-time known-sender bit. Flattened rather than nested
 /// so every field a client already decodes keeps its place on the wire.
 ///
-/// Stored per-message facts ride through the flatten untouched — `is_sent`, the
-/// bit the reader right-aligns the user's own bubbles on, among them; only
-/// fields COMPUTED at read time are declared here.
+/// Per-message facts ride through the flatten untouched — `is_sent`, the bit the
+/// reader right-aligns the user's own bubbles on, among them. THAT one the store
+/// computes inside the thread query (stored flag OR `from_addr` == the account's
+/// own address; see [`squelch_core::types::ClientMessage`]), which keeps this
+/// handler a pure flatten: only `sender_known` is computed here.
 #[derive(Debug, Serialize)]
 struct ThreadMessageView {
     #[serde(flatten)]

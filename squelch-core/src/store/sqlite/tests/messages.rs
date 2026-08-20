@@ -167,6 +167,62 @@ fn thread_view_carries_is_sent_per_message() {
 }
 
 #[test]
+fn thread_view_is_sent_is_authorship_not_the_sticky_stored_flag() {
+    // The stored column is a VISIBILITY flag: `MIN` on conflict pins it to 0
+    // once anything has seen the message as received, and the sync engine
+    // deliberately lets the INBOX copy of self-addressed mail win. So a message
+    // the user demonstrably WROTE can sit at is_sent=0 forever, and the served
+    // bit has to come from authorship — From == the account's own address,
+    // case-folded — or the reader draws the user's own words on the far side.
+    let (store, acct) = store();
+    let at = |n: i64| Utc::now() - chrono::Duration::minutes(10 - n);
+
+    // Self-Cc'd: the INBOX walk ingested it first (is_sent=0), then the SENT
+    // copy landed, and the sticky clause refused the flip. The From header
+    // spells the account's address in a different case than the accounts row.
+    triaged(acct, "g-selfcc", "t-self")
+        .received_at(at(1))
+        .from("Me@Example.COM")
+        .upsert(&store);
+    let self_id = triaged(acct, "g-selfcc", "t-self")
+        .received_at(at(1))
+        .from("Me@Example.COM")
+        .is_sent(true)
+        .upsert(&store);
+    // A stranger's reply in the same thread, and a row whose sender never
+    // parsed — the blank From falls back to the stored flag rather than
+    // matching anything.
+    triaged(acct, "g-them", "t-self")
+        .received_at(at(2))
+        .from("alice@example.com")
+        .upsert(&store);
+    triaged(acct, "g-blank", "t-self")
+        .received_at(at(3))
+        .from("")
+        .upsert(&store);
+
+    let stored: i64 = {
+        let conn = store.lock().unwrap();
+        conn.query_row(
+            "SELECT is_sent FROM messages WHERE id = ?1",
+            params![self_id],
+            |r| r.get(0),
+        )
+        .unwrap()
+    };
+    assert_eq!(stored, 0, "the stored flag is sticky to 0, by design");
+
+    let view = store.thread_view_with_html(acct, "t-self").unwrap();
+    let got: Vec<bool> = view.messages.iter().map(|m| m.is_sent).collect();
+    assert_eq!(
+        got,
+        vec![true, false, false],
+        "the user's own self-Cc'd message is theirs; the stranger's and the \
+         senderless row are not"
+    );
+}
+
+#[test]
 fn attachment_bytes_guards_sealed_overcap_and_unknown() {
     let (store, acct) = store();
 

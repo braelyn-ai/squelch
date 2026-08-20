@@ -345,11 +345,28 @@ impl SqliteStore {
         // Per-message triage rides along for in-thread attention highlighting.
         // LEFT JOIN: a message somehow missing its triage row still renders,
         // just unhighlighted.
+        //
+        // The served `is_sent` is AUTHORSHIP, not the stored column: stored
+        // `messages.is_sent` is a VISIBILITY flag that is sticky to 0 (see
+        // `upsert_message_conn`) and the sync engine deliberately lets the INBOX
+        // copy win for self-addressed mail, so a message the user wrote with
+        // themselves on Cc — or mailed to themselves, or echoed back by a group
+        // — stays pinned at 0. OR'ing the From address against the account's own
+        // gives the reader the bit it actually aligns bubbles on. The accounts
+        // LEFT JOIN is one row (`accounts.id` is the PK); LOWER on both sides
+        // matches the ASCII case-folding every other address compare here uses,
+        // and the empty-From guard keeps a blank sender from matching a blank
+        // email, so a missing/NULL address falls back to the stored bit.
         let mut stmt = conn.prepare(
             "SELECT m.id, m.from_addr, m.from_name, m.received_at, m.body, m.body_html,
-                    t.tier, t.deadline, t.status, t.one_line, m.auth_pass, m.is_sent
+                    t.tier, t.deadline, t.status, t.one_line, m.auth_pass,
+                    (m.is_sent = 1
+                     OR (TRIM(COALESCE(m.from_addr, '')) != ''
+                         AND LOWER(TRIM(COALESCE(m.from_addr, ''))) =
+                             LOWER(TRIM(COALESCE(a.email, ''))))) AS authored_by_account
              FROM messages m
              LEFT JOIN triage t ON t.message_id = m.id
+             LEFT JOIN accounts a ON a.id = m.account_id
              WHERE m.account_id=?1 AND m.thread_id=?2
              ORDER BY m.received_at ASC",
         )?;
@@ -365,7 +382,8 @@ impl SqliteStore {
                     content: r.get(4)?,
                     html: r.get(5)?,
                     attachments: Vec::new(), // filled below, once `stmt` is gone
-                    // NOT NULL DEFAULT 0 in the schema, so every row answers.
+                    // The computed authorship bit above: a boolean expression
+                    // guarded against NULL on both sides, so every row answers.
                     is_sent: r.get::<_, i64>(11)? != 0,
                     tier: r
                         .get::<_, Option<String>>(6)?
