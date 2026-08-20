@@ -200,6 +200,11 @@ struct ClientMessage: Codable, Sendable, Identifiable, Hashable, SenderStringCon
     var from_addr: String
     var from_name: String?
     var received_at: String
+    /// Display recipients as stored (comma-joined `Name <addr>`; split with
+    /// `SenderID.recipients`, which is quote-aware). ABSENT on rows synced
+    /// before the daemon kept them — the card simply shows no recipients line.
+    var to_addrs: String?
+    var cc_addrs: String?
     var content: String
     var html: String?
     var attachments: [Attachment]?

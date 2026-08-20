@@ -85,6 +85,13 @@ fn migrate_adds_to_addrs_null_so_old_sent_mail_enters_the_backfill_queue() {
         .query_row("SELECT to_addrs FROM messages WHERE id=1", [], |r| r.get(0))
         .unwrap();
     assert_eq!(existing, None, "old sent mail is queued, never invented");
+    // `cc_addrs` rides the same migration: NULL on every historical row (the
+    // headers live in RFC822 the store never kept — only a re-fetch fills it).
+    assert!(cols.iter().any(|c| c == "cc_addrs"));
+    let existing_cc: Option<String> = conn
+        .query_row("SELECT cc_addrs FROM messages WHERE id=1", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(existing_cc, None);
 }
 
 #[test]

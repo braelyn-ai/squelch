@@ -856,23 +856,32 @@ pub fn ingest(
 ) -> TriagedMessage {
     let parsed = MessageParser::default().parse(&fetched.raw);
 
-    // Recipients (To + Cc) — only meaningful for Sent mail, where they become
-    // BOTH the contacts seed and the stored display recipients. Collected here
-    // while the parse is in hand. Received mail collects nothing, so `to_addrs`
-    // stays NULL on it.
-    let mut mailboxes: Vec<(String, Option<String>)> = Vec::new();
-    if fetched.is_sent
-        && let Some(m) = &parsed
-    {
+    // Recipients (To / Cc), kept separate and collected for BOTH directions:
+    // the reader shows them above every message. Sent mail additionally seeds
+    // contacts from them; received mail must NOT — being cc'd beside a
+    // stranger is not knowing them, and the known-contact floor only means
+    // anything if it is built from people the USER chose to write to.
+    let mut to_mailboxes: Vec<(String, Option<String>)> = Vec::new();
+    let mut cc_mailboxes: Vec<(String, Option<String>)> = Vec::new();
+    if let Some(m) = &parsed {
         if let Some(to) = m.to() {
-            collect_mailboxes(to, &mut mailboxes);
+            collect_mailboxes(to, &mut to_mailboxes);
         }
         if let Some(cc) = m.cc() {
-            collect_mailboxes(cc, &mut mailboxes);
+            collect_mailboxes(cc, &mut cc_mailboxes);
         }
     }
-    let to_addrs = format_recipients(&mailboxes);
-    let mut recipients: Vec<String> = mailboxes.into_iter().map(|(addr, _)| addr).collect();
+    let to_addrs = format_recipients(&to_mailboxes);
+    let cc_addrs = format_recipients(&cc_mailboxes);
+    let mut recipients: Vec<String> = if fetched.is_sent {
+        to_mailboxes
+            .into_iter()
+            .chain(cc_mailboxes)
+            .map(|(addr, _)| addr)
+            .collect()
+    } else {
+        Vec::new()
+    };
 
     // Extract fields with graceful fallbacks for malformed mail.
     #[allow(clippy::type_complexity)]
@@ -1026,6 +1035,7 @@ pub fn ingest(
         body_html,
         is_sent: fetched.is_sent,
         to_addrs,
+        cc_addrs,
         list_unsubscribe,
         list_unsub_one_click,
         auth_pass,
@@ -1476,11 +1486,11 @@ mod tests {
     }
 
     #[test]
-    fn sent_mail_stores_display_recipients_received_mail_stores_none() {
-        // The display string is To then Cc in header order, `Name <addr>` where a
-        // name exists and bare otherwise — and it is NOT filtered the way contact
-        // seeding is: `support@` is who this went to, whatever the contacts table
-        // thinks of it.
+    fn both_directions_store_to_and_cc_separately() {
+        // `Name <addr>` where a name exists and bare otherwise, in header
+        // order, To and Cc in their OWN columns — the reader labels them
+        // differently. NOT filtered the way contact seeding is: `support@` is
+        // who this went to, whatever the contacts table thinks of it.
         let eml = "From: Me <me@example.com>\r\n\
                    To: Alice <alice@friends.com>, bob@friends.com\r\n\
                    Cc: unsubscribe@unsub.spmta.com\r\n\
@@ -1492,15 +1502,40 @@ mod tests {
         let t = ingest(&f, &Stage1Config::default(), Utc::now(), |_| false);
         assert_eq!(
             t.message.to_addrs.as_deref(),
-            Some("Alice <alice@friends.com>, bob@friends.com, unsubscribe@unsub.spmta.com")
+            Some("Alice <alice@friends.com>, bob@friends.com")
+        );
+        assert_eq!(
+            t.message.cc_addrs.as_deref(),
+            Some("unsubscribe@unsub.spmta.com")
         );
         // The contacts seed keeps its own, narrower rules.
         assert!(!t.recipients.iter().any(|r| r.contains("unsub")));
 
-        // Received mail has no "to" worth showing: the column stays NULL.
+        // Received mail stores the SAME recipients — the reader shows them
+        // above every message now — while still seeding no contacts (asserted
+        // in `received_mail_seeds_no_contacts`).
         let f = raw(1, "g-recv", eml, /* is_sent */ false);
         let t = ingest(&f, &Stage1Config::default(), Utc::now(), |_| false);
-        assert_eq!(t.message.to_addrs, None);
+        assert_eq!(
+            t.message.to_addrs.as_deref(),
+            Some("Alice <alice@friends.com>, bob@friends.com")
+        );
+        assert_eq!(
+            t.message.cc_addrs.as_deref(),
+            Some("unsubscribe@unsub.spmta.com")
+        );
+        // A message with no Cc header stays NULL there — "never looked" and
+        // "looked, none" both render as no cc line, but NULL is what lets the
+        // upsert's COALESCE keep a filled value over a later no-opinion write.
+        let eml_nocc = "From: Me <me@example.com>\r\n\
+                        To: Alice <alice@friends.com>\r\n\
+                        Subject: dinner\r\n\
+                        Date: Mon, 7 Jul 2026 10:00:00 +0000\r\n\
+                        \r\n\
+                        see you friday\r\n";
+        let f = raw(1, "g-nocc", eml_nocc, /* is_sent */ false);
+        let t = ingest(&f, &Stage1Config::default(), Utc::now(), |_| false);
+        assert_eq!(t.message.cc_addrs, None);
     }
 
     #[test]
@@ -2571,6 +2606,7 @@ mod tests {
                 body_html: None,
                 is_sent: false,
                 to_addrs: None,
+                cc_addrs: None,
                 list_unsubscribe: None,
                 list_unsub_one_click: false,
                 auth_pass: None,

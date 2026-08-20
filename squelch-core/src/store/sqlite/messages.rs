@@ -60,16 +60,16 @@ fn bump_unsub_violation_conn(
 /// ingest order or upstream filter quality. The reverse flip (1 -> 0) stays
 /// allowed: a message can only gain visibility, never lose it.
 ///
-/// `to_addrs` is the one column that PREFERS THE STORED VALUE over a NULL
-/// (`COALESCE(excluded, messages)`): only a sent-path ingest parses recipients,
-/// so a re-fetch that skips them — or an old row the backfill already filled —
-/// must not be blanked by the next writer that has no opinion.
+/// `to_addrs`/`cc_addrs` are the columns that PREFER THE STORED VALUE over a
+/// NULL (`COALESCE(excluded, messages)`): a caller that did not parse the
+/// headers — or an old row the backfill already filled — must not be blanked
+/// by the next writer that has no opinion.
 fn upsert_message_conn(conn: &Connection, msg: &NewMessage) -> Result<i64> {
     conn.execute(
         "INSERT INTO messages(account_id, gmail_msg_id, thread_id, from_addr, from_name,
-             subject, received_at, snippet, body, body_html, is_sent, to_addrs,
+             subject, received_at, snippet, body, body_html, is_sent, to_addrs, cc_addrs,
              list_unsubscribe, list_unsub_one_click, auth_pass)
-         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)
+         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)
          ON CONFLICT(account_id, gmail_msg_id) DO UPDATE SET
              thread_id=excluded.thread_id, from_addr=excluded.from_addr,
              from_name=excluded.from_name, subject=excluded.subject,
@@ -77,6 +77,7 @@ fn upsert_message_conn(conn: &Connection, msg: &NewMessage) -> Result<i64> {
              body=excluded.body, body_html=excluded.body_html,
              is_sent=MIN(messages.is_sent, excluded.is_sent),
              to_addrs=COALESCE(excluded.to_addrs, messages.to_addrs),
+             cc_addrs=COALESCE(excluded.cc_addrs, messages.cc_addrs),
              list_unsubscribe=excluded.list_unsubscribe,
              list_unsub_one_click=excluded.list_unsub_one_click,
              auth_pass=excluded.auth_pass",
@@ -93,6 +94,7 @@ fn upsert_message_conn(conn: &Connection, msg: &NewMessage) -> Result<i64> {
             msg.body_html,
             msg.is_sent as i64,
             msg.to_addrs,
+            msg.cc_addrs,
             msg.list_unsubscribe,
             msg.list_unsub_one_click as i64,
             msg.auth_pass.map(|p| p as i64),
@@ -349,7 +351,8 @@ impl SqliteStore {
         // just unhighlighted.
         let mut stmt = conn.prepare(
             "SELECT m.id, m.from_addr, m.from_name, m.received_at, m.body, m.body_html,
-                    t.tier, t.deadline, t.status, t.one_line, m.auth_pass
+                    t.tier, t.deadline, t.status, t.one_line, m.auth_pass,
+                    m.to_addrs, m.cc_addrs
              FROM messages m
              LEFT JOIN triage t ON t.message_id = m.id
              WHERE m.account_id=?1 AND m.thread_id=?2
@@ -364,6 +367,8 @@ impl SqliteStore {
                     from_addr: r.get(1)?,
                     from_name: r.get(2)?,
                     received_at: dt(r, 3)?,
+                    to_addrs: r.get(11)?,
+                    cc_addrs: r.get(12)?,
                     content: r.get(4)?,
                     html: r.get(5)?,
                     attachments: Vec::new(), // filled below, once `stmt` is gone
@@ -895,8 +900,17 @@ impl SqliteStore {
         // scopes the tracker to this account; `message_opens` carries no account
         // of its own. NULL `to_addrs` (pre-backfill history, or a message whose
         // headers named nobody) reads as "" on the wire.
+        // The listing's single display string is To and Cc TOGETHER, which is
+        // what `to_addrs` alone used to hold: new rows store them split, and
+        // this concat (joined only when both halves exist) keeps the page
+        // reading exactly as it did across both generations of rows.
         let mut stmt = conn.prepare(
-            "SELECT m.id, m.thread_id, COALESCE(m.to_addrs, ''), m.subject, m.snippet,
+            "SELECT m.id, m.thread_id,
+                    COALESCE(m.to_addrs, '') ||
+                        CASE WHEN COALESCE(m.cc_addrs, '') = '' OR COALESCE(m.to_addrs, '') = ''
+                             THEN COALESCE(m.cc_addrs, '')
+                             ELSE ', ' || m.cc_addrs END,
+                    m.subject, m.snippet,
                     m.received_at,
                     (SELECT COUNT(*) FROM message_opens o
                      JOIN send_trackers st ON st.token = o.token

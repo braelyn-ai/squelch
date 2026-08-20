@@ -81,6 +81,10 @@ pub(super) fn migrate(conn: &Connection) -> Result<()> {
     // IS NULL`); the backfill runs from the sync engine, over the network, so it
     // cannot live in this synchronous seam.
     add_column_if_missing(conn, "messages", "to_addrs", "TEXT")?;
+    // Cc recipients, split out of `to_addrs` when the reader grew per-message
+    // To/Cc lines. NULL on every pre-existing row; only a re-fetch fills
+    // history in, because recipients live in headers ingest already threw away.
+    add_column_if_missing(conn, "messages", "cc_addrs", "TEXT")?;
     // Per-property triage reasons (JSON object). NULL on pre-existing rows.
     add_column_if_missing(conn, "triage", "field_reasons", "TEXT")?;
 
