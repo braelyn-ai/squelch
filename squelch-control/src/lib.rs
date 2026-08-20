@@ -36,6 +36,7 @@ pub mod bifrost;
 pub mod config;
 pub mod cookie;
 pub mod handlers;
+pub mod import;
 pub mod invites;
 pub mod labels;
 pub mod oauth;
