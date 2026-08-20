@@ -162,8 +162,8 @@ fn insert_attachments_conn(
     )?;
     for a in attachments {
         conn.execute(
-            "INSERT OR IGNORE INTO attachments(account_id, message_id, filename, mime, size_bytes, data)
-             VALUES(?1,?2,?3,?4,?5,?6)",
+            "INSERT OR IGNORE INTO attachments(account_id, message_id, filename, mime, size_bytes, data, content_id)
+             VALUES(?1,?2,?3,?4,?5,?6,?7)",
             params![
                 account_id,
                 message_id,
@@ -171,6 +171,7 @@ fn insert_attachments_conn(
                 a.mime,
                 a.size_bytes,
                 a.data.as_deref(),
+                a.content_id,
             ],
         )?;
     }
@@ -251,7 +252,7 @@ fn load_client_attachments_conn(
     message_id: i64,
 ) -> Result<Vec<ClientAttachment>> {
     let mut stmt = conn.prepare(
-        "SELECT id, filename, mime, size_bytes, data IS NOT NULL
+        "SELECT id, filename, mime, size_bytes, data IS NOT NULL, content_id
          FROM attachments
          WHERE account_id=?1 AND message_id=?2
          ORDER BY id ASC",
@@ -264,6 +265,7 @@ fn load_client_attachments_conn(
                 mime: r.get(2)?,
                 size: r.get(3)?,
                 downloadable: r.get(4)?,
+                content_id: r.get(5)?,
             })
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;

@@ -259,7 +259,12 @@ struct ShortcutsOverlay: View {
                 (["h"], "remind + next"),
                 (["u"], "unsubscribe from this sender"),
                 (["t"], "new rule for this sender"),
-                (["f"], "search this sender"),
+                // `f` is FORWARD in the reader and search-this-sender
+                // everywhere else, which is exactly why both rows are spelled
+                // out here: the group above still shows `f` as search, and this
+                // is the one place a reader can see that the key changes hands.
+                (["f"], "forward this message"),
+                (["s"], "search this sender"),
                 (["Esc"], "back"),
             ]),
         Group(

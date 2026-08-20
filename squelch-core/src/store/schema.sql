@@ -677,6 +677,13 @@ CREATE TABLE IF NOT EXISTS attachments (
     mime        TEXT NOT NULL,
     size_bytes  INTEGER NOT NULL,
     data        BLOB,              -- NULL when over the ingest cap (metadata only)
+    -- The part's normalized Content-ID (brackets stripped), NULL when it declared
+    -- none. What an <img src="cid:..."> in the stored body_html resolves against.
+    -- Deliberately NOT in the UNIQUE key below: widening that key would re-open
+    -- the duplicate-file ingest DoS it exists to absorb. Two inline parts alike in
+    -- everything but their cid therefore still collapse to one row, and the
+    -- second img is simply dropped from the body rather than painted broken.
+    content_id  TEXT,
     UNIQUE(account_id, message_id, filename, size_bytes)
 );
 

@@ -43,6 +43,12 @@
 //! terminal that OBEYS what it is sent. Every string is [`declaw`]ed on arrival
 //! and every value is printed as JSON.
 //!
+//! They also disagree about time, and that is the one place a budget is part of
+//! this contract. `drift` is a read and finishes in a round trip. `reconcile`
+//! can delete a Deployment and wait minutes for a replacement, and giving up on
+//! it mid-flight stops the warden rather than merely losing the answer, so it
+//! carries [`crate::config::RECONCILE_TIMEOUT`] instead of the client's.
+//!
 //! A Deployment spec holds no secret material — Secrets reach a tenant pod as
 //! references by name — so quoting spec fields at an operator is safe. Nothing
 //! here may be pointed at a Secret's contents.
@@ -79,8 +85,52 @@ pub const STATUS_PENDING: &str = "pending";
 #[derive(Debug, thiserror::Error)]
 pub enum WardenError {
     /// The warden could not be reached, or answered something unparseable.
+    /// Everything a [`reqwest::Error`] can be EXCEPT a timeout, which is
+    /// [`WardenError::TimedOut`] and says the opposite thing.
     #[error("the provisioning service could not be reached")]
     Unreachable,
+    /// The request outlasted its budget. NOT [`WardenError::Unreachable`], and
+    /// the distinction is the whole variant: "could not be reached" reads as
+    /// NOTHING HAPPENED, and a timeout is the one failure where something did.
+    ///
+    /// A reconcile is delete, wait, apply, wait. When the client gives up
+    /// partway the warden is not told; it is holding a half-finished
+    /// destructive operation, and on 2026-08-19 an operator who read "could not
+    /// be reached" walked away from a tenant whose Deployment had been deleted
+    /// and not yet recreated. So this message says the warden may still be
+    /// working and names the one place that can settle it.
+    ///
+    /// The label is interpolated because the check is useless without it, and
+    /// it is safe to interpolate because every route validates it against
+    /// [`crate::labels`] before the socket is opened.
+    ///
+    /// THE `($| )` ALTERNATION IS LOAD-BEARING; DO NOT "SIMPLIFY" IT to a
+    /// trailing space. The warden logs through `tracing_subscriber::fmt()`'s
+    /// default format, which writes the message first and the fields after it,
+    /// so `tenant=<label>` is very often the LAST token on the line. The line
+    /// that reported the 2026-08-19 outage was exactly that shape:
+    ///
+    /// ```text
+    /// WARN squelch_warden::provision: a tenant with no workload and no
+    /// cancellation on record; a job that did not finish left it down tenant=ellie
+    /// ```
+    ///
+    /// A `"tenant=ellie "` match drops every one of those. Matching the bare
+    /// label instead drops nothing and catches too much: labels share prefixes
+    /// (`ellie` is inside `ellie-atuin`), and during that same incident a
+    /// prefix match on another tool sent the operator to the wrong tenant. End
+    /// of line or a following space is the pair of cases that are actually the
+    /// end of the label.
+    ///
+    /// The command is the LAST thing in the message, unquoted, with the regex
+    /// in single quotes: somebody reads this mid-incident and selects to end of
+    /// line, and nothing they paste should need thinking about.
+    #[error(
+        "the provisioning service did not answer in time and may still be working; read the \
+         warden's log before retrying or assuming nothing happened: \
+         kubectl -n warden logs deploy/squelch-warden | grep -E 'tenant={label}($| )'"
+    )]
+    TimedOut { label: String },
     /// 401/403. A deployment misconfiguration, and one worth shouting about:
     /// nothing will ever provision until it is fixed.
     #[error("the provisioning service refused our credentials")]
@@ -443,11 +493,11 @@ impl Warden for HttpWarden {
             })
             .send()
             .await
-            .map_err(|_| WardenError::Unreachable)?;
+            .map_err(|e| transport_error(e, label))?;
 
         match resp.status().as_u16() {
             201 => {
-                let body = read_capped(resp).await?;
+                let body = read_capped(resp, label).await?;
                 let created: Created =
                     serde_json::from_slice(&body).map_err(|_| WardenError::BadRecipient)?;
                 // A live refresh token is about to be encrypted to this string.
@@ -489,11 +539,11 @@ impl Warden for HttpWarden {
             })
             .send()
             .await
-            .map_err(|_| WardenError::Unreachable)?;
+            .map_err(|e| transport_error(e, label))?;
 
         match resp.status().as_u16() {
             200 => {
-                let body = read_capped(resp).await?;
+                let body = read_capped(resp, label).await?;
                 let pairing: Pairing =
                     serde_json::from_slice(&body).map_err(|_| WardenError::BadPairing)?;
                 validate_pairing(&pairing)?;
@@ -544,7 +594,7 @@ impl Warden for HttpWarden {
             })
             .send()
             .await
-            .map_err(|_| WardenError::Unreachable)?;
+            .map_err(|e| transport_error(e, label))?;
 
         match resp.status().as_u16() {
             // The 200 body is `{}` by contract: the key came in, nothing goes
@@ -573,11 +623,11 @@ impl Warden for HttpWarden {
             .bearer_auth(&self.token)
             .send()
             .await
-            .map_err(|_| WardenError::Unreachable)?;
+            .map_err(|e| transport_error(e, label))?;
 
         match resp.status().as_u16() {
             200 => {
-                let body = read_capped(resp).await?;
+                let body = read_capped(resp, label).await?;
                 let pairing: Pairing =
                     serde_json::from_slice(&body).map_err(|_| WardenError::BadPairing)?;
                 validate_pairing(&pairing)?;
@@ -601,11 +651,11 @@ impl Warden for HttpWarden {
             .bearer_auth(&self.token)
             .send()
             .await
-            .map_err(|_| WardenError::Unreachable)?;
+            .map_err(|e| transport_error(e, label))?;
 
         match resp.status().as_u16() {
             200 => {
-                let body = read_capped(resp).await?;
+                let body = read_capped(resp, label).await?;
                 let status: TenantStatus =
                     serde_json::from_slice(&body).map_err(|_| WardenError::Unreachable)?;
                 Ok(Some(status))
@@ -643,14 +693,14 @@ impl HttpWarden {
             .bearer_auth(&self.token)
             .send()
             .await
-            .map_err(|_| WardenError::Unreachable)?;
+            .map_err(|e| transport_error(e, label))?;
 
         match resp.status().as_u16() {
             200 => {
                 // The drift cap, not the contract's: a report is as big as the
                 // drift it found, and the tenant that drifted most must not be
                 // the one that comes back unreadable. See [`MAX_DRIFT_BODY`].
-                let body = read_capped_to(resp, MAX_DRIFT_BODY).await?;
+                let body = read_capped_to(resp, MAX_DRIFT_BODY, label).await?;
                 let mut report: DriftReport =
                     serde_json::from_slice(&body).map_err(|_| WardenError::Unreachable)?;
                 report.declaw();
@@ -670,6 +720,13 @@ impl HttpWarden {
     /// back, so a slow node reads as a failure with the workload already
     /// replaced. That is the shape the caller must be built for, and it is why
     /// this is one tenant per invocation.
+    ///
+    /// THE ONLY CALL HERE WITH ITS OWN TIMEOUT, and the only one that needs
+    /// one: on the delete-recreate path this runs for minutes, and giving up on
+    /// it early does not just lose the answer, it stops the warden mid-operation
+    /// with the tenant's Deployment already deleted. See
+    /// [`crate::config::RECONCILE_TIMEOUT`] for the arithmetic and for the
+    /// outage that produced it.
     pub async fn reconcile(&self, label: &str) -> Result<Reconciled, WardenError> {
         crate::labels::validate(label).map_err(|_| WardenError::LabelRefused)?;
 
@@ -678,13 +735,18 @@ impl HttpWarden {
             .http
             .post(self.url(&format!("/v1/tenants/{label}/reconcile")))
             .bearer_auth(&self.token)
+            // Overrides the client's budget for this request only. Every other
+            // route on this client is a small round trip and keeps the short
+            // one, so a warden that has genuinely stopped answering still fails
+            // a signup in thirty seconds rather than in ten minutes.
+            .timeout(crate::config::RECONCILE_TIMEOUT)
             .send()
             .await
-            .map_err(|_| WardenError::Unreachable)?;
+            .map_err(|e| transport_error(e, label))?;
 
         match resp.status().as_u16() {
             200 => {
-                let body = read_capped(resp).await?;
+                let body = read_capped(resp, label).await?;
                 let mut reconciled: Reconciled =
                     serde_json::from_slice(&body).map_err(|_| WardenError::Unreachable)?;
                 reconciled.declaw();
@@ -718,16 +780,46 @@ fn validate_pairing(p: &Pairing) -> Result<(), WardenError> {
     Ok(())
 }
 
-async fn read_capped(resp: reqwest::Response) -> Result<Vec<u8>, WardenError> {
-    read_capped_to(resp, MAX_RESPONSE_BODY).await
+/// Which failure a [`reqwest::Error`] actually was.
+///
+/// One `map_err(|_| WardenError::Unreachable)` used to stand at every call site
+/// here, flattening timeout, connection refused, DNS and TLS into a single
+/// sentence. Most of those really do mean the request never landed and nothing
+/// was started. A TIMEOUT means the opposite, and on 2026-08-19 that cost a
+/// live mailbox eight minutes: an operator was told "the provisioning service
+/// could not be reached" about a reconcile the warden had accepted, begun, and
+/// been cut off in the middle of.
+///
+/// So the one case this crate can actually tell apart gets told apart.
+/// `is_timeout()` covers both the client-level budget and a per-request
+/// override, which is how the reconcile route's longer budget lands here too.
+/// Everything else keeps the old variant, whose message is written for the case
+/// where the warden never heard from us.
+fn transport_error(e: reqwest::Error, label: &str) -> WardenError {
+    if e.is_timeout() {
+        WardenError::TimedOut {
+            label: label.to_string(),
+        }
+    } else {
+        WardenError::Unreachable
+    }
 }
 
+async fn read_capped(resp: reqwest::Response, label: &str) -> Result<Vec<u8>, WardenError> {
+    read_capped_to(resp, MAX_RESPONSE_BODY, label).await
+}
+
+/// The label rides in so that a body read which runs out the clock reports the
+/// timeout, exactly as the send that preceded it does. Exceeding the CAP stays
+/// [`WardenError::Unreachable`]: nothing timed out there, and the reasoning
+/// that sizes [`MAX_DRIFT_BODY`] depends on that message.
 async fn read_capped_to(
     mut resp: reqwest::Response,
     cap: usize,
+    label: &str,
 ) -> Result<Vec<u8>, WardenError> {
     let mut out = Vec::new();
-    while let Some(chunk) = resp.chunk().await.map_err(|_| WardenError::Unreachable)? {
+    while let Some(chunk) = resp.chunk().await.map_err(|e| transport_error(e, label))? {
         if out.len() + chunk.len() > cap {
             return Err(WardenError::Unreachable);
         }
@@ -1351,6 +1443,115 @@ mod tests {
         let seen = seen.lock().unwrap();
         assert_eq!(seen.len(), 6);
         assert!(seen.iter().all(|b| b == "Bearer token"));
+    }
+
+    /// A warden that takes `delay` to answer either operator route, behind a
+    /// client that gives up after `budget`. `delay` is the only thing these
+    /// tests care about, so the bodies are just enough to parse.
+    async fn slow_warden(delay: Duration, budget: Duration) -> HttpWarden {
+        use axum::{
+            Json, Router,
+            routing::{get, post},
+        };
+        use serde_json::json;
+
+        let app = Router::new()
+            .route(
+                "/v1/tenants/{label}/reconcile",
+                post(move || async move {
+                    tokio::time::sleep(delay).await;
+                    Json(json!({"deployment": "recreated", "status": "active"}))
+                }),
+            )
+            .route(
+                "/v1/tenants/{label}/drift",
+                get(move || async move {
+                    tokio::time::sleep(delay).await;
+                    Json(json!({"status": "active", "deployment_present": true}))
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        HttpWarden::new(format!("http://{addr}"), "token".into(), budget).unwrap()
+    }
+
+    /// The defect [`crate::config::RECONCILE_TIMEOUT`] exists for. A reconcile
+    /// on the delete-recreate path legitimately runs for minutes, so it carries
+    /// its own budget and outlasts the one sized for a signup round trip;
+    /// `drift` is a read and keeps the short one, because nothing about a drift
+    /// report justifies holding a shell open for ten minutes. One slow warden,
+    /// two answers.
+    #[tokio::test]
+    async fn reconcile_outlasts_the_budget_the_read_routes_keep() {
+        // Six times the client budget, so a loaded machine cannot pass this by
+        // accident, and a rounding error next to RECONCILE_TIMEOUT.
+        let w = slow_warden(Duration::from_millis(600), Duration::from_millis(100)).await;
+
+        assert_eq!(w.reconcile("ellie").await.unwrap().deployment, "recreated");
+        assert!(matches!(
+            w.drift("ellie").await,
+            Err(WardenError::TimedOut { .. })
+        ));
+    }
+
+    /// A timeout must not claim unreachability, which is what every one of them
+    /// did until 2026-08-19: an operator was told the provisioning service
+    /// "could not be reached" about a reconcile the warden had accepted, begun,
+    /// and been cut off inside, and left a mailbox down for eight minutes on the
+    /// strength of it. The message has to say the opposite, and name the one
+    /// place that settles which it was.
+    #[tokio::test]
+    async fn a_timeout_says_the_warden_may_still_be_working() {
+        let w = slow_warden(Duration::from_millis(600), Duration::from_millis(100)).await;
+        let err = w.drift("ellie").await.unwrap_err();
+
+        assert!(matches!(err, WardenError::TimedOut { .. }));
+        let said = err.to_string();
+        assert!(said.contains("may still be working"), "{said}");
+        // The check, with THIS tenant in it: the grep is useless without it.
+        assert!(
+            said.contains("kubectl -n warden logs deploy/squelch-warden"),
+            "{said}"
+        );
+        // The alternation, not a trailing space. `tenant=` is usually the last
+        // token on a warden log line, so `"tenant=ellie "` silently drops the
+        // lines that matter most - including the one that reported the
+        // 2026-08-19 outage. A bare `tenant=ellie` would match `ellie-atuin`.
+        assert!(said.contains("grep -E 'tenant=ellie($| )'"), "{said}");
+        assert!(!said.contains("tenant=ellie "), "{said}");
+        // The command runs to the end of the line, so it can be selected and
+        // pasted without picking up prose or a stray quote.
+        assert!(said.ends_with("grep -E 'tenant=ellie($| )'"), "{said}");
+        // The sentence this variant exists to stop saying.
+        assert!(!said.contains("could not be reached"), "{said}");
+    }
+
+    /// The other half of the split. A refused connection really does mean
+    /// nothing reached the warden and nothing was started, so it keeps the old
+    /// variant: pointing an operator at the warden's log for a call that was
+    /// never made is the same lie in the other direction.
+    #[tokio::test]
+    async fn a_refused_connection_is_still_unreachability() {
+        // Port 1 again, but with a budget generous enough that a loaded machine
+        // cannot turn an instant ECONNREFUSED into a timeout and make this pass
+        // for the wrong reason.
+        let w = HttpWarden::new(
+            "http://127.0.0.1:1".into(),
+            "token".into(),
+            Duration::from_secs(10),
+        )
+        .unwrap();
+        assert!(matches!(
+            w.drift("ellie").await,
+            Err(WardenError::Unreachable)
+        ));
+        assert!(matches!(
+            w.reconcile("ellie").await,
+            Err(WardenError::Unreachable)
+        ));
     }
 
     /// A field manager is named by whoever wrote the field, and this report is

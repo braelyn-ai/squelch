@@ -14,10 +14,11 @@ import SwiftUI
 /// Which primary surface the rail is showing. `sitrep` is the abstracted
 /// dashboard (the default on launch); `emails` is the classic band list.
 enum MainView: String, Sendable, Hashable, CaseIterable {
-    case sitrep, emails, auth, rules, audit, usage, settings
+    case sitrep, emails, auth, rules, audit, usage, settings, process
 
     /// The TOP rail group — also the 1..5 number-key mapping. Usage/Settings are
-    /// excluded so that adding them never renumbers 1..5.
+    /// excluded so that adding them never renumbers 1..5. `process` is off the
+    /// rail entirely: its one door is the all-mail header's peer-review chip.
     static let mainViews: [MainView] = [.sitrep, .emails, .auth, .rules, .audit]
     /// The BOTTOM rail group, pinned below a divider.
     static let bottomViews: [MainView] = [.usage, .settings]
@@ -31,6 +32,7 @@ enum MainView: String, Sendable, Hashable, CaseIterable {
         case .audit: "Audit"
         case .usage: "Usage"
         case .settings: "Settings"
+        case .process: "Process"
         }
     }
 
@@ -43,6 +45,7 @@ enum MainView: String, Sendable, Hashable, CaseIterable {
         case .audit: "scroll"
         case .usage: "waveform.path.ecg"
         case .settings: "gearshape"
+        case .process: "checkmark.seal"
         }
     }
 }
@@ -234,6 +237,16 @@ let ringSeconds: TimeInterval = 60
 struct ComposeState: Sendable, Equatable {
     enum Phase: Sendable { case edit, review }
     var replyToMessageId: Int?
+    /// The message this composer PASSES ON. Mutually exclusive with
+    /// `replyToMessageId` — a send names a parent to answer or an original to
+    /// forward, never both — and the daemon rejects a body carrying the pair.
+    ///
+    /// Nothing of the original travels with it: the daemon reads the message
+    /// out of its own store, quotes it, re-attaches its files and starts a NEW
+    /// thread. So this id is the whole of the forward on the wire, and the
+    /// composer's body is only what the sender adds on top of it (which may be
+    /// nothing at all).
+    var forwardOfMessageId: Int?
     var to: String = ""
     var subject: String = ""
     var body: String = ""
@@ -256,6 +269,22 @@ struct ComposeState: Sendable, Equatable {
     /// without `replyToMessageId`, and fixed when the composer opens: which key
     /// opened it is the whole choice, so there is no switch to flip afterwards.
     var replyAll = false
+    /// What the forwarded original is called, and how many files it drags with
+    /// it. DISPLAY ONLY, both of them: they NEVER reach the wire — the daemon
+    /// builds the quoted original from `forwardOfMessageId` alone, and a client
+    /// that shipped its own copy of the subject would be inviting the two to
+    /// disagree. They exist so the composer can state what rides along, which
+    /// is otherwise invisible: the body box shows only what the sender types.
+    var forwardedSubject: String?
+    var forwardedAttachmentCount: Int = 0
+
+    /// The one word both compose events use for what this draft IS —
+    /// `compose_opened` and `compose_send` must not disagree about that.
+    /// Analytics only; nothing on the wire reads it.
+    var analyticsKind: String {
+        if forwardOfMessageId != nil { return "forward" }
+        return replyToMessageId == nil ? "new" : "reply"
+    }
 }
 
 /// The email currently being reclassified by the `v` palette.
@@ -1796,9 +1825,7 @@ final class AppStore {
         if next.body.isEmpty { next.body = Prefs.shared.signatureSeed }
         compose = next
         DraftSaver.shared.noteOpened(.compose)
-        Analytics.capture(
-            "compose_opened",
-            ["kind": state.replyToMessageId == nil ? "new" : "reply"])
+        Analytics.capture("compose_opened", ["kind": next.analyticsKind])
     }
 
     /// `c` / ⌘N — the new-message composer, RESTORED. The account holds at most
@@ -1816,6 +1843,45 @@ final class AppStore {
         Task { await restoreNewMessage() }
     }
 
+    /// `f` in the reader — pass THIS message on to someone else, in the pane
+    /// composer. The pane rather than the reader's inline slot because a
+    /// forward needs the two fields a reply does not have: a recipient (nobody
+    /// is derivable from the original) and a subject.
+    ///
+    /// `subject` and `attachmentCount` are the CHROME's, not the wire's: the
+    /// daemon quotes the original and re-attaches its files from the id alone
+    /// (see `ComposeState.forwardedSubject`).
+    ///
+    /// Two deliberate absences:
+    ///
+    /// - No `restoreNewMessage`. That draft is the account's ONE plain new
+    ///   message, keyed `reply_to_message_id == nil` server-side, and adopting
+    ///   it here would drop a stranger's half-written mail into a forward of
+    ///   something else — and take its subject line with it.
+    /// - No autosave at all, for the mirror of the same reason: the drafts wire
+    ///   cannot record what is being forwarded, so a saved forward would come
+    ///   back as an ordinary new message with the original silently gone. See
+    ///   `DraftSaver.save`.
+    func openComposeForward(messageId: Int, subject: String, attachmentCount: Int) {
+        // A composer already up is not something a repeated `f` gets to blank
+        // out — the same rule `openComposeNew` and the inline reply keep.
+        guard compose == nil else { return }
+        var state = ComposeState()
+        state.forwardOfMessageId = messageId
+        // The subject is SENT, not derived: the daemon only titles a forward
+        // itself when the field is absent, and the composer shows one, so what
+        // is on screen has to be what goes out.
+        state.subject = ComposeCopy.forwardSubject(subject)
+        // Nil rather than "" when the original was untitled, so the chrome has
+        // one thing to test.
+        let original = subject.trimmed
+        state.forwardedSubject = original.isEmpty ? nil : original
+        state.forwardedAttachmentCount = attachmentCount
+        // Through `openCompose` so the tracker default and the signature are
+        // seeded by the one place that seeds them, and the open is counted.
+        openCompose(state)
+    }
+
     /// Fill the just-opened new-message composer from its saved draft. Silent on
     /// failure: a restore that cannot happen leaves a blank composer, which is
     /// what the reader asked for anyway.
@@ -1831,7 +1897,14 @@ final class AppStore {
         // window, and overwriting live keystrokes is worse than not restoring.
         // "Untouched" rather than empty: the composer opens holding the seeded
         // signature, and a seed nobody typed must not block the restore.
-        guard var next = compose, next.replyToMessageId == nil, next.draftId == nil,
+        //
+        // A FORWARD is not a candidate either, and it would otherwise pass every
+        // test above: `f` opens a composer with no reply parent, no draft id and
+        // an untouched body, so a `c` fired a moment earlier could land its
+        // restore in it and quietly re-address someone else's mail. The subject
+        // this seeds would survive as the only visible trace.
+        guard var next = compose, next.replyToMessageId == nil, next.forwardOfMessageId == nil,
+            next.draftId == nil,
             next.to.isEmpty, next.subject.isEmpty, Prefs.shared.isBodyUntouched(next.body)
         else { return }
         next.to = draft.to

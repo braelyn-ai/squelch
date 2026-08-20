@@ -63,11 +63,36 @@ run_suite email-images \
   Sources/Passband/Lib/ImageProxy.swift \
   Tests/EmailImagesTests.swift
 
+# The OTHER image rewrite: `cid:` references to this message's own parts. Pure
+# string and url work, so it builds with the wire type and the buckets it gates
+# on — no WebKit, no daemon. MailCSP rides along because the policy those urls
+# are loaded under is the one line of the reading frame that can be asserted
+# without standing a content process up, and Trackers because it runs FIRST in
+# the real pipeline: what it takes out of a body is what neither answer here may
+# still claim.
+run_suite cid-images \
+  Sources/Passband/Model/WireTypes.swift \
+  Sources/Passband/Lib/AttachmentKinds.swift \
+  Sources/Passband/Lib/HTMLImg.swift \
+  Sources/Passband/Lib/ImageProxy.swift \
+  Sources/Passband/Lib/Trackers.swift \
+  Sources/Passband/Lib/CidImages.swift \
+  Sources/Passband/Lib/MailCSP.swift \
+  Tests/CidImagesTests.swift
+
 # The thread minimap's window math. CoreGraphics only — the rail that draws it
 # is SwiftUI, the arithmetic that aims it is not.
 run_suite minimap-geometry \
   Sources/Passband/Lib/MinimapGeometry.swift \
   Tests/MinimapGeometryTests.swift
+
+# The banking card's recency window (issue #82): 24h or since-last-open,
+# whichever reaches further back. Platform rides along for the notification
+# names the lifecycle plumbing observes.
+run_suite sitrep-window \
+  Sources/Passband/Lib/Platform.swift \
+  Sources/Passband/Lib/SitrepWindow.swift \
+  Tests/SitrepWindowTests.swift
 
 # What "remind me…" resolves to. Foundation only, and every date computed
 # through an injected now/calendar — which is the whole reason it is testable:

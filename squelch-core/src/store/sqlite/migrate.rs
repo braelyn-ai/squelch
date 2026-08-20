@@ -326,6 +326,12 @@ pub(super) fn migrate(conn: &Connection) -> Result<()> {
     // column comment in schema.sql.
     add_column_if_missing(conn, "shipments", "cleared_at", "TEXT")?;
 
+    // The cid an inline image part declared. NULL on every pre-existing row and
+    // NOT backfillable from here — the Content-ID lives in the RFC822, which the
+    // store never kept — so already-synced mail keeps painting its inline images
+    // as tiles below the body until a re-sync re-ingests it.
+    add_column_if_missing(conn, "attachments", "content_id", "TEXT")?;
+
     // Adding `stage1_model_used` leaves it NULL on every historical row — exactly
     // the Stage-1 queue predicate — so without this backfill the whole mailbox
     // re-classifies through the paid model. Rows already classified or already

@@ -228,16 +228,22 @@ struct ThreadViewer: View {
 
     // MARK: - chrome
 
-    /// A Mac reads the whole header on ONE line: subject left, actions right,
-    /// the subject taking whatever width the actions leave. A phone has no such
-    /// width — four text buttons beside a subject would squeeze it to an
-    /// ellipsis — so the same pieces stack, the actions under the line they act
-    /// on, and leaving belongs to the navigation bar above rather than to a
-    /// button of our own.
+    /// A Mac reads the whole header as the shared TOP BAR: the subject sits on
+    /// the traffic lights' line the way every page title does, the participants
+    /// ride to its right, and the actions take the far end. The subject pays
+    /// for the fixed strip with truncation — one line, ellipsized — and the
+    /// full text stays a copy-click away. A phone has no such width — four
+    /// text buttons beside a subject would squeeze it to an ellipsis — so the
+    /// same pieces stack, the actions under the line they act on, and leaving
+    /// belongs to the navigation bar above rather than to a button of our own.
     private var header: some View {
         #if os(macOS)
-            HStack(alignment: .firstTextBaseline, spacing: 14) {
-                titleBlock
+            HStack(alignment: .firstTextBaseline, spacing: 12) {
+                subjectLine(lines: 1)
+                if !participantLine.isEmpty {
+                    participantsText
+                }
+                Spacer(minLength: 12)
                 actions
                 Button { store.closeThread() } label: {
                     HStack(spacing: 4) {
@@ -247,14 +253,10 @@ struct ThreadViewer: View {
                 }
                 .buttonStyle(.textAction)
             }
-            .padding(.horizontal, 22)
-            // PADDING, not the shared `TopBar.height`, and the one header in the
-            // app that keeps its own: a subject can wrap to two lines and carries
-            // a participant line under it, so a fixed bar height would either
-            // squash it or hold empty air for the threads that don't wrap. The
-            // subject still lands on the window buttons' line, which is what the
-            // bar was for.
-            .padding(.vertical, 13)
+            // These metrics match every other page's bar: the reader's rule
+            // ends on the line the rail's top edge is cut to.
+            .padding(.horizontal, 24)
+            .frame(height: TopBar.height)
             .overlay(alignment: .bottom) { Hairline() }
         #else
             VStack(alignment: .leading, spacing: 10) {
@@ -271,41 +273,53 @@ struct ThreadViewer: View {
         #endif
     }
 
-    private var titleBlock: some View {
-        VStack(alignment: .leading, spacing: 3) {
-            HStack(alignment: .firstTextBaseline, spacing: 8) {
-                // The subject IS the copy affordance — no icon earns a
-                // place in this header for a once-in-a-while verb.
-                Button {
-                    if let subject = thread?.subject, !subject.isEmpty {
-                        Clip.copy(subject, flashing: $subjectCopied)
-                    }
-                } label: {
-                    Text(thread?.subject ?? "…")
-                        .font(Typo.serif(19, weight: .medium))
-                        .foregroundStyle(Palette.ink)
-                        .lineLimit(2)
-                        .contentShape(Rectangle())
-                }
-                .buttonStyle(.plain)
-                .help("copy subject")
-                if subjectCopied {
-                    Text("copied!")
-                        .font(Typo.micro)
-                        .foregroundStyle(Palette.positive)
-                        .transition(.opacity)
+    #if !os(macOS)
+        private var titleBlock: some View {
+            VStack(alignment: .leading, spacing: 3) {
+                subjectLine(lines: 2)
+                if !participantLine.isEmpty {
+                    participantsText
                 }
             }
-            .animation(.easeOut(duration: 0.18), value: subjectCopied)
-            if !participantLine.isEmpty {
-                Text(participantLine)
-                    .font(Typo.rowSub)
-                    .foregroundStyle(Palette.inkFaint)
-                    .lineLimit(1)
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+    #endif
+
+    /// The subject IS the copy affordance — no icon earns a place in this
+    /// header for a once-in-a-while verb. `lines` is the platform's call: one
+    /// inside the Mac's fixed bar, two in the phone's stacked block.
+    private func subjectLine(lines: Int) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: 8) {
+            Button {
+                if let subject = thread?.subject, !subject.isEmpty {
+                    Clip.copy(subject, flashing: $subjectCopied)
+                }
+            } label: {
+                Text(thread?.subject ?? "…")
+                    .font(Typo.serif(19, weight: .medium))
+                    .foregroundStyle(Palette.ink)
+                    .lineLimit(lines)
                     .truncationMode(.tail)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .help("copy subject")
+            if subjectCopied {
+                Text("copied!")
+                    .font(Typo.micro)
+                    .foregroundStyle(Palette.positive)
+                    .transition(.opacity)
             }
         }
-        .frame(maxWidth: .infinity, alignment: .leading)
+        .animation(.easeOut(duration: 0.18), value: subjectCopied)
+    }
+
+    private var participantsText: some View {
+        Text(participantLine)
+            .font(Typo.rowSub)
+            .foregroundStyle(Palette.inkFaint)
+            .lineLimit(1)
+            .truncationMode(.tail)
     }
 
     /// EVERY ACTION HERE NEEDS THE THREAD: they act on its newest message and
@@ -783,11 +797,36 @@ struct ThreadViewer: View {
                     TriageFixTarget(
                         messageId: m.id, sender: m.from_addr, subject: thread.subject))
             },
-            // The SELECTED message's sender, not the thread's newest: on a
+            // `f` = FORWARD, and only in here. On a list row `f` is still
+            // search-this-sender: a row is a sender you are sizing up, an open
+            // email is a thing you might want to pass on, and the reader is the
+            // only surface where "this message" is unambiguous enough to
+            // forward without asking which one.
+            //
+            // The SELECTED message, not the thread's newest — the same rule `v`
+            // keeps. On a back-and-forth the two differ, and j/k is how you
+            // chose the one in front of you; forwarding something else because
+            // it happened to arrive last would be silently sending the wrong
+            // mail, which no undo covers.
+            //
+            // Into the PANE composer rather than the reader's inline slot: a
+            // forward starts a new thread, so it needs a recipient (nothing
+            // derives one) and a subject line, and the inline reply has neither
+            // field. The two draft slots are independent, so a reply
+            // half-written underneath is untouched.
+            KeyBinding("f", "forward") {
+                guard let m = messages[safe: index] else { return }
+                store.openComposeForward(
+                    messageId: m.id, subject: thread?.subject ?? "",
+                    attachmentCount: m.attachmentList.count)
+            },
+            // `s` = the search `f` used to be, moved rather than dropped: the
+            // sender lookup is worth a key in here, it just is not worth THE
+            // key. The SELECTED message's sender, not the thread's newest: on a
             // back-and-forth the two differ, and the one you are looking at is
             // the one you mean. Search opens as the strip beside the reader, so
             // this does not cost you the email you are reading.
-            KeyBinding("f", "search this sender") {
+            KeyBinding("s", "search this sender") {
                 guard let m = messages[safe: index] else { return }
                 store.openSearch(seed: "from:\(m.from_addr)")
             },
@@ -1159,8 +1198,12 @@ struct ThreadViewer: View {
         unsub = rows.first { $0.sender == newestSender }
     }
 
-    /// Confirmed unsubscribe. 200 -> open the url + toast + refresh the hint.
-    /// 422 -> swap the card to the "no link — block instead?" fallback.
+    /// Confirmed unsubscribe. 200 -> open the url, then LEAVE: the server
+    /// resolved this SENDER's open mail alongside the request (unsubscribing is
+    /// a verdict on them, not on one thread), so the reader departs the way e/d
+    /// does — an email that stays on screen after being dealt with reads as the
+    /// action not having taken. 422 -> swap the card to the "no link — block
+    /// instead?" fallback.
     private func runUnsubscribe() async {
         guard let newest, !confirmBusy else { return }
         confirmBusy = true
@@ -1168,13 +1211,11 @@ struct ThreadViewer: View {
         do {
             let result = try await APIClient.shared.unsubscribe(messageId: newest.id)
             Opener.open(result.url)
-            // The server resolved this SENDER's open mail (unsubscribing is a
-            // verdict on them, not on one thread); drop those rows now rather
-            // than waiting on the poll.
+            // Drop the resolved rows NOW rather than one poll later.
             store.noteSenderResolved(result.sender)
             store.pushToast("opened unsubscribe page — \(result.sender)", .success)
-            await refreshUnsub()
             confirmMode = nil
+            await departAndClose()
         } catch let apiError as APIError where apiError.status == 422 {
             // No http(s) unsubscribe link — offer to block the sender instead.
             confirmMode = .noLink
@@ -1184,7 +1225,8 @@ struct ThreadViewer: View {
         }
     }
 
-    /// No-link fallback: block the EXACT sender.
+    /// No-link fallback: block the EXACT sender — and leave, for the same
+    /// reason unsubscribe does: the rule's sweep resolved this sender's mail.
     private func runBlock() async {
         guard let newestSender, !confirmBusy else { return }
         confirmBusy = true
@@ -1195,10 +1237,26 @@ struct ThreadViewer: View {
             try await Actions.createBlockRule(sender: newestSender, sourceMessageId: newest?.id)
             store.noteSenderResolved(newestSender)
             store.pushToast("blocked \(newestSender)", .success)
+            confirmMode = nil
+            await departAndClose()
         } catch {
             store.pushToast(errText(error, "block failed"), .error)
+            confirmMode = nil
         }
-        confirmMode = nil
+    }
+
+    /// The LEAVING half of done+next, for the actions whose server call already
+    /// resolved the mail (unsubscribe, block): unpin, lift out through the top,
+    /// close. No advance — a verdict on a sender is a stopping point, not a
+    /// step to the next email; anything else of theirs in the queue is done too.
+    private func departAndClose() async {
+        let liftedAt = liftOff()
+        if let newest { await ImageStore.shared.release(messageId: newest.id) }
+        await flightOut(since: liftedAt)
+        // Esc can close the reader while the email is still leaving; a second
+        // close must not fire against whatever surface took its place.
+        guard store.threadId == threadId else { return }
+        store.closeThread()
     }
 
     private func retriageThis() async {
@@ -1271,12 +1329,14 @@ private struct MessageCard: View {
 
             if let html = message.html, !html.isEmpty {
                 EmailWebView(
-                    html: html, cacheKey: String(message.id), allowTrackers: message.allowsTrackers)
+                    html: html, cacheKey: String(message.id),
+                    allowTrackers: message.allowsTrackers,
+                    attachments: message.attachmentList)
             } else {
                 PlainBody(content: message.content)
             }
 
-            AttachmentStrip(attachments: message.attachmentList)
+            AttachmentStrip(attachments: message.attachmentList, inBody: inBodyImages)
         }
         // The gutter is reserved whether or not this message is selected, so
         // j/k moves a rule rather than shifting every body left and right.
@@ -1311,6 +1371,27 @@ private struct MessageCard: View {
         }
         .contentShape(Rectangle())
         .onTapGesture(perform: onSelect)
+    }
+
+    /// The parts the BODY already shows, because a `cid:` reference in the html
+    /// resolved to them — the strip must not paste those a second time under the
+    /// message. Recomputed with the card rather than remembered: the answer is a
+    /// substring probe for bodies with no `cid:` in them at all, which is nearly
+    /// all of them, and the alternative is a second cache to keep in step with
+    /// the prepared one.
+    ///
+    /// It has to read the SAME body the rewrite reads, which is the
+    /// tracker-stripped one under this message's own policy — see
+    /// EmailWebView.Prepared.make. The hidden and 1×1 tests there are blind to
+    /// the scheme, so a `cid:` image the sender hid never reaches the rewrite,
+    /// and counting it here would take the tile away from a photo nothing draws.
+    /// Only a body that actually names a cid pays for the extra pass.
+    private var inBodyImages: Set<Int> {
+        guard let html = message.html, !html.isEmpty,
+            html.range(of: "cid:", options: .caseInsensitive) != nil
+        else { return [] }
+        let body = message.allowsTrackers ? html : Trackers.strip(html).html
+        return CidImages.referencedAttachmentIDs(html: body, attachments: message.attachmentList)
     }
 }
 

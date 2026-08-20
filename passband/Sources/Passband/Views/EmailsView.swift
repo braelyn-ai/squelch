@@ -273,10 +273,13 @@ struct EmailsView: View {
     // MARK: - header
 
     /// A Mac's page header is also the app's chrome bar: wordmark, counts, the
-    /// freshness stamp, and the doors to auth / audit / shortcuts / theme. A
-    /// phone has a navigation bar for the name and a tab bar for the doors, so
-    /// all that is left up here is the one thing this page owns — which of the
-    /// two lists you are looking at, and how much is in the other one.
+    /// freshness stamp, and the door to the process page. The auth / audit /
+    /// shortcuts / theme chips that used to line up here are gone, not moved:
+    /// every one of them already has a rail button or a global key (g, A, ?, \),
+    /// and a second door in the chrome was chrome for its own sake. A phone has
+    /// a navigation bar for the name and a tab bar for the doors, so all that is
+    /// left up here is the one thing this page owns — which of the two lists you
+    /// are looking at, and how much is in the other one.
     @ViewBuilder
     private var header: some View {
         #if os(macOS)
@@ -380,22 +383,10 @@ struct EmailsView: View {
                 .accessibilityLabel(reminders ? "showing pending reminders" : "pending reminders")
             }
             RetriageButton()
-            if !store.sitrep.sealed.isEmpty {
-                ChromeChip(
-                    text: "\(store.sitrep.sealed.count)", icon: "key.fill",
-                    tone: Palette.lock,
-                    help: "login codes, password resets & sign-in alerts (g)"
-                ) { store.setView(.auth) }
-            }
             ChromeChip(
-                icon: "scroll", font: .system(size: 12),
-                help: "audit log — agent & app actions (A)"
-            ) { store.setView(.audit) }
-            ChromeChip(
-                text: "?", font: .system(size: 12, weight: .semibold),
-                help: "keyboard shortcuts (?)"
-            ) { store.shortcutsOpen = true }
-            ThemeToggle()
+                text: "peer-review", font: .system(size: 12),
+                help: "the process page: verify how your mail was sorted"
+            ) { store.setView(.process) }
         }
         // These metrics must match the sitrep masthead's: every page's bar ends
         // on the line the rail's top edge is cut to.

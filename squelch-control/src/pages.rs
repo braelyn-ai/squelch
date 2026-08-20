@@ -84,6 +84,24 @@ pub fn deep_link(tenant_url: &str, pair_code: &str) -> String {
     )
 }
 
+/// Where the client is downloaded from.
+///
+/// THIS IS WHERE THE DOWNLOAD LIVES NOW. The landing page used to lead with it
+/// and leads with the waitlist instead: an app is not worth holding before
+/// there is a mailbox behind it to point at, so the download waits until the
+/// end of this flow, which is the first moment somebody actually needs it. The
+/// pages that name it are the two that finish a flow, [`success`] and
+/// [`app_signed_in`], and on both of them it is the literal next step.
+///
+/// HARDCODED, NOT CONFIGURED, for the reason [`crate::resend::MARK_URL`] is:
+/// there is one place the Mac client is published and it is not the operator's
+/// origin. A self-hoster's own host serves no zips, so a variable pointing this
+/// at their site would only ever produce a 404 with their domain in front of
+/// it. `/download/latest` is the site's own redirect to whatever the appcast
+/// says shipped last (`passband-site/server.ts`), so this URL does not move
+/// when a release does.
+const DOWNLOAD_URL: &str = "https://passband.app/download/latest";
+
 /// Where a finished console login sends the browser: the tenant's own console,
 /// carrying the pairing code it will claim.
 ///
@@ -162,6 +180,22 @@ const MARK: &str = concat!(
 /// link-free also keeps it free of configuration, which is what lets the shell
 /// carry it rather than every call site having to pass an origin down.
 fn page(status: StatusCode, title: &str, body: &str) -> Response {
+    render(status, title, body, "")
+}
+
+/// The same shell on the OPERATOR'S surface: the landing page's dark ground in
+/// both palettes, its mark, its type, and none of its selling. See the
+/// `body.console` block in the stylesheet for what that means and why the
+/// colours are restated there rather than inherited from the dark media query.
+///
+/// The three pages behind the admin token, and nothing else. A signup page is
+/// read once by somebody deciding whether to hand over their mail; this is read
+/// every day by one person who already decided.
+fn console(status: StatusCode, title: &str, body: &str) -> Response {
+    render(status, title, body, r#" class="console""#)
+}
+
+fn render(status: StatusCode, title: &str, body: &str, body_class: &str) -> Response {
     let title = escape_html(title);
     let html = format!(
         r#"<!doctype html>
@@ -278,15 +312,93 @@ a.button {{ display: inline-block; margin: 0.25rem 0 1.25rem; padding: 0.65rem 1
   .card {{ background: rgba(255, 255, 255, 0.055); border-color: rgba(255, 255, 255, 0.11); }}
   .alt, details {{ border-color: rgba(255, 255, 255, 0.11); }}
 }}
+/* THE OPERATOR'S SURFACE.
+   The landing page's ground, its mark and its type, and none of its selling: no
+   hero, no accent hardware, no motion. This is a page somebody reads in columns
+   and presses in a hurry, so it takes the dark field from that page and leaves
+   behind everything built to persuade.
+   ALWAYS DARK, in both palettes, exactly as the landing page is: nobody has a
+   light-mode Passband to match it to. That is why every colour the dark media
+   query above sets is RESTATED here instead of being inherited from it, which
+   would leave this page reading as warm paper for anybody whose OS is light. */
+/* THE ACCENT COMES WITH THE GROUND. `--brand` is the mark's ink ramp on light
+   and its lit ramp on dark, chosen by the media query above; this surface is
+   dark in BOTH, so it must state the dark one or a light-mode operator gets the
+   ink ramp on a near-black field. */
+body.console {{ --brand: #7cc8eb; background: #0f0f10; color: #f5f5f7; }}
+/* Wider ONLY when there is a board to lay out, the same way the base sheet
+   above widens for a table. The login door is one field, and a credential
+   stretched across fifty-four rems reads as a page that lost its layout. */
+body.console main:has(table) {{ max-width: 54rem; }}
+body.console .muted, body.console .hint, body.console th {{ color: #8a8a90; }}
+body.console code, body.console .code {{ background: rgba(255, 255, 255, 0.07); }}
+body.console :is(input[type=text], input[type=password], input[type=email]) {{
+  background: rgba(255, 255, 255, 0.04); border-color: rgba(255, 255, 255, 0.14); }}
+body.console button {{ background: #f5f5f7; color: #0f0f10; }}
+body.console button.quiet {{ background: none; color: #f5f5f7;
+  border-color: rgba(255, 255, 255, 0.2); }}
+body.console button.quiet:hover {{ border-color: rgba(255, 255, 255, 0.45); }}
+body.console :is(th, td) {{ border-bottom-color: rgba(255, 255, 255, 0.09); }}
+body.console .stop {{ border-left-color: #f2b8b5; }}
+/* The board says its own size, so the operator does not count rows to learn it. */
+body.console h1 {{ margin-bottom: 0; }}
+body.console .tally {{ color: #8a8a90; font-size: 0.9rem; margin: 0.3rem 0 2.5rem; }}
+/* Section headings as CONSOLE LABELS rather than document headings. This page
+   is three lists, not three chapters, and a heading that competes with the
+   addresses under it is a heading in the way. */
+body.console h2 {{ font-size: 0.72rem; font-weight: 600; text-transform: uppercase;
+  letter-spacing: 0.12em; color: #8a8a90; margin: 2.75rem 0 0.6rem; }}
+body.console h2 + .hint {{ margin: -0.2rem 0 1rem; }}
+/* THE COLUMNS ARE THE WHOLE POINT. The address is what gets read, so it takes
+   the width and the ink. The date and the button are looked at only after a row
+   has been picked, so they shrink to their contents and stay out of the scan:
+   `width: 1%` with nowrap is how a table is told to give a column exactly what
+   it needs and not one pixel more. It is also what stops a date breaking across
+   two lines in the middle of `2026-08-14`, which is what the narrow reading
+   column used to do to every row on the board. */
+body.console :is(td, th) {{ padding: 0.6rem 1.1rem 0.6rem 0; }}
+body.console td.who {{ color: #f5f5f7; }}
+body.console td.when {{ width: 1%; white-space: nowrap; color: #8a8a90;
+  font-size: 0.85rem; font-variant-numeric: tabular-nums; }}
+body.console :is(td.act, th:last-child) {{ width: 1%; white-space: nowrap;
+  text-align: right; padding-right: 0; }}
+/* THE ONE ROW THAT IS WRONG: approved, and nobody was told. Every other button
+   in a row is bordered rather than filled, so this is the only filled one among
+   them and the eye lands on it. (The direct-invite form at the foot of the page
+   is filled too, and should be: it is a form's submit, not one of forty
+   identical row actions, and it competes with nothing above it.) */
+body.console :is(.flag, .done) {{ display: inline-block; margin-right: 0.55rem;
+  padding: 0.12rem 0.55rem; border-radius: 999px; border: 1px solid;
+  font-size: 0.72rem; font-weight: 600; letter-spacing: 0.06em;
+  text-transform: uppercase; }}
+body.console .flag {{ color: #f2b8b5; border-color: rgba(242, 184, 181, 0.35); }}
+/* The other end of the funnel, and the reason this column exists: the invite
+   was spent, so there is a mailbox. Quieter than the red one, because a board
+   should draw the eye to what is broken before what worked. */
+body.console .done {{ color: var(--brand); border-color: rgba(124, 200, 235, 0.3); }}
+/* The direct invite: field and button on one row, at the foot of the board.
+   It used to sit BETWEEN the two lists, which split the one thing this page is
+   for (reading down a list of people) into two halves either side of a form. */
+body.console .invite {{ display: flex; gap: 0.5rem; max-width: 34rem; }}
+body.console .invite input {{ margin: 0; }}
+body.console .invite button {{ flex: none; }}
+/* The way out, at the foot of the board and quiet: it is the rarest press on
+   this page, and the session is long enough now that it needed to exist at all. */
+body.console .signout {{ margin: 2.75rem 0 0.6rem; }}
+/* A label the screen reader gets and the layout does not. The heading above the
+   row and the placeholder in it are enough on screen; neither is a label. */
+body.console .sr {{ position: absolute; width: 1px; height: 1px; overflow: hidden;
+  clip-path: inset(50%); white-space: nowrap; }}
 </style>
 </head>
-<body><main><header class="brand">{mark}<span class="wordmark">Passband</span></header>
+<body{body_class}><main><header class="brand">{mark}<span class="wordmark">Passband</span></header>
 {body}</main></body>
 </html>
 "#,
         title = title,
         mark = MARK,
         body = body,
+        body_class = body_class,
     );
     (
         status,
@@ -423,7 +535,7 @@ pub fn success(tenant_url: &str, pair_code: &str, minutes: i64) -> Response {
 <p>Your daemon is running at <code>{url}</code> and is syncing your mail now.
 One more step: connect the app.</p>
 <ol>
-<li>Download Passband from <code>passband.app</code> and open it.</li>
+<li><a href="{download}">Download Passband</a> and open it.</li>
 <li>Press <strong>Pair</strong>.</li>
 <li>Enter the code below, or open the link on the same device.</li>
 </ol>
@@ -437,6 +549,7 @@ device in.</p>"#,
             url = escape_html(tenant_url),
             code = escape_html(pair_code),
             link = escape_html(&link),
+            download = DOWNLOAD_URL,
             minutes = minutes,
         ),
     )
@@ -476,7 +589,8 @@ pub fn app_signed_in(
 <p><a class="button" href="{link}">Open Passband</a></p>
 <h2>If that button does nothing</h2>
 <p>Passband may not be installed on this device, or your browser may not open
-app links. Open Passband yourself, choose hosted, and enter these:</p>
+app links. <a href="{download}">Download Passband</a> if you need it, then open
+it, choose hosted, and enter these:</p>
 <p><code>{url}</code></p>
 <p><span class="code">{code}</span></p>
 <p class="muted">The code is good for {minutes} minutes and works once. If it
@@ -487,6 +601,7 @@ device in.</p>"#,
             url = escape_html(tenant_url),
             code = escape_html(pair_code),
             link = escape_html(&link),
+            download = DOWNLOAD_URL,
             minutes = minutes,
         ),
     )
@@ -563,19 +678,34 @@ pub fn admin_login(error: Option<&str>) -> Response {
     } else {
         StatusCode::OK
     };
-    page(
+    admin_door(status, &stop_note(error))
+}
+
+/// The door after a DELIBERATE sign out, which is not a refusal and must not be
+/// dressed as one.
+///
+/// A 200 and a quiet note, where [`admin_login`] would answer 401 with a red
+/// banner. The rule that function states still holds and this is the other half
+/// of it: a 200 carrying "not accepted" is a lie to everything that reads status
+/// codes, and so is a 401 for a request that did exactly what was asked.
+pub fn admin_signed_out() -> Response {
+    admin_door(StatusCode::OK, r#"<p class="hint">Signed out.</p>"#)
+}
+
+/// The form both doors show, with whatever note belongs above it.
+fn admin_door(status: StatusCode, note: &str) -> Response {
+    console(
         status,
         "Passband admin",
         &format!(
             r#"<h1>Passband admin</h1>
-{error_html}
+{note}
 <form method="post" action="/admin/login">
 <label for="token">Admin token</label>
 <input type="password" id="token" name="token" autocomplete="current-password"
   autocapitalize="off" spellcheck="false" required>
 <button type="submit">Sign in</button>
-</form>"#,
-            error_html = stop_note(error),
+</form>"#
         ),
     )
 }
@@ -592,7 +722,7 @@ pub fn admin_login(error: Option<&str>) -> Response {
 /// `report` arrives already filtered by [`crate::admin`] and is escaped here
 /// too: the rule is that nothing is interpolated raw.
 pub fn admin_cross_origin(expected: &str, report: &str) -> Response {
-    page(
+    console(
         StatusCode::FORBIDDEN,
         "Passband admin",
         &format!(
@@ -629,11 +759,16 @@ pub fn admin_page(
         .iter()
         .map(|r| {
             format!(
-                r#"<tr><td>{email}</td><td class="muted">{joined}</td><td>{action}</td></tr>
+                r#"<tr><td class="who">{email}</td><td class="when">{joined}</td><td class="act">{action}</td></tr>
 "#,
                 email = escape_html(&r.email),
                 joined = day(r.created_at),
-                action = action_form("/admin/approve", r.id, "Approve and email invite", false),
+                // "Approve", not "Approve and email invite". The long label was
+                // the only disclosure that pressing it sends mail, and it paid
+                // for that by repeating three words down every row of the board
+                // in the loudest thing on the page. The sentence above the table
+                // says it once, and the button is a word.
+                action = action_form("/admin/approve", r.id, "Approve", true),
             )
         })
         .collect();
@@ -645,23 +780,50 @@ pub fn admin_page(
             // case (the mail went out; the button is there for the person who
             // lost it), and a missing one is the loud case: this row is
             // approved and nobody was told.
-            let outcome = match r.notified_at {
-                Some(at) => format!(
+            // THREE STATES, AND THE LAST ONE IS THE POINT OF THE COLUMN.
+            //
+            // Redemption was always in the store (`invite_codes.used_at`, joined
+            // on in `list_waitlist`) and the re-send handler already refused a
+            // spent code with INVITE_SPENT. What was missing was SAYING so: the
+            // only way to learn somebody had signed up was to press a button and
+            // read the refusal. Now the board says it, and offers NO button on
+            // that row, because the one it used to offer could only ever fail.
+            //
+            // No button is the honest answer rather than a tidy one. A spent
+            // code means a mailbox exists, and minting a second for the same
+            // person is a tenant nobody approved, which is what the handler's
+            // refusal is there to stop.
+            let outcome = if let Some(at) = r.accepted_at {
+                let label = r
+                    .accepted_label
+                    .as_deref()
+                    .map(|l| format!(" <code>{}</code>", escape_html(l)))
+                    .unwrap_or_default();
+                format!(
+                    r#"<span class="done">signed up</span><span class="muted">{}</span>{label}"#,
+                    day(at),
+                )
+            } else if let Some(at) = r.notified_at {
+                format!(
                     r#"<span class="muted">Invited {}</span> {}"#,
                     day(at),
-                    action_form("/admin/send", r.id, "Send fresh invite", true),
-                ),
-                None => format!(
-                    r#"<span class="stop">email not sent</span> {}"#,
-                    action_form("/admin/send", r.id, "Send new invite", false),
-                ),
+                    action_form("/admin/send", r.id, "Re-send", true),
+                )
+            } else {
+                // A PILL, not the `.stop` rule. `.stop` is a left border meant
+                // for a whole paragraph, and inline beside a button it drew a
+                // stray red tick that ran into the label next to it.
+                format!(
+                    r#"<span class="flag">email not sent</span>{}"#,
+                    action_form("/admin/send", r.id, "Send invite", false),
+                )
             };
             let approved_on = r
                 .approved_at
                 .map(|at| format!("<br>approved {}", day(at)))
                 .unwrap_or_default();
             format!(
-                r#"<tr><td>{email}</td><td class="muted">joined {joined}{approved_on}</td><td>{outcome}</td></tr>
+                r#"<tr><td class="who">{email}</td><td class="when">joined {joined}{approved_on}</td><td class="act">{outcome}</td></tr>
 "#,
                 email = escape_html(&r.email),
                 joined = day(r.created_at),
@@ -669,37 +831,48 @@ pub fn admin_page(
         })
         .collect();
 
-    page(
+    console(
         StatusCode::OK,
         "Waitlist",
         &format!(
             r#"<h1>Waitlist</h1>
+<p class="tally">{waiting_count} waiting, {approved_count} approved recently,
+{accepted_count} of those signed up</p>
 {error_html}
-<h2>Waiting ({waiting_count})</h2>
+<h2>Waiting</h2>
+<p class="hint">Approving mints one invite code and emails it. The code works
+once and expires in {ttl} days.</p>
 {waiting_table}
+<h2>Approved recently</h2>
+{history_table}
 <h2>Invite someone directly</h2>
-<form method="post" action="/admin/invite">
-<label for="email">Email address</label>
+<form class="invite" method="post" action="/admin/invite">
+<label class="sr" for="email">Email address</label>
 <input type="email" id="email" name="email" placeholder="them@example.com"
   autocomplete="off" autocapitalize="off" spellcheck="false" required>
 <button type="submit">Mint and email an invite</button>
 </form>
-<p class="muted">They do not have to be on the list. The address lands under
-Approved below, with the same re-send button as everybody else.</p>
-<h2>Approved recently</h2>
-{history_table}
-<p class="muted">Approving mints one invite code and emails it. The code works
-once and expires in {ttl} days. Nothing can read it back out of here, so a code
-that was lost is replaced rather than resent.</p>"#,
+<p class="hint">They do not have to be on the list. The address lands under
+Approved above and is tracked from there like everybody else. Nothing here can
+read a code back out, so a lost invite is replaced rather than resent, and a
+code that was already spent is not replaced at all.</p>
+<form class="signout" method="post" action="/admin/logout">
+<button type="submit" class="quiet">Sign out</button>
+</form>
+<p class="hint">This session lasts {session_days} days. Signing out ends it on
+this browser; rotating the admin token ends it everywhere.</p>"#,
             error_html = stop_note(error),
             waiting_count = pending.len(),
+            approved_count = approved.len(),
+            accepted_count = approved.iter().filter(|r| r.accepted_at.is_some()).count(),
+            session_days = crate::cookie::ADMIN_COOKIE_TTL_SECS / (24 * 60 * 60),
             waiting_table = table(
                 r#"<th>Email</th><th>Joined</th><th></th>"#,
                 &waiting,
                 "Nobody is waiting.",
             ),
             history_table = table(
-                r#"<th>Email</th><th>Dates</th><th>Invite</th>"#,
+                r#"<th>Email</th><th>Dates</th><th>Outcome</th>"#,
                 &history,
                 "Nobody has been approved yet.",
             ),
@@ -777,6 +950,24 @@ mod tests {
 
     async fn body_of(r: Response) -> String {
         String::from_utf8(to_bytes(r.into_body(), 1 << 20).await.unwrap().to_vec()).unwrap()
+    }
+
+    /// The rendered page WITHOUT the shell's stylesheet: what a reader can
+    /// actually see.
+    ///
+    /// USE THIS FOR ANY "MUST NOT APPEAR" ASSERTION. Every page here renders
+    /// through the one shell in [`render`], inline stylesheet and comments and
+    /// all, so a negative match against the whole response is really a match
+    /// against whatever those comments happen to say this week. That has broken
+    /// three separate assertions already: a comment about the signup form, one
+    /// about the admin board's `.invite` row, and one about re-sending being the
+    /// rarer errand. None of the three was ever about the stylesheet.
+    async fn document_of(r: Response) -> String {
+        let html = body_of(r).await;
+        html.split_once("</style>")
+            .expect("every page carries the shell's stylesheet")
+            .1
+            .to_string()
     }
 
     #[test]
@@ -913,6 +1104,41 @@ mod tests {
         assert!(!html.contains("<script"));
     }
 
+    /// THE DOWNLOAD LIVES AT THE END OF THE FLOW, not on the landing page: that
+    /// page leads with the waitlist now, so these two are the only screens that
+    /// hand anybody the client. Both need it, and each for its own reason: one
+    /// has just built a mailbox for somebody who has no app, and the other is
+    /// the page a person lands on precisely when the deep link did nothing,
+    /// which is most often because the app is not installed.
+    ///
+    /// A REAL `href`, not the bare hostname the success page used to print. It
+    /// was `<code>passband.app</code>` in the middle of a numbered step, which
+    /// asks somebody mid-setup to retype a domain, and now it is the one thing
+    /// on that step that can be pressed.
+    #[tokio::test]
+    async fn the_pages_that_finish_a_flow_hand_over_the_client() {
+        for html in [
+            body_of(success("https://ada.passband.email", "ABCD-EFGH", 10)).await,
+            body_of(app_signed_in(
+                "ada@example.com",
+                "https://ada.passband.email",
+                "ABCD-EFGH",
+                10,
+            ))
+            .await,
+        ] {
+            assert!(
+                html.contains(&format!(r#"<a href="{DOWNLOAD_URL}">Download Passband</a>"#)),
+                "{html}"
+            );
+        }
+        // And nowhere else. The signup form is somebody deciding whether to
+        // hand over their mail, and an app they cannot yet point at anything is
+        // not what that page is for.
+        let form = body_of(signup_form("passband.email", None, "", "", None)).await;
+        assert!(!form.contains(DOWNLOAD_URL), "{form}");
+    }
+
     /// The console redirect is assembled from a validated tenant URL and a
     /// validated code, and the code is encoded on the way in: nothing in it can
     /// end the parameter it sits in or start a second one.
@@ -954,6 +1180,18 @@ mod tests {
             approved_at: Some(at),
             invite_id: Some(7),
             notified_at: notified.then_some(at),
+            accepted_at: None,
+            accepted_label: None,
+        }
+    }
+
+    /// The same row after they spent the code: a mailbox exists.
+    fn accepted_row(id: i64, email: &str, label: &str) -> WaitlistRow {
+        let at = DateTime::from_timestamp(1_767_225_600, 0).unwrap();
+        WaitlistRow {
+            accepted_at: Some(at),
+            accepted_label: Some(label.to_string()),
+            ..row(id, email, true)
         }
     }
 
@@ -985,8 +1223,10 @@ mod tests {
         assert!(page.contains(r#"name="email""#), "{page}");
         assert!(page.contains("Mint and email an invite"), "{page}");
         assert!(page.contains("input[type=email]"), "{page}");
-        // Both palettes, or it is an unstyled box in one of them.
-        assert_eq!(page.matches("input[type=email]").count(), 2, "{page}");
+        // Both palettes, or it is an unstyled box in one of them, plus the
+        // console surface, which restates every colour rather than inheriting
+        // the dark media query (see the `body.console` block).
+        assert_eq!(page.matches("input[type=email]").count(), 3, "{page}");
         assert!(!page.contains("<script"), "{page}");
     }
 
@@ -996,22 +1236,106 @@ mod tests {
     async fn an_unsent_invite_says_so_and_offers_the_button() {
         let sent = body_of(admin_page(&[], &[row(1, "ada@example.com", true)], None)).await;
         assert!(sent.contains("Invited 2026-01-01"), "{sent}");
-        assert!(sent.contains("Send fresh invite"), "{sent}");
+        // Quiet: this row is fine, and the button is only there for somebody
+        // who lost the mail. Matched WITH its label, because the board carries
+        // a quiet sign-out button of its own at the foot.
+        assert!(
+            sent.contains(r#"<button type="submit" class="quiet">Re-send</button>"#),
+            "{sent}"
+        );
         assert!(!sent.contains("email not sent"), "{sent}");
 
         let failed = body_of(admin_page(&[], &[row(1, "ada@example.com", false)], None)).await;
         assert!(
-            failed.contains(r#"<span class="stop">email not sent</span>"#),
+            failed.contains(r#"<span class="flag">email not sent</span>"#),
             "{failed}"
         );
-        assert!(failed.contains("Send new invite"), "{failed}");
+        // Loud, and the only row action on the board that is: this one is asking
+        // to be pressed. No `class="quiet"` on THIS button, which is what the
+        // label in the match is for.
+        assert!(
+            failed.contains(r#"<button type="submit">Send invite</button>"#),
+            "{failed}"
+        );
 
         let waiting = body_of(admin_page(&[row(1, "ada@example.com", false)], &[], None)).await;
-        assert!(waiting.contains("Approve and email invite"), "{waiting}");
+        assert!(waiting.contains(">Approve</button>"), "{waiting}");
         assert!(waiting.contains(r#"name="id" value="1""#), "{waiting}");
         assert!(waiting.contains(r#"action="/admin/approve""#), "{waiting}");
         // No JavaScript on this page either: a button that acts is a form.
         assert!(!waiting.contains("<script"), "{waiting}");
+    }
+
+    /// THE FAR END OF THE FUNNEL, which the board could not show at all before
+    /// the redemption join: an invite that was spent means a mailbox, and the
+    /// row says which one.
+    ///
+    /// NO BUTTON ON THAT ROW. `admin::send` refuses a spent code (INVITE_SPENT)
+    /// because a second code for somebody who already has a mailbox is a tenant
+    /// nobody approved, so offering the press was offering a guaranteed
+    /// refusal, and pressing it was the only way to discover they had signed up.
+    #[tokio::test]
+    async fn a_spent_invite_says_which_mailbox_it_became_and_offers_no_button() {
+        let html = document_of(admin_page(
+            &[],
+            &[accepted_row(1, "ada@example.com", "ada")],
+            None,
+        ))
+        .await;
+        assert!(html.contains(r#"<span class="done">signed up</span>"#), "{html}");
+        assert!(html.contains("<code>ada</code>"), "{html}");
+        assert!(html.contains("1 of those signed up"), "{html}");
+        // The whole point: no press, and nothing that could mint a second code.
+        assert!(!html.contains("Re-send"), "{html}");
+        assert!(!html.contains("/admin/send"), "{html}");
+
+        // An outstanding invite is unchanged: still offered, still quiet.
+        let waiting_on_them =
+            document_of(admin_page(&[], &[row(1, "ada@example.com", true)], None)).await;
+        assert!(waiting_on_them.contains("Re-send"), "{waiting_on_them}");
+        assert!(
+            !waiting_on_them.contains("signed up</span>"),
+            "{waiting_on_them}"
+        );
+        assert!(
+            waiting_on_them.contains("0 of those signed up"),
+            "{waiting_on_them}"
+        );
+    }
+
+    /// A DELIBERATE SIGN OUT IS NOT A REFUSAL. The session runs for a month
+    /// now, so ending one on a borrowed machine had to become a press rather
+    /// than a trip to Railway to rotate the token; and the page that press lands
+    /// on answers 200, because the request did exactly what was asked. The
+    /// expired-session door is the 401, and still says so.
+    #[tokio::test]
+    async fn signing_out_is_a_200_and_being_thrown_out_is_a_401() {
+        let out = admin_signed_out();
+        assert_eq!(out.status(), StatusCode::OK);
+        let html = document_of(out).await;
+        assert!(html.contains("Signed out."), "{html}");
+        // The door, not a dead end: the way back in is on it.
+        assert!(html.contains(r#"action="/admin/login""#), "{html}");
+        // Not dressed as a refusal.
+        assert!(!html.contains(r#"class="stop""#), "{html}");
+
+        assert_eq!(
+            admin_login(Some("Your admin session has ended.")).status(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(admin_login(None).status(), StatusCode::OK);
+    }
+
+    /// The exit is ON the board, and it is a form, because a link cannot carry
+    /// the same-origin POST every other admin action on this page is held to.
+    #[tokio::test]
+    async fn the_board_carries_the_way_out() {
+        let html = document_of(admin_page(&[], &[], None)).await;
+        assert!(html.contains(r#"action="/admin/logout""#), "{html}");
+        assert!(html.contains("Sign out"), "{html}");
+        // The page states its own lifetime rather than leaving the operator to
+        // discover it by being signed out.
+        assert!(html.contains("This session lasts 30 days"), "{html}");
     }
 
     /// The door names nothing that is behind it, and a refusal is a 401 rather

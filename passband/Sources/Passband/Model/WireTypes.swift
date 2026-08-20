@@ -198,6 +198,12 @@ struct Attachment: Codable, Sendable, Identifiable, Hashable {
     var mime: String
     var size: Int
     var downloadable: Bool
+    /// The part's Content-ID with its angle brackets already off, which is what
+    /// a body's `<img src="cid:…">` names — see CidImages. ABSENT on a daemon
+    /// that predates the field and null for a part that declared none, so it
+    /// stays optional: the client's answer to both is the same, which is to drop
+    /// the reference rather than paint a broken image.
+    var content_id: String?
 }
 
 /// core::types::ClientMessage — the HUMAN-door message shape. `html` is a
@@ -726,6 +732,14 @@ struct LabelBody: Codable, Sendable {
 
 struct SendBody: Codable, Sendable {
     var reply_to_message_id: Int?
+    /// The message being PASSED ON, and the whole of a forward on this wire:
+    /// the daemon quotes the original, carries its attachments over and starts
+    /// a NEW thread from it. MUTUALLY EXCLUSIVE with `reply_to_message_id` —
+    /// the daemon rejects a body naming both — and it requires a non-empty
+    /// `to`, because a forward has nobody to derive a recipient from. An empty
+    /// `body` is fine here and only here: passing mail on without a word of
+    /// your own is the ordinary case.
+    var forward_of_message_id: Int?
     var to: String?
     /// Omitted (not "") on a reply: the daemon derives `Re: <parent subject>`
     /// only when the field is absent — `Some("")` is an explicit empty subject.

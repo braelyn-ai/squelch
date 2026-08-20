@@ -441,7 +441,7 @@ async fn the_admin_page_opens_only_to_the_token() {
     let (status, _, body) = h.get("/admin", Some(&cookie)).await;
     assert_eq!(status, StatusCode::OK);
     assert!(body.contains(APPLICANT), "{body}");
-    assert!(body.contains("Approve and email invite"), "{body}");
+    assert!(body.contains(">Approve</button>"), "{body}");
 }
 
 /// An address that is an injection attempt is rendered as text, on the one page
@@ -574,7 +574,7 @@ async fn a_failed_send_leaves_a_row_the_operator_can_repair() {
 
     let (_, _, page) = h.get("/admin", Some(&cookie)).await;
     assert!(page.contains("email not sent"), "{page}");
-    assert!(page.contains("Send new invite"), "{page}");
+    assert!(page.contains("Send invite"), "{page}");
 
     // The repair: the code nobody received is revoked, and a new one is minted
     // in its place. Two live invites for one approval would be one mailbox more
@@ -917,7 +917,7 @@ async fn an_address_that_never_joined_can_be_invited_directly() {
     // And the row is on the page with the same button as everybody else.
     let (_, _, page) = h.get("/admin", Some(&cookie)).await;
     assert!(page.contains("grace@example.com"), "{page}");
-    assert!(page.contains("Send fresh invite"), "{page}");
+    assert!(page.contains("Re-send"), "{page}");
 }
 
 /// Typing an address that is already waiting APPROVES that row rather than

@@ -45,6 +45,10 @@ struct ComposePane: View {
                 header(compose)
 
                 VStack(alignment: .leading, spacing: 12) {
+                    // ABOVE the phase branch, so it is stated in both — and once
+                    // rather than twice, because the sentence must not drift
+                    // between what the editor promises and what review confirms.
+                    forwardChrome(compose)
                     if inReview {
                         reviewPane(compose)
                     } else {
@@ -94,7 +98,7 @@ struct ComposePane: View {
                     .font(Typo.serif(24, weight: .medium))
                     .foregroundStyle(Palette.ink)
             #endif
-            Text(compose.replyToMessageId != nil ? "reply" : "new message")
+            Text(kindLabel(compose))
                 .font(Typo.micro)
                 .foregroundStyle(Palette.inkFaintest)
             Spacer()
@@ -110,6 +114,45 @@ struct ComposePane: View {
         .padding(.horizontal, 18)
         .padding(.vertical, 13)
         .overlay(alignment: .bottom) { Hairline() }
+    }
+
+    /// Which of the three this composer is, in the header's lowercase voice.
+    private func kindLabel(_ compose: ComposeState) -> String {
+        if compose.forwardOfMessageId != nil { return "forward" }
+        return compose.replyToMessageId != nil ? "reply" : "new message"
+    }
+
+    /// WHAT RIDES ALONG on a forward, in both phases.
+    ///
+    /// The quoted original and its files are assembled by the daemon and never
+    /// appear in the body box, so without this line the composer is an empty
+    /// new message that inexplicably sends a fat email — and review, whose
+    /// whole job is to promise what goes out, would be promising half of it.
+    /// Nothing here is on the wire; it is `ComposeState`'s display pair.
+    @ViewBuilder
+    private func forwardChrome(_ compose: ComposeState) -> some View {
+        if compose.forwardOfMessageId != nil {
+            Text(forwardChromeText(compose))
+                .font(Typo.micro)
+                .foregroundStyle(Palette.inkFaint)
+                .lineLimit(2)
+                // A long subject wraps instead of pushing the pane wider.
+                .fixedSize(horizontal: false, vertical: true)
+                .frame(maxWidth: .infinity, alignment: .leading)
+        }
+    }
+
+    /// The chrome's sentence. A stranger's subject line, rendered as Text and
+    /// never as markup — the same rule every sender-supplied string here keeps.
+    private func forwardChromeText(_ compose: ComposeState) -> String {
+        let subject = compose.forwardedSubject?.trimmed ?? ""
+        var line = "forwarding: " + (subject.isEmpty ? "(no subject)" : subject)
+        let files = compose.forwardedAttachmentCount
+        // Only when there are some: a line saying "0 attachments" on every
+        // ordinary forward is a line nobody reads, the same reason the review's
+        // tracking row only appears when the pixel is armed.
+        if files > 0 { line += " · \(files) attachment\(files == 1 ? "" : "s")" }
+        return line
     }
 
     private func footer(_ compose: ComposeState) -> some View {
@@ -370,7 +413,15 @@ struct ComposePane: View {
         guard let compose = store.compose else { return }
         // Untouched covers the seeded signature: a signature under nothing is
         // not a message, and review must not put it one Enter from going out.
-        guard !Prefs.shared.isBodyUntouched(compose.body) else {
+        //
+        // A FORWARD IS EXEMPT, and has to be: its content is the original the
+        // daemon quotes underneath, so "here, look at this" with nothing typed
+        // above it is the ordinary case rather than an empty message. The wire
+        // agrees — `forward_of_message_id` is the one shape that accepts an
+        // empty body — and refusing it here would make the bare forward, which
+        // is most of them, unsendable.
+        guard compose.forwardOfMessageId != nil || !Prefs.shared.isBodyUntouched(compose.body)
+        else {
             patch { $0.error = "body is empty" }
             return
         }

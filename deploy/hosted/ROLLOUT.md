@@ -226,10 +226,69 @@ copy of the manifest.)
 | `still behind: N more`, N not falling across runs | 3 | **Stall.** The same tenant is first in the queue every tick and its apply is refused, so nothing behind it moves. | `kubectl -n warden logs job/<name>` for the machine reason (`volume_failed`, `service_failed`, `workload_failed`…). Usually a config value the API server will not accept — often not the one you meant to change. Suspend, revert it, restart the warden, unsuspend. |
 | `HALTED before applying anything` | **4** | **Casualty — the fleet is FROZEN.** A tenant carries the new render and is not serving it, so the render is the suspect. Nothing was applied to anyone, and nothing will converge on any tick until this is dealt with. | Suspend immediately. Look at that pod. This is the roller telling you the release is bad, and it is the one exit code that should page. |
 | `HALTED on <label>` | 1 | That tenant's rollout did not finish. It is the only one written to, and it goes back on the queue. | `kubectl -n tenants logs deploy/<label>` and `describe pod -l app.kubernetes.io/instance=<label>`. |
-| `DOWN (no workload, and nothing recorded a cancellation)` | 1 | A job nobody finished left a mailbox with no pod. The roller will not repair one unattended. | `squelch-control reconcile <label>`. |
+| `DOWN (no workload, and nothing recorded a cancellation)` | 1 | A job nobody finished left a mailbox with no pod. Most often a `reconcile` the CLI hung up on between the delete and the apply. The roller will not repair one unattended. | `squelch-control reconcile <label>`, and read "A reconcile can outrun the CLI" below first. |
 | `needs a person (a workload whose sealed credential Secret is gone…)` | 1 | That tenant cannot be rendered at all, so no run will ever converge it. The walk continues past it rather than halting, but the fleet is not converged while it is there. | The credential is unrecoverable from here: the owner re-consents, and `PUT /v1/tenants/<label>/credentials` puts them back. |
 | `needs a person (another field manager…)` | 2 | Somebody's `kubectl` owns part of that Deployment. It is out of every roll until repaired. | `squelch-control drift <label>`, then `reconcile <label>` when you can afford that mailbox to blip. |
 | Nothing at all in the log, one sentence | 1 | It never started: a refused config value, or an API server it could not reach. | Check `15-warden-config.yaml` against `squelch-warden/README.md`'s env table. |
+
+### A reconcile can outrun the CLI
+
+`squelch-control reconcile <label>` waits for the warden to finish, and on the
+delete-recreate path finishing takes minutes: delete the Deployment, wait for the
+old pod to let go of the `ReadWriteOnce` volume, apply five objects, wait for a
+ready replica. Both waits are bounded by `SQUELCH_WARDEN_READY_TIMEOUT_SECS`,
+180 seconds each by default, so the honest ceiling is around six minutes.
+
+**Hanging up on it does not just lose the answer, it stops the work.** The
+warden's reconcile lives in the request handler: when the client gives up,
+reqwest drops the connection, axum drops the handler future, and the warden stops
+wherever it had got to. If that is between the delete and the apply, the mailbox
+is down and nothing is coming to recreate it. That is not a hypothetical: on
+2026-08-19 it took one tenant down for eight minutes, and the roller's next tick
+reporting it as `DOWN` is how anyone found out.
+
+So: **the CLI's answer is not the record of what happened. The warden's log is.**
+Two different failures, two different messages, and they mean opposite things:
+
+- `did not answer in time and may still be working` — the call landed. The
+  warden may be mid-operation right now. **Do not retry blind.** Read the log
+  first, then look at the object:
+
+  ```sh
+  kubectl -n warden logs deploy/squelch-warden | grep -E 'tenant=<label>($| )'
+  kubectl -n tenants get deploy <label>     # NotFound means it stopped mid-recreate
+  ```
+
+  The `($| )` is not decoration and a trailing space will not do instead. See
+  PRODUCTION.md, "Shipping a tenant-shape change", for the two ways the obvious
+  greps are wrong.
+
+  Once the old pod is gone, running the same `reconcile` again resumes rather
+  than refusing (see PRODUCTION.md, "A reconcile that died in its own
+  delete/apply window").
+- `could not be reached` — connection refused, DNS, TLS. The call never landed
+  and nothing was started. Fix the reachability and run it again.
+
+The CLI now allows **ten minutes** for `reconcile` alone (`RECONCILE_TIMEOUT` in
+`squelch-control/src/config.rs`; every other call, `drift` included, keeps 30
+seconds). That covers the default warden with room to spare. **If you ever raise
+`SQUELCH_WARDEN_READY_TIMEOUT_SECS` above 300, raise that constant with it** —
+`control` cannot see the warden's configuration, so nothing enforces the pair and
+the symptom is this incident again.
+
+To run one past the CLI's budget entirely, call the warden yourself with a
+timeout you choose:
+
+```sh
+TOKEN=$(kubectl -n warden get secret squelch-warden -o jsonpath='{.data.token}' | base64 -d)
+WARDEN_URL=https://warden.passband.app
+curl -sS -X POST -m 600 -H "Authorization: Bearer $TOKEN" \
+  "$WARDEN_URL/v1/tenants/<label>/reconcile"
+```
+
+`-m` is a hang-up like any other, so it buys a longer window and not a safer one.
+Pick a number you are willing to wait out, and if it does expire, go read the log
+rather than pressing up-enter.
 
 ### Rolling back
 
@@ -252,7 +311,9 @@ rollback has fewer tenants to undo than you would fear.
    anyone does to a sick mailbox — record that person as an owner of those
    fields, and the roller refuses to touch a Deployment it does not solely own.
    Undoing the edit does not help: the ownership tombstone survives. Only
-   `squelch-control reconcile <label>` clears it.
+   `squelch-control reconcile <label>` clears it, and that is the command that
+   deletes and recreates the Deployment — read "A reconcile can outrun the CLI"
+   above before you run it, because interrupting it leaves the mailbox down.
 2. **One sick mailbox freezes the whole fleet.** The casualty rule stops the run
    before it writes anything — not just that tenant, everything.
 3. **`imagePullPolicy: IfNotPresent` plus a moved tag means no pull.** Roll

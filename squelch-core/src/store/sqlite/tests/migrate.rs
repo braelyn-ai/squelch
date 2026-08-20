@@ -820,3 +820,40 @@ fn migrate_adds_reminder_columns_and_the_due_index_to_preexisting_triage() {
     assert_eq!(remind, None);
     assert_eq!(reminded, None);
 }
+
+#[test]
+fn migrate_adds_content_id_null_to_a_preexisting_attachments_table() {
+    // An install predating the cid column. The migration adds it, and every
+    // already-synced attachment rests at NULL: the Content-ID only exists in the
+    // RFC822, which the store never kept, so there is nothing to backfill from
+    // and those inline images stay tiles until a re-sync re-ingests the mail.
+    let conn = Connection::open_in_memory().unwrap();
+    conn.execute_batch(
+        "CREATE TABLE attachments(
+             id INTEGER PRIMARY KEY, account_id INTEGER NOT NULL,
+             message_id INTEGER NOT NULL, filename TEXT NOT NULL,
+             mime TEXT NOT NULL, size_bytes INTEGER NOT NULL, data BLOB,
+             UNIQUE(account_id, message_id, filename, size_bytes));
+         INSERT INTO attachments(id, account_id, message_id, filename, mime, size_bytes, data)
+             VALUES (1, 1, 1, 'logo.png', 'image/png', 3, x'616263');",
+    )
+    .unwrap();
+    migrate(&conn).unwrap();
+    migrate(&conn).unwrap(); // idempotent
+    let mut stmt = conn.prepare("PRAGMA table_info(attachments)").unwrap();
+    let cols: Vec<String> = stmt
+        .query_map([], |r| r.get::<_, String>(1))
+        .unwrap()
+        .collect::<std::result::Result<_, _>>()
+        .unwrap();
+    assert!(cols.iter().any(|c| c == "content_id"));
+    let existing: Option<String> = conn
+        .query_row("SELECT content_id FROM attachments WHERE id=1", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(
+        existing, None,
+        "pre-existing attachments are not backfilled"
+    );
+}

@@ -57,10 +57,26 @@ pub const COOKIE_TTL_SECS: i64 = 10 * 60;
 /// browser that holds both must be able to lose one without losing the other.
 pub const ADMIN_COOKIE_NAME: &str = "passband_admin";
 
-/// How long one admin sign-in lasts. A working day: long enough that an
-/// operator working through a morning's waitlist signs in once, short enough
-/// that a laptop left open somewhere is not an admin session next week.
-pub const ADMIN_COOKIE_TTL_SECS: i64 = 12 * 60 * 60;
+/// How long one admin sign-in lasts. THIRTY DAYS.
+///
+/// It was twelve hours, on the reasoning that a working day is long enough to
+/// get through a morning's waitlist and short enough that a laptop left open is
+/// not an admin session next week. The first half was wrong about how this page
+/// is actually used: approving a waitlist is a minute of work a few times a
+/// week, not a morning of it, so twelve hours meant the operator fetched the
+/// token out of Railway nearly every visit. A credential that has to be looked
+/// up that often is a credential that ends up somewhere convenient, which is a
+/// worse outcome than a long session.
+///
+/// The expiry was never the real kill switch and is not being asked to be one
+/// now. Rotating `SQUELCH_CONTROL_ADMIN_TOKEN` still ends every session on the
+/// next request, because [`AdminClaim::tfp`] pins each cookie to the token that
+/// opened it, and that is instant rather than a wait of any length. The cookie
+/// is `HttpOnly`, `SameSite=Strict`, and `Secure` off a plain-http origin, so
+/// what a longer window widens is one case: a browser somebody else gets their
+/// hands on. [`crate::admin::logout`] is the answer to that one, and it exists
+/// because this constant grew.
+pub const ADMIN_COOKIE_TTL_SECS: i64 = 30 * 24 * 60 * 60;
 
 /// The `aud` every admin claim carries and no other claim in this crate does.
 /// The marker is what makes the two claim types different DOCUMENTS under one
@@ -132,9 +148,10 @@ pub struct AdminClaim {
     pub aud: String,
     /// Which admin token opened this session, as [`token_fingerprint`]. It is
     /// what makes rotating `SQUELCH_CONTROL_ADMIN_TOKEN` a kill switch: without
-    /// it, a cookie minted under a leaked token keeps working for its full
-    /// twelve hours and the only remedy is rotating the cookie key, which
-    /// signs out every signup in flight too.
+    /// it, a cookie minted under a leaked token keeps working for the whole of
+    /// [`ADMIN_COOKIE_TTL_SECS`] and the only remedy is rotating the cookie key,
+    /// which signs out every signup in flight too. That mattered when the window
+    /// was twelve hours and it matters thirty times more now.
     pub tfp: String,
     /// Issued-at, unix seconds. The TTL is enforced on the server, so this is
     /// signed rather than trusted.
@@ -490,7 +507,7 @@ mod tests {
 
     /// ROTATING THE TOKEN IS THE KILL SWITCH. An operator who thinks the admin
     /// token leaked changes it, and every cookie minted under the old one stops
-    /// working on the next request rather than lasting out its twelve hours.
+    /// working on the next request rather than lasting out its month.
     /// The alternative kill switch, rotating the cookie key, would also sign out
     /// every signup in flight.
     #[test]
@@ -560,7 +577,7 @@ mod tests {
             None
         );
 
-        // Twelve hours and a second is a sign-in that has to happen again.
+        // One second past the window is a sign-in that has to happen again.
         assert_eq!(
             verify_admin(KEY, TOKEN, &v, c.iat + ADMIN_COOKIE_TTL_SECS + 1),
             None
