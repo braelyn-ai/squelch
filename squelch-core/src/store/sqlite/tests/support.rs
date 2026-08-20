@@ -70,6 +70,7 @@ pub(super) fn triaged(account_id: AccountId, gmail: &str, thread: &str) -> Triag
             body_html: None,
             is_sent: false,
             to_addrs: None,
+            cc_addrs: None,
             list_unsubscribe: None,
             list_unsub_one_click: false,
             auth_pass: None,
@@ -125,9 +126,13 @@ impl TriagedBuilder {
         self.msg.is_sent = is_sent;
         self
     }
-    /// Sent mail's display recipients, as the ingest path renders them.
+    /// Display recipients, as the ingest path renders them.
     pub(super) fn to_addrs(mut self, to: &str) -> Self {
         self.msg.to_addrs = Some(to.to_string());
+        self
+    }
+    pub(super) fn cc_addrs(mut self, cc: &str) -> Self {
+        self.msg.cc_addrs = Some(cc.to_string());
         self
     }
     pub(super) fn list_unsubscribe(mut self, header: &str, one_click: bool) -> Self {

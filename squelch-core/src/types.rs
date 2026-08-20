@@ -226,6 +226,15 @@ pub struct ClientMessage {
     pub from_addr: String,
     pub from_name: Option<String>,
     pub received_at: DateTime<Utc>,
+    /// Display recipients of THIS message, as stored (`to_addrs`/`cc_addrs`:
+    /// comma-joined `Name <addr>` entries the client splits on unquoted
+    /// commas). Absent on rows ingested before the columns existed — the
+    /// reader simply shows no recipients line there — and `None` never
+    /// serializes, keeping old clients' decoders calm.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub to_addrs: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cc_addrs: Option<String>,
     pub content: String,
     /// Sanitized HTML body; served ONLY here (GET /client/thread/{id}).
     pub html: Option<String>,
@@ -545,12 +554,15 @@ pub struct NewMessage {
     /// door serves flattened `body` text (see docs/SECURITY.md).
     pub body_html: Option<String>,
     pub is_sent: bool,
-    /// Display recipients (To + Cc) of SENT mail, comma-joined `Name <addr>`
-    /// (bare addr when the header carried no display name). `None` for received
-    /// mail, and `None` from any caller that did not parse the headers — the
+    /// Display recipients from the To header, comma-joined `Name <addr>` (bare
+    /// addr when the header carried no display name), collected for BOTH
+    /// directions. `None` from any caller that did not parse the headers — the
     /// upsert treats `None` as "no opinion" and keeps whatever is stored, so a
     /// re-fetch can fill a row in without a later one blanking it.
     pub to_addrs: Option<String>,
+    /// Same, for the Cc header. The pair used to be one merged sent-only
+    /// string in `to_addrs`; old rows still hold that shape.
+    pub cc_addrs: Option<String>,
     /// Raw `List-Unsubscribe` header value (comma-separated `<mailto:…>` /
     /// `<https:…>` entries). Consumed ONLY by the human door's unsubscribe
     /// endpoint; never crosses /mcp.
@@ -743,6 +755,8 @@ mod tests {
                     from_addr: "a@b.com".into(),
                     from_name: None,
                     received_at: Utc::now(),
+                    to_addrs: None,
+                    cc_addrs: None,
                     content: "text".into(),
                     html: Some("<p>hi</p>".into()),
                     attachments: vec![
@@ -774,6 +788,8 @@ mod tests {
                     from_addr: "a@b.com".into(),
                     from_name: None,
                     received_at: Utc::now(),
+                    to_addrs: None,
+                    cc_addrs: None,
                     content: "plain".into(),
                     html: None,
                     attachments: vec![],

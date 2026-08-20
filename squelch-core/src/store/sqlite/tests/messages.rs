@@ -741,6 +741,59 @@ fn sent_listing_shows_only_sent_mail_newest_first_with_recipients_and_opens() {
 }
 
 #[test]
+fn thread_view_carries_to_and_cc() {
+    let (store, acct) = store();
+    triaged(acct, "g-rcpt", "t-rcpt")
+        .to_addrs("Alice <alice@friends.com>, bob@friends.com")
+        .cc_addrs("Carol <carol@friends.com>")
+        .seed(&store);
+    // A row from before the columns existed serves None — the reader shows no
+    // recipients line there, rather than an empty one.
+    triaged(acct, "g-old", "t-old").seed(&store);
+
+    let view = store.thread_view_with_html(acct, "t-rcpt").unwrap();
+    assert_eq!(
+        view.messages[0].to_addrs.as_deref(),
+        Some("Alice <alice@friends.com>, bob@friends.com")
+    );
+    assert_eq!(
+        view.messages[0].cc_addrs.as_deref(),
+        Some("Carol <carol@friends.com>")
+    );
+
+    let old = store.thread_view_with_html(acct, "t-old").unwrap();
+    assert_eq!(old.messages[0].to_addrs, None);
+    assert_eq!(old.messages[0].cc_addrs, None);
+}
+
+#[test]
+fn sent_listing_joins_split_to_and_cc_into_one_display_string() {
+    let (store, acct) = store();
+    let t0 = Utc::now();
+    // A new-generation row stores To and Cc split; the listing joins them with
+    // ", " — exactly the merged string old rows already hold, so the page
+    // reads the same across both generations.
+    triaged(acct, "s-split", "t-split")
+        .is_sent(true)
+        .to_addrs("Alice <alice@friends.com>")
+        .cc_addrs("Bob <bob@friends.com>")
+        .subject("Re: Lunch?")
+        .received_at(t0)
+        .seed(&store);
+    // Cc with no To (a bcc-style send) must not grow a stray leading comma.
+    triaged(acct, "s-cconly", "t-cconly")
+        .is_sent(true)
+        .cc_addrs("Carol <carol@friends.com>")
+        .subject("Re: Lunch?")
+        .received_at(t0 - chrono::Duration::hours(1))
+        .seed(&store);
+
+    let rows = store.sent_listing(acct, 50, 0).unwrap();
+    assert_eq!(rows[0].to, "Alice <alice@friends.com>, Bob <bob@friends.com>");
+    assert_eq!(rows[1].to, "Carol <carol@friends.com>");
+}
+
+#[test]
 fn sent_listing_fails_closed_on_sealed_and_untriaged_rows() {
     let (store, acct) = store();
     let now = Utc::now();

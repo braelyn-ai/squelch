@@ -558,6 +558,7 @@ mod tests {
             body_html: None,
             is_sent: false,
             to_addrs: None,
+            cc_addrs: None,
             list_unsubscribe: None,
             list_unsub_one_click: false,
             auth_pass: None,

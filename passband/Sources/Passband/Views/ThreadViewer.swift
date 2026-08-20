@@ -1248,6 +1248,22 @@ private struct MessageCard: View {
                     .foregroundStyle(Palette.inkFaintest)
             }
 
+            // WHO THIS COPY WENT TO — the full To and Cc lists, resolved to
+            // display names, wrapping as far as they need to: a fifteen-way
+            // thread's reader should not have to open Gmail to learn who else
+            // is on it. Aligned under the sender's name, addresses on hover.
+            // Absent entirely on mail synced before the daemon stored
+            // recipients, which renders exactly the old header.
+            if let line = recipientLine {
+                Text(line)
+                    .font(Typo.micro)
+                    .foregroundStyle(Palette.inkFaint)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .padding(.leading, 33)
+                    .padding(.top, -4)
+                    .help(recipientHelp)
+            }
+
             if let html = message.html, !html.isEmpty {
                 EmailWebView(
                     html: html, cacheKey: String(message.id),
@@ -1292,6 +1308,37 @@ private struct MessageCard: View {
         }
         .contentShape(Rectangle())
         .onTapGesture(perform: onSelect)
+    }
+
+    /// "to Alice, Bob · cc Carol" — display names only, because the addresses
+    /// live in the tooltip and a full address per recipient would wrap a wide
+    /// thread's header into a paragraph. nil when the wire carried no
+    /// recipients (old rows), which suppresses the line entirely.
+    private var recipientLine: String? {
+        let to = recipientNames(message.to_addrs)
+        let cc = recipientNames(message.cc_addrs)
+        guard !to.isEmpty || !cc.isEmpty else { return nil }
+        var parts: [String] = []
+        if !to.isEmpty { parts.append("to " + to.joined(separator: ", ")) }
+        if !cc.isEmpty { parts.append("cc " + cc.joined(separator: ", ")) }
+        return parts.joined(separator: "  ·  ")
+    }
+
+    /// The tooltip: the lists exactly as the headers spelled them, addresses
+    /// included — the line above resolves to bare names, and "which Alice" is
+    /// a fair question.
+    private var recipientHelp: String {
+        var parts: [String] = []
+        if let to = message.to_addrs, !to.isEmpty { parts.append("To: \(to)") }
+        if let cc = message.cc_addrs, !cc.isEmpty { parts.append("Cc: \(cc)") }
+        return parts.joined(separator: "\n")
+    }
+
+    /// Split one stored list (quote-aware — a display name may hold a comma)
+    /// and resolve each entry the same way every sender label resolves.
+    private func recipientNames(_ list: String?) -> [String] {
+        guard let list, !list.isEmpty else { return [] }
+        return SenderID.recipients(list).map { SenderCache.resolved($0).displayName }
     }
 
     /// The parts the BODY already shows, because a `cid:` reference in the html
