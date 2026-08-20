@@ -50,7 +50,12 @@ struct RemindPalette: View {
     @ViewBuilder
     private var surface: some View {
         #if os(macOS)
-            OverlayScrim(alignment: .top, topInset: 110, onDismiss: onClose) {
+            // Top-ANCHORED even though it sits near the middle: the list
+            // shrinks and grows as typing filters it, and a center-anchored
+            // card would breathe in both directions — the input line jumping
+            // under the cursor mid-word. The inset, not the anchor, is what
+            // puts it at the screen's visual center.
+            OverlayScrim(alignment: .top, topInset: 210, onDismiss: onClose) {
                 GlassEffectContainer(spacing: 8) {
                     palette
                         .frame(width: 560)
@@ -153,7 +158,7 @@ struct RemindPalette: View {
                 .padding(.horizontal, 8)
                 .padding(.vertical, 6)
             }
-            .frame(maxHeight: 300)
+            .frame(maxHeight: 230)
             .onChange(of: selection) { _, i in
                 guard let hit = hits[safe: i] else { return }
                 withAnimation(.easeOut(duration: 0.1)) { proxy.scrollTo(hit.id, anchor: .center) }
