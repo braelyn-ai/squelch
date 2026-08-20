@@ -437,6 +437,33 @@ response, a log, or the audit row.
 **kinds**; `override_guard: true` sends anyway and writes a `guard_override:<kinds>`
 audit row. False positives are acceptable precisely because it is overridable.
 
+**Forwards are scanned twice over.** Forwarding is the classic exfiltration shape —
+a clean note wrapped around someone else's secret — so `handlers::forward_send`
+scans the ORIGINAL as well as the note, unions the kinds and issues ONE 422 / one
+`guard_override` row for both. The scan runs on the raw bytes re-fetched from Gmail
+and about to be composed, never on the stored row: the stored body is a sanitized,
+flattened memory of the message and the bytes on the wire are the original.
+
+*Exactly what is scanned* on a forward: the sender's typed note, **and** the
+original's decoded text bodies — every part in mail-parser's `text_body` list, plus
+an html-to-text conversion of its `html_body` view. Both views are needed because
+when a `text/plain` part exists mail-parser never converts the html alternative down,
+so an alternative whose text half is innocuous and whose html half carries the key
+would otherwise ship unread. Two known limits, stated rather than implied: **attachment
+bytes are not scanned** (a key in an attached `id_rsa` passes), and **html attribute
+values are not scanned** (the converter yields visible text, so a secret inside an
+`href` or a `data-` attribute survives). The guard is a seatbelt against the accident,
+not a DLP boundary against a determined sender — it is overridable by design.
+
+**Forwarded HTML goes out verbatim, trackers included.** The original's markup is
+embedded as it arrived (the only edit is stripping `<meta charset=…>` tags that would
+contradict the part's own `charset="UTF-8"`), which means the ORIGINAL sender's
+tracking pixels are re-armed and will fire toward whoever the forward is addressed to.
+This is deliberate and matches every mainstream mail client: passband strips trackers
+out of what it RENDERS to its user, not out of what its user chooses to pass on.
+Rewriting a stranger's markup on the way out would forward something other than what
+arrived, and the user's decision is to send *this message*.
+
 **Do not break.** `GuardMatch::kind()` is the only thing that may leave the process —
 never return, log, or audit the matched substring. Keep the override audited; an
 un-audited bypass is not a bypass we can reason about.
@@ -446,9 +473,16 @@ un-audited bypass is not a bypass we can reason about.
 ingests it locally so the thread shows the reply immediately. It is strictly
 best-effort — the mail has already left, so nothing here may fail the request — and
 audits under its own action `send.echo`, alongside the `send` row's own outcomes
-(`rejected:confirm`, `rejected:empty_body`, `blocked:guard`, `guard_override:<kinds>`,
-`rejected:no_write_credential`, `failed:target`, `rejected:no_recipient`,
-`rejected:compose`, `failed:gmail`, `ok`):
+(`rejected:confirm`, `rejected:forward_and_reply`, `rejected:empty_body` — skipped for
+a forward, whose note may legitimately be empty — `blocked:guard`,
+`guard_override:<kinds>`, `rejected:no_write_credential` (including the forward whose
+raw fetch found the write credential dead — a 403 telling the user to re-run
+`squelchd auth --write`, never the 502 that would blame Gmail), `failed:target`,
+`rejected:no_recipient`, `rejected:too_large` (the original exceeds
+`MAX_FORWARD_RAW_BYTES` = 20 MiB decoded, refused with a 413 before the four-to-five-x
+re-encode allocates), `failed:fetch_original` (the forwarded original could not be
+read back, so nothing was sent), `rejected:compose`, `failed:gmail`, `ok`,
+`ok:forward`):
 
 | `send.echo` detail | meaning |
 | --- | --- |

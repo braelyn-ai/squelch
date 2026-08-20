@@ -5,6 +5,10 @@
 //! from a read path. Tokens, auth headers and bodies are NEVER logged.
 
 use base64::Engine as _;
+// The per-part MIME accessors a forward reads (`content_id`,
+// `content_disposition`, `attachment_name`, ...) hang off a trait; imported
+// anonymously because nothing here names the trait itself.
+use mail_parser::MimeHeaders as _;
 use serde_json::{Value, json};
 
 use squelch_core::credentials::CredentialStore;
@@ -135,19 +139,66 @@ fn html_alternative(parts: &ReplyParts) -> Option<String> {
     Some(format!("<html><body>\n{inner}{pixel}</body></html>\n"))
 }
 
-/// A multipart boundary none of the parts contain. Deterministic: a fixed
-/// distinctive prefix, and if a part actually contains it (someone typed it),
-/// bump the suffix until none does — content can imitate any single boundary,
-/// but not every member of an unbounded family.
-fn multipart_boundary(parts: &[&str]) -> String {
-    let mut n = 0u32;
-    loop {
-        let boundary = format!("=_passband_alt_{n}");
+/// Boundary prefixes, one per nesting level. THE TWO MUST DIFFER: a forward
+/// nests multipart/alternative inside multipart/mixed, and a shared prefix would
+/// let the inner level's delimiter close the outer one.
+const BOUNDARY_ALT: &str = "=_passband_alt_";
+const BOUNDARY_MIX: &str = "=_passband_mix_";
+
+/// How far the sequential bump below is allowed to walk. THE PROBED PARTS ARE
+/// ATTACKER-AUTHORED — a forward carries a stranger's message body and their
+/// base64'd attachments — so an unbounded walk is an unbounded full-body scan
+/// per step: mail stuffed with `=_passband_alt_0` through `=_passband_alt_99999`
+/// would pin a tokio worker for a hundred thousand of them. Honest content needs
+/// zero bumps and a genuine accident needs one; sixteen is already absurd, and
+/// past it the search stops walking and changes shape instead.
+const BOUNDARY_BUMP_LIMIT: u32 = 16;
+
+/// A boundary with `prefix` that none of `parts` contain. Deterministic: the
+/// fixed distinctive prefix, and if a part actually contains it (someone typed
+/// it), bump the suffix until none does — content can imitate any single
+/// boundary, but not every member of an unbounded family.
+///
+/// The bump is CAPPED (see [`BOUNDARY_BUMP_LIMIT`]). Past the cap the suffix is
+/// derived from the content itself: a hash of every probe part, hex, then the
+/// same verify-and-bump on top. That fallback is what makes the cap safe rather
+/// than a shorter fuse — to force even one bump there, a sender would have to
+/// embed the hex of the hash OF THEIR OWN BYTES inside those bytes, a fixpoint
+/// they would have to know the digest to write and writing it changes the
+/// digest. So the loop below runs once in practice, and the crafted case costs a
+/// bounded 17 scans instead of however many the attacker felt like typing.
+///
+/// NORMAL CONTENT IS UNTOUCHED: clean parts still take suffix `0` on the first
+/// try, so a reply's bytes are what they have always been.
+fn boundary_with_prefix(prefix: &str, parts: &[&str]) -> String {
+    for n in 0..BOUNDARY_BUMP_LIMIT {
+        let boundary = format!("{prefix}{n}");
         if parts.iter().all(|p| !p.contains(&boundary)) {
             return boundary;
         }
-        n += 1;
     }
+    // Not a security hash and it does not need to be: the property required is
+    // "the sender cannot predict this value", and SipHash over content they do
+    // not fully control (their bytes, the user's note, our framing) gives it.
+    use std::hash::{DefaultHasher, Hash, Hasher};
+    let mut hasher = DefaultHasher::new();
+    for p in parts {
+        p.hash(&mut hasher);
+    }
+    let digest = format!("{:016x}", hasher.finish());
+    let mut m = 0u32;
+    loop {
+        let boundary = format!("{prefix}{digest}_{m}");
+        if parts.iter().all(|p| !p.contains(&boundary)) {
+            return boundary;
+        }
+        m += 1;
+    }
+}
+
+/// The multipart/alternative boundary for a message whose parts are `parts`.
+fn multipart_boundary(parts: &[&str]) -> String {
+    boundary_with_prefix(BOUNDARY_ALT, parts)
 }
 
 /// Build a minimal RFC822 message from [`ReplyParts`], guarded against CRLF
@@ -238,9 +289,17 @@ pub fn send_request_body(raw: &[u8], thread_id: Option<&str>) -> (String, Value)
 }
 
 /// Compute the reply subject: prepend `Re: ` unless it is already present.
+///
+/// Sliced with `get` rather than `trimmed[..3]`: a byte-index slice PANICS when
+/// byte 3 lands mid-character, so replying to a subject that opens with an emoji
+/// ("🎉 party" — one 4-byte character) used to take the whole request down as a
+/// 500. `get` simply returns `None` there, which is also the right answer.
 pub fn reply_subject(original: &str) -> String {
     let trimmed = original.trim();
-    if trimmed.len() >= 3 && trimmed[..3].eq_ignore_ascii_case("re:") {
+    if trimmed
+        .get(..3)
+        .is_some_and(|p| p.eq_ignore_ascii_case("re:"))
+    {
         trimmed.to_string()
     } else {
         format!("Re: {trimmed}")
@@ -716,6 +775,545 @@ pub fn default_recipient(msg: &ActionMessageRef) -> String {
     msg.from_addr.clone()
 }
 
+// --- forwarding --------------------------------------------------------------
+//
+// A forward is NOT a reply: it starts a new conversation (no In-Reply-To, no
+// References, no threadId), it carries the original's body AND its attachments
+// back out, and its note may be empty — "here, look at this" is the whole point.
+// Everything below composes that message from the original's RAW RFC822 bytes,
+// because what is forwarded must be what was received, not what our store's
+// baked/sanitized copy remembers of it.
+
+/// Compute the forwarded subject: prepend `Fwd: ` unless it is already
+/// prefixed. `Fwd:` and `Fw:` both count (either case) — a forward of a forward
+/// must not stack prefixes, and the two spellings are the ones mail clients in
+/// the wild actually emit. Sliced with `get` because a subject can open with a
+/// multi-byte character and a byte-index slice would panic on it.
+///
+/// An untitled original yields a bare `Fwd:` with NO trailing space, which is
+/// what the Swift client's mirror of this function (`ComposeCopy.forwardSubject`)
+/// puts in the composer — the two must agree or the subject visibly changes
+/// between what was previewed and what was sent.
+pub fn forward_subject(original: &str) -> String {
+    let trimmed = original.trim();
+    if trimmed.is_empty() {
+        return "Fwd:".to_string();
+    }
+    let prefixed = trimmed
+        .get(..4)
+        .is_some_and(|p| p.eq_ignore_ascii_case("fwd:"))
+        || trimmed
+            .get(..3)
+            .is_some_and(|p| p.eq_ignore_ascii_case("fw:"));
+    if prefixed {
+        trimmed.to_string()
+    } else {
+        format!("Fwd: {trimmed}")
+    }
+}
+
+/// One part of the original that rides along on the forward: a real attachment,
+/// or an inline part the html references by `cid:`.
+///
+/// `content_id` is the part's `Content-ID` token WITHOUT its angle brackets (the
+/// parser strips them; the builder writes them back), preserved otherwise
+/// VERBATIM — the html goes out unchanged, so every `cid:` reference in it
+/// resolves only if the token it names comes across untouched.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForwardAttachment {
+    pub filename: String,
+    pub mime: String,
+    pub content_id: Option<String>,
+    /// Emit as `Content-Disposition: inline` rather than `attachment`. Only ever
+    /// true for a part that also has a `Content-ID`: an inline part nothing can
+    /// reference is one the recipient would simply never see.
+    pub is_inline: bool,
+    /// The original part's `method` content-type parameter, if it had one. Carried
+    /// because a `text/calendar` part WITHOUT `method=REQUEST` is a file rather
+    /// than an invitation: the recipient's client stops offering Accept/Decline
+    /// and the forward loses the only thing the user was forwarding.
+    pub method: Option<String>,
+    pub data: Vec<u8>,
+}
+
+/// The original message a forward carries, decoded out of its raw RFC822 bytes.
+///
+/// The header fields are DISPLAY STRINGS destined for body text, never for
+/// headers of the outgoing message: nothing here is interpolated into a header
+/// line, so an attacker-authored `From` can shape the quoted block and nothing
+/// more (and even there, the builder strips CR/LF so it cannot forge a line).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ForwardedOriginal {
+    pub from: String,
+    pub date: String,
+    pub to: String,
+    pub subject: String,
+    /// The decoded text body, empty when the original had none.
+    pub text: String,
+    /// The decoded html body, if the original had one.
+    pub html: Option<String>,
+    pub attachments: Vec<ForwardAttachment>,
+}
+
+/// Render one address-list header as the display string a forwarded block
+/// quotes: `Name <addr>` per mailbox, comma-joined, dropping whichever half is
+/// missing. This is body text, not a header value — display names SURVIVE here,
+/// unlike [`parse_addr_list`], because nobody re-parses it as an address.
+fn address_display(addr: Option<&mail_parser::Address>) -> String {
+    let Some(addr) = addr else {
+        return String::new();
+    };
+    let mut out: Vec<String> = Vec::new();
+    for a in addr.iter() {
+        let name = a.name().map(str::trim).filter(|s| !s.is_empty());
+        let email = a.address().map(str::trim).filter(|s| !s.is_empty());
+        match (name, email) {
+            (Some(n), Some(e)) => out.push(format!("{n} <{e}>")),
+            (None, Some(e)) => out.push(e.to_string()),
+            (Some(n), None) => out.push(n.to_string()),
+            (None, None) => {}
+        }
+    }
+    out.join(", ")
+}
+
+/// Parse the original's raw RFC822 bytes into everything a forward needs.
+/// `None` only when the bytes are not a message at all — the caller answers that
+/// with a 502, because a forward that cannot read its original has nothing to
+/// send.
+///
+/// EVERY attachment part mail-parser yields is kept (real attachments and
+/// cid-inline parts alike): dropping one silently forwards less than the user
+/// reviewed. Only multipart containers, which carry no bytes of their own, are
+/// skipped.
+pub fn parse_forwarded_original(raw: &[u8]) -> Option<ForwardedOriginal> {
+    let msg = mail_parser::MessageParser::default().parse(raw)?;
+    let mut attachments = Vec::new();
+    for (i, part) in msg.attachments().enumerate() {
+        if part.is_multipart() {
+            continue;
+        }
+        let content_id = part
+            .content_id()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        // Inline is a claim about PLACEMENT, and placement is what the html's
+        // `cid:` reference expresses. Without one, the part is re-emitted as an
+        // ordinary attachment so it stays visible.
+        //
+        // AN ABSENT DISPOSITION READS AS INLINE, not as an attachment: the
+        // ordinary multipart/related shape (every templated newsletter on earth)
+        // carries `Content-ID` and no `Content-Disposition` header at all.
+        // Demanding an explicit `inline` there re-emitted six referenced images
+        // as `attachment; filename="attachment-N"` and dropped six extensionless
+        // files into the recipient's tray. A `Content-ID` is only ever written by
+        // something that means to be pointed at.
+        let is_inline = content_id.is_some()
+            && part
+                .content_disposition()
+                .is_none_or(mail_parser::ContentType::is_inline);
+        let filename = part
+            .attachment_name()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("attachment-{}", i + 1));
+        let mime = part
+            .content_type()
+            .map(|ct| match ct.subtype() {
+                Some(sub) => format!("{}/{}", ct.ctype(), sub),
+                None => ct.ctype().to_string(),
+            })
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "application/octet-stream".to_string());
+        // Attribute names come out of the parser lowercased, so the lookup is
+        // exact regardless of how the sender spelled the header.
+        let method = part
+            .content_type()
+            .and_then(|ct| ct.attribute("method"))
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        attachments.push(ForwardAttachment {
+            filename,
+            mime,
+            content_id,
+            is_inline,
+            method,
+            data: part.contents().to_vec(),
+        });
+    }
+    // EVERY body part, not only the first. mail-parser's `text_body`/`html_body`
+    // lists name ONE rendition per alternative and then every sibling body part
+    // after it, converting each into the view being asked for — so a
+    // multipart/mixed[alternative[text, html], text/plain "DISCLAIMER…"] yields
+    // two entries in each list: the alternative's matching half, and the
+    // disclaimer rendered into that view. Joining the whole list therefore
+    // carries the later parts across WITHOUT ever emitting both of the
+    // alternative's renditions of the same words. Reading index 0 alone dropped
+    // the disclaimer out of the forward silently, which is the one failure mode a
+    // disclaimer exists to prevent.
+    let text = (0..msg.text_body_count())
+        .filter_map(|i| msg.body_text(i).map(|c| c.into_owned()))
+        .collect::<Vec<String>>()
+        .join("\n\n");
+    let html_views: Vec<String> = (0..msg.html_body_count())
+        .filter_map(|i| msg.body_html(i).map(|c| c.into_owned()))
+        .collect();
+    Some(ForwardedOriginal {
+        from: address_display(msg.from()),
+        date: msg.date().map(|d| d.to_rfc822()).unwrap_or_default(),
+        to: address_display(msg.to()),
+        subject: msg.subject().unwrap_or_default().to_string(),
+        text,
+        html: (!html_views.is_empty()).then(|| html_views.join("\n")),
+        attachments,
+    })
+}
+
+/// Inputs for composing a forward.
+#[derive(Debug, Clone)]
+pub struct ForwardParts {
+    pub to: String,
+    pub subject: String,
+    /// The user's typed note. MAY BE EMPTY: an uncommented forward is a normal
+    /// thing to send, which is why the send path skips its empty-body rejection
+    /// for forwards.
+    pub note: String,
+    /// HTML alternative for `note`, rendered SERVER-SIDE from markdown (see
+    /// `markdown.rs`) — never caller-supplied, so the guard's scan of the note
+    /// covers it.
+    pub note_html: Option<String>,
+    /// Read-tracking pixel URL; the `<img>` rides in the html part only, exactly
+    /// as it does on a reply.
+    pub pixel_url: Option<String>,
+    pub original: ForwardedOriginal,
+}
+
+/// The `---------- Forwarded message ---------` header line every mail client
+/// writes, and every mail client's quote-collapser recognizes.
+const FORWARD_BANNER: &str = "---------- Forwarded message ---------";
+
+/// Drop CR and LF outright. Used on the original's header values before they are
+/// interpolated into the QUOTED BLOCK: they are body content, so a newline could
+/// not forge a real header, but it could forge extra lines inside the block and
+/// make the quote claim a sender or a date that was never there.
+fn strip_newlines(s: &str) -> String {
+    s.chars().filter(|c| *c != '\r' && *c != '\n').collect()
+}
+
+/// The text/plain part: the note, then the forwarded block, then the original's
+/// text. LF here; the caller CRLF-normalizes the whole part at the end.
+fn forward_text_part(parts: &ForwardParts) -> String {
+    let o = &parts.original;
+    let mut out = String::new();
+    if !parts.note.trim().is_empty() {
+        out.push_str(&parts.note);
+        out.push_str("\n\n");
+    }
+    out.push_str(FORWARD_BANNER);
+    out.push('\n');
+    out.push_str(&format!("From: {}\n", strip_newlines(&o.from)));
+    out.push_str(&format!("Date: {}\n", strip_newlines(&o.date)));
+    out.push_str(&format!("Subject: {}\n", strip_newlines(&o.subject)));
+    out.push_str(&format!("To: {}\n", strip_newlines(&o.to)));
+    out.push('\n');
+    out.push_str(&o.text);
+    out
+}
+
+/// Strip `<meta>` tags that DECLARE A CHARSET (`<meta charset=…>` and the
+/// `http-equiv="Content-Type"` spelling) out of html about to be embedded in a
+/// part whose own header says `charset="UTF-8"`.
+///
+/// This is the one edit made to the forwarded markup, and it is made because
+/// leaving the tag in place is a LIE: mail-parser hands us the body already
+/// transcoded to UTF-8, so an inherited `<meta charset="iso-8859-1">` describes
+/// bytes that no longer exist, and the clients that honor an embedded meta over
+/// the part header render correctly-transcoded text as mojibake. Only the
+/// contradicting tag is dropped; everything else in the document, meta tags
+/// included, survives byte for byte.
+fn strip_charset_meta(html: &str) -> String {
+    // ASCII-lowercasing is byte-length preserving and leaves multi-byte
+    // sequences alone, so offsets found in `lower` index `html` identically.
+    let lower = html.to_ascii_lowercase();
+    let mut out = String::with_capacity(html.len());
+    let mut cursor = 0usize;
+    while let Some(rel) = lower[cursor..].find("<meta") {
+        let start = cursor + rel;
+        // `<metadata>` is not `<meta>`: the tag name has to actually end here.
+        let is_meta = lower[start + 5..]
+            .chars()
+            .next()
+            .is_none_or(|c| c.is_whitespace() || c == '/' || c == '>');
+        // The tag runs to the first `>`; an unterminated one runs to the end of
+        // the document, and there is nothing after it to preserve.
+        let end = match lower[start..].find('>') {
+            Some(i) => start + i + 1,
+            None => html.len(),
+        };
+        out.push_str(&html[cursor..start]);
+        if !is_meta || !lower[start..end].contains("charset") {
+            out.push_str(&html[start..end]);
+        }
+        cursor = end;
+    }
+    out.push_str(&html[cursor..]);
+    out
+}
+
+/// The text/html part. A forward ALWAYS has one, tracking pixel or not: the
+/// original's html is the message, and a text-only forward would strip the
+/// formatting, the layout and every inline image out of what the user is
+/// passing on.
+///
+/// The original's html is embedded VERBATIM inside a wrapper div, save for the
+/// charset-declaring `<meta>` tags [`strip_charset_meta`] removes. It is the
+/// sender's markup on its way back out to a mail client, not into our reader —
+/// rewriting it here would forward something other than what arrived, and the
+/// receiving client sanitizes on render exactly as ours does.
+fn forward_html_part(parts: &ForwardParts) -> String {
+    let o = &parts.original;
+    let note = match parts.note_html.as_deref() {
+        Some(html) => html.to_string(),
+        None => paragraphs_html(&parts.note),
+    };
+    let original_html = match o.html.as_deref() {
+        Some(html) => strip_charset_meta(html),
+        None => paragraphs_html(&o.text),
+    };
+    let pixel = match parts.pixel_url.as_deref() {
+        Some(url) => format!(
+            "<img src=\"{}\" width=\"1\" height=\"1\" alt=\"\">\n",
+            escape_html(url)
+        ),
+        None => String::new(),
+    };
+    let mut out = String::new();
+    out.push_str("<html><body>\n");
+    out.push_str(&note);
+    out.push_str("<div class=\"passband_forward\">\n<hr>\n<p>");
+    out.push_str(FORWARD_BANNER);
+    out.push_str("<br>\n");
+    // Every quoted value goes through `escape_html`: the original's headers are
+    // attacker-authored text, and this block is the one place they become markup.
+    for (label, value) in [
+        ("From", &o.from),
+        ("Date", &o.date),
+        ("Subject", &o.subject),
+        ("To", &o.to),
+    ] {
+        out.push_str(&format!(
+            "<b>{label}:</b> {}<br>\n",
+            escape_html(&strip_newlines(value))
+        ));
+    }
+    out.push_str("</p>\n");
+    out.push_str(&original_html);
+    out.push_str("\n</div>\n");
+    out.push_str(&pixel);
+    out.push_str("</body></html>\n");
+    out
+}
+
+/// base64 for a message body: standard alphabet WITH padding, hard-wrapped at 76
+/// columns and CRLF-terminated, which is what RFC 2045 asks of a `base64`
+/// Content-Transfer-Encoding (and what every MTA in the path assumes).
+fn base64_body(data: &[u8]) -> String {
+    let encoded = base64::engine::general_purpose::STANDARD.encode(data);
+    let mut out = String::new();
+    for chunk in encoded.as_bytes().chunks(76) {
+        // Chunks of a base64 string are ASCII by construction.
+        out.push_str(std::str::from_utf8(chunk).unwrap_or_default());
+        out.push_str("\r\n");
+    }
+    out
+}
+
+/// A value on its way into a QUOTED header parameter (`filename="…"`). CR/LF
+/// would open a header line and the quote/backslash would close or escape the
+/// parameter, so all four are dropped rather than escaped — a mangled filename
+/// is cosmetic, a forged header is not.
+fn quoted_param(value: &str) -> String {
+    value
+        .chars()
+        .filter(|c| !matches!(c, '\r' | '\n' | '"' | '\\'))
+        .collect()
+}
+
+/// The stored mime reduced to the characters a `type/subtype` token may hold.
+/// Anything else (a `;` opening a parameter, a quote, CR/LF) is dropped, and a
+/// value with nothing left falls back to the universal default.
+fn mime_token(value: &str) -> String {
+    let cleaned: String = value
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '+' | '-' | '.' | '_'))
+        .collect();
+    if cleaned.is_empty() {
+        "application/octet-stream".to_string()
+    } else {
+        cleaned
+    }
+}
+
+/// A content-type PARAMETER value reduced to the characters an RFC 2045 `token`
+/// may hold, so it can be emitted unquoted and cannot end the parameter, open a
+/// new one, or start a header line. `None` when nothing survives — a parameter
+/// we cannot spell safely is one we simply do not write.
+fn param_token(value: &str) -> Option<String> {
+    let cleaned: String = value
+        .trim()
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '.' | '_' | '+'))
+        .collect();
+    (!cleaned.is_empty()).then_some(cleaned)
+}
+
+/// The `Content-ID` token, angle brackets stripped and structure characters
+/// removed. Everything else survives byte for byte: the token IS the name the
+/// html's `cid:` reference resolves against.
+fn content_id_token(value: &str) -> String {
+    value
+        .trim()
+        .trim_start_matches('<')
+        .trim_end_matches('>')
+        .chars()
+        .filter(|c| !c.is_control() && !c.is_whitespace() && !matches!(c, '<' | '>'))
+        .collect()
+}
+
+/// One attachment as a MIME part under `boundary`.
+fn attachment_part(boundary: &str, att: &ForwardAttachment, encoded: &str) -> String {
+    let filename = {
+        let f = quoted_param(&att.filename);
+        if f.trim().is_empty() {
+            "attachment".to_string()
+        } else {
+            f
+        }
+    };
+    let mime = mime_token(&att.mime);
+    let mut out = format!("--{boundary}\r\n");
+    out.push_str(&format!("Content-Type: {mime}; name=\"{filename}\""));
+    // A TEXT PART'S BYTES ARE UTF-8 BY THE TIME WE SEE THEM: mail-parser decodes
+    // each part out of its declared charset before handing it over, so re-emitting
+    // the header with no charset at all leaves the recipient's client guessing —
+    // and a latin-1 `notes.txt` guessed as latin-1 renders those UTF-8 bytes as
+    // mojibake. Say what the bytes now ARE, not what they arrived as.
+    if mime.starts_with("text/") {
+        out.push_str("; charset=\"utf-8\"");
+    }
+    // `method` is structural for text/calendar (see [`ForwardAttachment::method`]).
+    if let Some(method) = att.method.as_deref().and_then(param_token) {
+        out.push_str(&format!("; method={method}"));
+    }
+    out.push_str("\r\n");
+    out.push_str("Content-Transfer-Encoding: base64\r\n");
+    let disposition = if att.is_inline {
+        "inline"
+    } else {
+        "attachment"
+    };
+    out.push_str(&format!(
+        "Content-Disposition: {disposition}; filename=\"{filename}\"\r\n"
+    ));
+    if let Some(cid) = att.content_id.as_deref() {
+        let token = content_id_token(cid);
+        if !token.is_empty() {
+            out.push_str(&format!("Content-ID: <{token}>\r\n"));
+        }
+    }
+    out.push_str("\r\n");
+    out.push_str(encoded);
+    out
+}
+
+/// The multipart/alternative section (text part, html part, closing delimiter),
+/// used both as the whole body and as the first part of a multipart/mixed.
+fn alternative_section(boundary: &str, text: &str, html: &str) -> String {
+    let mut out = String::new();
+    out.push_str(&format!(
+        "--{boundary}\r\nContent-Type: text/plain; charset=\"UTF-8\"\r\n\r\n{text}\r\n"
+    ));
+    out.push_str(&format!(
+        "--{boundary}\r\nContent-Type: text/html; charset=\"UTF-8\"\r\n\r\n{html}\r\n"
+    ));
+    out.push_str(&format!("--{boundary}--\r\n"));
+    out
+}
+
+/// Build the forward's RFC822 bytes, guarded against CRLF header injection the
+/// same way [`build_reply_rfc822`] is.
+///
+/// NO `In-Reply-To` AND NO `References`: a forward starts a new conversation, and
+/// threading it onto the original would file the user's "look at this" inside the
+/// correspondence they are forwarding OUT of.
+///
+/// Structure: multipart/alternative alone when nothing rides along, and
+/// multipart/mixed[alternative, one part per attachment] when something does.
+pub fn build_forward_rfc822(parts: &ForwardParts) -> Result<Vec<u8>, WriteError> {
+    for (name, val) in [
+        ("To", parts.to.as_str()),
+        ("Subject", parts.subject.as_str()),
+    ] {
+        if val.contains('\r') || val.contains('\n') {
+            return Err(WriteError::Invalid(format!(
+                "{name} header must not contain CR/LF"
+            )));
+        }
+    }
+    if parts.to.trim().is_empty() {
+        return Err(WriteError::Invalid("forward has no recipient".into()));
+    }
+
+    let crlf = |s: &str| s.replace("\r\n", "\n").replace('\n', "\r\n");
+    let text = crlf(&forward_text_part(parts));
+    let html = crlf(&forward_html_part(parts));
+    let encoded: Vec<String> = parts
+        .original
+        .attachments
+        .iter()
+        .map(|a| base64_body(&a.data))
+        .collect();
+
+    // Both boundaries are checked against EVERY part, base64 chunks included.
+    // Cheap, and it makes the guarantee one sentence long: no part of this
+    // message contains either delimiter.
+    let mut probe: Vec<&str> = vec![text.as_str(), html.as_str()];
+    probe.extend(encoded.iter().map(String::as_str));
+    let alt = boundary_with_prefix(BOUNDARY_ALT, &probe);
+    let mix = boundary_with_prefix(BOUNDARY_MIX, &probe);
+
+    let mut out = String::new();
+    out.push_str(&format!("To: {}\r\n", parts.to));
+    out.push_str(&format!("Subject: {}\r\n", parts.subject));
+    if parts.original.attachments.is_empty() {
+        out.push_str(&format!(
+            "Content-Type: multipart/alternative; boundary=\"{alt}\"\r\n"
+        ));
+        out.push_str("MIME-Version: 1.0\r\n");
+        out.push_str("\r\n");
+        out.push_str(&alternative_section(&alt, &text, &html));
+    } else {
+        out.push_str(&format!(
+            "Content-Type: multipart/mixed; boundary=\"{mix}\"\r\n"
+        ));
+        out.push_str("MIME-Version: 1.0\r\n");
+        out.push_str("\r\n");
+        out.push_str(&format!(
+            "--{mix}\r\nContent-Type: multipart/alternative; boundary=\"{alt}\"\r\n\r\n"
+        ));
+        out.push_str(&alternative_section(&alt, &text, &html));
+        for (att, enc) in parts.original.attachments.iter().zip(&encoded) {
+            out.push_str(&attachment_part(&mix, att, enc));
+        }
+        out.push_str(&format!("--{mix}--\r\n"));
+    }
+    Ok(out.into_bytes())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -768,6 +1366,11 @@ mod tests {
         assert_eq!(reply_subject("Re: Lunch?"), "Re: Lunch?");
         assert_eq!(reply_subject("RE: Lunch?"), "RE: Lunch?");
         assert_eq!(reply_subject("  spaced  "), "Re: spaced");
+        // A subject whose FIRST character is four bytes wide: a byte-index
+        // slice panicked here, taking the whole request down as a 500.
+        assert_eq!(reply_subject("🎉 party"), "Re: 🎉 party");
+        assert_eq!(reply_subject("é"), "Re: é");
+        assert_eq!(reply_subject(""), "Re: ");
     }
 
     #[test]
@@ -1293,6 +1896,637 @@ mod tests {
             build_reply_rfc822(&parts),
             Err(WriteError::Invalid(_))
         ));
+    }
+
+    // ---- forwarding -------------------------------------------------------
+
+    #[test]
+    fn forward_subject_prefixes_once() {
+        assert_eq!(forward_subject("Lunch?"), "Fwd: Lunch?");
+        assert_eq!(forward_subject("Fwd: Lunch?"), "Fwd: Lunch?");
+        assert_eq!(forward_subject("FWD: Lunch?"), "FWD: Lunch?");
+        // The other spelling clients emit counts as already prefixed too.
+        assert_eq!(forward_subject("Fw: Lunch?"), "Fw: Lunch?");
+        assert_eq!(forward_subject("fw: Lunch?"), "fw: Lunch?");
+        assert_eq!(forward_subject("  spaced  "), "Fwd: spaced");
+        // An untitled original: a bare `Fwd:` with NO trailing space, matching
+        // what `ComposeCopy.forwardSubject` put in the composer the user just
+        // looked at.
+        assert_eq!(forward_subject(""), "Fwd:");
+        assert_eq!(forward_subject("   "), "Fwd:");
+        // A reply being forwarded keeps its Re: and gains one Fwd:.
+        assert_eq!(forward_subject("Re: Lunch?"), "Fwd: Re: Lunch?");
+        // A subject opening with a multi-byte character must not panic the slice.
+        assert_eq!(forward_subject("🎉 party"), "Fwd: 🎉 party");
+    }
+
+    /// An original with an html body and one cid-inline image, the shape a
+    /// forward has to carry across intact.
+    fn fixture_original_raw() -> Vec<u8> {
+        concat!(
+            "From: Alice <alice@example.com>\r\n",
+            "To: Me <me@example.com>, Bob <bob@example.com>\r\n",
+            "Subject: Quarterly numbers\r\n",
+            "Date: Tue, 7 Jul 2026 10:00:00 +0000\r\n",
+            "MIME-Version: 1.0\r\n",
+            "Content-Type: multipart/related; boundary=\"orig\"\r\n",
+            "\r\n",
+            "--orig\r\n",
+            "Content-Type: text/html; charset=\"UTF-8\"\r\n",
+            "\r\n",
+            "<p>chart below</p><img src=\"cid:logo@corp\">\r\n",
+            "--orig\r\n",
+            "Content-Type: image/png; name=\"logo.png\"\r\n",
+            "Content-Transfer-Encoding: base64\r\n",
+            "Content-Disposition: inline; filename=\"logo.png\"\r\n",
+            "Content-ID: <logo@corp>\r\n",
+            "\r\n",
+            "aGVsbG8gcG5n\r\n",
+            "--orig--\r\n",
+        )
+        .as_bytes()
+        .to_vec()
+    }
+
+    #[test]
+    fn parsing_the_original_keeps_the_body_and_the_cid_part() {
+        let o = parse_forwarded_original(&fixture_original_raw()).unwrap();
+        assert_eq!(o.from, "Alice <alice@example.com>");
+        assert_eq!(o.to, "Me <me@example.com>, Bob <bob@example.com>");
+        assert_eq!(o.subject, "Quarterly numbers");
+        assert!(o.date.contains("7 Jul 2026"), "date: {}", o.date);
+        assert!(o.html.as_deref().unwrap().contains("cid:logo@corp"));
+        assert!(o.text.contains("chart below"), "text: {:?}", o.text);
+        assert_eq!(o.attachments.len(), 1);
+        let a = &o.attachments[0];
+        assert_eq!(a.filename, "logo.png");
+        assert_eq!(a.mime, "image/png");
+        // Brackets stripped by the parser; the token itself is untouched.
+        assert_eq!(a.content_id.as_deref(), Some("logo@corp"));
+        assert!(a.is_inline, "a cid part stays inline");
+        assert_eq!(a.data, b"hello png");
+    }
+
+    #[test]
+    fn parsing_garbage_yields_nothing_to_forward() {
+        assert!(parse_forwarded_original(b"").is_none());
+    }
+
+    /// [`ForwardParts`] over the fixture original, with the optional bits off.
+    fn fwd_parts(note: &str) -> ForwardParts {
+        ForwardParts {
+            to: "carol@example.com".into(),
+            subject: "Fwd: Quarterly numbers".into(),
+            note: note.into(),
+            note_html: None,
+            pixel_url: None,
+            original: parse_forwarded_original(&fixture_original_raw()).unwrap(),
+        }
+    }
+
+    #[test]
+    fn forward_rfc822_carries_the_original_and_its_attachment() {
+        let s =
+            String::from_utf8(build_forward_rfc822(&fwd_parts("worth a read")).unwrap()).unwrap();
+
+        // Nesting: mixed on the outside, alternative on the inside, and the two
+        // levels never share a delimiter.
+        assert!(s.contains("Content-Type: multipart/mixed; boundary=\"=_passband_mix_0\"\r\n"));
+        assert!(
+            s.contains("Content-Type: multipart/alternative; boundary=\"=_passband_alt_0\"\r\n")
+        );
+        assert!(s.ends_with("--=_passband_mix_0--\r\n"));
+        assert!(s.contains("--=_passband_alt_0--\r\n--=_passband_mix_0\r\n"));
+
+        // A forward is a NEW conversation.
+        assert!(!s.contains("In-Reply-To"));
+        assert!(!s.contains("References"));
+
+        assert!(s.contains("To: carol@example.com\r\n"));
+        assert!(s.contains("Subject: Fwd: Quarterly numbers\r\n"));
+
+        // The forwarded block appears in BOTH alternatives.
+        assert_eq!(
+            s.matches("---------- Forwarded message ---------").count(),
+            2
+        );
+        assert!(s.contains("From: Alice <alice@example.com>\r\n"));
+        assert!(s.contains("<b>From:</b> Alice &lt;alice@example.com&gt;<br>"));
+        assert!(s.contains("Date: Tue, 7 Jul 2026"));
+        assert!(s.contains("Subject: Quarterly numbers\r\n"));
+        assert!(s.contains("To: Me <me@example.com>, Bob <bob@example.com>\r\n"));
+        // The note leads, before the quoted block, in both parts.
+        assert!(s.contains("worth a read\r\n\r\n----------"));
+        assert!(s.contains("<p>worth a read</p>"));
+        // The original's html rides verbatim, cid reference and all.
+        assert!(s.contains("<p>chart below</p><img src=\"cid:logo@corp\">"));
+
+        // ...and the part that reference resolves against rides with it.
+        assert!(s.contains("Content-Type: image/png; name=\"logo.png\"\r\n"));
+        assert!(s.contains("Content-Transfer-Encoding: base64\r\n"));
+        assert!(s.contains("Content-Disposition: inline; filename=\"logo.png\"\r\n"));
+        assert!(s.contains("Content-ID: <logo@corp>\r\n"));
+        assert!(
+            s.contains(&base64::engine::general_purpose::STANDARD.encode(b"hello png")),
+            "the attachment's bytes ride base64-encoded"
+        );
+    }
+
+    #[test]
+    fn an_attachment_free_forward_is_a_plain_alternative() {
+        let mut parts = fwd_parts("fyi");
+        parts.original.attachments.clear();
+        let s = String::from_utf8(build_forward_rfc822(&parts).unwrap()).unwrap();
+        assert!(!s.contains("multipart/mixed"), "nothing to mix");
+        assert!(
+            s.contains("Content-Type: multipart/alternative; boundary=\"=_passband_alt_0\"\r\n")
+        );
+        assert!(s.ends_with("--=_passband_alt_0--\r\n"));
+    }
+
+    #[test]
+    fn an_empty_note_forwards_the_original_alone() {
+        // An uncommented forward is legitimate: no note, no leading blank line,
+        // the quoted block first.
+        let mut parts = fwd_parts("");
+        parts.original.attachments.clear();
+        let s = String::from_utf8(build_forward_rfc822(&parts).unwrap()).unwrap();
+        let (_h, mime) = parse_multipart_of(&s, "multipart/alternative");
+        assert!(
+            mime[0]
+                .1
+                .starts_with("---------- Forwarded message ---------")
+        );
+        assert!(
+            mime[1]
+                .1
+                .starts_with("<html><body>\r\n<div class=\"passband_forward\">"),
+            "no note means the quoted block opens the document: {:?}",
+            &mime[1].1[..60.min(mime[1].1.len())]
+        );
+    }
+
+    #[test]
+    fn a_text_only_original_still_gets_an_html_part() {
+        // A forward ALWAYS has an html part. mail-parser generates one from the
+        // text body, so the lines survive...
+        let raw = concat!(
+            "From: alice@example.com\r\n",
+            "Subject: plain\r\n",
+            "\r\n",
+            "line one\r\n\r\nline two\r\n",
+        );
+        let mut parts = fwd_parts("");
+        parts.original = parse_forwarded_original(raw.as_bytes()).unwrap();
+        assert!(parts.original.html.is_some());
+        let s = String::from_utf8(build_forward_rfc822(&parts).unwrap()).unwrap();
+        assert!(s.contains("Content-Type: text/html"));
+        assert!(s.contains("line one<br/><br/>line two"));
+
+        // ...and an original with no html at all is rendered by the builder,
+        // rather than forwarding an empty document.
+        parts.original.html = None;
+        let s = String::from_utf8(build_forward_rfc822(&parts).unwrap()).unwrap();
+        assert!(s.contains("<p>line one</p>"));
+        assert!(s.contains("<p>line two</p>"));
+    }
+
+    #[test]
+    fn forward_rfc822_rejects_header_injection() {
+        for (to, subject) in [
+            ("carol@example.com\r\nBcc: evil@x.com", "Fwd: x"),
+            ("carol@example.com", "Fwd: x\r\nBcc: evil@x.com"),
+            ("carol@example.com", "Fwd: x\nBcc: evil@x.com"),
+        ] {
+            let mut parts = fwd_parts("hi");
+            parts.to = to.into();
+            parts.subject = subject.into();
+            assert!(
+                matches!(build_forward_rfc822(&parts), Err(WriteError::Invalid(_))),
+                "{to:?} / {subject:?} must be refused"
+            );
+        }
+        let mut empty = fwd_parts("hi");
+        empty.to = "   ".into();
+        assert!(matches!(
+            build_forward_rfc822(&empty),
+            Err(WriteError::Invalid(_))
+        ));
+    }
+
+    #[test]
+    fn a_crafted_original_header_cannot_forge_a_line_in_the_quoted_block() {
+        // The original's From is body text here, so it cannot forge a HEADER —
+        // but left alone it could forge extra lines INSIDE the quoted block and
+        // make the forward claim a date and a recipient that never existed.
+        let mut parts = fwd_parts("");
+        parts.original.from = "Alice <alice@x>\r\nDate: never\r\nTo: nobody@x".into();
+        let s = String::from_utf8(build_forward_rfc822(&parts).unwrap()).unwrap();
+        assert!(s.contains("From: Alice <alice@x>Date: neverTo: nobody@x\r\n"));
+        assert!(!s.contains("\r\nDate: never\r\n"));
+    }
+
+    #[test]
+    fn a_forward_boundary_dodges_content_that_types_one_out() {
+        // Both levels bump, independently, off whichever part collides.
+        let mut parts = fwd_parts("look: =_passband_mix_0");
+        parts.original.text = "and =_passband_alt_0 too".into();
+        parts.original.html = Some("<p>=_passband_alt_0 =_passband_mix_0</p>".into());
+        let s = String::from_utf8(build_forward_rfc822(&parts).unwrap()).unwrap();
+        assert!(s.contains("boundary=\"=_passband_mix_1\""));
+        assert!(s.contains("boundary=\"=_passband_alt_1\""));
+        // The message still parses: two alternatives inside, closing delimiters
+        // where they belong.
+        let (_h, mime) = parse_multipart_of(&s, "multipart/mixed");
+        assert_eq!(mime.len(), 2, "the alternative section plus one attachment");
+        assert!(s.ends_with("--=_passband_mix_1--\r\n"));
+    }
+
+    #[test]
+    fn no_part_of_a_forward_ever_contains_its_delimiters() {
+        // The invariant the bump exists for, checked over the whole message
+        // rather than one part: attachment bytes are probed alongside the text
+        // and html, even though base64's alphabet cannot spell either prefix.
+        let mut parts = fwd_parts("look: =_passband_mix_0 =_passband_alt_0");
+        parts.original.text = "and =_passband_alt_1 too".into();
+        parts.original.html = Some("<p>=_passband_mix_1</p>".into());
+        parts.original.attachments[0].data = b"=_passband_mix_2 =_passband_alt_2".to_vec();
+        let s = String::from_utf8(build_forward_rfc822(&parts).unwrap()).unwrap();
+        let (_h, mime) = parse_multipart_of(&s, "multipart/mixed");
+        let mix = s
+            .split("boundary=\"")
+            .nth(1)
+            .unwrap()
+            .split('"')
+            .next()
+            .unwrap();
+        for (_ph, pb) in &mime {
+            assert!(!pb.contains(mix), "part must not contain {mix}");
+        }
+    }
+
+    #[test]
+    fn attachment_header_values_cannot_open_a_header_or_a_parameter() {
+        let mut parts = fwd_parts("");
+        let a = &mut parts.original.attachments[0];
+        a.filename = "in\"voice\r\nBcc: evil@x.com.pdf".into();
+        a.mime = "application/pdf; x=\"\r\nBcc: evil@x.com".into();
+        a.content_id = Some("<lo go@corp>\r\nBcc: evil@x.com".into());
+        let s = String::from_utf8(build_forward_rfc822(&parts).unwrap()).unwrap();
+        // The smuggled text survives as INERT characters inside the parameter it
+        // could not close; what it must never do is start a line of its own.
+        assert!(!s.contains("\r\nBcc:"), "no forged header anywhere");
+        assert!(s.contains(
+            "Content-Type: application/pdfxBccevilx.com; name=\"invoiceBcc: evil@x.com.pdf\"\r\n"
+        ));
+        assert!(s.contains("Content-Disposition: inline; filename=\"invoiceBcc: evil@x.com.pdf\""));
+        assert!(s.contains("Content-ID: <logo@corpBcc:evil@x.com>\r\n"));
+    }
+
+    #[test]
+    fn the_pixel_rides_the_forward_html_only() {
+        let mut parts = fwd_parts("fyi");
+        parts.original.attachments.clear();
+        parts.pixel_url = Some("https://p.passband.app/o/z.gif".into());
+        let s = String::from_utf8(build_forward_rfc822(&parts).unwrap()).unwrap();
+        let (_h, mime) = parse_multipart_of(&s, "multipart/alternative");
+        assert!(!mime[0].1.contains("img"), "the text part carries nothing");
+        assert!(
+            mime[1]
+                .1
+                .contains("<img src=\"https://p.passband.app/o/z.gif\" width=\"1\" height=\"1\"")
+        );
+    }
+
+    #[test]
+    fn a_rendered_note_replaces_the_generated_paragraphs() {
+        let mut parts = fwd_parts("**bold**");
+        parts.note_html = Some("<div><strong>bold</strong></div>".into());
+        let s = String::from_utf8(build_forward_rfc822(&parts).unwrap()).unwrap();
+        assert!(s.contains("<div><strong>bold</strong></div>"));
+        // The plain part keeps the markdown source exactly as typed.
+        assert!(s.contains("\r\n\r\n**bold**\r\n\r\n----------"));
+    }
+
+    #[test]
+    fn a_boundary_search_stops_walking_and_derives_a_suffix_instead() {
+        // THE PROBE PARTS ARE ATTACKER-AUTHORED. Mail that types out every
+        // suffix the sequential bump is willing to try must not send it walking
+        // — that is an unbounded full-body scan per step. Past the cap the
+        // suffix comes from a hash of the content, which the sender cannot aim
+        // at: to force even one bump there they would have to embed the hex of
+        // the hash of their own bytes inside those bytes.
+        let mut typed = String::new();
+        for n in 0..=BOUNDARY_BUMP_LIMIT {
+            typed.push_str(&format!("{BOUNDARY_ALT}{n} and {BOUNDARY_MIX}{n}\n"));
+        }
+        let mut parts = fwd_parts("look what I can type");
+        parts.original.text = typed.clone();
+        parts.original.html = Some(format!("<pre>{typed}</pre>"));
+        let s = String::from_utf8(build_forward_rfc822(&parts).unwrap()).unwrap();
+
+        let after = |marker: &str| -> String {
+            s.split(marker)
+                .nth(1)
+                .unwrap()
+                .split('"')
+                .next()
+                .unwrap()
+                .to_string()
+        };
+        let mix = after("multipart/mixed; boundary=\"");
+        let alt = after("multipart/alternative; boundary=\"");
+        // Prefix + 16 hex digits + `_0`. The `_0` is the point: the fallback
+        // needed no bump of its own, so the whole crafted case cost 17 scans per
+        // level rather than however many the sender felt like typing.
+        for (prefix, boundary) in [(BOUNDARY_ALT, &mix), (BOUNDARY_ALT, &alt)] {
+            assert!(boundary.ends_with("_0"), "{boundary}");
+            assert_eq!(boundary.len(), prefix.len() + 16 + 2, "{boundary}");
+        }
+        assert!(mix.starts_with(BOUNDARY_MIX) && alt.starts_with(BOUNDARY_ALT));
+        assert_ne!(mix, alt, "the two levels must not share a delimiter");
+
+        // The invariant the search exists for, over every probed part.
+        for probe in [typed.as_str(), parts.note.as_str()] {
+            assert!(!probe.contains(&mix) && !probe.contains(&alt));
+        }
+        let (_h, mime) = parse_multipart_of(&s, "multipart/mixed");
+        assert_eq!(mime.len(), 2, "the alternative section plus one attachment");
+        for (_ph, pb) in &mime {
+            assert!(!pb.contains(&mix), "part must not contain {mix}");
+        }
+
+        // ...and what came out is still a message a parser agrees with.
+        let parsed = mail_parser::MessageParser::default()
+            .parse(s.as_bytes())
+            .expect("the assembled forward parses");
+        assert!(
+            parsed
+                .body_text(0)
+                .unwrap()
+                .contains("look what I can type")
+        );
+        assert!(parsed.body_html(0).unwrap().contains("<pre>"));
+        assert_eq!(parsed.attachments().count(), 1);
+    }
+
+    /// multipart/mixed[alternative[text, html], text/plain] — a corporate
+    /// footer's shape: a body in two renditions, then a disclaimer part that
+    /// belongs to neither of them.
+    fn fixture_disclaimer_raw() -> Vec<u8> {
+        concat!(
+            "From: Alice <alice@example.com>\r\n",
+            "Subject: Quarterly numbers\r\n",
+            "MIME-Version: 1.0\r\n",
+            "Content-Type: multipart/mixed; boundary=\"mix\"\r\n",
+            "\r\n",
+            "--mix\r\n",
+            "Content-Type: multipart/alternative; boundary=\"alt\"\r\n",
+            "\r\n",
+            "--alt\r\n",
+            "Content-Type: text/plain; charset=\"UTF-8\"\r\n",
+            "\r\n",
+            "the numbers are in\r\n",
+            "--alt\r\n",
+            "Content-Type: text/html; charset=\"UTF-8\"\r\n",
+            "\r\n",
+            "<p>the numbers are in</p>\r\n",
+            "--alt--\r\n",
+            "--mix\r\n",
+            "Content-Type: text/plain; charset=\"UTF-8\"\r\n",
+            "\r\n",
+            "DISCLAIMER this mail is confidential\r\n",
+            "--mix--\r\n",
+        )
+        .as_bytes()
+        .to_vec()
+    }
+
+    #[test]
+    fn every_body_part_forwards_not_only_the_first() {
+        // Reading index 0 dropped the disclaimer out of the forward silently,
+        // which is the one failure mode a disclaimer exists to prevent.
+        let o = parse_forwarded_original(&fixture_disclaimer_raw()).unwrap();
+        assert!(o.text.contains("the numbers are in"), "{:?}", o.text);
+        assert!(o.text.contains("DISCLAIMER this mail is confidential"));
+        let html = o.html.as_deref().unwrap();
+        assert!(html.contains("<p>the numbers are in</p>"));
+        assert!(html.contains("DISCLAIMER this mail is confidential"));
+        // ...and joining the whole list does NOT emit both of the alternative's
+        // renditions of the same words into one view: each list names one half
+        // of the alternative and then the sibling parts after it.
+        assert_eq!(o.text.matches("the numbers are in").count(), 1);
+        assert_eq!(html.matches("the numbers are in").count(), 1);
+
+        let mut parts = fwd_parts("");
+        parts.original = o;
+        let s = String::from_utf8(build_forward_rfc822(&parts).unwrap()).unwrap();
+        let (_h, mime) = parse_multipart_of(&s, "multipart/alternative");
+        assert!(
+            mime[0].1.contains("DISCLAIMER this mail is confidential"),
+            "the text alternative carries it"
+        );
+        assert!(
+            mime[1].1.contains("DISCLAIMER this mail is confidential"),
+            "and so does the html one"
+        );
+    }
+
+    #[test]
+    fn a_cid_part_with_no_disposition_header_is_still_inline() {
+        // The ordinary multipart/related shape — Content-ID, no
+        // Content-Disposition at all. Demanding an explicit `inline` re-emitted
+        // every referenced image as an attachment and dropped a tray full of
+        // extensionless files on the recipient.
+        let raw = concat!(
+            "From: alice@example.com\r\n",
+            "Subject: newsletter\r\n",
+            "MIME-Version: 1.0\r\n",
+            "Content-Type: multipart/related; boundary=\"rel\"\r\n",
+            "\r\n",
+            "--rel\r\n",
+            "Content-Type: text/html; charset=\"UTF-8\"\r\n",
+            "\r\n",
+            "<img src=\"cid:hero@corp\">\r\n",
+            "--rel\r\n",
+            "Content-Type: image/png\r\n",
+            "Content-ID: <hero@corp>\r\n",
+            "Content-Transfer-Encoding: base64\r\n",
+            "\r\n",
+            "aGVsbG8gcG5n\r\n",
+            "--rel\r\n",
+            "Content-Type: application/pdf\r\n",
+            "Content-ID: <invoice@corp>\r\n",
+            "Content-Disposition: attachment; filename=\"invoice.pdf\"\r\n",
+            "Content-Transfer-Encoding: base64\r\n",
+            "\r\n",
+            "aGVsbG8gcGRm\r\n",
+            "--rel--\r\n",
+        );
+        let o = parse_forwarded_original(raw.as_bytes()).unwrap();
+        assert_eq!(o.attachments.len(), 2);
+        assert!(o.attachments[0].is_inline, "cid + no disposition = inline");
+        assert!(
+            !o.attachments[1].is_inline,
+            "an explicit `attachment` disposition still wins"
+        );
+
+        let mut parts = fwd_parts("");
+        parts.original = o;
+        let s = String::from_utf8(build_forward_rfc822(&parts).unwrap()).unwrap();
+        // Unnamed, so the filename is generated — but it is INLINE and it keeps
+        // the token the html's `cid:` resolves against, which is what keeps it
+        // out of the tray and in the layout.
+        assert!(
+            s.contains("Content-Disposition: inline; filename=\"attachment-1\"\r\n"),
+            "{s}"
+        );
+        assert!(s.contains("Content-ID: <hero@corp>\r\n"));
+        assert!(s.contains("Content-Disposition: attachment; filename=\"invoice.pdf\"\r\n"));
+    }
+
+    #[test]
+    fn a_text_attachment_declares_the_charset_its_bytes_now_have() {
+        // mail-parser decodes a part out of its DECLARED charset before we ever
+        // see it, so a rebuilt header with no charset left a latin-1 notes.txt
+        // to be guessed as latin-1 and rendered as mojibake.
+        let mut raw = concat!(
+            "From: alice@example.com\r\n",
+            "Subject: notes\r\n",
+            "MIME-Version: 1.0\r\n",
+            "Content-Type: multipart/mixed; boundary=\"m\"\r\n",
+            "\r\n",
+            "--m\r\n",
+            "Content-Type: text/plain\r\n",
+            "\r\n",
+            "see attached\r\n",
+            "--m\r\n",
+            "Content-Type: text/plain; charset=\"iso-8859-1\"\r\n",
+            "Content-Disposition: attachment; filename=\"notes.txt\"\r\n",
+            "\r\n",
+            "caf",
+        )
+        .as_bytes()
+        .to_vec();
+        raw.push(0xE9); // é, one byte in latin-1
+        raw.extend_from_slice(b"\r\n--m--\r\n");
+
+        let o = parse_forwarded_original(&raw).unwrap();
+        assert_eq!(o.attachments.len(), 1);
+        assert_eq!(
+            o.attachments[0].data,
+            "café".as_bytes(),
+            "the parser hands over UTF-8, whatever the part declared"
+        );
+        let mut parts = fwd_parts("");
+        parts.original = o;
+        let s = String::from_utf8(build_forward_rfc822(&parts).unwrap()).unwrap();
+        assert!(
+            s.contains("Content-Type: text/plain; name=\"notes.txt\"; charset=\"utf-8\"\r\n"),
+            "{s}"
+        );
+        // A binary part gains nothing: charset on an image is noise.
+        let s = String::from_utf8(build_forward_rfc822(&fwd_parts("")).unwrap()).unwrap();
+        assert!(s.contains("Content-Type: image/png; name=\"logo.png\"\r\n"));
+    }
+
+    #[test]
+    fn a_calendar_invitation_keeps_its_method() {
+        // A text/calendar part WITHOUT `method=REQUEST` is a file, not an
+        // invitation: the recipient's client stops offering Accept/Decline.
+        let raw = concat!(
+            "From: alice@example.com\r\n",
+            "Subject: standup\r\n",
+            "MIME-Version: 1.0\r\n",
+            "Content-Type: multipart/mixed; boundary=\"m\"\r\n",
+            "\r\n",
+            "--m\r\n",
+            "Content-Type: text/plain\r\n",
+            "\r\n",
+            "invite attached\r\n",
+            "--m\r\n",
+            "Content-Type: text/calendar; charset=\"UTF-8\"; METHOD=REQUEST; name=\"invite.ics\"\r\n",
+            "Content-Disposition: attachment; filename=\"invite.ics\"\r\n",
+            "\r\n",
+            "BEGIN:VCALENDAR\r\nEND:VCALENDAR\r\n",
+            "--m--\r\n",
+        );
+        let o = parse_forwarded_original(raw.as_bytes()).unwrap();
+        assert_eq!(o.attachments[0].method.as_deref(), Some("REQUEST"));
+        let mut parts = fwd_parts("");
+        parts.original = o;
+        let s = String::from_utf8(build_forward_rfc822(&parts).unwrap()).unwrap();
+        assert!(
+            s.contains(
+                "Content-Type: text/calendar; name=\"invite.ics\"; \
+                 charset=\"utf-8\"; method=REQUEST\r\n"
+            ),
+            "{s}"
+        );
+
+        // ...and the parameter is a TOKEN, so a crafted method cannot close it
+        // or open a header line.
+        parts.original.attachments[0].method = Some("REQUEST\r\nBcc: evil@x.com".into());
+        let s = String::from_utf8(build_forward_rfc822(&parts).unwrap()).unwrap();
+        assert!(!s.contains("\r\nBcc:"), "no forged header anywhere");
+        assert!(s.contains("; method=REQUESTBccevilx.com\r\n"), "{s}");
+    }
+
+    #[test]
+    fn a_charset_declaring_meta_is_dropped_from_the_embedded_original() {
+        // The part header says UTF-8 and the bytes ARE UTF-8; an inherited
+        // `<meta charset=iso-8859-1>` describes bytes that no longer exist, and
+        // the clients that honor it over the part header render mojibake.
+        let mut parts = fwd_parts("");
+        parts.original.attachments.clear();
+        parts.original.html = Some(
+            concat!(
+                "<html><head>",
+                "<META HTTP-EQUIV=\"Content-Type\" CONTENT=\"text/html; charset=iso-8859-1\">",
+                "<meta charset='windows-1252'/>",
+                "<meta name=\"viewport\" content=\"width=device-width\">",
+                "</head><body><p>café</p>",
+                "<metadata charset=\"x\">keep me</metadata></body></html>",
+            )
+            .to_string(),
+        );
+        let s = String::from_utf8(build_forward_rfc822(&parts).unwrap()).unwrap();
+        assert!(!s.contains("iso-8859-1"), "{s}");
+        assert!(!s.contains("windows-1252"), "{s}");
+        assert!(!s.contains("HTTP-EQUIV"), "{s}");
+        // Everything else in the document survives byte for byte, `<meta>` tags
+        // that declare nothing about charset included.
+        assert!(s.contains("<meta name=\"viewport\" content=\"width=device-width\">"));
+        assert!(s.contains("<metadata charset=\"x\">keep me</metadata>"));
+        assert!(s.contains("<p>café</p>"));
+    }
+
+    /// [`parse_multipart`] for an arbitrary top-level multipart subtype.
+    fn parse_multipart_of(s: &str, ctype: &str) -> (String, Vec<(String, String)>) {
+        let (headers, body) = s.split_once("\r\n\r\n").unwrap();
+        let ct = headers
+            .lines()
+            .find(|l| l.starts_with(&format!("Content-Type: {ctype}")))
+            .expect("multipart content-type");
+        let boundary = ct
+            .split("boundary=\"")
+            .nth(1)
+            .unwrap()
+            .split('"')
+            .next()
+            .unwrap();
+        let body = body
+            .strip_suffix(&format!("--{boundary}--\r\n"))
+            .expect("closing delimiter");
+        let parts = body
+            .split(&format!("--{boundary}\r\n"))
+            .skip(1)
+            .map(|chunk| {
+                let (ph, pb) = chunk.split_once("\r\n\r\n").unwrap();
+                (ph.to_string(), pb.strip_suffix("\r\n").unwrap().to_string())
+            })
+            .collect();
+        (headers.to_string(), parts)
     }
 
     // ---- network executor against a one-shot mock server ------------------

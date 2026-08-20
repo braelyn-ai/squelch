@@ -708,6 +708,14 @@ struct LabelBody: Codable, Sendable {
 
 struct SendBody: Codable, Sendable {
     var reply_to_message_id: Int?
+    /// The message being PASSED ON, and the whole of a forward on this wire:
+    /// the daemon quotes the original, carries its attachments over and starts
+    /// a NEW thread from it. MUTUALLY EXCLUSIVE with `reply_to_message_id` —
+    /// the daemon rejects a body naming both — and it requires a non-empty
+    /// `to`, because a forward has nobody to derive a recipient from. An empty
+    /// `body` is fine here and only here: passing mail on without a word of
+    /// your own is the ordinary case.
+    var forward_of_message_id: Int?
     var to: String?
     /// Omitted (not "") on a reply: the daemon derives `Re: <parent subject>`
     /// only when the field is absent — `Some("")` is an explicit empty subject.

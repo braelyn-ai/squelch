@@ -6097,3 +6097,677 @@ async fn thread_view_sender_known_needs_the_mail_to_pass_email_authentication() 
     assert!(msgs[0]["sender_known"].is_boolean());
     assert!(msgs[0].get("auth_pass").is_none());
 }
+
+// --- forwarding (POST /client/actions/send, forward_of_message_id) -----------
+
+/// The raw RFC822 Gmail hands back for the message being forwarded: an html body
+/// with a `cid:` reference and the inline part that reference resolves against.
+/// Deliberately small — the mock reads one 8KB request.
+fn original_raw_b64(body_html: &str) -> String {
+    use base64::Engine as _;
+    let eml = format!(
+        "From: Alice <alice@example.com>\r\n\
+         To: Me <me@example.com>\r\n\
+         Subject: Quarterly numbers\r\n\
+         Date: Tue, 7 Jul 2026 10:00:00 +0000\r\n\
+         MIME-Version: 1.0\r\n\
+         Content-Type: multipart/related; boundary=\"orig\"\r\n\
+         \r\n\
+         --orig\r\n\
+         Content-Type: text/html; charset=\"UTF-8\"\r\n\
+         \r\n\
+         {body_html}\r\n\
+         --orig\r\n\
+         Content-Type: image/png; name=\"logo.png\"\r\n\
+         Content-Transfer-Encoding: base64\r\n\
+         Content-Disposition: inline; filename=\"logo.png\"\r\n\
+         Content-ID: <logo@corp>\r\n\
+         \r\n\
+         aGVsbG8gcG5n\r\n\
+         --orig--\r\n"
+    );
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(eml)
+}
+
+/// The `format=raw` response body carrying [`original_raw_b64`].
+fn original_raw_response(body_html: &str) -> String {
+    format!(
+        "{{\"id\":\"gmail-original\",\"threadId\":\"thread-77\",\
+          \"internalDate\":\"1783591200000\",\"raw\":\"{}\"}}",
+        original_raw_b64(body_html)
+    )
+}
+
+/// A `format=raw` response for a multipart/ALTERNATIVE original: a text/plain
+/// half and a text/html half saying different things. The shape that proves what
+/// the guard reads, because mail-parser hands back the text part verbatim and
+/// never converts the html half down when a text half exists.
+fn alternative_raw_response(text: &str, html: &str) -> String {
+    use base64::Engine as _;
+    let eml = format!(
+        "From: Alice <alice@example.com>\r\n\
+         To: Me <me@example.com>\r\n\
+         Subject: Quarterly numbers\r\n\
+         Date: Tue, 7 Jul 2026 10:00:00 +0000\r\n\
+         MIME-Version: 1.0\r\n\
+         Content-Type: multipart/alternative; boundary=\"orig\"\r\n\
+         \r\n\
+         --orig\r\n\
+         Content-Type: text/plain; charset=\"UTF-8\"\r\n\
+         \r\n\
+         {text}\r\n\
+         --orig\r\n\
+         Content-Type: text/html; charset=\"UTF-8\"\r\n\
+         \r\n\
+         {html}\r\n\
+         --orig--\r\n"
+    );
+    format!(
+        "{{\"id\":\"gmail-original\",\"threadId\":\"thread-77\",\
+          \"internalDate\":\"1783591200000\",\"raw\":\"{}\"}}",
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(eml)
+    )
+}
+
+#[tokio::test]
+async fn forwarding_and_replying_at_once_is_refused() {
+    // The two disagree about threading and about the subject; there is no
+    // sensible message to compose out of both.
+    let Harness { app, store, acct } = harness(|store, acct| {
+        seed_one_signal(store, acct, "gmail-original", "thread-77", "Lunch?");
+    });
+    let id = store.search(acct, "lunch", 10, 0).unwrap()[0].id;
+    let resp = app
+        .oneshot(authed_json(
+            "POST",
+            "/client/actions/send",
+            serde_json::json!({
+                "forward_of_message_id": id,
+                "reply_to_message_id": id,
+                "to": "carol@example.com",
+                "body": "look at this",
+                "confirm": true
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    let audit = store.list_audit(acct, 10).unwrap();
+    assert_eq!(audit[0].action, "send");
+    assert_eq!(
+        audit[0].detail.as_deref(),
+        Some("rejected:forward_and_reply")
+    );
+    // The target is the message the send was ABOUT, even on a rejection.
+    assert_eq!(audit[0].target.as_deref(), Some(&*id.to_string()));
+}
+
+#[tokio::test]
+async fn a_forward_without_a_recipient_is_refused() {
+    // Nobody on the original is who the user means to forward TO, so there is
+    // nothing to derive and the send must not compose recipient-less.
+    let Harness { app, store, acct } = harness(|store, acct| {
+        seed_one_signal(store, acct, "gmail-original", "thread-77", "Lunch?");
+    });
+    let id = store.search(acct, "lunch", 10, 0).unwrap()[0].id;
+    for to in [serde_json::Value::Null, serde_json::json!("   ")] {
+        let resp = app
+            .clone()
+            .oneshot(authed_json(
+                "POST",
+                "/client/actions/send",
+                serde_json::json!({
+                    "forward_of_message_id": id,
+                    "to": to,
+                    "body": "look at this",
+                    "confirm": true
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "to = {to:?}");
+        let json = body_json(resp).await;
+        assert!(json["error"].as_str().unwrap().contains("forward requires"));
+    }
+    let audit = store.list_audit(acct, 10).unwrap();
+    assert_eq!(audit.len(), 2);
+    assert!(
+        audit
+            .iter()
+            .all(|a| a.detail.as_deref() == Some("rejected:no_recipient"))
+    );
+}
+
+#[tokio::test]
+async fn an_empty_note_is_a_legitimate_forward_but_not_a_legitimate_send() {
+    // The empty-body rejection is skipped for forwards and kept for everything
+    // else. No write credential here, so the forward stops at the 403 gate —
+    // which is exactly the proof that it cleared the body validation.
+    let Harness { app, store, acct } = harness(|store, acct| {
+        seed_one_signal(store, acct, "gmail-original", "thread-77", "Lunch?");
+    });
+    let id = store.search(acct, "lunch", 10, 0).unwrap()[0].id;
+    let resp = app
+        .clone()
+        .oneshot(authed_json(
+            "POST",
+            "/client/actions/send",
+            serde_json::json!({
+                "forward_of_message_id": id,
+                "to": "carol@example.com",
+                "body": "",
+                "confirm": true
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+    let resp = app
+        .oneshot(authed_json(
+            "POST",
+            "/client/actions/send",
+            serde_json::json!({ "to": "carol@example.com", "body": "  ", "confirm": true }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let audit = store.list_audit(acct, 10).unwrap();
+    assert!(
+        audit
+            .iter()
+            .any(|a| a.detail.as_deref() == Some("rejected:empty_body")),
+        "a note-less send that is not a forward is still refused"
+    );
+}
+
+#[tokio::test]
+async fn forward_success_sends_a_new_conversation_carrying_the_original() {
+    // Two Gmail calls: the original's raw read, then the send. The send answers
+    // `{}` (no id), so no echo read-back follows.
+    let (base, handle) = mock_gmail_seq(vec![
+        (
+            200,
+            original_raw_response("<p>chart</p><img src=\"cid:logo@corp\">"),
+        ),
+        (200, "{}".to_string()),
+    ])
+    .await;
+    let Harness { app, store, acct } = app_with_writes(base, |store, acct| {
+        seed_one_signal(
+            store,
+            acct,
+            "gmail-original",
+            "thread-77",
+            "Quarterly numbers",
+        );
+    });
+    let id = store.search(acct, "quarterly", 10, 0).unwrap()[0].id;
+
+    let resp = app
+        .oneshot(authed_json(
+            "POST",
+            "/client/actions/send",
+            serde_json::json!({
+                "forward_of_message_id": id,
+                "to": "carol@example.com",
+                "body": "worth a read",
+                "confirm": true
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+    assert_eq!(json["status"], "sent");
+
+    let reqs = handle.await.unwrap();
+    assert_eq!(reqs.len(), 2);
+    assert!(
+        reqs[0].starts_with("GET "),
+        "the original is read raw first"
+    );
+    assert!(reqs[0].contains("/messages/gmail-original?format=raw"));
+    assert!(reqs[1].contains("/messages/send"));
+    // A FORWARD STARTS A NEW CONVERSATION: no threadId on the wire.
+    assert!(
+        !reqs[1].contains("threadId"),
+        "a forward must not be threaded onto the original"
+    );
+
+    let mime = sent_mime(&reqs[1]);
+    assert!(mime.contains("To: carol@example.com\r\n"));
+    assert!(mime.contains("Subject: Fwd: Quarterly numbers\r\n"));
+    assert!(!mime.contains("In-Reply-To"), "{mime}");
+    assert!(!mime.contains("References"), "{mime}");
+    // The note, then the quoted block, in both alternatives.
+    assert!(mime.contains("worth a read"));
+    assert_eq!(
+        mime.matches("---------- Forwarded message ---------")
+            .count(),
+        2
+    );
+    assert!(mime.contains("From: Alice <alice@example.com>\r\n"));
+    // The original's html rides verbatim, and the part its cid names rides with it.
+    assert!(mime.contains("<p>chart</p><img src=\"cid:logo@corp\">"));
+    assert!(mime.contains("filename=\"logo.png\""));
+    assert!(mime.contains("Content-ID: <logo@corp>\r\n"));
+    assert!(mime.contains("Content-Transfer-Encoding: base64\r\n"));
+
+    let audit = store.list_audit(acct, 10).unwrap();
+    assert!(
+        audit
+            .iter()
+            .any(|a| a.action == "send" && a.detail.as_deref() == Some("ok:forward")),
+        "the ledger says a forward went out, not a plain send"
+    );
+    // FORWARDING IS NOT HANDLING: the attention row is left where it was, unlike
+    // a reply, which resolves it.
+    let done = store
+        .attention_updates(
+            acct,
+            chrono::Utc::now() - chrono::Duration::days(1),
+            None,
+            Some(squelch_core::types::AttentionStatus::Done),
+            None,
+        )
+        .unwrap();
+    assert!(
+        done.is_empty(),
+        "passing a message on can leave the user's own action outstanding"
+    );
+}
+
+#[tokio::test]
+async fn the_guard_scans_the_original_a_forward_carries() {
+    // The classic exfil shape: a clean note wrapped around someone else's
+    // secret. The note alone would sail through; what is SENT is what is
+    // scanned, so the block comes from the original's own bytes.
+    let secret = "-----BEGIN RSA PRIVATE KEY-----";
+    let (base, handle) = mock_gmail_seq(vec![(
+        200,
+        original_raw_response(&format!("<pre>{secret}</pre>")),
+    )])
+    .await;
+    let Harness { app, store, acct } = app_with_writes(base, |store, acct| {
+        seed_one_signal(
+            store,
+            acct,
+            "gmail-original",
+            "thread-77",
+            "Quarterly numbers",
+        );
+    });
+    let id = store.search(acct, "quarterly", 10, 0).unwrap()[0].id;
+
+    let resp = app
+        .oneshot(authed_json(
+            "POST",
+            "/client/actions/send",
+            serde_json::json!({
+                "forward_of_message_id": id,
+                "to": "carol@example.com",
+                "body": "thought you should see this",
+                "confirm": true
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let json = body_json(resp).await;
+    let err = json["error"].as_str().unwrap();
+    assert!(err.contains("pem_block"), "422 lists redacted kinds: {err}");
+    assert!(!err.contains("PRIVATE KEY"), "must NEVER echo the match");
+    assert_eq!(
+        handle.await.unwrap().len(),
+        1,
+        "read the original, sent nothing"
+    );
+
+    let audit = store.list_audit(acct, 10).unwrap();
+    assert!(
+        audit
+            .iter()
+            .any(|a| a.action == "send" && a.detail.as_deref() == Some("blocked:guard"))
+    );
+
+    // ...and the override is the ceremony's second act: same request, one flag,
+    // now it sends and the bypass is on the record.
+    let (base, handle) = mock_gmail_seq(vec![
+        (200, original_raw_response(&format!("<pre>{secret}</pre>"))),
+        (200, "{}".to_string()),
+    ])
+    .await;
+    let Harness { app, store, acct } = app_with_writes(base, |store, acct| {
+        seed_one_signal(
+            store,
+            acct,
+            "gmail-original",
+            "thread-77",
+            "Quarterly numbers",
+        );
+    });
+    let id = store.search(acct, "quarterly", 10, 0).unwrap()[0].id;
+    let resp = app
+        .oneshot(authed_json(
+            "POST",
+            "/client/actions/send",
+            serde_json::json!({
+                "forward_of_message_id": id,
+                "to": "carol@example.com",
+                "body": "thought you should see this",
+                "confirm": true,
+                "override_guard": true
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(handle.await.unwrap().len(), 2);
+
+    let audit = store.list_audit(acct, 10).unwrap();
+    assert!(
+        audit.iter().any(|a| {
+            a.action == "send"
+                && a.detail
+                    .as_deref()
+                    .is_some_and(|d| d.starts_with("guard_override:") && d.contains("pem_block"))
+        }),
+        "the override names the kinds it bypassed"
+    );
+    assert!(
+        audit
+            .iter()
+            .any(|a| a.detail.as_deref() == Some("ok:forward"))
+    );
+}
+
+#[tokio::test]
+async fn a_forward_whose_original_cannot_be_read_is_a_loud_502() {
+    // What is forwarded IS the request, so there is nothing to degrade to: no
+    // send happens and the client hears about it.
+    let (base, handle) = mock_gmail_seq(vec![(500, "{\"error\":\"backend\"}".to_string())]).await;
+    let Harness { app, store, acct } = app_with_writes(base, |store, acct| {
+        seed_one_signal(
+            store,
+            acct,
+            "gmail-original",
+            "thread-77",
+            "Quarterly numbers",
+        );
+    });
+    let id = store.search(acct, "quarterly", 10, 0).unwrap()[0].id;
+
+    let resp = app
+        .oneshot(authed_json(
+            "POST",
+            "/client/actions/send",
+            serde_json::json!({
+                "forward_of_message_id": id,
+                "to": "carol@example.com",
+                "body": "worth a read",
+                "confirm": true
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+    let json = body_json(resp).await;
+    assert!(
+        json["error"]
+            .as_str()
+            .unwrap()
+            .contains("forward was not sent")
+    );
+    assert_eq!(handle.await.unwrap().len(), 1, "nothing was sent");
+
+    let audit = store.list_audit(acct, 10).unwrap();
+    assert!(
+        audit
+            .iter()
+            .any(|a| a.action == "send" && a.detail.as_deref() == Some("failed:fetch_original"))
+    );
+}
+
+#[tokio::test]
+async fn forwarding_a_sealed_message_is_a_404_and_reads_nothing() {
+    // Sealed mail is invisible to every action, forwarding most of all.
+    let (base, handle) = mock_gmail(0).await;
+    let Harness { app, store, acct } = app_with_writes(base, |store, acct| {
+        let s = store
+            .upsert_message(&msg(acct, "gmail-sealed", "t9", "code", "123456"))
+            .unwrap();
+        store
+            .set_triage(
+                s,
+                acct,
+                90,
+                Tier::Noise,
+                Sensitivity::Sealed,
+                Some(SealedKind::Otp),
+                "",
+                "",
+                None,
+            )
+            .unwrap();
+    });
+    let sealed_id = store.sealed_messages(acct).unwrap()[0].id;
+    let resp = app
+        .oneshot(authed_json(
+            "POST",
+            "/client/actions/send",
+            serde_json::json!({
+                "forward_of_message_id": sealed_id,
+                "to": "carol@example.com",
+                "body": "look",
+                "confirm": true
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    handle.abort();
+
+    let audit = store.list_audit(acct, 10).unwrap();
+    assert!(
+        audit
+            .iter()
+            .any(|a| a.action == "send" && a.detail.as_deref() == Some("failed:target"))
+    );
+}
+
+#[tokio::test]
+async fn the_guard_reads_the_html_half_a_clean_text_half_would_hide() {
+    // mail-parser hands back the text/plain part VERBATIM when one exists and
+    // never converts the html alternative down, so a scan of the text view alone
+    // sees "nothing to see here" and ships the key sitting in the html half.
+    // What is scanned has to be what is SENT.
+    let secret = "-----BEGIN RSA PRIVATE KEY-----";
+    let (base, handle) = mock_gmail_seq(vec![(
+        200,
+        alternative_raw_response("nothing to see here", &format!("<pre>{secret}</pre>")),
+    )])
+    .await;
+    let Harness { app, store, acct } = app_with_writes(base, |store, acct| {
+        seed_one_signal(
+            store,
+            acct,
+            "gmail-original",
+            "thread-77",
+            "Quarterly numbers",
+        );
+    });
+    let id = store.search(acct, "quarterly", 10, 0).unwrap()[0].id;
+
+    let resp = app
+        .oneshot(authed_json(
+            "POST",
+            "/client/actions/send",
+            serde_json::json!({
+                "forward_of_message_id": id,
+                "to": "carol@example.com",
+                "body": "thought you should see this",
+                "confirm": true
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let json = body_json(resp).await;
+    let err = json["error"].as_str().unwrap();
+    assert!(err.contains("pem_block"), "422 lists redacted kinds: {err}");
+    assert!(!err.contains("PRIVATE KEY"), "must NEVER echo the match");
+    assert_eq!(
+        handle.await.unwrap().len(),
+        1,
+        "read the original, sent nothing"
+    );
+
+    let audit = store.list_audit(acct, 10).unwrap();
+    assert!(
+        audit
+            .iter()
+            .any(|a| a.action == "send" && a.detail.as_deref() == Some("blocked:guard"))
+    );
+}
+
+#[tokio::test]
+async fn a_forward_of_an_oversized_original_is_refused_not_attempted() {
+    // A forward re-encodes everything it reads — decode, base64 back out, JSON,
+    // reqwest's buffer — so a 25 MB original is four to five copies of itself in
+    // memory and then an opaque 502 pointing at Gmail. The ceiling turns that
+    // into a 413 that says which side the problem is on, before the parse
+    // allocates a copy of every part.
+    let oversized = {
+        use base64::Engine as _;
+        let mut eml = String::from(
+            "From: Alice <alice@example.com>\r\n\
+             Subject: Quarterly numbers\r\n\
+             MIME-Version: 1.0\r\n\
+             Content-Type: text/plain; charset=\"UTF-8\"\r\n\
+             \r\n",
+        );
+        eml.push_str(&"x".repeat(20 * 1024 * 1024 + 1));
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(eml)
+    };
+    let (base, handle) = mock_gmail_seq(vec![(
+        200,
+        format!("{{\"id\":\"gmail-original\",\"threadId\":\"thread-77\",\"raw\":\"{oversized}\"}}"),
+    )])
+    .await;
+    let Harness { app, store, acct } = app_with_writes(base, |store, acct| {
+        seed_one_signal(
+            store,
+            acct,
+            "gmail-original",
+            "thread-77",
+            "Quarterly numbers",
+        );
+    });
+    let id = store.search(acct, "quarterly", 10, 0).unwrap()[0].id;
+
+    let resp = app
+        .oneshot(authed_json(
+            "POST",
+            "/client/actions/send",
+            serde_json::json!({
+                "forward_of_message_id": id,
+                "to": "carol@example.com",
+                "body": "worth a read",
+                "confirm": true
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    let json = body_json(resp).await;
+    assert!(
+        json["error"]
+            .as_str()
+            .unwrap()
+            .contains("too large to forward"),
+        "{json}"
+    );
+    assert_eq!(
+        handle.await.unwrap().len(),
+        1,
+        "the original was read, nothing was sent"
+    );
+
+    let audit = store.list_audit(acct, 10).unwrap();
+    assert!(
+        audit
+            .iter()
+            .any(|a| a.action == "send" && a.detail.as_deref() == Some("rejected:too_large"))
+    );
+}
+
+/// A write credential store that has nothing left to hand out: the shape of an
+/// expired or revoked write token whose refresh has stopped working.
+struct DeadCreds;
+#[async_trait]
+impl CredentialStore for DeadCreds {
+    async fn token(&self, _a: i64) -> squelch_core::Result<OAuthToken> {
+        Err(squelch_core::error::CoreError::Credential(
+            "invalid_grant".into(),
+        ))
+    }
+}
+
+#[tokio::test]
+async fn a_forward_whose_write_credential_is_dead_says_so_instead_of_blaming_gmail() {
+    // The raw fetch runs on the WRITE token too, so a dead credential fails
+    // inside it — before any send. Collapsing that into the fetch's 502 told the
+    // composer to blame Gmail when the fix is `squelchd auth --write`, which the
+    // client already knows how to say when it sees the 403.
+    let (base, handle) = mock_gmail(0).await;
+    let (state, store, acct) = common::state_with(|store, acct| {
+        seed_one_signal(
+            store,
+            acct,
+            "gmail-original",
+            "thread-77",
+            "Quarterly numbers",
+        );
+    });
+    let state = state.with_write_test_harness(Arc::new(DeadCreds), base);
+    let app = router(state);
+    let id = store.search(acct, "quarterly", 10, 0).unwrap()[0].id;
+
+    let resp = app
+        .oneshot(authed_json(
+            "POST",
+            "/client/actions/send",
+            serde_json::json!({
+                "forward_of_message_id": id,
+                "to": "carol@example.com",
+                "body": "worth a read",
+                "confirm": true
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let json = body_json(resp).await;
+    assert!(
+        json["error"].as_str().unwrap().contains("auth --write"),
+        "the 403 names the fix: {json}"
+    );
+    handle.abort();
+
+    let audit = store.list_audit(acct, 10).unwrap();
+    assert!(
+        audit
+            .iter()
+            .any(|a| a.action == "send"
+                && a.detail.as_deref() == Some("rejected:no_write_credential")),
+        "a dead credential is not a fetch failure: {audit:?}"
+    );
+    assert!(
+        !audit
+            .iter()
+            .any(|a| a.detail.as_deref() == Some("failed:fetch_original")),
+        "and it must not be audited as one"
+    );
+}
