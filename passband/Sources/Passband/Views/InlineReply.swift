@@ -456,6 +456,18 @@ struct InlineReply: View {
         store.inlineReply = next
     }
 
+    /// Patch the slot ONLY IF it still holds the composer `id` names. The pane
+    /// composer keeps the identical pair for the identical reason: the plain
+    /// `patch` above is safe only because its callers run synchronously off a
+    /// keystroke, while a send's continuation resumes into whatever the slot
+    /// holds by then — which may be a reply to another message entirely. See
+    /// `ComposeState.id`.
+    private func patch(_ id: UUID, _ mutate: (inout ComposeState) -> Void) {
+        guard var next = store.inlineReply, next.id == id else { return }
+        mutate(&next)
+        store.inlineReply = next
+    }
+
     /// Same empty-body guard as the modal composer: an accidental ⌘Enter must not
     /// put a blank reply one keystroke away from going out.
     private func toReview() {
@@ -472,9 +484,17 @@ struct InlineReply: View {
         }
     }
 
+    /// EVERY WRITE BELOW IS KEYED TO `slot`, the composer this send belongs to.
+    /// `store.inlineReply` is a slot, not an object: while the await is out the
+    /// sender can Escape (which flushes the draft and empties the slot) and open
+    /// a reply on another message into it, and an unkeyed continuation would
+    /// then land on that draft — `noteSent` clearing its touched mark, so the
+    /// close's flush refuses to save, so everything typed into it is gone. See
+    /// `ComposeState.id`.
     private func fire(override: Bool) async {
         guard let compose = store.inlineReply, !compose.sending else { return }
-        patch {
+        let slot = compose.id
+        patch(slot) {
             $0.sending = true
             $0.error = nil
         }
@@ -483,6 +503,10 @@ struct InlineReply: View {
             // The daemon resolved the replied-to update; without this the row sits
             // in whatever list is mounted behind the reader until the next poll,
             // reading as a no-op. No undo pairs with a send.
+            //
+            // Not keyed to the slot, and deliberately: this is a fact about the
+            // MAIL rather than about the composer, and it stands whoever holds
+            // the slot by now. Same for the toast.
             if let repliedTo = compose.replyToMessageId { store.noteResolved(repliedTo) }
             store.pushToast("reply sent", .success)
             // An echo means the sent copy is ALREADY in the local store, so a
@@ -490,26 +514,31 @@ struct InlineReply: View {
             // ingest has not caught up and there is nothing to fetch — the poll
             // gets there.
             let echoed = result.echo_message_id != nil
-            // The send already deleted the draft; the close below must not flush it
-            // back and leave a reply that went out sitting there to be restored.
-            DraftSaver.shared.noteSent(.inlineReply)
-            store.closeInlineReply()
+            // The slot half. The send already deleted the draft it carried, so
+            // without `noteSent` the close would flush it back and leave a reply
+            // that went out sitting there to be restored — but only for THIS
+            // composer. If the slot moved on, both of these belong to another
+            // draft and the right amount of work to do is none.
+            if store.inlineReply?.id == slot {
+                DraftSaver.shared.noteSent(.inlineReply)
+                store.closeInlineReply()
+            }
             if echoed { onEchoed() }
         case .guardBlocked(let kinds):
             // Stay in review with the verdict; the override is a separate act.
-            patch {
+            patch(slot) {
                 $0.phase = .review
                 $0.guardKinds = kinds
                 $0.sending = false
                 $0.error = nil
             }
         case .forbidden:
-            patch {
+            patch(slot) {
                 $0.sending = false
                 $0.error = ComposeCopy.noWriteCredential
             }
         case .failure(let text):
-            patch {
+            patch(slot) {
                 $0.sending = false
                 $0.error = text
             }

@@ -230,6 +230,26 @@ let ringSeconds: TimeInterval = 60
 /// reply.
 struct ComposeState: Sendable, Equatable {
     enum Phase: Sendable { case edit, review }
+
+    /// WHICH COMPOSER THIS IS. Minted once when the state is built and carried
+    /// through every copy of it, because this is a value type living in a slot
+    /// (`AppStore.compose` / `AppStore.inlineReply`) that anything can replace:
+    /// the only way an async continuation can tell "still mine" from "somebody
+    /// else's draft is in the slot now" is an identity that copies along.
+    ///
+    /// The race it exists for: a send is awaited, the sender presses Escape
+    /// (which flushes the draft and clears the slot) and opens a different
+    /// composer, then the response lands and the continuation closes and
+    /// un-marks THAT one — destroying whatever was typed into it. A 60s forward
+    /// holds that window open for a minute. Every send continuation therefore
+    /// checks this id against the slot before touching it.
+    ///
+    /// Being `let` with a default keeps it out of the memberwise init, so no
+    /// caller can mint two states with one identity — and note this makes
+    /// Equatable DISTINGUISH two composers holding identical text, which is
+    /// exactly what the slot logic wants: same words, different draft.
+    let id = UUID()
+
     var replyToMessageId: Int?
     /// The message this composer PASSES ON. Mutually exclusive with
     /// `replyToMessageId` — a send names a parent to answer or an original to
@@ -1716,6 +1736,25 @@ final class AppStore {
         // A composer already up is not something a repeated `f` gets to blank
         // out — the same rule `openComposeNew` and the inline reply keep.
         guard compose == nil else { return }
+        // REFUSE RATHER THAN HOPE. An outdated daemon does not reject a forward,
+        // it ignores the field it does not know and answers 200 "sent" having
+        // mailed the covering note alone — the original, its quote and its
+        // files gone, with the sender told it went. That is a lie a toast cannot
+        // walk back, so the composer never opens at all. See
+        // `forwardingAvailable` for why nil counts as no.
+        guard forwardingAvailable else {
+            // Two states hide behind one refusal and only one is the daemon's
+            // fault: before the first /client/stats lands there is no verdict
+            // yet, and sending the user to a terminal to "update squelchd"
+            // over a half-second race would be the wrong sentence. Both still
+            // REFUSE — hope is what mails the note alone.
+            pushToast(
+                sitrep.stats == nil
+                    ? "still connecting · try forward again in a moment"
+                    : "this daemon cannot forward mail · update squelchd",
+                .error)
+            return
+        }
         var state = ComposeState()
         state.forwardOfMessageId = messageId
         // The subject is SENT, not derived: the daemon only titles a forward
@@ -1823,6 +1862,22 @@ final class AppStore {
     /// this. A self-host daemon never says `assistant_relay`, and nil means
     /// the switch is simply not offered (same posture as `trackingAvailable`).
     var relayAvailable: Bool { sitrep.stats?.assistant_relay == true }
+
+    // MARK: - forwarding
+
+    /// Whether this daemon understands `forward_of_message_id`. Read off the
+    /// same sitrep stats `relayAvailable` is, for the same reason: /client/stats
+    /// is already the connect probe and SitrepPoller keeps it fresh, so this
+    /// capability costs no fetch of its own.
+    ///
+    /// STRICTLY `== true`. nil covers two states — stats not fetched yet, and a
+    /// daemon too old to answer — and BOTH have to refuse. The failure this
+    /// prevents is not an error dialog: an old daemon silently ignores the
+    /// unknown field, sends the covering note by itself and returns 200 "sent",
+    /// so hoping would mean mailing a stranger an empty "look at this" and
+    /// telling the sender it worked. A send has no undo, so the only safe read
+    /// of "we do not know" is no.
+    var forwardingAvailable: Bool { sitrep.stats?.forwarding == true }
 
     // MARK: - read tracking
 

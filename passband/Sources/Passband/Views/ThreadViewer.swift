@@ -786,8 +786,17 @@ struct ThreadViewer: View {
             // half-written underneath is untouched.
             KeyBinding("f", "forward") {
                 guard let m = messages[safe: index] else { return }
+                // THE MESSAGE'S OWN SUBJECT, with the thread's as the fallback.
+                // `thread?.subject` is the CONVERSATION's title, and the daemon
+                // quotes the selected message's own header — so titling the
+                // forward from the thread would name one email while sending
+                // another, on exactly the threads where they differ (a retitled
+                // reply, a list that stamps its own prefix). The fallback is for
+                // a daemon too old to send per-message subjects; both the
+                // outgoing subject and the composer's "forwarding: …" line are
+                // built from this one value, so the two cannot drift.
                 store.openComposeForward(
-                    messageId: m.id, subject: thread?.subject ?? "",
+                    messageId: m.id, subject: m.subject ?? thread?.subject ?? "",
                     attachmentCount: m.attachmentList.count)
             },
             // `s` = the search `f` used to be, moved rather than dropped: the

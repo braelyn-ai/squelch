@@ -41,14 +41,29 @@ actor APIClient {
     /// A forward is the one send that moves the whole original — the daemon
     /// fetches it back from Gmail and uploads it again, attachments and all —
     /// so 15s would report slow-but-successful forwards as failures and invite
-    /// a second, duplicate send. The session's 60s resource ceiling (set in
-    /// `init`) is the real upper bound; this matches it rather than pretending
-    /// to exceed it.
+    /// a second, duplicate send, which is the one mistake this app cannot undo.
+    ///
+    /// This is an IDLE timer, not a deadline: `timeoutIntervalForRequest` is
+    /// reset by every byte that arrives, so it fires when the daemon has gone
+    /// quiet for a minute, not when the work has taken one. The wall clock is
+    /// the session's resource ceiling (`Self.resourceCeiling`), and that is
+    /// where the daemon's real worst case had to be paid for — a ~60s-class raw
+    /// fetch, plus the send, plus the 5s echo wait, is past two minutes.
     private static let forwardTimeout: TimeInterval = 60
+
+    /// WALL CLOCK for any one request, forward included. It has to sit above the
+    /// slowest thing the daemon does, because it is a hard deadline that no
+    /// amount of steady progress resets: at 60s it would cut a forward that was
+    /// transferring the whole time and hand the caller a "failed" for mail that
+    /// went out — an invitation to send it twice, and precisely the bug
+    /// `forwardTimeout` was raised to close. 180 clears the ~125s worst case
+    /// with room, and no other route comes near it (they idle out at 15s or 30s
+    /// long before this matters).
+    private static let resourceCeiling: TimeInterval = 180
 
     init() {
         session = Sessions.ephemeral(
-            timeout: Self.requestTimeout, resource: 60,
+            timeout: Self.requestTimeout, resource: Self.resourceCeiling,
             cachePolicy: .reloadIgnoringLocalCacheData, emptyHeaders: true)
     }
 

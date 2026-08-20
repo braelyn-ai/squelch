@@ -185,14 +185,14 @@ final class DraftSaver {
             // id yet there was never a row, so there is nothing to discard either.
             guard let id = state.draftId else { return }
             try? await APIClient.shared.deleteDraft(id)
-            adopt(nil, slot: slot, key: state.replyToMessageId)
+            adopt(nil, slot: slot, key: state.id)
             return
         }
         do {
             let saved = try await APIClient.shared.putDraft(
                 replyToMessageId: state.replyToMessageId, to: state.to,
                 subject: state.subject, body: state.body)
-            adopt(saved.id, slot: slot, key: state.replyToMessageId)
+            adopt(saved.id, slot: slot, key: state.id)
         } catch {
             // Silent, always. A 404 here is a parent sealed since the composer
             // opened — the draft is deliberately unsavable, and the reader is told
@@ -204,24 +204,24 @@ final class DraftSaver {
     /// successful send takes the draft with it.
     ///
     /// The slot may have moved on while the request was in flight: closed, or
-    /// re-opened on a different message. `key` is what it was saved for, so a
-    /// mismatch means the id belongs to a draft nobody is editing any more and is
-    /// dropped rather than stamped onto the current one.
-    private func adopt(_ id: Int?, slot: Slot, key: Int?) {
+    /// re-opened on a different message. `key` is the IDENTITY of the composer
+    /// the save was taken from (`ComposeState.id`), so a mismatch means the id
+    /// belongs to a draft nobody is editing any more and is dropped rather than
+    /// stamped onto the current one.
+    ///
+    /// Identity, not the reply key: `replyToMessageId` is nil for a plain new
+    /// message AND for a forward, and identical for two successive composers on
+    /// the same message — so a stale flush's id could stamp onto a SUCCESSOR
+    /// composer, whose send would then carry it and DELETE a draft holding mail
+    /// that never went out. The UUID tells every composer from every other.
+    private func adopt(_ id: Int?, slot: Slot, key: UUID) {
         switch slot {
         case .compose:
-            // A forward also has `replyToMessageId == nil`, so the key alone
-            // cannot tell it from the new-message draft this save was keyed to.
-            // Forwards never save (see `save`), so an id landing on one is always
-            // a stale flush from the composer before it — stamped on, it would
-            // ride the forward's send and DELETE that half-written draft.
-            guard var next = store.compose, next.replyToMessageId == key,
-                next.forwardOfMessageId == nil
-            else { return }
+            guard var next = store.compose, next.id == key else { return }
             next.draftId = id
             store.compose = next
         case .inlineReply:
-            guard var next = store.inlineReply, next.replyToMessageId == key else { return }
+            guard var next = store.inlineReply, next.id == key else { return }
             next.draftId = id
             store.inlineReply = next
         }

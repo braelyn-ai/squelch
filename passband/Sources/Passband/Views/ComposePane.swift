@@ -240,13 +240,39 @@ struct ComposePane: View {
         isReply ? ComposeCopy.derivedSubject : "subject"
     }
 
+    /// WHAT THE MAIL WILL BE TITLED, which is not always what is in the subject
+    /// field: review's whole job is promising what goes out, so an empty field
+    /// has to show the title the DAEMON will derive rather than a blank row.
+    ///
+    /// The empty test is `trimmed.isEmpty`, because that is the DAEMON's test:
+    /// `action_send` filters the subject through `!s.trim().is_empty()` before
+    /// falling back to its derivation, so a field holding only spaces hands
+    /// titling back to the daemon exactly as a cleared one does. (`fire` sends
+    /// the spaces, and the daemon discards them — the wire carries them, the
+    /// mail never does.) Testing `isEmpty` here promised a blank title for a
+    /// mail about to go out titled `Fwd: …`, one whitespace away from the lie
+    /// this function exists to remove.
+    ///
+    /// Three empty cases, and they derive differently:
+    /// - a reply: `gmail_write::reply_subject` from the parent, which the
+    ///   composer's update cannot see (it carries an LLM summary, not headers).
+    /// - a FORWARD: `gmail_write::forward_subject` of the original, which we CAN
+    ///   mirror, because the original's subject is right here as
+    ///   `forwardedSubject`. Reachable exactly when the sender cleared the field
+    ///   the composer opened pre-filled.
+    /// - a new message: nothing derives one; it goes out untitled.
+    private func reviewSubject(_ compose: ComposeState) -> String {
+        guard compose.subject.trimmed.isEmpty else { return compose.subject }
+        if compose.forwardOfMessageId != nil {
+            return ComposeCopy.forwardSubject(compose.forwardedSubject ?? "")
+        }
+        return isReply ? ComposeCopy.derivedSubject : "(none)"
+    }
+
     private func reviewPane(_ compose: ComposeState) -> some View {
         VStack(alignment: .leading, spacing: 10) {
             ComposeSummaryRow("to", compose.to.isEmpty ? "(none)" : compose.to)
-            ComposeSummaryRow(
-                "subject",
-                compose.subject.isEmpty
-                    ? (isReply ? ComposeCopy.derivedSubject : "(none)") : compose.subject)
+            ComposeSummaryRow("subject", reviewSubject(compose))
             // Review states what is about to go out, and an invisible pixel in
             // it is part of that. Only when armed: a row saying "no" on every
             // ordinary send is a row nobody reads.
@@ -409,6 +435,19 @@ struct ComposePane: View {
         store.compose = next
     }
 
+    /// Patch the slot ONLY IF it still holds the composer `id` names. Every
+    /// write that happens after an `await` goes through here: the plain `patch`
+    /// above is safe only because its callers run synchronously off a keystroke,
+    /// while a send's continuation resumes into whatever the slot holds by then,
+    /// which may be an entirely different draft (see `ComposeState.id`).
+    /// Silently does nothing in that case, by design — the composer that moved
+    /// on is not this send's to edit, and the mail may well have gone out.
+    private func patch(_ id: UUID, _ mutate: (inout ComposeState) -> Void) {
+        guard var next = store.compose, next.id == id else { return }
+        mutate(&next)
+        store.compose = next
+    }
+
     private func toReview() {
         guard let compose = store.compose else { return }
         // Untouched covers the seeded signature: a signature under nothing is
@@ -434,9 +473,18 @@ struct ComposePane: View {
 
     /// The request lives in `ComposeSubmit`; what is left here is this surface's
     /// own reaction to each outcome.
+    ///
+    /// EVERY WRITE BELOW IS KEYED TO `slot`, the composer this send belongs to.
+    /// `store.compose` is a slot, not an object: while the await is out the
+    /// sender can Escape (which flushes the draft and empties the slot) and open
+    /// a different composer into it, and an unkeyed continuation would then land
+    /// on a stranger's draft — `noteSent` clearing its touched mark, so the
+    /// close's flush refuses to save, so everything typed into it is gone. See
+    /// `ComposeState.id`.
     private func fire(override: Bool) async {
         guard let compose = store.compose, !compose.sending else { return }
-        patch {
+        let slot = compose.id
+        patch(slot) {
             $0.sending = true
             $0.error = nil
         }
@@ -445,28 +493,37 @@ struct ComposePane: View {
             // The daemon resolved the replied-to update; without this the row
             // sits in its band until the next poll, reading as a no-op. No undo
             // pairs with it — a send is the one irreversible action.
+            //
+            // These two are facts about the MAIL, not about the slot, so they
+            // stand whoever holds the composer now: it really went out, and the
+            // person who sent it is owed the toast that says so.
             if let repliedTo = compose.replyToMessageId { store.noteResolved(repliedTo) }
             store.pushToast("sent", .success)
-            // The send already deleted the draft; without this the close below
-            // would flush it straight back and offer to restore mail that is gone.
-            DraftSaver.shared.noteSent(.compose)
-            store.closeCompose()
+            // The slot half. The send already deleted the draft it carried, so
+            // without `noteSent` the close would flush it straight back and
+            // offer to restore mail that is gone — but only for THIS composer.
+            // If the slot moved on, both of these belong to someone else's
+            // draft and the right amount of work to do is none.
+            if store.compose?.id == slot {
+                DraftSaver.shared.noteSent(.compose)
+                store.closeCompose()
+            }
         case .guardBlocked(let kinds):
             // Stay in review with the redacted verdict; the override must be an
             // explicit second act, not a re-fire of the same call.
-            patch {
+            patch(slot) {
                 $0.phase = .review
                 $0.guardKinds = kinds
                 $0.sending = false
                 $0.error = nil
             }
         case .forbidden:
-            patch {
+            patch(slot) {
                 $0.sending = false
                 $0.error = ComposeCopy.noWriteCredential
             }
         case .failure(let text):
-            patch {
+            patch(slot) {
                 $0.sending = false
                 $0.error = text
             }
