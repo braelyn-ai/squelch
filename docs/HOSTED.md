@@ -302,7 +302,7 @@ The actual path, in order:
    this size and buys a control loop, encrypted-at-rest Secrets, NetworkPolicy
    and admission control for free. This gets embarrassingly far, and the
    100-user verification cap makes it moot anyway.
-2. **Next — Gmail push.** Hosted daemons switch from 45s polling to `users.watch` +
+2. **Next — Gmail push.** Hosted daemons switch from 5s polling to `users.watch` +
    Pub/Sub; the control plane receives pushes and pokes the right daemon. Idle
    tenants become nearly free and API quota stays flat as users grow. This is the
    single highest-leverage scaling change, not orchestration. (Self-host keeps

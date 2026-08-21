@@ -2594,7 +2594,7 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
     async fn refresh_inbox_unread(&self) {
         let url = format!("{}/labels/{LABEL_INBOX}", self.api_base);
         // Both halves land in one Result so both go through the one latch:
-        // whichever way this fails, it fails every 45s, and a branch that
+        // whichever way this fails, it fails every poll tick, and a branch that
         // printed on its own would be the branch that spams.
         let outcome = match self.get_json::<LabelResp>(&url).await {
             Ok(label) => self
