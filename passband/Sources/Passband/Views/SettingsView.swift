@@ -415,11 +415,17 @@ struct AppearanceSection: View {
 }
 
 /// The banner chime. Picking an option plays it once, right here — judging a
-/// half-second sound from its name alone is not a thing.
+/// half-second sound from its name alone is not a thing. Same idea one row
+/// down: whether a banner ARRIVES depends on a grant, a focus mode and a Do
+/// Not Disturb schedule that all live outside this app, so there is a button
+/// that posts one.
 struct NotificationsSection: View {
     @Environment(Prefs.self) private var prefs
     /// Held for the duration of playback: the sound stops when deallocated.
     @State private var player: PlatformSound?
+    /// What the last test banner did, shown until the next one. nil before the
+    /// first press — no verdict to report yet.
+    @State private var delivered: Bool?
 
     var body: some View {
         @Bindable var prefs = prefs
@@ -432,8 +438,32 @@ struct NotificationsSection: View {
             SettingsHint(
                 "Chimes on urgent and deadline banners. Surfaced mail stays silent either way."
             )
+            InlineRow(key: "test") {
+                Button("post a banner") {
+                    Task { delivered = await Notifier.shared.postTest() }
+                }
+                .buttonStyle(.glass)
+                .controlSize(.small)
+            }
+            // Three states, because two of them look identical from the outside:
+            // a banner that never came because the grant is off, and one that
+            // never came because a focus mode ate it. Only the first is visible
+            // from in here, so the second is what the posted line points at.
+            SettingsHint(hint)
         }
         .onChange(of: prefs.notificationSound) { _, choice in preview(choice) }
+    }
+
+    private var hint: String {
+        switch delivered {
+        case .none:
+            return "Posts one now, from Passband itself. Every banner carries the sender's own mark."
+        case .some(true):
+            return "Posted. If nothing appeared, a focus mode or Do Not Disturb is holding it."
+        case .some(false):
+            return
+                "The system is refusing banners for Passband. Turn them back on in System Settings, Notifications."
+        }
     }
 
     private func preview(_ choice: NotificationSound) {
