@@ -461,6 +461,15 @@ pub struct StoreSnapshot {
     pub db_bytes: u64,
     /// The `-wal` sidecar; 0 when checkpointed away or absent.
     pub wal_bytes: u64,
+    /// Unrevoked, non-console device tokens
+    /// ([`crate::store::SqliteStore::count_client_devices`]).
+    ///
+    /// A GAUGE, and NOT the activation signal: it falls again when somebody
+    /// revokes a phone, while activation is a fact about the past that nothing
+    /// undoes. The stamp is read out of band by `squelchd token first-paired`;
+    /// this is here so an operator can see the fleet's paired devices on a
+    /// dashboard, and nothing reads it back.
+    pub devices_paired: u64,
 }
 
 /// Roll the per-day ledger rows up into one total per category.
@@ -744,6 +753,17 @@ pub fn render(metrics: &SyncMetrics, db: Option<&StoreSnapshot>) -> String {
             db.llm_cost_usd,
         );
 
+        // UNLABELLED, which is what keeps it inside this module's rule: a
+        // per-device series would put a device name in a label, and a scrape is
+        // unauthenticated. One integer says how many clients this mailbox has
+        // without saying anything about any of them.
+        e.scalar(
+            "squelchd_devices_paired",
+            MetricKind::Gauge,
+            "Client devices currently holding an unrevoked device token; console sessions excluded.",
+            db.devices_paired as f64,
+        );
+
         e.family(
             "squelchd_db_size_bytes",
             MetricKind::Gauge,
@@ -901,6 +921,7 @@ mod tests {
         assert!(text.contains("squelchd_sync_last_success_timestamp_seconds 0\n"));
         assert!(!text.contains("squelchd_db_size_bytes"));
         assert!(!text.contains("squelchd_store_messages"));
+        assert!(!text.contains("squelchd_devices_paired"));
         assert!(text.ends_with('\n'));
     }
 
@@ -943,6 +964,7 @@ mod tests {
             llm_cost_usd: 0.25,
             db_bytes: 4096,
             wal_bytes: 0,
+            devices_paired: 2,
         };
         let text = render(&m, Some(&db));
         assert!(text.contains("squelchd_store_messages{tier=\"signal\"} 7\n"));
@@ -959,6 +981,11 @@ mod tests {
         ));
         assert!(text.contains("squelchd_llm_cost_usd_total 0.25\n"));
         assert!(text.contains("squelchd_db_size_bytes{file=\"wal\"} 0\n"));
+        // The device gauge is a bare scalar: no name, no id, nothing that says
+        // WHICH devices, because a scrape needs no bearer.
+        assert!(text.contains("# TYPE squelchd_devices_paired gauge\n"));
+        assert!(text.contains("squelchd_devices_paired 2\n"));
+        assert!(!text.contains("squelchd_devices_paired{"));
     }
 
     #[test]

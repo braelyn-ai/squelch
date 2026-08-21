@@ -1281,6 +1281,28 @@ pub fn pair_argv(config: &Config, name: &TenantName) -> Vec<String> {
     ]
 }
 
+/// The argv `squelchd token first-paired` runs as inside a tenant pod: when a
+/// client device first paired with this mailbox, for the activation signal.
+///
+/// TAKES NEITHER THE CONFIG NOR THE TENANT, unlike [`pair_argv`], and that is
+/// the whole shape of the command rather than an omission. The store path and
+/// the account come from the container's environment, which an exec session
+/// inherits; there is no URL to pass because nothing is being handed to a
+/// device. Every byte of this argv is a fixed string, so no tenant label can
+/// reach a command line from here even by accident.
+///
+/// A daemon image too old to have the subcommand exits non-zero on it, which the
+/// caller reports as a cluster failure and the control plane's poller simply
+/// waits out — see [`crate::provision::Warden::first_paired`]. No version
+/// negotiation, because the next fleet roll is the fix.
+pub fn first_paired_argv() -> Vec<String> {
+    vec![
+        "/usr/local/bin/squelchd".to_string(),
+        "token".to_string(),
+        "first-paired".to_string(),
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

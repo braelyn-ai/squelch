@@ -68,13 +68,15 @@
 //!   debug a failed signup.
 
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use chrono::{DateTime, Utc};
 use k8s_openapi::api::apps::v1::Deployment;
 use k8s_openapi::api::core::v1::Secret;
 
 use crate::cluster::{Cluster, ClusterError, Kind, Object};
 use crate::config::Config;
+use crate::devices;
 use crate::drift::{self, DriftReport};
 use crate::identity::TenantIdentity;
 use crate::objects;
@@ -385,6 +387,17 @@ pub enum WardenError {
     /// [`Warden::reconcile`].
     #[error("nothing to reconcile")]
     NotReconcilable,
+    /// The tenant is real and there is no pod to ask: it is pending, stopped or
+    /// failed, and the question this refuses
+    /// ([`Warden::first_paired`]) can only be answered by a running daemon.
+    ///
+    /// Its own variant rather than [`WardenError::NotReconcilable`]'s 409,
+    /// because the two say different things to the caller. A 409 means "do
+    /// something else"; this means "ask again later", and later is exactly what
+    /// the control plane's poller does anyway. See the wire mapping in
+    /// [`crate::handlers`].
+    #[error("tenant not running")]
+    NotRunning,
     /// The account behind this tenant is CLOSED
     /// ([`objects::CANCELLED_AT_ANNOTATION`]), so nothing here may put a
     /// workload up, roll one, or hand out a key to one.
@@ -426,6 +439,22 @@ const RECREATE_REFUSED: &str = "recreate_refused";
 /// named for a person, or the whole run stopped - and a misspelling here would
 /// silently pick the wrong one.
 const CREDENTIAL_MISSING: &str = "credential_missing";
+
+/// How long [`Warden::first_paired`] waits for a Ready pod before giving up.
+///
+/// DELIBERATELY NOT [`crate::config::Config::ready_timeout`], which is what
+/// every other exec path on this service uses. Those paths are a person's
+/// signup: something is being provisioned, somebody is watching a spinner, and
+/// waiting the rollout out is the difference between a finished signup and a
+/// failed one. This one is a periodic poll for an analytics fact, and ITS RETRY
+/// IS THE WAIT — the control plane comes back in minutes regardless, so holding
+/// a warden request open for a whole ready_timeout buys a stamp that was going
+/// to be collected on the next tick anyway, at the price of a thread parked on
+/// a tenant that is mid-roll.
+///
+/// Five seconds rather than zero because a settled tenant answers immediately
+/// and this is only ever spent on one that is moving.
+const DEVICES_POD_WAIT: Duration = Duration::from_secs(5);
 
 /// Log the shape of the failure here and return the machine reason for the
 /// wire.
@@ -926,6 +955,91 @@ impl Warden {
             .await
             .map_err(|e| fail(name.as_str(), "no_ready_pod", &e))?;
         self.mint_pairing(&name, &pod).await
+    }
+
+    /// When a client device FIRST paired with this tenant's mailbox, or `None`
+    /// if none ever has: the activation signal (issue #89).
+    ///
+    /// ONE TIMESTAMP CROSSES THIS BOUNDARY. Not a device count, not a name, not
+    /// a listing — the daemon subcommand this execs was made separate from
+    /// `token list` precisely so that over-sharing is impossible here rather
+    /// than merely avoided. What the control plane learns is whether somebody
+    /// ever ran the app, which is the question it could not answer at all.
+    ///
+    /// ITS OWN ROUTE, not a field on [`Warden::status`]. A status is a cheap GET
+    /// that the control plane makes freely, and an exec into a pod is not cheap;
+    /// putting one behind `status()` would turn every incidental status check
+    /// into a pod round trip.
+    ///
+    /// The refusals, in the order they are reached:
+    ///
+    /// - an unknown label is [`WardenError::NotFound`], decided off the identity
+    ///   Secret exactly as `status` decides it, so the two routes agree about
+    ///   what a tenant IS;
+    /// - anything but [`TenantStatus::Active`] is [`WardenError::NotRunning`]
+    ///   (503, not 409): there is no pod to ask, the caller's next move is to
+    ///   ask again later, and it was going to do that anyway;
+    /// - a non-zero exit or output this warden cannot read is a terse 500 with a
+    ///   machine reason. NEVER A GUESS: an unparseable answer must not become
+    ///   "nobody has ever paired", because the control plane would store that as
+    ///   a standing fact about a tenant it never actually heard from.
+    ///
+    /// NO ROLLOUT WAIT, unlike [`Warden::repair`], and the difference is what
+    /// the two are asking for. A pairing code minted in a pod that is about to
+    /// terminate is a code that dies with the pod, so `repair` has to reach the
+    /// pod that will SURVIVE. A read is not like that: every pod on this tenant
+    /// mounts the same volume and reads the same store, so an answer from a
+    /// terminating-but-Ready pod is exactly as true as one from its replacement.
+    ///
+    /// The exec output is not logged, at any level, on any branch. That is
+    /// [`Warden::mint_pairing`]'s blanket rule and this inherits it whole: a
+    /// timestamp would be harmless in a log line, and a rule with one harmless
+    /// exception in it is a rule nobody can apply to the next command.
+    pub async fn first_paired(
+        &self,
+        raw_label: &str,
+    ) -> Result<Option<DateTime<Utc>>, WardenError> {
+        let name = TenantName::parse(raw_label)?;
+        if self.identity(&name).await?.is_none() {
+            return Err(WardenError::NotFound);
+        }
+        if self.status_of(&name).await? != TenantStatus::Active {
+            return Err(WardenError::NotRunning);
+        }
+        let pod = self
+            .cluster
+            .ready_pod(&objects::pod_selector(&name), DEVICES_POD_WAIT)
+            .await
+            .map_err(|e| fail(name.as_str(), "no_ready_pod", &e))?;
+        let output = self
+            .cluster
+            .exec(&pod, &objects::first_paired_argv())
+            .await
+            .map_err(|e| fail(name.as_str(), "first_paired_failed", &e))?;
+        if !output.ok {
+            // The state an old daemon image is in: no such subcommand, non-zero
+            // exit. Terse on purpose — the control plane's poller eats the 500
+            // and the next fleet roll is the fix, so there is nothing here for
+            // anyone to act on beyond the reason word.
+            tracing::error!(
+                tenant = %name,
+                reason = "first_paired_failed",
+                "squelchd token first-paired exited non-zero"
+            );
+            return Err(WardenError::cluster("first_paired_failed"));
+        }
+        // STDOUT ONLY. The daemon puts its one machine-readable line there and
+        // everything a human reads on stderr, so folding the two together (which
+        // `mint_pairing` does, for a parser that scans for a prefix) would let a
+        // warning line become the answer.
+        devices::parse_first_paired(&output.stdout).ok_or_else(|| {
+            tracing::error!(
+                tenant = %name,
+                reason = "first_paired_unparsed",
+                "squelchd token first-paired succeeded but printed neither a timestamp nor none"
+            );
+            WardenError::cluster("first_paired_unparsed")
+        })
     }
 
     /// What the cluster says about this tenant.
@@ -3079,6 +3193,166 @@ mod tests {
                 .unwrap_err(),
             WardenError::cluster("pair_output_unparsed")
         );
+    }
+
+    // ---- the activation signal -------------------------------------------
+
+    /// A tenant that is up and has been paired with: put through both phases,
+    /// then asked. The argv is asserted STRING FOR STRING because it is a wire
+    /// contract with the daemon's CLI, and the pod because a read aimed at the
+    /// wrong one would answer somebody else's fact.
+    #[tokio::test]
+    async fn first_paired_reads_one_timestamp_out_of_the_tenants_pod() {
+        let h = Harness::new();
+        h.warden
+            .create_tenant("alice", "alice@example.com")
+            .await
+            .unwrap();
+        h.warden
+            .set_credentials("alice", &armored("alice"))
+            .await
+            .unwrap();
+
+        h.cluster
+            .exec_prints(&crate::testing::first_paired_stdout("2026-03-01T09:30:00Z"));
+        let at = h
+            .warden
+            .first_paired("alice")
+            .await
+            .unwrap()
+            .expect("a client paired");
+        assert_eq!(
+            at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            "2026-03-01T09:30:00Z"
+        );
+
+        let (pod, argv) = h.cluster.last_exec().unwrap();
+        assert_eq!(pod, "alice-abc123");
+        assert_eq!(
+            argv,
+            vec!["/usr/local/bin/squelchd", "token", "first-paired"],
+            "the argv is a contract with the daemon's CLI"
+        );
+        // The command takes no label, so not even this tenant's name reaches
+        // that command line.
+        assert!(argv.iter().all(|arg| !arg.contains("alice")));
+    }
+
+    /// `none` is an ANSWER. A running tenant nobody has paired a client with
+    /// reports exactly that, and it is not a failure and not a retry.
+    #[tokio::test]
+    async fn first_paired_answers_for_a_mailbox_nobody_has_paired_with() {
+        let h = Harness::new();
+        h.warden
+            .create_tenant("alice", "alice@example.com")
+            .await
+            .unwrap();
+        h.warden
+            .set_credentials("alice", &armored("alice"))
+            .await
+            .unwrap();
+
+        h.cluster
+            .exec_prints(&crate::testing::first_paired_none_stdout());
+        assert_eq!(h.warden.first_paired("alice").await.unwrap(), None);
+    }
+
+    /// An unknown label is the same 404 `status` gives, decided off the same
+    /// identity Secret, and it never reaches a pod.
+    #[tokio::test]
+    async fn first_paired_404s_a_tenant_that_does_not_exist() {
+        let h = Harness::new();
+        assert_eq!(
+            h.warden.first_paired("nobody").await.unwrap_err(),
+            WardenError::NotFound
+        );
+        assert!(h.cluster.last_exec().is_none());
+        // A label that is not a label is refused before the cluster is touched.
+        assert!(matches!(
+            h.warden.first_paired("-nope-").await.unwrap_err(),
+            WardenError::InvalidLabel(_)
+        ));
+    }
+
+    /// A tenant with no pod is NOT RUNNING, which is neither "no such tenant"
+    /// nor a conflict: there is nothing to ask right now, and the caller is a
+    /// poller whose next tick is the whole remedy. Both workload-less states
+    /// answer it, and neither execs.
+    #[tokio::test]
+    async fn a_tenant_with_no_pod_is_not_running_rather_than_missing() {
+        let h = Harness::new();
+        h.warden
+            .create_tenant("alice", "alice@example.com")
+            .await
+            .unwrap();
+        // Pending: phase two never ran.
+        assert_eq!(
+            h.warden.first_paired("alice").await.unwrap_err(),
+            WardenError::NotRunning
+        );
+        assert!(h.cluster.last_exec().is_none());
+
+        // Stopped: the workload was taken down and the mail kept.
+        h.warden
+            .set_credentials("alice", &armored("alice"))
+            .await
+            .unwrap();
+        h.warden.delete("alice").await.unwrap();
+        assert_eq!(
+            h.warden.first_paired("alice").await.unwrap_err(),
+            WardenError::NotRunning
+        );
+    }
+
+    /// The state every daemon image from before this subcommand is in: the exec
+    /// exits non-zero. A terse 500, which the control plane's poller eats and
+    /// the next fleet roll fixes.
+    #[tokio::test]
+    async fn a_first_paired_exec_that_exits_non_zero_is_a_terse_500() {
+        let h = Harness::new();
+        h.warden
+            .create_tenant("alice", "alice@example.com")
+            .await
+            .unwrap();
+        h.warden
+            .set_credentials("alice", &armored("alice"))
+            .await
+            .unwrap();
+
+        h.cluster.exec_fails();
+        assert_eq!(
+            h.warden.first_paired("alice").await.unwrap_err(),
+            WardenError::cluster("first_paired_failed")
+        );
+    }
+
+    /// Output this warden cannot read is a FAILURE, never `None`. Reading it as
+    /// "nobody has ever paired" would hand the control plane a fact the daemon
+    /// never stated, and the control plane would store it.
+    #[tokio::test]
+    async fn unreadable_first_paired_output_is_never_half_an_answer() {
+        let h = Harness::new();
+        h.warden
+            .create_tenant("alice", "alice@example.com")
+            .await
+            .unwrap();
+        h.warden
+            .set_credentials("alice", &armored("alice"))
+            .await
+            .unwrap();
+
+        for garbage in [
+            "error: unrecognized subcommand 'first-paired'\n",
+            "2026-03-01\n",
+            "",
+        ] {
+            h.cluster.exec_prints(garbage);
+            assert_eq!(
+                h.warden.first_paired("alice").await.unwrap_err(),
+                WardenError::cluster("first_paired_unparsed"),
+                "{garbage:?}"
+            );
+        }
     }
 
     /// The destructive-action guard, stated as a test: DELETE takes the

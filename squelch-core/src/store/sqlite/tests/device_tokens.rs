@@ -4,10 +4,12 @@
 //! indistinguishable from an unknown one, that every pairing failure is the same
 //! failure, and that no plaintext ever reaches a listing or the audit log.
 
-use super::super::device_tokens::{PAIRING_CODE_LEN, PAIRING_TTL_SECS, TOKEN_PREFIX};
+use super::super::device_tokens::{
+    CONSOLE_DEVICE_NAME, PAIRING_CODE_LEN, PAIRING_TTL_SECS, TOKEN_PREFIX,
+};
 use super::super::*;
 use super::support::*;
-use chrono::Duration;
+use chrono::{Duration, TimeZone};
 
 fn ttl() -> Duration {
     Duration::seconds(PAIRING_TTL_SECS)
@@ -246,6 +248,110 @@ fn last_used_at_is_touched_once_then_throttled() {
     let refreshed = raw_token_row(&store, issued.id).1.unwrap();
     assert_ne!(refreshed, stale, "a stale stamp is refreshed");
     assert!(seen.last_used_at.is_some());
+}
+
+// ---- activation --------------------------------------------------------
+
+/// Rewrite a token's `created_at`, so a pairing order can be built without
+/// waiting for the clock. The column is the one the activation reader folds a
+/// minimum over.
+fn backdate_created(store: &SqliteStore, id: i64, at: DateTime<Utc>) {
+    let conn = store.lock().unwrap();
+    conn.execute(
+        "UPDATE device_tokens SET created_at = ?2 WHERE id = ?1",
+        params![id, at.to_rfc3339()],
+    )
+    .unwrap();
+}
+
+#[test]
+fn a_mailbox_nobody_paired_with_has_no_activation_stamp() {
+    let (store, acct) = store();
+    assert_eq!(store.first_client_pairing_at(acct).unwrap(), None);
+    assert_eq!(store.count_client_devices(acct).unwrap(), 0);
+}
+
+/// The console signs in by claiming a pairing code under a RESERVED name, which
+/// on a hosted tenant is part of the signup flow itself. Counting it would
+/// report every signup as an activation.
+#[test]
+fn a_console_session_is_not_a_paired_device() {
+    let (store, acct) = store();
+    let minted = store.mint_pairing_code(acct, ttl()).unwrap();
+    store
+        .claim_pairing_code(&minted.code, CONSOLE_DEVICE_NAME)
+        .unwrap();
+
+    assert_eq!(store.first_client_pairing_at(acct).unwrap(), None);
+    assert_eq!(store.count_client_devices(acct).unwrap(), 0);
+    // The row is really there; it is the READERS that skip it.
+    assert_eq!(store.list_device_tokens(acct).unwrap().len(), 1);
+
+    // One real device, and the answer appears.
+    store.issue_device_token(acct, "iPhone").unwrap();
+    assert!(store.first_client_pairing_at(acct).unwrap().is_some());
+    assert_eq!(store.count_client_devices(acct).unwrap(), 1);
+    assert_eq!(store.list_device_tokens(acct).unwrap().len(), 2);
+}
+
+/// The EARLIEST pairing wins whatever order the rows went in, because the answer
+/// is folded over parsed timestamps rather than taken off the id order or off a
+/// string comparison of the column.
+#[test]
+fn the_earliest_pairing_wins_regardless_of_insert_order() {
+    let (store, acct) = store();
+    let march = Utc
+        .with_ymd_and_hms(2026, 3, 1, 9, 30, 0)
+        .single()
+        .unwrap();
+    let april = Utc
+        .with_ymd_and_hms(2026, 4, 1, 9, 30, 0)
+        .single()
+        .unwrap();
+
+    // Inserted newest-first, so an implementation that trusted id order would
+    // answer April.
+    let later = store.issue_device_token(acct, "iPad").unwrap();
+    backdate_created(&store, later.id, april);
+    let earlier = store.issue_device_token(acct, "iPhone").unwrap();
+    backdate_created(&store, earlier.id, march);
+    // And a console row in between, older than either, which must not win.
+    let console = store.issue_device_token(acct, CONSOLE_DEVICE_NAME).unwrap();
+    backdate_created(
+        &store,
+        console.id,
+        Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).single().unwrap(),
+    );
+
+    assert_eq!(store.first_client_pairing_at(acct).unwrap(), Some(march));
+    assert_eq!(store.count_client_devices(acct).unwrap(), 2);
+
+    // Another account's devices are nobody else's activation.
+    let other = store.ensure_account("other@example.com").unwrap();
+    assert_eq!(store.first_client_pairing_at(other).unwrap(), None);
+    assert_eq!(store.count_client_devices(other).unwrap(), 0);
+}
+
+/// REVOKING A DEVICE DOES NOT UN-HAPPEN THE PAIRING. The stamp is a fact about
+/// the past; the gauge is a statement about right now, and this is the one case
+/// where the two readers deliberately disagree.
+#[test]
+fn a_revoked_first_device_still_counts_as_the_activation() {
+    let (store, acct) = store();
+    let march = Utc
+        .with_ymd_and_hms(2026, 3, 1, 9, 30, 0)
+        .single()
+        .unwrap();
+    let phone = store.issue_device_token(acct, "iPhone").unwrap();
+    backdate_created(&store, phone.id, march);
+    assert!(store.revoke_device_token(acct, phone.id).unwrap());
+
+    assert_eq!(store.first_client_pairing_at(acct).unwrap(), Some(march));
+    assert_eq!(
+        store.count_client_devices(acct).unwrap(),
+        0,
+        "nothing can connect right now, which is a different question"
+    );
 }
 
 // ---- pairing -----------------------------------------------------------
