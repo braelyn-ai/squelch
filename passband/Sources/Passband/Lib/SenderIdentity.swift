@@ -236,11 +236,36 @@ enum SenderID {
         return first.isEmpty ? nil : first
     }
 
+    /// Consumer mail hosts, where a display name matching the host asserts
+    /// nothing at all: the domain belongs to the mailbox provider, not to the
+    /// sender, so "Gmail <friend@gmail.com>" is a person with an odd display
+    /// name and not a brand mailing you. Vetoed only for the DISPLAY-NAME arm
+    /// below — a robot local-part at one of these is still a service.
+    private static let consumerHosts: Set<String> = [
+        "gmail.com", "googlemail.com", "outlook.com", "hotmail.com", "live.com", "msn.com",
+        "yahoo.com", "ymail.com", "aol.com", "icloud.com", "me.com", "mac.com",
+        "proton.me", "protonmail.com", "pm.me", "gmx.com", "gmx.net", "mail.com",
+        "zoho.com", "fastmail.com", "hey.com", "yandex.com", "qq.com", "163.com",
+        "126.com", "naver.com", "web.de", "t-online.de",
+    ]
+
+    /// The words of a brandable name, each folded to plain lowercase letters
+    /// and digits: "Blue Apron" and "blue-apron" become the same two tokens,
+    /// "Nestlé" and "nestle" the same one, "L'Oréal" and "loreal" the same one
+    /// (the apostrophe is dropped INSIDE a token rather than splitting it).
+    private static func nameTokens(_ s: String) -> [String] {
+        s.folding(options: [.diacriticInsensitive, .caseInsensitive], locale: nil)
+            .split(whereSeparator: { $0.isWhitespace || $0 == "-" || $0 == "." || $0 == "_" })
+            .map { $0.filter { $0.isLetter || $0.isNumber } }
+            .filter { !$0.isEmpty }
+    }
+
     /// True when the sender presents itself AS the brand rather than as a
     /// person, by either of the two ways mail actually does that:
     ///
     ///  1. the local-part equals the domain's base label ("eBay@eBay.com"), or
-    ///  2. the DISPLAY NAME equals it ("Airbnb <express@airbnb.com>").
+    ///  2. the DISPLAY NAME is the domain, word for word
+    ///     ("Airbnb <express@airbnb.com>").
     ///
     /// (2) is the common shape and (1) alone missed it: bulk mail goes out from
     /// whatever routing mailbox the sender's ESP minted — express@, e@,
@@ -248,22 +273,30 @@ enum SenderID {
     /// is on `robotLocals` either. So the brand went unrecognised and got a
     /// human's treatment: initials, and no logo anywhere it appeared.
     ///
-    /// It stays inside the privacy rule. A person does not sign their mail with
-    /// their employer's domain label, so this cannot reach a correspondent; the
-    /// nearest false positive is a role mailbox whose display name IS the
-    /// company ("Acme <bob@acme.com>"), which is a brand for this purpose
-    /// anyway. And the only thing that leaves the device is the DOMAIN, which
-    /// any no-reply@ at the same domain already discloses.
+    /// WORD FOR WORD is what keeps (2) inside the privacy rule, and the first
+    /// cut of it — squashing both sides to letters and digits and comparing —
+    /// was outside: it read "Jane Doe <jane@janedoe.com>" as a brand and sent
+    /// janedoe.com off to the icon service, which is a private correspondent's
+    /// domain leaving the device, the one thing this file exists to prevent.
+    /// The freelancer, the consultant and the family domain are the COMMON
+    /// shape of a personal address, not an edge case.
     ///
-    /// Matched on letters and digits alone, and exactly: "Airbnb" is the brand,
-    /// "Airbnb Support" is not asserted to be. Conservative on purpose — a
-    /// prefix match would read "Samuel Smith <ssmith@sam.com>" as the brand Sam
-    /// and send a correspondent's domain out to be looked up.
+    /// The tokens are what tell the two apart, because the two register their
+    /// domains differently and always have. A brand with a two-word name buys
+    /// the hyphen — blue-apron.com, marks-and-spencer.co.uk, t-mobile.com — and
+    /// its tokens line up with its name's. A person buys the concatenation —
+    /// janedoe.com, bobsmith.com — and "Jane Doe" is two tokens against one.
+    /// Same reason "Airbnb Support" is not the brand: three-vs-one.
     ///
-    /// The name is matched against the label AND the whole domain, because some
-    /// brands are named with the TLD attached and mean it: "Booking.com" and
-    /// booking.com are the same assertion, and squashing the punctuation is
-    /// what lets them meet.
+    /// Matched against the label AND the whole domain, because some brands are
+    /// named with the TLD attached and mean it ("Booking.com").
+    ///
+    /// WHAT IS STILL REACHABLE, stated plainly: a person whose ONE-WORD display
+    /// name is their own registrable domain — "Anderson <john@anderson.com>".
+    /// No shape available at this layer separates that from "Airbnb", and the
+    /// signal that would (`sender_known`, the daemon's Sent-derived contacts)
+    /// does not reach `Avatar`'s call sites yet. It is the narrowest form of
+    /// the leak and it is a deliberate remainder, not an oversight.
     static func isBrand(_ sender: String) -> Bool {
         let parsed = parse(sender)
         guard let domain = faviconDomain(sender) else { return false }
@@ -274,11 +307,12 @@ enum SenderID {
             .split(separator: "+").first.map(String.init) ?? ""
         if !local.isEmpty, local.lowercased() == base { return true }
 
+        guard !consumerHosts.contains(domain) else { return false }
         // `parse().name`, never `displayName` — displayName asks THIS question
         // on its way to an answer, and the two calling each other never returns.
-        let squashed = parsed.name.lowercased().filter { $0.isLetter || $0.isNumber }
-        guard !squashed.isEmpty else { return false }
-        return squashed == base || squashed == domain.filter { $0.isLetter || $0.isNumber }
+        let name = nameTokens(parsed.name)
+        guard !name.isEmpty else { return false }
+        return name == nameTokens(base) || name == nameTokens(domain)
     }
 
     /// The name to SHOW for a sender:

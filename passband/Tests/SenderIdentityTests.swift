@@ -23,6 +23,7 @@ struct SenderIdentityTests {
         brandsAreRecognised()
         peopleAreNot()
         theBoundaryHolds()
+        theKnownRemainder()
         namesStayCorrect()
 
         if failures > 0 {
@@ -40,11 +41,20 @@ struct SenderIdentityTests {
         // The arm this suite exists for. Bulk mail leaves from whatever
         // mailbox the sender's ESP minted, and none of these is on
         // `robotLocals` — before the display name counted, every one of them
-        // was treated as a person.
+        // was treated as a person. (`express@airbnb.com` is the witness that
+        // matters: nothing else in this file would have caught it.)
         expect(SenderID.isBrand("Airbnb <express@airbnb.com>"), "display name over a routing box")
-        expect(SenderID.isBrand("Notion <team@mail.notion.so>"), "and through a mail subdomain")
         expect(SenderID.isBrand("STRIPE <e@stripe.com>"), "case is not part of the match")
-        expect(SenderID.isBrand("Booking.com <news-2938@booking.com>"), "punctuation is not either")
+        expect(SenderID.isBrand("Booking.com <news-2938@booking.com>"), "a name carrying its TLD")
+
+        // Word for word, which is what makes a HYPHENATED brand domain work:
+        // the tokens line up on both sides.
+        expect(SenderID.isBrand("Blue Apron <hi@blue-apron.com>"), "two words, one hyphen")
+        expect(SenderID.isBrand("T-Mobile <news@t-mobile.com>"), "hyphens on both sides")
+        expect(
+            SenderID.isBrand("Marks and Spencer <news@marks-and-spencer.co.uk>"),
+            "three words under a compound suffix")
+        expect(SenderID.isBrand("Nestlé <news@nestle.com>"), "diacritics fold before matching")
 
         // A robot local-part still stands on its own, with or without a name.
         expect(SenderID.isRobot("no-reply@stripe.com"), "the robot arm is untouched")
@@ -54,10 +64,27 @@ struct SenderIdentityTests {
     static func peopleAreNot() {
         expect(!SenderID.isBrand("Sarah Chen <sarah@acme.com>"), "a person at a company")
         expect(!SenderID.isBrand("sarah@acme.com"), "a bare human address")
+
+        // THE ONES THAT MATTER. A person on their own name-domain is the
+        // common shape of a personal address — freelancers, consultants,
+        // family domains — and the first cut of the display-name arm squashed
+        // the space out of "Jane Doe" and read it as the brand janedoe.com.
+        // The tokens are what tell them apart: a brand buys the hyphen, a
+        // person buys the concatenation.
+        expect(!SenderID.isBrand("Jane Doe <jane@janedoe.com>"), "a person on their own domain")
+        expect(!SenderID.isBrand("Bob Smith <bob@bobsmith.com>"), "and again, concatenated")
+        expect(
+            !SenderID.isBrand("Sarah Chen <sarah@sarahchen.co.uk>"),
+            "and under a compound suffix")
+
+        // A consumer host's domain belongs to the mailbox provider, so a
+        // display name matching it asserts nothing about the sender.
+        expect(!SenderID.isBrand("Gmail <friend@gmail.com>"), "a consumer host is never the brand")
+        expect(!SenderID.isBrand("Proton <friend@proton.me>"), "nor a privacy host")
         expect(!SenderID.isBrand("Sarah <sarah@gmail.com>"), "a first name on a consumer host")
 
-        // EXACT, on letters and digits. A prefix match would read the address
-        // below as the brand Sam, which is a person's mail leaving the device.
+        // EXACT, token for token. A prefix match would read the address below
+        // as the brand Sam, which is a person's mail leaving the device.
         expect(!SenderID.isBrand("Samuel Smith <ssmith@sam.com>"), "no prefix matching")
         // And a qualified team name is not the company asserting itself.
         expect(!SenderID.isBrand("Airbnb Support <express@airbnb.com>"), "\"Airbnb Support\" is not")
@@ -65,6 +92,23 @@ struct SenderIdentityTests {
 
         // A display name that is just the address again is not a name.
         expect(!SenderID.isBrand("sarah@acme.com <sarah@acme.com>"), "the address is not a name")
+    }
+
+    /// The remainder, pinned as BEHAVIOUR rather than left to be discovered.
+    ///
+    /// A one-word display name equal to your own registrable domain is
+    /// structurally identical to "Airbnb", and nothing available at this layer
+    /// separates them. These assert what the code does today so that the day
+    /// `sender_known` reaches `Avatar`, the person who closes it sees exactly
+    /// which cases they closed — and so that nobody reads the arm above as
+    /// airtight.
+    static func theKnownRemainder() {
+        expect(
+            SenderID.isBrand("Anderson <john@anderson.com>"),
+            "KNOWN: a one-word surname on its own domain still reads as a brand")
+        expect(
+            SenderID.eligibleFaviconDomain("Chen <sc@chen.com>") == "chen.com",
+            "KNOWN: and its domain is therefore resolved over the network")
     }
 
     static func theBoundaryHolds() {
@@ -83,6 +127,9 @@ struct SenderIdentityTests {
         expect(
             SenderID.eligibleFaviconDomain("Samuel Smith <ssmith@sam.com>") == nil,
             "nor one who nearly matched their own domain")
+        expect(
+            SenderID.eligibleFaviconDomain("Jane Doe <jane@janedoe.com>") == nil,
+            "NOR ONE WHOSE NAME IS THEIR DOMAIN")
         expect(
             SenderID.eligibleFaviconDomain("express@airbnb.com") == nil,
             "an unnamed routing box stays local — the brand is not asserted")
