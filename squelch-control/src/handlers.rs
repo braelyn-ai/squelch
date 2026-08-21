@@ -1144,10 +1144,7 @@ pub async fn oauth_callback(
     // arm would still record this person by the Google account they signed up
     // with, which is the outcome worth having.
     //
-    // `let _user` because PR 4 is what consumes it: the analytics id rides the
-    // deep link on the success page below, and binding it here is what keeps
-    // that a one-line change rather than a re-plumb.
-    let _user = match state
+    let user = match state
         .store()
         .record_signup(invite_id, &grant.account_email, &label, chrono::Utc::now())
         .await
@@ -1171,10 +1168,15 @@ pub async fn oauth_callback(
 
     tracing::info!(label = %label, "tenant provisioned");
 
+    // The analytics id rides the pairing deep link so the app can adopt it as
+    // its PostHog distinct_id — the funnel-to-behavior join that never names
+    // an address. `None` when the funnel stamp failed above: the pairing does
+    // not wait on analytics, and the next /app/auth sign-in heals the gap.
     done(pages::success(
         &config.tenant_url(&label),
         &pairing.pair_code,
         PAIRING_MINUTES,
+        user.as_ref().map(|u| u.analytics_id.as_str()),
     ))
 }
 
@@ -1348,6 +1350,19 @@ async fn app_login(state: &ControlState, code: String, pkce_verifier: String) ->
     // the whole credential. The mailbox is not logged either, here as everywhere.
     tracing::info!(label = %label, "app login complete");
 
+    // The person's analytics id, re-issued IDENTICALLY on every sign-in: that
+    // stability is what lets a reinstall (or a second device) re-adopt the
+    // same PostHog identity. Fail-soft — a lookup error is an aid-less link,
+    // never a refused login — and `Ok(None)` is simply a tenant that predates
+    // the funnel.
+    let analytics_id = match state.store().analytics_id_for_label(&label).await {
+        Ok(id) => id,
+        Err(e) => {
+            tracing::error!(error = %e, label = %label, "analytics id lookup failed");
+            None
+        }
+    };
+
     // The page builds the `passband://` link itself, from this deployment's own
     // tenant URL and the warden's code. Nothing a caller sent is in it, because
     // this route accepted nothing a caller sent.
@@ -1356,6 +1371,7 @@ async fn app_login(state: &ControlState, code: String, pkce_verifier: String) ->
         &state.config().tenant_url(&label),
         &pairing.pair_code,
         PAIRING_MINUTES,
+        analytics_id.as_deref(),
     );
     // A live pairing code is on this page. Nothing may cache it, and it must not
     // ride out as a referer when the deep link is pressed.

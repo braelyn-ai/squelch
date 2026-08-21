@@ -108,6 +108,14 @@ struct ConnectView: View {
     /// A deep link filled the form and stopped. Rings the button that is
     /// waiting for the press the link will never make for the user.
     @State private var linkArmed = false
+    /// The analytics id a hosted deep link carried, held until the pairing it
+    /// belongs to actually LANDS. It is a claim about who this person is, and
+    /// the only proof of that claim is a successful connect to the daemon the
+    /// same link named — so it waits here rather than being adopted on arrival.
+    /// Cleared alongside `heldToken`/`linkArmed` for the same reason they are:
+    /// once a human has hand-edited the url or the code, the form is no longer
+    /// that link's claim about anything.
+    @State private var linkAid: String?
     @State private var pairingHelp = false
     @FocusState private var focus: ConnectField?
 
@@ -499,6 +507,7 @@ struct ConnectView: View {
                 url = next
                 heldToken = nil
                 linkArmed = false
+                linkAid = nil
             })
     }
 
@@ -512,6 +521,7 @@ struct ConnectView: View {
                 code = next
                 heldToken = nil
                 linkArmed = false
+                linkAid = nil
             })
     }
 
@@ -567,7 +577,10 @@ struct ConnectView: View {
 
         // Already paid for. Retry the connection, not the claim.
         if let held = heldToken {
-            if await finish(serverURL: base, apiToken: held) { heldToken = nil }
+            if await finish(serverURL: base, apiToken: held) {
+                heldToken = nil
+                adoptLinkAid()
+            }
             return
         }
 
@@ -592,11 +605,32 @@ struct ConnectView: View {
             // which is for USER edits and would drop the token we just held.
             code = ""
             heldToken = issued.token
-            if await finish(serverURL: base, apiToken: issued.token) { heldToken = nil }
+            if await finish(serverURL: base, apiToken: issued.token) {
+                heldToken = nil
+                adoptLinkAid()
+            }
         } catch {
             claiming = false
             pairError = Pairing.message(for: error)
         }
+    }
+
+    /// Adopt the deep link's analytics id, now that the pairing it came with has
+    /// actually landed. Called from BOTH success paths in `claim`, because a
+    /// connect that only succeeded on the second press is no less a pairing —
+    /// the retry re-probes a token the same link's code already bought.
+    ///
+    /// Deliberately not reached from anywhere else. A token-mode connect and a
+    /// hand-typed code carry no id, so there is nothing to adopt and nothing
+    /// invented: that install stays anonymous until the next `/app/auth` sign-in
+    /// link brings the id over, which heals it without a guess. Runs for the
+    /// add-account sheet as well as the gate — `Analytics.adopt` decides what a
+    /// second account means, and that decision belongs there rather than split
+    /// across a view that only knows about one form.
+    private func adoptLinkAid() {
+        guard let aid = linkAid else { return }
+        Analytics.adopt(analyticsId: aid)
+        linkAid = nil
     }
 
     /// Fill the form from a deep link. It NEVER claims, whatever host it names:
@@ -612,6 +646,10 @@ struct ConnectView: View {
         mode = .pair
         url = link.serverURL
         code = Pairing.formatted(link.code)
+        // Copied, not merged: a new link replaces the previous link's claim
+        // whole, and a self-hosted one (which carries no id) correctly clears
+        // whatever a hosted link left sitting here.
+        linkAid = link.analyticsId
         heldToken = nil
         pairError = nil
         addError = nil
