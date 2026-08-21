@@ -1703,6 +1703,7 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
                         "squelch: revisit config-level failure ({kind}); \
                          re-evaluations stay scheduled"
                     );
+                    self.metrics.record_llm_config_failure();
                     break;
                 }
                 Ok(stage1_llm::ClassifyOutcome::Refused)
@@ -1894,6 +1895,7 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
                          resolved key/endpoint/model is wrong for the gateway; rows stay queued",
                         row.message_id
                     );
+                    self.metrics.record_llm_config_failure();
                     break;
                 }
                 Ok(stage1_llm::ClassifyOutcome::Refused)
@@ -2095,6 +2097,7 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
                                 "squelch: extract config-level failure ({kind}); the resolved \
                                  key/endpoint/model is wrong for the gateway; rows stay queued"
                             );
+                            self.metrics.record_llm_config_failure();
                             auth_failed = true;
                             break;
                         }
@@ -2158,6 +2161,7 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
                                 "squelch: extract config-level failure ({kind}); the resolved \
                                  key/endpoint/model is wrong for the gateway; rows stay queued"
                             );
+                            self.metrics.record_llm_config_failure();
                             auth_failed = true;
                             break;
                         }
@@ -2272,6 +2276,7 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
                         "squelch: ship-extract config-level failure ({kind}); the resolved \
                          key/endpoint/model is wrong for the gateway; rows stay queued"
                     );
+                    self.metrics.record_llm_config_failure();
                     break;
                 }
                 Ok(shipments::ExtractOutcome::Refused)
@@ -2560,6 +2565,7 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
                              queued",
                             row.message_id
                         );
+                        self.metrics.record_llm_config_failure();
                         self.metrics.record_stage2(Stage2Verdict::Retryable);
                         break;
                     }
