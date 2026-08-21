@@ -525,6 +525,12 @@ struct ThreadViewer: View {
                         // the body is inset from that by the card's gutter.
                         .onGeometryChange(for: CGFloat.self) { $0.size.width } action: { width in
                             bodyWidth = max(0, width - MessageCard.bodyInset)
+                            // Declared the moment it is known, not when the
+                            // measuring pass starts a beat later: the frames on
+                            // screen are already reporting heights, and they
+                            // would be filed against a width nobody had named
+                            // and then thrown away by the pass that named it.
+                            FrameHeights.shared.using(width: bodyWidth)
                         }
                         .padding(.horizontal, Self.columnPadding)
                         .padding(.vertical, 4)
@@ -709,7 +715,14 @@ struct ThreadViewer: View {
     /// whole rail hostage to a body no engine will ever be asked to lay out
     /// would mean a thread with one plain reply never gets a true map at all.
     private static func measuredCard(_ m: ClientMessage) -> CGFloat? {
-        guard let html = m.html, !html.isEmpty else { return mapEstimate(m) }
+        guard let html = m.html, !html.isEmpty else {
+            // Its own guess, not `mapEstimate`: this card draws with its quoted
+            // history collapsed behind a chip, exactly as the html ones do, and
+            // the rail must not draw it at the length of the chain it is
+            // answering.
+            return MinimapGeometry.card(
+                bodyHeight: MessageCard.guessedBody(m), attachments: m.attachmentList.count)
+        }
         guard let body = FrameHeights.shared.get(String(m.id)) else { return nil }
         return MinimapGeometry.card(bodyHeight: body, attachments: m.attachmentList.count)
     }
@@ -1476,7 +1489,7 @@ private struct MessageCard: View, Equatable {
                     html: html, cacheKey: String(message.id),
                     allowTrackers: message.allowsTrackers,
                     attachments: message.attachmentList,
-                    textHeight: guessedTextHeight)
+                    textHeight: Self.guessedBody(message))
             } else {
                 PlainBody(content: message.content)
             }
@@ -1532,7 +1545,7 @@ private struct MessageCard: View, Equatable {
     ///
     /// Memoized by message id: this is read from a view body, and the split is
     /// a regex walk of every line of the message.
-    private var guessedTextHeight: CGFloat {
+    static func guessedBody(_ message: ClientMessage) -> CGFloat {
         FrameHeights.shared.guess(String(message.id)) {
             MinimapGeometry.textHeight(
                 text: Quotes.splitText(message.content).visible, html: message.html)

@@ -38,19 +38,33 @@ final class FrameMeasurer {
 
     /// The measuring frame's viewport. The width is the reading column's and is
     /// load-bearing — mail reflows, and the same body measured at 843 and at
-    /// 500 differs by a third. The HEIGHT is not: the document is
-    /// `overflow:hidden`, so the body's own box is the answer whatever the
-    /// viewport is. A screenful is only the least surprising thing for a
-    /// percentage height to resolve against.
+    /// 500 differs by a third.
+    ///
+    /// The height very nearly is not: `height:100%`, a table at `height="100%"`,
+    /// a float overflowing the body box and an absolutely positioned child were
+    /// all measured to give the same answer at viewport 100, 800 and 2400,
+    /// because the document is `overflow:hidden` and the body's own box is what
+    /// is measured. `vh` units are the one exception (`min-height:100vh` is
+    /// whatever this number says), and they are rare enough in mail — and
+    /// equally circular in the reader, where the frame's height IS the content
+    /// — that a screenful is as good an answer as exists.
     private static let viewportHeight: CGFloat = 800
     /// How long a document has to hold the same height before it is believed.
-    /// Images arrive after the document does and each one moves the number —
-    /// measured at 8 to 25ms behind the load — so a number that has stopped
-    /// moving for this long has stopped moving.
-    private static let quiet: Duration = .milliseconds(40)
-    /// And the longest any one message may take. A body that never settles is
-    /// not allowed to hold up the nineteen behind it.
+    /// Short, because the navigation has already done the waiting: `didFinish`
+    /// does not fire until the subresources are in, so an image delayed two
+    /// seconds is still counted before the first poll. This only catches a
+    /// document that is still settling after that.
+    private static let quiet: Duration = .milliseconds(25)
+    /// The longest the POLLING may go on for a document that will not hold
+    /// still.
     private static let deadline: Duration = .milliseconds(1200)
+    /// And the longest we wait for the load itself. `didFinish` waiting for
+    /// every subresource is what makes the poll trustworthy, and it is also
+    /// what makes it hostage: with remote images turned on, one body pointing
+    /// at a host that never answers stalls on the fetch timeout — measured
+    /// still in flight at ten seconds — and takes the whole pass with it. The
+    /// mail is not worth that; a guess is fine for one message.
+    private static let loadDeadline: Duration = .seconds(2)
 
     private var frame: WKWebView?
     private var relay: MeasureRelay?
@@ -165,7 +179,22 @@ final class FrameMeasurer {
         // THE NAVIGATION IS THE TOKEN. Until this one finishes, the frame is
         // still showing the previous message and anything it reports is that
         // message's answer.
-        guard await relay.settled(navigation) else { return 0 }
+        //
+        // On a clock, because the load is the unbounded part (see
+        // `loadDeadline`): the watchdog releases the wait, and the frame is
+        // told to stop so a dead fetch is not still running under the next
+        // message.
+        let watchdog = Task { @MainActor [weak relay] in
+            try? await Task.sleep(for: Self.loadDeadline)
+            guard !Task.isCancelled else { return }
+            relay?.abort()
+        }
+        let landed = await relay.settled(navigation)
+        watchdog.cancel()
+        guard landed else {
+            view.stopLoading()
+            return 0
+        }
 
         var previous: CGFloat = -1
         var silent = 0

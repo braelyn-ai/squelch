@@ -262,10 +262,19 @@ struct EmailWebView: View {
         .task(id: prepared.sourceHash) {
             try? await Task.sleep(for: .seconds(2))
             guard !Task.isCancelled, !measured else { return }
-            // A remembered height is still a good size; only a never-measured
-            // open needs the tall fallback. Either way the frame must become
-            // visible — opacity is gated on `measured` alone.
-            if height == 0 { height = Self.unmeasuredFallbackHeight }
+            // A REMEMBERED MEASUREMENT STANDS: the frame is already that size,
+            // so it becomes visible without also lurching — which is what
+            // reaching straight for the fallback did to every message that had
+            // a perfectly good size on file.
+            //
+            // With nothing measured, the tall fallback still wins, and it wins
+            // over the guess too. A frame that never reported is a frame
+            // nothing verified, and the guess counts text and scores pictures
+            // at zero: too tall leaves whitespace, too short silently hides
+            // mail, and only one of those is recoverable by scrolling.
+            if height == 0 {
+                height = rememberedHeight ?? max(guessedHeight ?? 0, Self.unmeasuredFallbackHeight)
+            }
             measured = true
         }
     }
