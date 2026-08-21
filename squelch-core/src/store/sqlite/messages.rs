@@ -347,17 +347,34 @@ impl SqliteStore {
         // Per-message triage rides along for in-thread attention highlighting.
         // LEFT JOIN: a message somehow missing its triage row still renders,
         // just unhighlighted.
+        //
         // `m.subject` rides along per message. The view's own `subject` is the
         // OLDEST message's (see `thread_guard_and_subject`), which titles the
         // conversation correctly and titles one message inside it WRONGLY the
         // moment somebody renames the thread — and a forward is composed from
         // one message, not from the conversation.
+        //
+        // The served `is_sent` is AUTHORSHIP, not the stored column: stored
+        // `messages.is_sent` is a VISIBILITY flag that is sticky to 0 (see
+        // `upsert_message_conn`) and the sync engine deliberately lets the INBOX
+        // copy win for self-addressed mail, so a message the user wrote with
+        // themselves on Cc — or mailed to themselves, or echoed back by a group
+        // — stays pinned at 0. OR'ing the From address against the account's own
+        // gives the reader the bit it actually aligns bubbles on. The accounts
+        // LEFT JOIN is one row (`accounts.id` is the PK); LOWER on both sides
+        // matches the ASCII case-folding every other address compare here uses,
+        // and the empty-From guard keeps a blank sender from matching a blank
+        // email, so a missing/NULL address falls back to the stored bit.
         let mut stmt = conn.prepare(
             "SELECT m.id, m.from_addr, m.from_name, m.received_at, m.body, m.body_html,
                     t.tier, t.deadline, t.status, t.one_line, m.auth_pass, m.subject,
-                    m.is_sent
+                    (m.is_sent = 1
+                     OR (TRIM(COALESCE(m.from_addr, '')) != ''
+                         AND LOWER(TRIM(COALESCE(m.from_addr, ''))) =
+                             LOWER(TRIM(COALESCE(a.email, ''))))) AS authored_by_account
              FROM messages m
              LEFT JOIN triage t ON t.message_id = m.id
+             LEFT JOIN accounts a ON a.id = m.account_id
              WHERE m.account_id=?1 AND m.thread_id=?2
              ORDER BY m.received_at ASC",
         )?;
@@ -374,6 +391,9 @@ impl SqliteStore {
                     content: r.get(4)?,
                     html: r.get(5)?,
                     attachments: Vec::new(), // filled below, once `stmt` is gone
+                    // The computed authorship bit above: a boolean expression
+                    // guarded against NULL on both sides, so every row answers.
+                    is_sent: r.get::<_, i64>(12)? != 0,
                     tier: r
                         .get::<_, Option<String>>(6)?
                         .as_deref()
@@ -382,10 +402,6 @@ impl SqliteStore {
                     attention_open: r.get::<_, Option<String>>(8)?.map(|s| s != "done"),
                     one_line: r.get::<_, Option<String>>(9)?.filter(|s| !s.is_empty()),
                     auth_pass: r.get::<_, Option<bool>>(10)?,
-                    // The thread carries the user's own replies (that is what
-                    // makes it a conversation); the reader is where "which of
-                    // these is mine" gets answered.
-                    is_sent: r.get::<_, i64>(12)? != 0,
                 })
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;

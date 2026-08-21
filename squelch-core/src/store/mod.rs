@@ -842,6 +842,11 @@ pub trait Store: Send + Sync {
     /// behavior as [`Store::thread_view`], but each message also carries its
     /// sanitized `html` (`None` for plain-text-only mail). MUST NOT be called
     /// from MCP, sync, or triage.
+    ///
+    /// Its `is_sent` is AUTHORSHIP, not the stored column: the stored flag OR a
+    /// case-insensitive `from_addr` == account-email match, because the column is
+    /// a visibility flag that stays 0 on self-addressed mail the user did write.
+    /// See [`crate::types::ClientMessage::is_sent`].
     fn thread_view_with_html(
         &self,
         account_id: AccountId,

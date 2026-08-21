@@ -698,6 +698,7 @@ final class AppStore {
             // message ids, and persisted wholesale under the new key on the
             // first `set`.
             AuthDecisions.shared.reload()
+            ThreadStyleLedger.shared.reload()
             // The gate's world is empty, but not necessarily CLEAN: view state
             // parked before the disconnect — a thread id planted by a stale
             // notification tap, answers still in flight from the previous
@@ -1014,10 +1015,12 @@ final class AppStore {
         connError = nil
         await APIClient.shared.configure(baseURL: next.serverURL, token: next.apiToken)
         AccountManager.shared.markActive(record.id)
-        // AFTER `markActive`, deliberately: the ledger's UserDefaults key is
-        // derived from the live account id, so reloading it with the singletons
-        // in step (7) would have re-read the account that just went away.
+        // AFTER `markActive`, deliberately: each ledger's UserDefaults key is
+        // derived from the live account id, so reloading them with the
+        // singletons in step (7) would have re-read the account that just went
+        // away.
         AuthDecisions.shared.reload()
+        ThreadStyleLedger.shared.reload()
 
         // (9) Restart by hand. `connStatus` was never dropped, so the
         //     `.connected` transition that normally does this never fires.
@@ -1035,7 +1038,7 @@ final class AppStore {
     /// lands in one path and misses another leaves that path presenting a
     /// forgotten daemon's token.
     ///
-    /// The ledger reload empties the in-memory verdicts (no live account, no
+    /// The ledger reloads empty the in-memory verdicts (no live account, no
     /// key), so a later `connect` cannot inherit — and then persist — a gone
     /// account's decisions under a new daemon's colliding message ids. The
     /// deconfigure is the same principle for the client itself.
@@ -1046,6 +1049,7 @@ final class AppStore {
         wipeAccountState()
         wipeAccountCaches()
         AuthDecisions.shared.reload()
+        ThreadStyleLedger.shared.reload()
         await APIClient.shared.deconfigure()
         settings = nil
         connStatus = .disconnected

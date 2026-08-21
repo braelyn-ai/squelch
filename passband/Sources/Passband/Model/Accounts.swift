@@ -150,6 +150,7 @@ enum AccountIndex {
         "passband.events.lastSeen",
         "passband.auth-seen",
         "passband.auth-decisions",
+        "passband.thread-style",
     ]
 
     /// The per-account name for one of those keys. Derived in ONE place so a

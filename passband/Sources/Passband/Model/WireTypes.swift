@@ -226,6 +226,13 @@ struct ClientMessage: Codable, Sendable, Identifiable, Hashable, SenderStringCon
     /// in — the daemon's own fallback quotes this same header.
     var subject: String?
     var attachments: [Attachment]?
+    /// True for a message the USER authored, false for anything received.
+    /// ABSENT on an older daemon, which reads as unknown — and unknown is
+    /// drawn as theirs (see `fromMe`), which is where every message sat before
+    /// the chat style existed, and must not make the reader treat a reply as
+    /// somebody else's mail. Aligns the chat bubbles, and picks which message
+    /// in a thread a reminder lands on: see ThreadViewer's `h`.
+    var is_sent: Bool?
     /// This message's OWN triage verdict — ABSENT on a pre-highlight daemon.
     /// Drives the in-thread attention highlight: the bands show one row per
     /// thread, so the reader is where "which message is the reason" is answered.
@@ -240,13 +247,13 @@ struct ClientMessage: Codable, Sendable, Identifiable, Hashable, SenderStringCon
     /// daemon, which reads as unknown — the strict side. Governs the reader's
     /// tracker strip: see `allowsTrackers`.
     var sender_known: Bool?
-    /// Whether the USER sent this one. ABSENT on a pre-sent-flag daemon, which
-    /// reads as unknown rather than as inbound — a nil here must not make the
-    /// reader treat a reply as somebody else's mail. Picks which message in a
-    /// thread a reminder lands on: see ThreadViewer's `h`.
-    var is_sent: Bool?
 
     var attachmentList: [Attachment] { attachments ?? [] }
+
+    /// The side of the conversation this message is on, for the chat style.
+    /// `nil` (old daemon) is THEIRS: an unknown side drawn as the user's own
+    /// would right-align somebody else's mail under their name.
+    var fromMe: Bool { is_sent ?? false }
 
     /// Whether this message's tracking pixels may load. Trusted people are
     /// allowed to learn their mail was opened; everyone else is stripped as

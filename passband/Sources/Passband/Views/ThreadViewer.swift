@@ -23,9 +23,23 @@ struct ThreadViewer: View {
     @Environment(AppStore.self) private var store
     @Environment(Prefs.self) private var prefs
 
+    /// Computed, not stored: a stored property here would drag the memberwise
+    /// initializer down to `private` with it.
+    private var styles: ThreadStyleLedger { .shared }
+
     @State private var thread: ClientThreadView?
     @State private var error: String?
     @State private var loading = true
+    /// HOW THIS THREAD IS DRAWN, resolved once per thread rather than per row:
+    /// this thread's own answer if it has ever been given one, else the global
+    /// default. Held in state so the toggle can flip it under the reader.
+    @State private var style: ThreadStyle = .classic
+    /// The thread id `style` was resolved FOR. The toggle pins forever, so it
+    /// must know the difference between an answer and a leftover: on a switch
+    /// this view stays mounted and holds the LAST thread's style until the new
+    /// one's `adopt` runs — a gap the load flag does not cover, because the
+    /// prefetch-cache path never raises it.
+    @State private var styledFor: String?
     /// Selected message: j/k move it, click selects, the rail highlights it.
     @State private var index = 0
     /// Existing unsubscribe record for THIS thread's sender; drives the header
@@ -62,6 +76,10 @@ struct ThreadViewer: View {
     /// the reader is wherever the initial anchor dropped it, which is not a
     /// position anybody chose.
     @State private var landed = false
+    /// The re-aiming loop, held so the next one can end it: two live settles
+    /// issue competing `scrollTo`s at two targets, which is a column that
+    /// judders rather than lands. See `settle`.
+    @State private var settleTask: Task<Void, Never>?
 
     enum ConfirmMode: Equatable { case ask, noLink }
 
@@ -159,6 +177,16 @@ struct ThreadViewer: View {
             await refreshOpens()
         }
         .task(id: newestSender) { await refreshUnsub() }
+        // The default changed in Settings while this thread is open. A thread
+        // that has been switched by hand keeps what it was told — that is the
+        // whole point of an override — so only the ones following the default
+        // follow it here, and they follow it through the guess: switching TO
+        // Automatic has to re-read the thread, not leave it on what the fixed
+        // setting last drew.
+        .onChange(of: prefs.threadStyle) { _, _ in
+            guard styles.style(threadId) == nil else { return }
+            style = resolvedStyle(messages)
+        }
         // NEW MAIL IN THIS VERY THREAD, from the poll that heard about it.
         // `onChange` rather than `.task(id:)`: a task keyed on the token would
         // also fire on mount, refetching the thread `load()` is already
@@ -440,7 +468,7 @@ struct ThreadViewer: View {
                         LazyVStack(alignment: .leading, spacing: 0) {
                             ForEach(Array(messages.enumerated()), id: \.element.id) { i, m in
                                 MessageCard(
-                                    message: m, selected: i == index, ruled: i > 0,
+                                    message: m, style: style, selected: i == index, ruled: i > 0,
                                     opens: opens[m.id] ?? []
                                 ) {
                                     index = i
@@ -545,6 +573,55 @@ struct ThreadViewer: View {
                 .onChange(of: messages.last?.id) { _, _ in
                     proxy.scrollTo(index, anchor: .top)
                 }
+                // A STYLE FLIP IS THE WHOLE COLUMN RELAID OUT UNDER SOMEBODY'S
+                // EYES. Every html message re-measures under the other style's
+                // cache key (see ThreadStyle.frameKey), so for a beat the thread
+                // is a stack of empty placeholders and the message being read is
+                // nowhere near where it was. Nothing else here re-aims: the
+                // landing above only fires for a reader parked on the newest, and
+                // the selection has not moved, so this is the one hand on it.
+                //
+                // A LONGER LEASH than a rail jump, and it holds: those heights
+                // arrive out of a web frame long after the flip, and each one that
+                // lands shifts the target again — so being on target once is not
+                // being finished. A plain-text thread reports nothing late, is on
+                // target from the first check, and is done in three.
+                //
+                // IT AIMS WHERE THE READER IS, not at the selection — the same
+                // distinction `refreshInPlace` makes, for the same reason: a
+                // wheel scroll moves what is on screen without ever touching
+                // the selection, and re-aiming at the selection would use the
+                // flip to yank a wheel reader back to the newest. The selection
+                // itself stays put, so `settle` is told which selection it is
+                // riding under rather than assuming it is the target.
+                //
+                // Only for a thread that has already landed. Before that, the
+                // style is being resolved by the load that is about to land it,
+                // and two hands on the scroll is a fight.
+                //
+                // KNOWN LIMITATION: a reader deep inside a NEWEST message that
+                // is taller than the window has no row to name — `anchorId` is
+                // nil there, because the selection is the newest and the topmost
+                // visible row is that same message — so the flip re-lands them at
+                // its top rather than at the paragraph they were on. Anchoring
+                // finer than a message would mean asking the web frame where the
+                // reader is inside its document, which the frame is not asked
+                // anything else.
+                .onChange(of: style) { _, _ in
+                    guard landed else { return }
+                    let target = anchorId.flatMap { id in messages.firstIndex { $0.id == id } } ?? index
+                    settle(
+                        on: target, proxy: proxy, tries: 24, every: .milliseconds(40), hold: 3,
+                        under: index)
+                }
+                // The style radio rides the mail's own top-right corner rather
+                // than the header row: it is a verdict about the mail below it,
+                // and the header is already a sentence of verbs.
+                .overlay(alignment: .topTrailing) {
+                    StyleRadio(style: style, ready: styleReady) { chooseStyle($0) }
+                        .padding(.top, 10)
+                        .padding(.trailing, 12)
+                }
             }
         }
     }
@@ -572,13 +649,48 @@ struct ThreadViewer: View {
     /// top of the window, aim again. Bounded, because a thread whose heights
     /// never settle must cost a fifth of a second and not a spin, and abandoned
     /// the moment the selection moves — somebody who has moved on owns the scroll.
-    private func settle(on target: Int, proxy: ScrollViewProxy) {
+    ///
+    /// `hold` is how many checks in a row must find the card on target before the
+    /// loop believes it. One is right for a jump, where arriving IS the job. A
+    /// relayout of the whole column (a style flip) needs more: the first frames
+    /// to re-measure can put the target at the top on their own, and the ones
+    /// still to come would then move it with nobody watching.
+    ///
+    /// `under` is the selection this settle is riding beneath when the target is
+    /// not the selection itself — a style flip anchors on the message on SCREEN,
+    /// which for a wheel reader is not the selected one. The loop is still
+    /// abandoned the moment the selection moves off it, because somebody who has
+    /// moved on owns the scroll; left nil, the target is the selection, as it is
+    /// for every jump.
+    ///
+    /// ONE SETTLE AT A TIME: each call ends the previous loop first. Two live
+    /// loops can hold the same selection and different targets — a flip while a
+    /// rail jump is still landing — and would issue competing `scrollTo`s on
+    /// alternating ticks. And THE WHEEL ENDS IT TOO: the selection guard cannot
+    /// see a wheel scroll, so on macOS each loop watches for one and stands
+    /// down — the reader's own hand always outranks the aim. The watch is the
+    /// loop's alone and dies with it, so a loop ending late can never take a
+    /// newer loop's watch down with it.
+    private func settle(
+        on target: Int, proxy: ScrollViewProxy, tries: Int = 8,
+        every: Duration = .milliseconds(25), hold: Int = 1, under selection: Int? = nil
+    ) {
+        settleTask?.cancel()
         proxy.scrollTo(target, anchor: .top)
-        Task { @MainActor in
-            for _ in 0..<8 {
-                try? await Task.sleep(for: .milliseconds(25))
-                guard index == target else { return }
-                if let frame = map.frames[target], abs(frame.minY) < 2 { return }
+        settleTask = Task { @MainActor in
+            let wheel = WheelYield()
+            wheel.watch()
+            defer { wheel.end() }
+            var steady = 0
+            for _ in 0..<tries {
+                do { try await Task.sleep(for: every) } catch { return }
+                guard !wheel.tripped, index == (selection ?? target) else { return }
+                if let frame = map.frames[target], abs(frame.minY) < 2 {
+                    steady += 1
+                    if steady >= hold { return }
+                    continue
+                }
+                steady = 0
                 proxy.scrollTo(target, anchor: .top)
             }
         }
@@ -623,13 +735,18 @@ struct ThreadViewer: View {
     /// holding still is the whole job.
     private func mapEstimate(_ m: ClientMessage) -> CGFloat {
         MinimapGeometry.estimate(
-            text: m.content, html: m.html, attachments: m.attachmentList.count)
+            text: m.content, html: m.html, attachments: m.attachmentList.count, style: style)
     }
 
     /// The mail's measure. The dismissible gutter is defined as the complement
     /// of it, so the two can never drift apart — and the inline composer pins
     /// itself to the same measure, so the reply sits under the column it answers.
     static let columnWidth: CGFloat = 900
+
+    /// The widest a chat bubble is ever drawn. Narrower than the column on
+    /// purpose: what makes a conversation readable as one is the empty margin
+    /// opposite each side, and a bubble that fills the measure has none.
+    static let bubbleWidth: CGFloat = 620
 
     /// The mail's own inset. A phone is narrower than the column will ever be,
     /// so the padding IS the measure there and it matches the header above it.
@@ -872,6 +989,10 @@ struct ThreadViewer: View {
                 openReplyAll()
                 return true
             },
+            // `b` = the shape of the thread, cards or bubbles. Per-thread, and
+            // the last word: whatever Settings or the guess said, this is what
+            // this thread is from now on.
+            KeyBinding("b", "chat / email style") { toggleStyle() },
             // `t` = tune sender rule, same as on a list row: one verb, one key
             // everywhere. The target differs (the thread's sender rather than the
             // selected row's) but that is the only sender in view here. This
@@ -890,6 +1011,73 @@ struct ThreadViewer: View {
     private func stepMessage(_ delta: Int) {
         guard !messages.isEmpty else { return }
         index = min(newestIndex, max(0, index + delta))
+    }
+
+    /// `b` walks the radio: same choice, keyboard spelling.
+    private func toggleStyle() { chooseStyle(style.flipped) }
+
+    /// The radio and `b`, which are the same answer. It is kept for THIS thread
+    /// and PINNED THERE, even when it agrees with the default of the moment:
+    /// with Automatic in Settings the default is re-read on every open, so a
+    /// thread left following it would go back to the guess the next time a
+    /// reply changes what the guess says. A reader who has answered the
+    /// question should not be asked it again.
+    ///
+    /// AND IT IS A NO-OP UNTIL THERE IS A THREAD TO ANSWER FOR. `style` holds
+    /// its placeholder `.classic` until `adopt` resolves it, and the pin is for
+    /// good — the ledger has no un-answering — so a press into the load window
+    /// would pin the placeholder, for a thread nobody has read yet, and nothing
+    /// would ever ask again.
+    private func chooseStyle(_ chosen: ThreadStyle) {
+        guard styleReady else { return }
+        styles.set(threadId, chosen)
+        guard style != chosen else { return }
+        style = chosen
+    }
+
+    /// Whether `style` is THIS thread's resolved answer rather than the state's
+    /// starting value or another thread's leftover. Asked of `styledFor`, not of
+    /// the load flag: a switch to another thread keeps this view mounted with
+    /// the previous answer in `style`, and the prefetch-cache path of `load`
+    /// never raises `loading` at all — the id is the only thing that says which
+    /// thread the answer in hand belongs to.
+    ///
+    /// The header button disables on the same test, so both doors to the flip
+    /// say the same thing.
+    private var styleReady: Bool { thread != nil && styledFor == threadId }
+
+    /// HOW THIS THREAD IS DRAWN, in the one order that matters: what the reader
+    /// said about THIS thread, then what Settings says about every thread, and
+    /// only where that says Automatic, what the thread itself looks like.
+    ///
+    /// Answered from the messages that are in hand rather than from the state,
+    /// because the caller is `adopt`, which is holding the thread it is about to
+    /// install and has not installed it yet.
+    private func resolvedStyle(_ messages: [ClientMessage]) -> ThreadStyle {
+        if let pinned = styles.style(threadId) { return pinned }
+        if let fixed = prefs.threadStyle.fixed { return fixed }
+        // The participation veto, asked BEFORE the samples exist: it reads
+        // `is_sent` alone, and the thread that fails it — which is most mail —
+        // should not pay for quote-splitting and markup-scanning every body it
+        // was never going to draw as chat.
+        guard ThreadStyle.participated(messages.map(\.is_sent)) else { return .classic }
+        return ThreadStyle.automatic(messages.map(sample))
+    }
+
+    /// A message reduced to what the guess asks about. The fresh length is the
+    /// message WITHOUT the history it is quoting — the same split PlainBody
+    /// collapses behind the chip, because "how long is this message" and "how
+    /// much of it is this message" are the same question. In UTF-8 bytes, for
+    /// the reason `chatMedianBytes` gives.
+    private func sample(_ m: ClientMessage) -> ThreadStyle.Sample {
+        ThreadStyle.Sample(
+            // `is_sent` and not `fromMe`: the accessor answers the drawing
+            // question, where an unknown side is drawn as theirs. The guess
+            // needs to know it is unknown.
+            fromMe: m.is_sent,
+            freshBytes: Quotes.splitText(m.content).visible.utf8.count,
+            htmlHeavy: ThreadStyle.htmlHeavy(html: m.html, plain: m.content),
+            sender: m.from_addr)
     }
 
     /// The rule composer for THIS thread's sender — the same request shape `t`
@@ -1032,6 +1220,7 @@ struct ThreadViewer: View {
                     // Same unpin as Actions.done — this path resolves the
                     // message without going through it.
                     await ImageStore.shared.release(messageId: newest.id)
+                    FrameHeights.shared.clear(messageId: newest.id)
                     // And the same optimistic drop: the surface underneath is
                     // still mounted, so without this the reader closes back
                     // onto a row for mail that is already done.
@@ -1133,7 +1322,7 @@ struct ThreadViewer: View {
         // Fresh prefetch hit → render it and skip the round-trip entirely (the
         // cache is at most 60s old; e/d/refresh paths repopulate it).
         if let cached = ThreadPrefetch.shared.cached(threadId) {
-            adopt(cached)
+            adopt(cached, opening: true)
             error = nil
             loading = false
             return
@@ -1143,16 +1332,25 @@ struct ThreadViewer: View {
         do {
             let view = try await APIClient.shared.getThread(threadId)
             ThreadPrefetch.shared.note(threadId, view)  // instant reopen
-            adopt(view)
+            adopt(view, opening: true)
         } catch {
             self.error = errText(error, "thread load failed")
         }
         loading = false
     }
 
-    /// Take a loaded thread and derive its reader state.
-    private func adopt(_ view: ClientThreadView) {
+    /// Take a loaded thread and derive its reader state. `opening` is true only
+    /// when this is the thread ARRIVING — a refetch under somebody's eyes says
+    /// false, which is what keeps the style from being re-decided while they
+    /// read: the guess reads the messages, a reply changes the messages, and a
+    /// column that redraws itself as chat because an answer landed is a column
+    /// that moved the paragraph somebody was on.
+    private func adopt(_ view: ClientThreadView, opening: Bool = false) {
         thread = view
+        if opening {
+            style = resolvedStyle(view.messages)
+            styledFor = threadId
+        }
         // LAND ON THE NEWEST. It is last in the stack now, and `tailSpace` is
         // what lets the scroll put it at the top of the window rather than the
         // bottom.
@@ -1177,9 +1375,12 @@ struct ThreadViewer: View {
 
     /// Read receipts for this thread's messages.
     ///
-    /// Every message is asked about rather than only the ones the user sent:
-    /// the wire carries no "this copy is mine" flag, only a TRACKED SEND can
-    /// have opens, and an untracked or inbound id answers with an empty list.
+    /// Every message is asked about rather than only the ones the user sent.
+    /// The wire does carry a "this copy is mine" flag now (`is_sent`), but it is
+    /// ABSENT on an older daemon, and filtering by it there would ask about
+    /// nothing and lose every receipt. Only a TRACKED SEND can have opens, so an
+    /// untracked or inbound id answers with an empty list and costs one entry in
+    /// a request that was being made anyway.
     /// The whole pass is skipped while the daemon has no tracking configured —
     /// then there are no receipts anywhere and this would be pure round-trips.
     private func refreshOpens() async {
@@ -1307,8 +1508,15 @@ struct ReaderBackdrop: View {
 /// information around a frame that already clips itself round, paid on every
 /// message in a surface whose whole job is reading. Messages are divided by a
 /// hairline and marked by a rule, and the mail is the only thing with edges.
+///
+/// THE CHAT STYLE CHANGES THE ARRANGEMENT AND NOTHING ELSE. The same avatar,
+/// the same attention chip, the same read receipt, the same web frame and the
+/// same quoted-history collapse — moved into a caption over a bubble on the
+/// sender's own side. The rails stay where they are in both, because they are
+/// what j/k moves and a navigation affordance that jumps sides is no affordance.
 private struct MessageCard: View {
     let message: ClientMessage
+    let style: ThreadStyle
     let selected: Bool
     /// The first message needs no divider above it: that is the top of the
     /// document, not a seam between two messages.
@@ -1318,47 +1526,41 @@ private struct MessageCard: View {
     let opens: [MessageOpen]
     let onSelect: () -> Void
 
+    /// Which side of the conversation this is. Only the chat style asks.
+    private var mine: Bool { message.fromMe }
+    private var side: HorizontalAlignment { mine ? .trailing : .leading }
+    private var edge: Alignment { mine ? .trailing : .leading }
+    private var chat: Bool { style == .bubbles }
+
     var body: some View {
-        VStack(alignment: .leading, spacing: 9) {
-            HStack(spacing: 9) {
-                Avatar(sender: message.senderString, size: 24)
-                Text(SenderCache.resolved(message.senderString).displayName)
-                    .font(.system(size: 13, weight: .semibold))
-                    .foregroundStyle(Palette.ink)
-                Spacer(minLength: 8)
-                // THE ATTENTION MARK: this message's own unresolved standing-tier
-                // verdict — the reason the thread surfaced. Same chip grammar as
-                // the list rows, so the mark reads as "that row, this message".
-                if message.needsAttention {
-                    let chip = Fmt.deadlineChip(message.deadline)
-                    Chip(
-                        text: chip?.text ?? "needs attention",
-                        tone: (chip?.overdue ?? false) ? Palette.danger : Palette.warn,
-                        filled: chip?.overdue ?? false
-                    )
-                    .help(message.one_line ?? "this message put the thread in for-your-eyes")
-                }
-                ReadReceiptMark(opens: opens)
-                Text(Fmt.dateTime(message.received_at))
-                    .font(Typo.num(11))
-                    .foregroundStyle(Palette.inkFaintest)
-            }
-
-            if let html = message.html, !html.isEmpty {
-                EmailWebView(
-                    html: html, cacheKey: String(message.id),
-                    allowTrackers: message.allowsTrackers,
-                    attachments: message.attachmentList)
-            } else {
-                PlainBody(content: message.content)
-            }
-
+        // ONE TREE FOR BOTH STYLES, and it is load-bearing: a `switch style`
+        // here would make the two styles separate view identities, and a flip
+        // would tear down every message's subtree — the web frame's remote-image
+        // grant, the expanded quoted history, the measured heights, all of it
+        // @State that only survives while its structural position does. So the
+        // style is expressed entirely in VALUES (alignments, paddings, widths)
+        // on one stack whose stateful children never move. The header/caption
+        // swap is the one conditional, and nothing in either holds state worth
+        // keeping.
+        VStack(alignment: chat ? side : .leading, spacing: chat ? 5 : 9) {
+            if chat { caption } else { cardHeader }
+            mail
             AttachmentStrip(attachments: message.attachmentList, inBody: inBodyImages)
         }
+        .frame(
+            maxWidth: chat ? ThreadViewer.bubbleWidth : .infinity,
+            alignment: chat ? edge : .leading
+        )
+        .frame(maxWidth: .infinity, alignment: chat ? edge : .leading)
         // The gutter is reserved whether or not this message is selected, so
-        // j/k moves a rule rather than shifting every body left and right.
+        // j/k moves a rule rather than shifting every body left and right. The
+        // chat style reserves the far side too, or a sent bubble would sit
+        // against an edge its neighbours keep clear of.
         .padding(.leading, 13)
-        .padding(.vertical, 16)
+        .padding(.trailing, style == .bubbles ? 13 : 0)
+        // The divider is what separates two cards; bubbles are separated by the
+        // air between them, so that is what the padding buys there.
+        .padding(.vertical, style == .bubbles ? 5 : 16)
         .frame(maxWidth: .infinity, alignment: .leading)
         // BOTH rules stay mounted and only change opacity. A conditional
         // modifier here would give selected and unselected separate view
@@ -1373,21 +1575,151 @@ private struct MessageCard: View {
             RoundedRectangle(cornerRadius: 1.5, style: .continuous)
                 .fill(message.tier == .pastDue ? Palette.danger : Palette.warn)
                 .frame(width: 3)
-                .padding(.vertical, 11)
+                .padding(.vertical, railInset)
                 .opacity(message.needsAttention && !selected ? 0.75 : 0)
         }
         .overlay(alignment: .leading) {
             RoundedRectangle(cornerRadius: 1.5, style: .continuous)
                 .fill(Palette.accent)
                 .frame(width: 3)
-                .padding(.vertical, 11)
+                .padding(.vertical, railInset)
                 .opacity(selected ? 1 : 0)
         }
+        // ONLY THE CARDS ARE RULED. A hairline between two bubbles would draw a
+        // seam across the gap that is already saying the same thing.
         .overlay(alignment: .top) {
-            Hairline().opacity(ruled ? 1 : 0)
+            Hairline().opacity(ruled && style == .classic ? 1 : 0)
         }
         .contentShape(Rectangle())
         .onTapGesture(perform: onSelect)
+    }
+
+    /// A short message is a short bubble, so the rail cannot be inset as far as
+    /// a card's or there would be nothing left of it to see.
+    private var railInset: CGFloat { style == .bubbles ? 6 : 11 }
+
+    // MARK: - the email card's header
+
+    private var cardHeader: some View {
+        HStack(spacing: 9) {
+            Avatar(sender: message.senderString, size: 24)
+            Text(SenderCache.resolved(message.senderString).displayName)
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundStyle(Palette.ink)
+            Spacer(minLength: 8)
+            attentionChip
+            ReadReceiptMark(opens: opens)
+            Text(Fmt.dateTime(message.received_at))
+                .font(Typo.num(11))
+                .foregroundStyle(Palette.inkFaintest)
+        }
+    }
+
+    // MARK: - the chat bubble's caption
+
+    /// Who and when, small, over the bubble on the sender's own side. The avatar
+    /// is the received side's alone — a face beside every one of your own lines
+    /// is a face you already know. The read receipt is NOT gated on the side:
+    /// the card renders it unconditionally, `is_sent` is absent on an older
+    /// daemon (which draws everything as theirs), and the mark already no-ops on
+    /// empty opens — a gate would only hide receipts the card shows.
+    private var caption: some View {
+        HStack(spacing: 6) {
+            if !mine {
+                Avatar(sender: message.senderString, size: 17)
+            }
+            Text(SenderCache.resolved(message.senderString).displayName)
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundStyle(Palette.inkDim)
+                .lineLimit(1)
+            attentionChip
+            ReadReceiptMark(opens: opens)
+            Text(captionTime)
+                .font(Typo.num(10))
+                .foregroundStyle(Palette.inkFaintest)
+        }
+    }
+
+    /// A caption has room for a clock and not for a calendar, so today's mail
+    /// says the time and everything older keeps the date it needs.
+    private var captionTime: String {
+        Fmt.isToday(message.received_at)
+            ? Fmt.timeOfDay(message.received_at) : Fmt.dateTime(message.received_at)
+    }
+
+    // MARK: - shared parts
+
+    /// THE ATTENTION MARK: this message's own unresolved standing-tier verdict —
+    /// the reason the thread surfaced. Same chip grammar as the list rows, so
+    /// the mark reads as "that row, this message".
+    @ViewBuilder
+    private var attentionChip: some View {
+        if message.needsAttention {
+            let chip = Fmt.deadlineChip(message.deadline)
+            Chip(
+                text: chip?.text ?? "needs attention",
+                tone: (chip?.overdue ?? false) ? Palette.danger : Palette.warn,
+                filled: chip?.overdue ?? false
+            )
+            .help(message.one_line ?? "this message put the thread in for-your-eyes")
+        }
+    }
+
+    /// The mail itself. HTML brings its own bubble: the frame's document is an
+    /// opaque white page with rounded corners already, so the chat style only
+    /// has to hand it a narrower measure. Plain text gets the fill, tinted on
+    /// the user's own side.
+    ///
+    /// The frame key carries the style (see ThreadStyle.frameKey) because a
+    /// document measured at 620 points is not the one a full-width card wants
+    /// back out of the pool.
+    ///
+    /// ONE PlainBody FOR BOTH STYLES, for the same identity reason as `body`:
+    /// a card branch and a bubble branch would be two positions in the same
+    /// conditional, and a flip would collapse the quoted history the reader
+    /// opened. The bubble's chrome is values on that one view — zero padding
+    /// and a clear fill ARE the card.
+    @ViewBuilder
+    private var mail: some View {
+        if let html = message.html, !html.isEmpty {
+            EmailWebView(
+                html: html, cacheKey: style.frameKey(message.id),
+                allowTrackers: message.allowsTrackers,
+                attachments: message.attachmentList)
+                // The web frame's document is hardcoded #fff (EmailFrame), so
+                // white IS this bubble's fill, in either theme.
+                .overlay(alignment: mine ? .bottomTrailing : .bottomLeading) {
+                    tail(Color.white)
+                }
+        } else {
+            PlainBody(content: message.content, fills: !chat)
+                .padding(.horizontal, chat ? 12 : 0)
+                .padding(.vertical, chat ? 9 : 0)
+                // The same corner the web frame clips itself to, so a plain
+                // reply and an html one are the same shape on the same side.
+                .background(
+                    RoundedRectangle(cornerRadius: 10, style: .continuous)
+                        .fill(
+                            !chat
+                                ? Color.clear
+                                : mine ? Palette.accentSoft : Palette.hairline)
+                )
+                .overlay(alignment: mine ? .bottomTrailing : .bottomLeading) {
+                    tail(mine ? Palette.accentSoft : Palette.hairline)
+                }
+        }
+    }
+
+    /// The speech tail, hung under the bubble's OUTER bottom corner and poking
+    /// past it — the message's side said twice, once by alignment and once by
+    /// the point. Mounted in both styles and merely clear in classic, for the
+    /// same identity reason as everything else on this card.
+    private func tail(_ color: Color) -> some View {
+        BubbleTail(mine: mine)
+            .fill(chat ? color : Color.clear)
+            .frame(width: 12, height: 12)
+            .offset(x: mine ? BubbleTail.poke : -BubbleTail.poke)
+            .allowsHitTesting(false)
     }
 
     /// The parts the BODY already shows, because a `cid:` reference in the html
@@ -1412,6 +1744,103 @@ private struct MessageCard: View {
     }
 }
 
+/// The little point under a bubble's OUTER bottom corner — the part that makes
+/// a rounded rectangle read as speech. Drawn for the trailing (sent) side and
+/// mirrored for the leading one.
+///
+/// The box overlaps the bubble by its inner span and is FILLED SOLID up to its
+/// top edge there, which is what buries the bubble's corner radius: the arc
+/// carves a wedge out of the corner, and a tail whose top boundary dips below
+/// the arc leaves that wedge showing through as a notch. The outer curve then
+/// starts ON the bubble's own edge line, heading down before it bends out, so
+/// the silhouette runs straight off the bubble's side into the point.
+private struct BubbleTail: Shape {
+    /// How far the point pokes past the bubble's edge; the view's offset uses
+    /// the same number so the shape's idea of "the edge" is where the edge is.
+    static let poke: CGFloat = 7
+
+    var mine: Bool
+
+    func path(in rect: CGRect) -> Path {
+        let edge = rect.maxX - Self.poke
+        var p = Path()
+        p.move(to: CGPoint(x: 0, y: 0))
+        p.addLine(to: CGPoint(x: edge, y: 0))
+        // Leaves the edge heading DOWN (control barely outboard), then bends
+        // out to the point — the vertical tangent is what makes the bubble's
+        // side and the tail read as one line.
+        p.addQuadCurve(
+            to: CGPoint(x: rect.maxX, y: rect.maxY),
+            control: CGPoint(x: edge + (rect.maxX - edge) * 0.3, y: rect.maxY * 0.65))
+        p.addQuadCurve(
+            to: CGPoint(x: 0, y: rect.maxY),
+            control: CGPoint(x: edge * 0.8, y: rect.maxY))
+        p.closeSubpath()
+        guard !mine else { return p }
+        return p.applying(
+            CGAffineTransform(scaleX: -1, y: 1).translatedBy(x: -rect.width, y: 0))
+    }
+}
+
+/// The style switch, riding the mail's own top-right corner: two icon slots —
+/// text above, talk below — and one highlight that travels between them. A
+/// radio rather than a flip because two icons can SAY both answers where the
+/// old header button could only name the other one. Same crossing time as
+/// GlassSegmented, so every selector in the app moves at one speed.
+private struct StyleRadio: View {
+    let style: ThreadStyle
+    let ready: Bool
+    let choose: (ThreadStyle) -> Void
+
+    private static let slot: CGFloat = 26
+    private static let gap: CGFloat = 2
+    private static let pad: CGFloat = 3
+
+    var body: some View {
+        VStack(spacing: Self.gap) {
+            option(.classic, icon: "text.alignleft", help: "read this thread as email cards")
+            option(.bubbles, icon: "bubble.left", help: "read this thread as chat bubbles")
+        }
+        .padding(Self.pad)
+        .background(alignment: .top) { highlight }
+        .animation(.smooth(duration: 0.32), value: style)
+        .background(
+            RoundedRectangle(cornerRadius: 9, style: .continuous)
+                .fill(Palette.hairline.opacity(0.5)))
+        // Same gate as `b` (see `chooseStyle`): the pin is permanent, and there
+        // is nothing to answer about until the thread on screen is this one.
+        .opacity(ready ? 1 : 0.35)
+        .disabled(!ready)
+    }
+
+    private func option(_ value: ThreadStyle, icon: String, help: String) -> some View {
+        Button { choose(value) } label: {
+            Image(systemName: icon)
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundStyle(style == value ? .white : Palette.inkDim)
+                .frame(width: Self.slot, height: Self.slot)
+                .contentShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+        }
+        .buttonStyle(.plain)
+        .help(help)
+    }
+
+    /// The travelling pane, one view for the life of the control — the slots
+    /// are fixed squares, so the offset is arithmetic rather than measurement.
+    private var highlight: some View {
+        Color.clear
+            .frame(width: Self.slot, height: Self.slot)
+            .glassEffect(
+                .regular.tint(Palette.accent.opacity(0.55)),
+                in: RoundedRectangle(cornerRadius: 6, style: .continuous)
+            )
+            // Sits over the active slot — an interactive material would eat
+            // that option's clicks.
+            .allowsHitTesting(false)
+            .offset(y: Self.pad + (style == .bubbles ? Self.slot + Self.gap : 0))
+    }
+}
+
 /// A plain-text body with its trailing quoted history collapsed behind a chip.
 /// Mirrors the html-side collapse; the split heuristic is shared (Quotes) and
 /// conservative — when in doubt the full text renders.
@@ -1423,6 +1852,10 @@ private struct MessageCard: View {
 /// the one the reader spent this file getting right.
 struct PlainBody: View {
     let content: String
+    /// Whether the text takes the whole measure it is offered. A card's body IS
+    /// the column, so it does; a bubble is only as wide as what is in it, and a
+    /// flexible frame with no bound is the child's own size.
+    var fills = true
     @State private var open = false
 
     var body: some View {
@@ -1432,7 +1865,7 @@ struct PlainBody: View {
                 .font(.system(size: 13.5))
                 .foregroundStyle(Palette.ink)
                 .textSelection(.enabled)
-                .frame(maxWidth: .infinity, alignment: .leading)
+                .frame(maxWidth: fills ? .infinity : nil, alignment: .leading)
                 .fixedSize(horizontal: false, vertical: true)
             if let quoted = split.quoted {
                 Button {
@@ -1578,5 +2011,40 @@ private struct TriageDebugOverlay: View {
         .keyBindings(.modal, [
             KeyBinding("Escape", "close", allowInInput: true) { onClose() }
         ])
+    }
+}
+
+/// A settle loop's watch for the reader's own wheel, macOS only: the loop
+/// re-aims for up to a second after a style flip, and a wheel scroll never
+/// moves the selection its guard is watching, so without this the loop drags
+/// the reader back to its target for the rest of the leash. A LOCAL monitor
+/// sees the event before the scroll view does, trips the flag, and passes the
+/// event through untouched.
+///
+/// Owned by ONE loop and ended by it on every exit path — a leaked monitor
+/// watches every scroll the app ever makes, and a SHARED one would let a loop
+/// ending late tear down its successor's watch. On iOS the flip is a header
+/// tap and the leash is a second; there is no monitor to install and the flag
+/// simply never trips.
+@MainActor
+private final class WheelYield {
+    private(set) var tripped = false
+    private var monitor: Any?
+
+    func watch() {
+        #if os(macOS)
+            monitor = NSEvent.addLocalMonitorForEvents(matching: .scrollWheel) {
+                [weak self] event in
+                MainActor.assumeIsolated { self?.tripped = true }
+                return event
+            }
+        #endif
+    }
+
+    func end() {
+        #if os(macOS)
+            if let monitor { NSEvent.removeMonitor(monitor) }
+        #endif
+        monitor = nil
     }
 }
