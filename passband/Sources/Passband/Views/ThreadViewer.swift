@@ -1712,8 +1712,8 @@ private struct MessageCard: View {
     private func tail(_ color: Color) -> some View {
         BubbleTail(mine: mine)
             .fill(chat ? color : Color.clear)
-            .frame(width: 12, height: 11)
-            .offset(x: mine ? 7 : -7)
+            .frame(width: 12, height: 12)
+            .offset(x: mine ? BubbleTail.poke : -BubbleTail.poke)
             .allowsHitTesting(false)
     }
 
@@ -1741,21 +1741,35 @@ private struct MessageCard: View {
 
 /// The little point under a bubble's OUTER bottom corner — the part that makes
 /// a rounded rectangle read as speech. Drawn for the trailing (sent) side and
-/// mirrored for the leading one. The box's inner edge tucks a few points under
-/// the bubble, where its straight left side sits inside the fill, so the two
-/// shapes meet behind the corner radius without a seam.
+/// mirrored for the leading one.
+///
+/// The box overlaps the bubble by its inner span and is FILLED SOLID up to its
+/// top edge there, which is what buries the bubble's corner radius: the arc
+/// carves a wedge out of the corner, and a tail whose top boundary dips below
+/// the arc leaves that wedge showing through as a notch. The outer curve then
+/// starts ON the bubble's own edge line, heading down before it bends out, so
+/// the silhouette runs straight off the bubble's side into the point.
 private struct BubbleTail: Shape {
+    /// How far the point pokes past the bubble's edge; the view's offset uses
+    /// the same number so the shape's idea of "the edge" is where the edge is.
+    static let poke: CGFloat = 7
+
     var mine: Bool
 
     func path(in rect: CGRect) -> Path {
+        let edge = rect.maxX - Self.poke
         var p = Path()
         p.move(to: CGPoint(x: 0, y: 0))
+        p.addLine(to: CGPoint(x: edge, y: 0))
+        // Leaves the edge heading DOWN (control barely outboard), then bends
+        // out to the point — the vertical tangent is what makes the bubble's
+        // side and the tail read as one line.
         p.addQuadCurve(
             to: CGPoint(x: rect.maxX, y: rect.maxY),
-            control: CGPoint(x: rect.maxX * 0.55, y: rect.maxY * 0.35))
+            control: CGPoint(x: edge + (rect.maxX - edge) * 0.3, y: rect.maxY * 0.65))
         p.addQuadCurve(
             to: CGPoint(x: 0, y: rect.maxY),
-            control: CGPoint(x: rect.maxX * 0.45, y: rect.maxY))
+            control: CGPoint(x: edge * 0.8, y: rect.maxY))
         p.closeSubpath()
         guard !mine else { return p }
         return p.applying(
