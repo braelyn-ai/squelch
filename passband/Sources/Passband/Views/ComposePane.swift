@@ -45,14 +45,10 @@ struct ComposePane: View {
                 header(compose)
 
                 VStack(alignment: .leading, spacing: 12) {
-                    // ABOVE the phase branch, so it is stated in both — and once
-                    // rather than twice, because the sentence must not drift
-                    // between what the editor promises and what review confirms.
-                    forwardChrome(compose)
                     if inReview {
                         reviewPane(compose)
                     } else {
-                        editPane
+                        editPane(compose)
                     }
                     if let error = compose.error {
                         Text(error).font(Typo.micro).foregroundStyle(Palette.danger)
@@ -122,37 +118,88 @@ struct ComposePane: View {
         return compose.replyToMessageId != nil ? "reply" : "new message"
     }
 
-    /// WHAT RIDES ALONG on a forward, in both phases.
-    ///
-    /// The quoted original and its files are assembled by the daemon and never
-    /// appear in the body box, so without this line the composer is an empty
-    /// new message that inexplicably sends a fat email — and review, whose
-    /// whole job is to promise what goes out, would be promising half of it.
-    /// Nothing here is on the wire; it is `ComposeState`'s display pair.
-    @ViewBuilder
-    private func forwardChrome(_ compose: ComposeState) -> some View {
-        if compose.forwardOfMessageId != nil {
-            Text(forwardChromeText(compose))
-                .font(Typo.micro)
-                .foregroundStyle(Palette.inkFaint)
-                .lineLimit(2)
-                // A long subject wraps instead of pushing the pane wider.
-                .fixedSize(horizontal: false, vertical: true)
-                .frame(maxWidth: .infinity, alignment: .leading)
-        }
-    }
+    // MARK: - the forwarded original
 
-    /// The chrome's sentence. A stranger's subject line, rendered as Text and
-    /// never as markup — the same rule every sender-supplied string here keeps.
-    private func forwardChromeText(_ compose: ComposeState) -> String {
-        let subject = compose.forwardedSubject?.trimmed ?? ""
-        var line = "forwarding: " + (subject.isEmpty ? "(no subject)" : subject)
-        let files = compose.forwardedAttachmentCount
-        // Only when there are some: a line saying "0 attachments" on every
-        // ordinary forward is a line nobody reads, the same reason the review's
-        // tracking row only appears when the pixel is armed.
-        if files > 0 { line += " · \(files) attachment\(files == 1 ? "" : "s")" }
-        return line
+    /// How tall the quote may grow in the EDIT phase before it starts scrolling
+    /// inside itself. One number for both platforms on purpose: it is a CEILING,
+    /// not a height — the editor above is greedy too, so a short pane (or a
+    /// phone sheet with the keyboard up) splits the space between them and the
+    /// quote simply gets less than this. Review has no ceiling at all; there is
+    /// nothing to type into by then, so the whole thing scrolls with the note.
+    private static let quoteEditHeight: CGFloat = 300
+
+    /// WHAT RIDES ALONG on a forward, in both phases: the message itself,
+    /// indented behind a rail the way every mail client draws included mail.
+    ///
+    /// The real quote is assembled by the DAEMON out of its own raw fetch, so
+    /// nothing here is on the wire — this is the reader's sanitized copy of the
+    /// same message (see `ComposeState.forwardedMessage`), shown so the composer
+    /// is not an empty new message that inexplicably sends a fat email, and so
+    /// review, whose whole job is promising what goes out, promises the whole of
+    /// it rather than the covering note.
+    ///
+    /// NO `to` OR `cc` LINES, and their absence is a fact about the client
+    /// rather than a choice: `ClientMessage` carries the sender and nothing else
+    /// about the audience, while the daemon's block writes `To:` and `Cc:` from
+    /// the raw headers. Inventing them from what is in reach would be inventing
+    /// recipients, and the one question a forwarded header block exists to
+    /// answer is who was on it.
+    @ViewBuilder
+    private func forwardedQuote(_ compose: ComposeState) -> some View {
+        if compose.forwardOfMessageId != nil, let message = compose.forwardedMessage {
+            VStack(alignment: .leading, spacing: 9) {
+                // The composer's mirror of the wire's
+                // "---------- Forwarded message ---------" banner: the same
+                // sentence the outgoing mail carries, said in the house's micro
+                // voice instead of in a row of hyphens.
+                Text("forwarded message")
+                    .font(Typo.micro)
+                    .foregroundStyle(Palette.inkFaintest)
+                    .textCase(.uppercase)
+
+                // The header lines of that banner, in review's own summary
+                // grammar — a header being checked, in mono. The subject comes
+                // off `forwardedSubject` rather than off the message, because
+                // that is the value the outgoing `Fwd: …` title was built from
+                // and the two must not read differently.
+                VStack(alignment: .leading, spacing: 3) {
+                    ComposeSummaryRow("from", message.senderString)
+                    ComposeSummaryRow("date", Fmt.dateTime(message.received_at))
+                    ComposeSummaryRow("subject", compose.forwardedSubject ?? "(no subject)")
+                }
+
+                // THE READER'S OWN BODY VIEWS, picked by the reader's own test
+                // (MessageCard) — html when there is any, plain text otherwise.
+                // Same `cacheKey` the reader passes, so this shares the frame
+                // pool and the image cache with the thread behind the pane
+                // rather than fetching every picture a second time, and the same
+                // tracker policy, so opening a composer cannot load a pixel the
+                // reader refused.
+                if let html = message.html, !html.isEmpty {
+                    EmailWebView(
+                        html: html, cacheKey: String(message.id),
+                        allowTrackers: message.allowsTrackers)
+                } else {
+                    PlainBody(content: message.content)
+                }
+
+                // Unconditional, exactly as the reader mounts it: the strip
+                // draws nothing at all when there are no files.
+                AttachmentStrip(attachments: message.attachmentList)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            // INDENTED LIKE QUOTED MAIL: the whole block sits behind a static
+            // bar in the hairline token. Same idiom as the reader's selection
+            // rail, minus the only thing that rail does — this one never moves
+            // and never changes color, because it marks a kind of content
+            // rather than where you are.
+            .padding(.leading, 12)
+            .overlay(alignment: .leading) {
+                RoundedRectangle(cornerRadius: 1, style: .continuous)
+                    .fill(Palette.hairlineStrong)
+                    .frame(width: 2)
+            }
+        }
     }
 
     private func footer(_ compose: ComposeState) -> some View {
@@ -196,7 +243,7 @@ struct ComposePane: View {
         .overlay(alignment: .top) { Hairline() }
     }
 
-    private var editPane: some View {
+    private func editPane(_ compose: ComposeState) -> some View {
         VStack(alignment: .leading, spacing: 12) {
             RecipientField(text: bind(\.to), focus: $focusedField, field: FocusTarget.to)
             Field(label: "subject") {
@@ -228,6 +275,20 @@ struct ComposePane: View {
                             .strokeBorder(Palette.hairlineStrong, lineWidth: 0.75))
             }
             .frame(maxHeight: .infinity)
+
+            // UNDER the editor, where the quote sits in the mail itself, and in
+            // a scroller of its own: the note is what you are writing and keeps
+            // the flexible remainder, while the original — which can be a whole
+            // newsletter — scrolls inside a bounded pocket instead of pushing
+            // the editor off the pane.
+            //
+            // The EDITOR is deliberately not the thing wrapped: MarkdownTextView
+            // is a platform text view that scrolls itself, and nesting it in a
+            // ScrollView breaks its own scrolling.
+            if compose.forwardOfMessageId != nil {
+                ScrollView { forwardedQuote(compose) }
+                    .frame(maxHeight: Self.quoteEditHeight)
+            }
         }
     }
 
@@ -240,13 +301,39 @@ struct ComposePane: View {
         isReply ? ComposeCopy.derivedSubject : "subject"
     }
 
+    /// WHAT THE MAIL WILL BE TITLED, which is not always what is in the subject
+    /// field: review's whole job is promising what goes out, so an empty field
+    /// has to show the title the DAEMON will derive rather than a blank row.
+    ///
+    /// The empty test is `trimmed.isEmpty`, because that is the DAEMON's test:
+    /// `action_send` filters the subject through `!s.trim().is_empty()` before
+    /// falling back to its derivation, so a field holding only spaces hands
+    /// titling back to the daemon exactly as a cleared one does. (`fire` sends
+    /// the spaces, and the daemon discards them — the wire carries them, the
+    /// mail never does.) Testing `isEmpty` here promised a blank title for a
+    /// mail about to go out titled `Fwd: …`, one whitespace away from the lie
+    /// this function exists to remove.
+    ///
+    /// Three empty cases, and they derive differently:
+    /// - a reply: `gmail_write::reply_subject` from the parent, which the
+    ///   composer's update cannot see (it carries an LLM summary, not headers).
+    /// - a FORWARD: `gmail_write::forward_subject` of the original, which we CAN
+    ///   mirror, because the original's subject is right here as
+    ///   `forwardedSubject`. Reachable exactly when the sender cleared the field
+    ///   the composer opened pre-filled.
+    /// - a new message: nothing derives one; it goes out untitled.
+    private func reviewSubject(_ compose: ComposeState) -> String {
+        guard compose.subject.trimmed.isEmpty else { return compose.subject }
+        if compose.forwardOfMessageId != nil {
+            return ComposeCopy.forwardSubject(compose.forwardedSubject ?? "")
+        }
+        return isReply ? ComposeCopy.derivedSubject : "(none)"
+    }
+
     private func reviewPane(_ compose: ComposeState) -> some View {
         VStack(alignment: .leading, spacing: 10) {
             ComposeSummaryRow("to", compose.to.isEmpty ? "(none)" : compose.to)
-            ComposeSummaryRow(
-                "subject",
-                compose.subject.isEmpty
-                    ? (isReply ? ComposeCopy.derivedSubject : "(none)") : compose.subject)
+            ComposeSummaryRow("subject", reviewSubject(compose))
             // Review states what is about to go out, and an invisible pixel in
             // it is part of that. Only when armed: a row saying "no" on every
             // ordinary send is a row nobody reads.
@@ -255,11 +342,20 @@ struct ComposePane: View {
             }
 
             ScrollView {
-                // The scanner's own styling, so review shows the formatting the
-                // HTML half will carry — not a second interpretation of it.
-                Text(MarkdownStyle.attributed(compose.body))
-                    .textSelection(.enabled)
-                    .frame(maxWidth: .infinity, alignment: .leading)
+                VStack(alignment: .leading, spacing: 14) {
+                    // The scanner's own styling, so review shows the formatting
+                    // the HTML half will carry — not a second interpretation of
+                    // it.
+                    Text(MarkdownStyle.attributed(compose.body))
+                        .textSelection(.enabled)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                    // INSIDE this scroller rather than beside it, and under the
+                    // note exactly as it will sit in the mail: on a forward the
+                    // quote is most of what goes out, and review's whole job is
+                    // stating what goes out. No inner ScrollView here — one
+                    // scroll surface, the outer one.
+                    forwardedQuote(compose)
+                }
             }
             .frame(maxHeight: .infinity)
             .padding(10)
@@ -409,6 +505,19 @@ struct ComposePane: View {
         store.compose = next
     }
 
+    /// Patch the slot ONLY IF it still holds the composer `id` names. Every
+    /// write that happens after an `await` goes through here: the plain `patch`
+    /// above is safe only because its callers run synchronously off a keystroke,
+    /// while a send's continuation resumes into whatever the slot holds by then,
+    /// which may be an entirely different draft (see `ComposeState.id`).
+    /// Silently does nothing in that case, by design — the composer that moved
+    /// on is not this send's to edit, and the mail may well have gone out.
+    private func patch(_ id: UUID, _ mutate: (inout ComposeState) -> Void) {
+        guard var next = store.compose, next.id == id else { return }
+        mutate(&next)
+        store.compose = next
+    }
+
     private func toReview() {
         guard let compose = store.compose else { return }
         // Untouched covers the seeded signature: a signature under nothing is
@@ -434,9 +543,18 @@ struct ComposePane: View {
 
     /// The request lives in `ComposeSubmit`; what is left here is this surface's
     /// own reaction to each outcome.
+    ///
+    /// EVERY WRITE BELOW IS KEYED TO `slot`, the composer this send belongs to.
+    /// `store.compose` is a slot, not an object: while the await is out the
+    /// sender can Escape (which flushes the draft and empties the slot) and open
+    /// a different composer into it, and an unkeyed continuation would then land
+    /// on a stranger's draft — `noteSent` clearing its touched mark, so the
+    /// close's flush refuses to save, so everything typed into it is gone. See
+    /// `ComposeState.id`.
     private func fire(override: Bool) async {
         guard let compose = store.compose, !compose.sending else { return }
-        patch {
+        let slot = compose.id
+        patch(slot) {
             $0.sending = true
             $0.error = nil
         }
@@ -445,28 +563,37 @@ struct ComposePane: View {
             // The daemon resolved the replied-to update; without this the row
             // sits in its band until the next poll, reading as a no-op. No undo
             // pairs with it — a send is the one irreversible action.
+            //
+            // These two are facts about the MAIL, not about the slot, so they
+            // stand whoever holds the composer now: it really went out, and the
+            // person who sent it is owed the toast that says so.
             if let repliedTo = compose.replyToMessageId { store.noteResolved(repliedTo) }
             store.pushToast("sent", .success)
-            // The send already deleted the draft; without this the close below
-            // would flush it straight back and offer to restore mail that is gone.
-            DraftSaver.shared.noteSent(.compose)
-            store.closeCompose()
+            // The slot half. The send already deleted the draft it carried, so
+            // without `noteSent` the close would flush it straight back and
+            // offer to restore mail that is gone — but only for THIS composer.
+            // If the slot moved on, both of these belong to someone else's
+            // draft and the right amount of work to do is none.
+            if store.compose?.id == slot {
+                DraftSaver.shared.noteSent(.compose)
+                store.closeCompose()
+            }
         case .guardBlocked(let kinds):
             // Stay in review with the redacted verdict; the override must be an
             // explicit second act, not a re-fire of the same call.
-            patch {
+            patch(slot) {
                 $0.phase = .review
                 $0.guardKinds = kinds
                 $0.sending = false
                 $0.error = nil
             }
         case .forbidden:
-            patch {
+            patch(slot) {
                 $0.sending = false
                 $0.error = ComposeCopy.noWriteCredential
             }
         case .failure(let text):
-            patch {
+            patch(slot) {
                 $0.sending = false
                 $0.error = text
             }

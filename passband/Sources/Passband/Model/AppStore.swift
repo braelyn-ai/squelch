@@ -236,6 +236,26 @@ let ringSeconds: TimeInterval = 60
 /// reply.
 struct ComposeState: Sendable, Equatable {
     enum Phase: Sendable { case edit, review }
+
+    /// WHICH COMPOSER THIS IS. Minted once when the state is built and carried
+    /// through every copy of it, because this is a value type living in a slot
+    /// (`AppStore.compose` / `AppStore.inlineReply`) that anything can replace:
+    /// the only way an async continuation can tell "still mine" from "somebody
+    /// else's draft is in the slot now" is an identity that copies along.
+    ///
+    /// The race it exists for: a send is awaited, the sender presses Escape
+    /// (which flushes the draft and clears the slot) and opens a different
+    /// composer, then the response lands and the continuation closes and
+    /// un-marks THAT one — destroying whatever was typed into it. A 60s forward
+    /// holds that window open for a minute. Every send continuation therefore
+    /// checks this id against the slot before touching it.
+    ///
+    /// Being `let` with a default keeps it out of the memberwise init, so no
+    /// caller can mint two states with one identity — and note this makes
+    /// Equatable DISTINGUISH two composers holding identical text, which is
+    /// exactly what the slot logic wants: same words, different draft.
+    let id = UUID()
+
     var replyToMessageId: Int?
     /// The message this composer PASSES ON. Mutually exclusive with
     /// `replyToMessageId` — a send names a parent to answer or an original to
@@ -269,14 +289,32 @@ struct ComposeState: Sendable, Equatable {
     /// without `replyToMessageId`, and fixed when the composer opens: which key
     /// opened it is the whole choice, so there is no switch to flip afterwards.
     var replyAll = false
-    /// What the forwarded original is called, and how many files it drags with
-    /// it. DISPLAY ONLY, both of them: they NEVER reach the wire — the daemon
-    /// builds the quoted original from `forwardOfMessageId` alone, and a client
-    /// that shipped its own copy of the subject would be inviting the two to
-    /// disagree. They exist so the composer can state what rides along, which
-    /// is otherwise invisible: the body box shows only what the sender types.
+    /// What the forwarded original is called. DISPLAY ONLY: it NEVER reaches the
+    /// wire — the daemon builds the quoted original from `forwardOfMessageId`
+    /// alone, and a client that shipped its own copy of the subject would be
+    /// inviting the two to disagree. It exists so the composer can name what
+    /// rides along, and so `ComposePane.reviewSubject` can mirror the daemon's
+    /// own `Fwd: …` titling for a sender who cleared the subject field.
     var forwardedSubject: String?
-    var forwardedAttachmentCount: Int = 0
+    /// THE FORWARDED ORIGINAL ITSELF, which the composer shows underneath the
+    /// note, indented like quoted mail. DISPLAY ONLY, exactly like
+    /// `forwardedSubject` and for exactly the same reason: the wire carries
+    /// `forwardOfMessageId` and nothing else, and the daemon rebuilds the quote
+    /// from its own RAW GMAIL FETCH of that id.
+    ///
+    /// So this is THE READER'S SANITIZED COPY of the same message, standing in
+    /// for a quote that is assembled somewhere else. Without it the composer is
+    /// an empty new message that inexplicably sends a fat email, and review —
+    /// whose whole job is promising what goes out — promises the covering note
+    /// alone.
+    ///
+    /// THE PREVIEW AND THE WIRE CAN DIFFER, in exactly the ways ingest
+    /// sanitization differs from raw: this html has been through ammonia, its
+    /// tracking pixels are stripped unless the sender is `sender_known`, and its
+    /// `cid:` sources have been rewritten to point at the stored parts. What
+    /// actually goes out is the original as Gmail holds it, pixels and all.
+    /// Nothing else drifts — same message, same id, same files.
+    var forwardedMessage: ClientMessage?
 
     /// The one word both compose events use for what this draft IS —
     /// `compose_opened` and `compose_send` must not disagree about that.
@@ -1852,9 +1890,19 @@ final class AppStore {
     /// forward needs the two fields a reply does not have: a recipient (nobody
     /// is derivable from the original) and a subject.
     ///
-    /// `subject` and `attachmentCount` are the CHROME's, not the wire's: the
-    /// daemon quotes the original and re-attaches its files from the id alone
-    /// (see `ComposeState.forwardedSubject`).
+    /// THE WHOLE MESSAGE comes in, and only its `id` goes out: the daemon
+    /// quotes the original and re-attaches its files from that id alone. The
+    /// rest is what the composer SHOWS — the subject it titles itself with and
+    /// the quoted body it renders underneath the note (see
+    /// `ComposeState.forwardedMessage`).
+    ///
+    /// `fallbackSubject` is the CONVERSATION's title, used only when the message
+    /// carries no subject header of its own (a daemon too old to send one). The
+    /// message's own header wins, because that is the header the daemon quotes:
+    /// titling the forward from the thread would name one email while sending
+    /// another, on exactly the threads where the two differ (a retitled reply, a
+    /// list that stamps its own prefix). Resolved HERE rather than at the call
+    /// site so the outgoing subject and the shown one cannot drift.
     ///
     /// Two deliberate absences:
     ///
@@ -1866,21 +1914,45 @@ final class AppStore {
     ///   cannot record what is being forwarded, so a saved forward would come
     ///   back as an ordinary new message with the original silently gone. See
     ///   `DraftSaver.save`.
-    func openComposeForward(messageId: Int, subject: String, attachmentCount: Int) {
+    func openComposeForward(message: ClientMessage, fallbackSubject: String) {
         // A composer already up is not something a repeated `f` gets to blank
         // out — the same rule `openComposeNew` and the inline reply keep.
         guard compose == nil else { return }
+        // REFUSE RATHER THAN HOPE. An outdated daemon does not reject a forward,
+        // it ignores the field it does not know and answers 200 "sent" having
+        // mailed the covering note alone — the original, its quote and its
+        // files gone, with the sender told it went. That is a lie a toast cannot
+        // walk back, so the composer never opens at all. See
+        // `forwardingAvailable` for why nil counts as no.
+        guard forwardingAvailable else {
+            // Two states hide behind one refusal and only one is the daemon's
+            // fault: before the first /client/stats lands there is no verdict
+            // yet, and sending the user to a terminal to "update squelchd"
+            // over a half-second race would be the wrong sentence. Both still
+            // REFUSE — hope is what mails the note alone.
+            pushToast(
+                sitrep.stats == nil
+                    ? "still connecting · try forward again in a moment"
+                    : "this daemon cannot forward mail · update squelchd",
+                .error)
+            return
+        }
         var state = ComposeState()
-        state.forwardOfMessageId = messageId
+        state.forwardOfMessageId = message.id
+        // THE MESSAGE'S OWN SUBJECT, with the caller's thread title as the
+        // fallback — see the note above on why the message wins.
+        let subject = message.subject ?? fallbackSubject
         // The subject is SENT, not derived: the daemon only titles a forward
         // itself when the field is absent, and the composer shows one, so what
         // is on screen has to be what goes out.
         state.subject = ComposeCopy.forwardSubject(subject)
-        // Nil rather than "" when the original was untitled, so the chrome has
-        // one thing to test.
+        // Nil rather than "" when the original was untitled, so the quote's
+        // header has one thing to test.
         let original = subject.trimmed
         state.forwardedSubject = original.isEmpty ? nil : original
-        state.forwardedAttachmentCount = attachmentCount
+        // The reader's copy of what the daemon will quote, for the composer to
+        // show. Never sent — see `ComposeState.forwardedMessage`.
+        state.forwardedMessage = message
         // Through `openCompose` so the tracker default and the signature are
         // seeded by the one place that seeds them, and the open is counted.
         openCompose(state)
@@ -1977,6 +2049,22 @@ final class AppStore {
     /// this. A self-host daemon never says `assistant_relay`, and nil means
     /// the switch is simply not offered (same posture as `trackingAvailable`).
     var relayAvailable: Bool { sitrep.stats?.assistant_relay == true }
+
+    // MARK: - forwarding
+
+    /// Whether this daemon understands `forward_of_message_id`. Read off the
+    /// same sitrep stats `relayAvailable` is, for the same reason: /client/stats
+    /// is already the connect probe and SitrepPoller keeps it fresh, so this
+    /// capability costs no fetch of its own.
+    ///
+    /// STRICTLY `== true`. nil covers two states — stats not fetched yet, and a
+    /// daemon too old to answer — and BOTH have to refuse. The failure this
+    /// prevents is not an error dialog: an old daemon silently ignores the
+    /// unknown field, sends the covering note by itself and returns 200 "sent",
+    /// so hoping would mean mailing a stranger an empty "look at this" and
+    /// telling the sender it worked. A send has no undo, so the only safe read
+    /// of "we do not know" is no.
+    var forwardingAvailable: Bool { sitrep.stats?.forwarding == true }
 
     // MARK: - read tracking
 

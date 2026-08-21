@@ -239,6 +239,17 @@ pub struct ClientMessage {
     pub from_addr: String,
     pub from_name: Option<String>,
     pub received_at: DateTime<Utc>,
+    /// THIS message's own `Subject`, not the thread's.
+    ///
+    /// [`ClientThreadView::subject`] is the OLDEST message's subject, which is
+    /// the right title for the conversation and the WRONG title for one message
+    /// inside it: a renamed thread ("Lunch?" -> "Re: Lunch? -> Thursday
+    /// instead") makes the two diverge. The client forwards ONE message, and it
+    /// titles and labels that forward from the message it actually forwards, so
+    /// the per-message value has to be on the wire.
+    ///
+    /// An old client simply ignores the extra key.
+    pub subject: String,
     pub content: String,
     /// Sanitized HTML body; served ONLY here (GET /client/thread/{id}).
     pub html: Option<String>,
@@ -779,6 +790,9 @@ mod tests {
                     from_addr: "a@b.com".into(),
                     from_name: None,
                     received_at: Utc::now(),
+                    // Renamed mid-thread: the message's own subject is NOT the
+                    // thread's, and the forward composer titles from this one.
+                    subject: "Re: s -> Thursday instead".into(),
                     content: "text".into(),
                     html: Some("<p>hi</p>".into()),
                     attachments: vec![
@@ -811,6 +825,7 @@ mod tests {
                     from_addr: "a@b.com".into(),
                     from_name: None,
                     received_at: Utc::now(),
+                    subject: "s".into(),
                     content: "plain".into(),
                     html: None,
                     attachments: vec![],
@@ -850,6 +865,15 @@ mod tests {
             "None content_id must not serialize"
         );
         assert_eq!(v["messages"][1]["attachments"], serde_json::json!([]));
+        // PER-MESSAGE subject, which a renamed thread makes differ from the
+        // thread's own: the forward composer titles from the message it
+        // forwards, so both values have to be on the wire, at their own levels.
+        assert_eq!(v["subject"], serde_json::json!("s"));
+        assert_eq!(
+            v["messages"][0]["subject"],
+            serde_json::json!("Re: s -> Thursday instead")
+        );
+        assert_eq!(v["messages"][1]["subject"], serde_json::json!("s"));
         // Triage highlight fields: present when set, structurally ABSENT when
         // None (not null) — an old client's strict decoder never sees the keys.
         assert_eq!(v["messages"][0]["tier"], serde_json::json!("past_due"));

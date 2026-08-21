@@ -161,12 +161,19 @@ const BOUNDARY_BUMP_LIMIT: u32 = 16;
 ///
 /// The bump is CAPPED (see [`BOUNDARY_BUMP_LIMIT`]). Past the cap the suffix is
 /// derived from the content itself: a hash of every probe part, hex, then the
-/// same verify-and-bump on top. That fallback is what makes the cap safe rather
-/// than a shorter fuse — to force even one bump there, a sender would have to
-/// embed the hex of the hash OF THEIR OWN BYTES inside those bytes, a fixpoint
-/// they would have to know the digest to write and writing it changes the
-/// digest. So the loop below runs once in practice, and the crafted case costs a
-/// bounded 17 scans instead of however many the attacker felt like typing.
+/// same verify-and-bump on top.
+///
+/// WHY THAT FALLBACK IS SAFE, STATED CORRECTLY. It is NOT because the value is
+/// unpredictable — it is entirely predictable, and the comment here used to
+/// claim otherwise. `DefaultHasher` is zero-keyed SipHash: same input, same
+/// digest, in this process and in the sender's, so anyone can compute what our
+/// fallback boundary would be for bytes they hold. The mechanism survives that
+/// for a different reason. THE DIGEST IS TAKEN OVER THE FINAL PARTS, imitation
+/// included, so to force even ONE bump a sender must produce bytes containing
+/// the hex of the hash of those same bytes — a fixpoint, not a prediction.
+/// Writing the guess changes the input, which changes the digest. So the loop
+/// below runs once in practice, and the crafted case costs a bounded 17 scans
+/// instead of however many the attacker felt like typing.
 ///
 /// NORMAL CONTENT IS UNTOUCHED: clean parts still take suffix `0` on the first
 /// try, so a reply's bytes are what they have always been.
@@ -177,9 +184,9 @@ fn boundary_with_prefix(prefix: &str, parts: &[&str]) -> String {
             return boundary;
         }
     }
-    // Not a security hash and it does not need to be: the property required is
-    // "the sender cannot predict this value", and SipHash over content they do
-    // not fully control (their bytes, the user's note, our framing) gives it.
+    // NOT a security hash, and it does not need to be one: what the fallback
+    // rests on is the fixpoint above, not secrecy or unpredictability. A faster
+    // non-cryptographic digest would do the same job.
     use std::hash::{DefaultHasher, Hash, Hasher};
     let mut hasher = DefaultHasher::new();
     for p in parts {
@@ -847,6 +854,12 @@ pub struct ForwardedOriginal {
     pub from: String,
     pub date: String,
     pub to: String,
+    /// The original's `Cc`, same display-string treatment as `to`. EMPTY when
+    /// there was none, and an empty one writes no line at all — exactly how
+    /// Gmail's own forwarded block does it. Without this the block understates
+    /// the audience, which is the one question a forwarded header block exists
+    /// to answer.
+    pub cc: String,
     pub subject: String,
     /// The decoded text body, empty when the original had none.
     pub text: String,
@@ -855,10 +868,42 @@ pub struct ForwardedOriginal {
     pub attachments: Vec<ForwardAttachment>,
 }
 
+/// The characters that force a display name into an RFC 5322 quoted-string:
+/// `specials` plus the double quote and the backslash. A `,` is the one that
+/// actually misleads — the list is comma-joined, so an unquoted "Doe, Jane"
+/// reads as two people — but `<` is just as bad the other way, making one
+/// mailbox look like a name wrapped around somebody else's address.
+const DISPLAY_NAME_SPECIALS: &[char] =
+    &['(', ')', '<', '>', '[', ']', ':', ';', '@', '\\', ',', '"'];
+
+/// One display name as it may appear before an address: bare when it is plain
+/// text, an RFC 5322 quoted-string when it holds a special, with `\` and `"`
+/// backslash-escaped inside.
+///
+/// MIRRORS `squelch_core::sync::ingest::format_recipients`, which does the same
+/// job for the stored `to_addrs` column, because that one is `pub(crate)` and
+/// cannot be called from here. The two differ deliberately in one place: core
+/// DROPS an embedded `"` (its consumer, the Swift client's splitter, is
+/// quote-aware but not backslash-aware), whereas this string is read by a mail
+/// client and by a human, so escaping keeps the name intact. If core's rule
+/// changes, look here too.
+fn quoted_display_name(name: &str) -> String {
+    if !name.contains(DISPLAY_NAME_SPECIALS) {
+        return name.to_string();
+    }
+    let escaped = name.replace('\\', "\\\\").replace('"', "\\\"");
+    format!("\"{escaped}\"")
+}
+
 /// Render one address-list header as the display string a forwarded block
 /// quotes: `Name <addr>` per mailbox, comma-joined, dropping whichever half is
 /// missing. This is body text, not a header value — display names SURVIVE here,
 /// unlike [`parse_addr_list`], because nobody re-parses it as an address.
+///
+/// The name is QUOTED when it needs to be (see [`quoted_display_name`]): the
+/// block's whole job is to state who the original went to, and a lastname-first
+/// name would otherwise split one recipient into two and misstate the audience
+/// the user is passing the message on from.
 fn address_display(addr: Option<&mail_parser::Address>) -> String {
     let Some(addr) = addr else {
         return String::new();
@@ -868,9 +913,11 @@ fn address_display(addr: Option<&mail_parser::Address>) -> String {
         let name = a.name().map(str::trim).filter(|s| !s.is_empty());
         let email = a.address().map(str::trim).filter(|s| !s.is_empty());
         match (name, email) {
-            (Some(n), Some(e)) => out.push(format!("{n} <{e}>")),
+            (Some(n), Some(e)) => out.push(format!("{} <{e}>", quoted_display_name(n))),
             (None, Some(e)) => out.push(e.to_string()),
-            (Some(n), None) => out.push(n.to_string()),
+            // A name with no address still has to stay ONE entry in the joined
+            // list, so it is quoted on the same rule.
+            (Some(n), None) => out.push(quoted_display_name(n)),
             (None, None) => {}
         }
     }
@@ -966,6 +1013,7 @@ pub fn parse_forwarded_original(raw: &[u8]) -> Option<ForwardedOriginal> {
         from: address_display(msg.from()),
         date: msg.date().map(|d| d.to_rfc822()).unwrap_or_default(),
         to: address_display(msg.to()),
+        cc: address_display(msg.cc()),
         subject: msg.subject().unwrap_or_default().to_string(),
         text,
         html: (!html_views.is_empty()).then(|| html_views.join("\n")),
@@ -1019,6 +1067,11 @@ fn forward_text_part(parts: &ForwardParts) -> String {
     out.push_str(&format!("Date: {}\n", strip_newlines(&o.date)));
     out.push_str(&format!("Subject: {}\n", strip_newlines(&o.subject)));
     out.push_str(&format!("To: {}\n", strip_newlines(&o.to)));
+    // Only when there was one: a bare `Cc:` line would claim the original
+    // copied somebody it did not.
+    if !o.cc.trim().is_empty() {
+        out.push_str(&format!("Cc: {}\n", strip_newlines(&o.cc)));
+    }
     out.push('\n');
     out.push_str(&o.text);
     out
@@ -1048,19 +1101,148 @@ fn strip_charset_meta(html: &str) -> String {
             .chars()
             .next()
             .is_none_or(|c| c.is_whitespace() || c == '/' || c == '>');
-        // The tag runs to the first `>`; an unterminated one runs to the end of
-        // the document, and there is nothing after it to preserve.
-        let end = match lower[start..].find('>') {
-            Some(i) => start + i + 1,
-            None => html.len(),
+        // WHERE THE TAG ACTUALLY ENDS: at the first `>` OUTSIDE a quoted
+        // attribute value. Stopping at the first `>` full stop cut the tag in
+        // half whenever an attribute value contained one, and the tail of the
+        // value then leaked into the document as text once the head was dropped.
+        //
+        // UNTERMINATED MEANS UNBOUNDED, AND UNBOUNDED MEANS HANDS OFF: with no
+        // closing `>` the "tag" has no far edge, and dropping to any guessed
+        // edge deletes document. Malformed markup keeps its meta tag (worst
+        // case is the mojibake the strip exists to prevent) rather than losing
+        // the newsletter (which is the mail).
+        let end = match tag_end(&lower[start..]) {
+            Some(i) => start + i,
+            None => {
+                out.push_str(&html[cursor..]);
+                return out;
+            }
         };
         out.push_str(&html[cursor..start]);
-        if !is_meta || !lower[start..end].contains("charset") {
+        // WHAT ACTUALLY DECLARES A CHARSET: a `charset` attribute, or the
+        // `http-equiv="content-type"` spelling. Substring-matching "charset"
+        // over the whole tag dropped `<meta name="description" content="…how to
+        // pick a charset…">`, a tag that declares nothing and says something.
+        let drops = is_meta && meta_declares_charset(&lower[start..end]);
+        if !drops {
             out.push_str(&html[start..end]);
         }
         cursor = end;
     }
     out.push_str(&html[cursor..]);
+    out
+}
+
+/// The index just PAST the `>` that closes the tag opening at byte 0 of `tag`,
+/// or `None` for an unterminated tag. Single- and double-quoted attribute values
+/// are skipped over, because a `>` inside one is data, not structure.
+///
+/// A quote OPENS a value only directly after `=` (whitespace allowed between).
+/// Anywhere else — the apostrophe in an unquoted `data-x=it's`, a stray `"` in
+/// prose — it is data, and reading it as a delimiter made one such byte swallow
+/// everything to the next coincidental quote, or the whole document.
+fn tag_end(tag: &str) -> Option<usize> {
+    let bytes = tag.as_bytes();
+    let mut quote: Option<u8> = None;
+    // The last non-whitespace byte seen outside a quoted value — `=` here is
+    // what licenses the next quote to delimit.
+    let mut prev = 0u8;
+    for (i, &b) in bytes.iter().enumerate() {
+        match quote {
+            Some(q) if b == q => {
+                quote = None;
+                // A quote just closed a value; the `=` that opened it must not
+                // also license the byte after the close.
+                prev = 0;
+            }
+            Some(_) => {}
+            None if (b == b'"' || b == b'\'') && prev == b'=' => quote = Some(b),
+            None if b == b'>' => return Some(i + 1),
+            None => {
+                if !b.is_ascii_whitespace() {
+                    prev = b;
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Whether an ALREADY-LOWERCASED `<meta …>` tag declares a character set: it
+/// carries a `charset` attribute, or it is the `http-equiv="content-type"`
+/// spelling of the same thing. Attribute VALUES are never inspected for the word
+/// (see [`strip_charset_meta`]) — a value is prose, only the name is a
+/// declaration.
+fn meta_declares_charset(tag: &str) -> bool {
+    tag_attributes(tag).into_iter().any(|(name, value)| {
+        name == "charset" || (name == "http-equiv" && value.trim() == "content-type")
+    })
+}
+
+/// The `(name, value)` pairs of an ALREADY-LOWERCASED html tag, values unquoted
+/// (empty when the attribute is bare). A tiny scanner rather than a parser: it
+/// only has to be right about where a value starts and stops, which is what
+/// keeps a `>` or the word "charset" inside a value from being read as
+/// structure.
+fn tag_attributes(tag: &str) -> Vec<(String, String)> {
+    let bytes = tag.as_bytes();
+    let mut out = Vec::new();
+    // Step past `<meta` (or any tag name) before the first attribute.
+    let mut i = match bytes.iter().position(|b| b.is_ascii_whitespace()) {
+        Some(i) => i,
+        None => return out,
+    };
+    while i < bytes.len() {
+        // Skip separators; `/` and `>` end the attribute list.
+        while i < bytes.len() && (bytes[i].is_ascii_whitespace() || bytes[i] == b'/') {
+            i += 1;
+        }
+        if i >= bytes.len() || bytes[i] == b'>' {
+            break;
+        }
+        let name_start = i;
+        while i < bytes.len()
+            && !bytes[i].is_ascii_whitespace()
+            && !matches!(bytes[i], b'=' | b'>' | b'/')
+        {
+            i += 1;
+        }
+        let name = tag[name_start..i].to_string();
+        // An `=` (possibly spaced) introduces a value; anything else means the
+        // attribute was bare.
+        let mut j = i;
+        while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+            j += 1;
+        }
+        let mut value = String::new();
+        if j < bytes.len() && bytes[j] == b'=' {
+            j += 1;
+            while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+                j += 1;
+            }
+            if j < bytes.len() && (bytes[j] == b'"' || bytes[j] == b'\'') {
+                let quote = bytes[j];
+                j += 1;
+                let value_start = j;
+                while j < bytes.len() && bytes[j] != quote {
+                    j += 1;
+                }
+                value = tag[value_start..j].to_string();
+                // Step past the closing quote when there was one.
+                j = (j + 1).min(bytes.len());
+            } else {
+                let value_start = j;
+                while j < bytes.len() && !bytes[j].is_ascii_whitespace() && bytes[j] != b'>' {
+                    j += 1;
+                }
+                value = tag[value_start..j].to_string();
+            }
+            i = j;
+        }
+        if !name.is_empty() {
+            out.push((name, value));
+        }
+    }
     out
 }
 
@@ -1099,12 +1281,20 @@ fn forward_html_part(parts: &ForwardParts) -> String {
     out.push_str("<br>\n");
     // Every quoted value goes through `escape_html`: the original's headers are
     // attacker-authored text, and this block is the one place they become markup.
+    //
+    // An EMPTY `Cc` writes no line, matching the text part and Gmail's own
+    // block; the other four are always stated, blank or not, because their
+    // absence from a forwarded block reads as "unknown", not as "none".
     for (label, value) in [
         ("From", &o.from),
         ("Date", &o.date),
         ("Subject", &o.subject),
         ("To", &o.to),
+        ("Cc", &o.cc),
     ] {
+        if label == "Cc" && value.trim().is_empty() {
+            continue;
+        }
         out.push_str(&format!(
             "<b>{label}:</b> {}<br>\n",
             escape_html(&strip_newlines(value))
@@ -1184,8 +1374,75 @@ fn content_id_token(value: &str) -> String {
         .collect()
 }
 
+/// Whether every character is one a bare (unencoded) header parameter may hold:
+/// printable US-ASCII, space included.
+fn is_printable_ascii(s: &str) -> bool {
+    s.chars().all(|c| c.is_ascii_graphic() || c == ' ')
+}
+
+/// `s` projected into printable ASCII, one `_` per character that is not — the
+/// legible-but-lossy fallback a client that ignores RFC 2231 will show.
+fn ascii_projection(s: &str) -> String {
+    s.chars()
+        .map(|c| {
+            if c.is_ascii_graphic() || c == ' ' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+/// RFC 2231 percent-encoding of `s`'s UTF-8 bytes: everything outside the
+/// `attr-char` set becomes `%XX`. Uppercase hex, as the RFC's examples use.
+/// Trim a filename to at most `max` characters, keeping the extension: the
+/// stem gives way, the suffix that decides which application opens the file
+/// does not. Char-boundary safe by construction (it works in `char`s), and a
+/// name already within the cap comes back byte-identical.
+fn truncate_filename(name: &str, max: usize) -> String {
+    if name.chars().count() <= max {
+        return name.to_string();
+    }
+    // The extension is worth preserving only when it looks like one: a short
+    // trailing dot-segment. A 60-char "extension" is just a name with a dot.
+    let ext: String = match name.rfind('.') {
+        Some(i) if name[i..].chars().count() <= 16 => name[i..].to_string(),
+        _ => String::new(),
+    };
+    let keep = max.saturating_sub(ext.chars().count()).max(1);
+    let stem: String = name.chars().take(keep).collect();
+    format!("{stem}{ext}")
+}
+
+fn rfc2231_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.as_bytes() {
+        let plain = b.is_ascii_alphanumeric()
+            || matches!(
+                b,
+                b'!' | b'#' | b'$' | b'&' | b'+' | b'-' | b'.' | b'^' | b'_' | b'`' | b'|' | b'~'
+            );
+        if plain {
+            out.push(*b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
+}
+
 /// One attachment as a MIME part under `boundary`.
+///
+/// FILENAMES ARE A NEW EMISSION SURFACE. A reply never wrote one; a forward
+/// writes back whatever the original called its parts, and mail-parser has
+/// ALREADY decoded any RFC 2047 `=?utf-8?…?=` spelling, so what arrives here is
+/// real UTF-8 that must not be dropped raw into a header parameter. Non-ASCII
+/// names therefore go out as RFC 2231 (`filename*=utf-8''…`) beside an
+/// ASCII-projected `filename=` for clients that ignore 2231. An all-ASCII name
+/// is emitted exactly as it always was, byte for byte.
 fn attachment_part(boundary: &str, att: &ForwardAttachment, encoded: &str) -> String {
+    let mime = mime_token(&att.mime);
     let filename = {
         let f = quoted_param(&att.filename);
         if f.trim().is_empty() {
@@ -1194,9 +1451,46 @@ fn attachment_part(boundary: &str, att: &ForwardAttachment, encoded: &str) -> St
             f
         }
     };
-    let mime = mime_token(&att.mime);
+    // A `message/*` PART MAY NOT BE BASE64. RFC 2045 §6.4 forbids any
+    // transfer-encoding but 7bit/8bit/binary for composite types — the whole
+    // `message/` tree, not just `message/rfc822`: a forwarded BOUNCE carries
+    // `message/delivery-status`, a read receipt `message/disposition-notification`,
+    // and bounces are the most-forwarded mail there is. We re-encode every part
+    // we carry, so the one honest way to ship these is to stop calling them
+    // messages: relabelled `application/octet-stream` with an `.eml` name, the
+    // bytes are preserved exactly and every mail client still opens the file.
+    // The trade is that the recipient's client will not render it INLINE as a
+    // nested message.
+    let message_type = mime.to_ascii_lowercase().starts_with("message/");
+    let (mime, filename) = if message_type {
+        let named = if filename.to_ascii_lowercase().ends_with(".eml") {
+            filename
+        } else if filename == "attachment" {
+            "forwarded.eml".to_string()
+        } else {
+            format!("{filename}.eml")
+        };
+        ("application/octet-stream".to_string(), named)
+    } else {
+        (mime, filename)
+    };
+    // The name is a stranger's header with no cap anywhere upstream, and RFC
+    // 2231 percent-encoding expands a multi-byte character 9x — a ~110-CJK-char
+    // name would push the unfolded disposition line past RFC 5322's 998-octet
+    // hard limit. 80 characters keeps the worst case (encoded form + ASCII
+    // fallback + the header's own overhead) comfortably under it, and no real
+    // filename is the poorer for the trim.
+    let filename = truncate_filename(&filename, 80);
+    let ascii_name = is_printable_ascii(&filename);
     let mut out = format!("--{boundary}\r\n");
-    out.push_str(&format!("Content-Type: {mime}; name=\"{filename}\""));
+    out.push_str(&format!("Content-Type: {mime}"));
+    // `name=` is the LEGACY spelling of the filename (RFC 2045 never defined it;
+    // `Content-Disposition: filename` did). It has no 2231 story worth writing,
+    // so a non-ASCII name simply omits it and lets the disposition carry the
+    // truth — every client this century reads that one.
+    if ascii_name {
+        out.push_str(&format!("; name=\"{filename}\""));
+    }
     // A TEXT PART'S BYTES ARE UTF-8 BY THE TIME WE SEE THEM: mail-parser decodes
     // each part out of its declared charset before handing it over, so re-emitting
     // the header with no charset at all leaves the recipient's client guessing —
@@ -1216,9 +1510,24 @@ fn attachment_part(boundary: &str, att: &ForwardAttachment, encoded: &str) -> St
     } else {
         "attachment"
     };
-    out.push_str(&format!(
-        "Content-Disposition: {disposition}; filename=\"{filename}\"\r\n"
-    ));
+    if ascii_name {
+        out.push_str(&format!(
+            "Content-Disposition: {disposition}; filename=\"{filename}\"\r\n"
+        ));
+    } else {
+        // `filename*` COMES FIRST ON PURPOSE. RFC 6266 §4.3 says a recipient
+        // should prefer the extended form when both are present, but plenty of
+        // parsers simply take the first parameter of that name they meet — ours
+        // does — and the extended form is the one carrying the real name. A
+        // parser that has never heard of RFC 2231 skips `filename*` as an
+        // unknown parameter and finds the ASCII projection right behind it, so
+        // putting it first costs that reader nothing.
+        out.push_str(&format!(
+            "Content-Disposition: {disposition}; filename*=utf-8''{}; filename=\"{}\"\r\n",
+            rfc2231_encode(&filename),
+            ascii_projection(&filename)
+        ));
+    }
     if let Some(cid) = att.content_id.as_deref() {
         let token = content_id_token(cid);
         if !token.is_empty() {
@@ -1230,15 +1539,89 @@ fn attachment_part(boundary: &str, att: &ForwardAttachment, encoded: &str) -> St
     out
 }
 
-/// The multipart/alternative section (text part, html part, closing delimiter),
-/// used both as the whole body and as the first part of a multipart/mixed.
+/// The longest line quoted-printable output may contain, INCLUDING the `=` of a
+/// soft break. RFC 2045 says 76; RFC 5322's hard limit is 998.
+const QP_MAX_LINE: usize = 76;
+
+/// Encode CRLF-normalized text as RFC 2045 quoted-printable.
+///
+/// WHY A FORWARD NEEDS THIS AT ALL: the parts it carries are a STRANGER'S mail,
+/// decoded out of whatever encoding it arrived in. A newsletter's html routinely
+/// arrives quoted-printable precisely because it is one 40 KB line, and
+/// mail-parser hands it back decoded — so re-emitting it with no
+/// Content-Transfer-Encoding put a single 40,000-octet line on the wire, past
+/// RFC 5322's 998-octet limit, along with raw 8-bit bytes on a transport that
+/// was never told to expect them. Both are things MTAs are entitled to mangle.
+///
+/// Rules implemented: `=` always encodes; control and non-ASCII bytes encode;
+/// space and tab encode ONLY where they would end a line (an MTA may strip
+/// trailing whitespace, and QP's own decoder would then lose it); CRLF passes
+/// through as a hard break; lines soft-break with `=\r\n` before they can reach
+/// [`QP_MAX_LINE`], and a `=XX` token is never split across one.
+fn qp_encode(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = String::with_capacity(bytes.len() + bytes.len() / 4);
+    let mut line = 0usize;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let b = bytes[i];
+        // A hard line break is structure: it passes through and resets the count.
+        if b == b'\r' && bytes.get(i + 1) == Some(&b'\n') {
+            out.push_str("\r\n");
+            line = 0;
+            i += 2;
+            continue;
+        }
+        // Whitespace that would sit at the end of a line has to be encoded, or
+        // an MTA trimming the line silently deletes it.
+        let ends_line = matches!(b, b' ' | b'\t')
+            && (i + 1 == bytes.len()
+                || (bytes[i + 1] == b'\r' && bytes.get(i + 2) == Some(&b'\n')));
+        let token = if b == b'=' || !(32..=126).contains(&b) || ends_line {
+            format!("={b:02X}")
+        } else {
+            (b as char).to_string()
+        };
+        // Break BEFORE the token, never inside it, and never leaving the soft
+        // break's `=` past the limit.
+        if line + token.len() > QP_MAX_LINE - 1 {
+            out.push_str("=\r\n");
+            line = 0;
+        }
+        out.push_str(&token);
+        line += token.len();
+        i += 1;
+    }
+    out
+}
+
+/// The multipart/alternative section (text part, html part, closing delimiter)
+/// of a FORWARD, used both as the whole body and as the first part of a
+/// multipart/mixed. `text`/`html` arrive ALREADY quoted-printable encoded (see
+/// [`qp_encode`]); the caller encodes first because the boundary search has to
+/// probe the bytes that actually go on the wire.
+///
+/// A WINDFALL WORTH NAMING: quoted-printable output can never contain the
+/// two-character sequence `=_`, because `=` survives encoding only as `=3D` or
+/// as a soft break's `=\r\n`. Both boundary prefixes begin `=_`, so these parts
+/// are STRUCTURALLY incapable of imitating a delimiter no matter what the
+/// original's author typed. The probe still runs — it also covers the base64
+/// attachment parts, and a guarantee that depends on nobody having changed the
+/// prefix is not one worth having — but for these two parts it can no longer be
+/// forced to bump.
+///
+/// The REPLY builder does NOT share this function: its parts are short,
+/// server-rendered content, and its wire shape is frozen by tests that pin the
+/// bytes.
 fn alternative_section(boundary: &str, text: &str, html: &str) -> String {
     let mut out = String::new();
     out.push_str(&format!(
-        "--{boundary}\r\nContent-Type: text/plain; charset=\"UTF-8\"\r\n\r\n{text}\r\n"
+        "--{boundary}\r\nContent-Type: text/plain; charset=\"UTF-8\"\r\n\
+         Content-Transfer-Encoding: quoted-printable\r\n\r\n{text}\r\n"
     ));
     out.push_str(&format!(
-        "--{boundary}\r\nContent-Type: text/html; charset=\"UTF-8\"\r\n\r\n{html}\r\n"
+        "--{boundary}\r\nContent-Type: text/html; charset=\"UTF-8\"\r\n\
+         Content-Transfer-Encoding: quoted-printable\r\n\r\n{html}\r\n"
     ));
     out.push_str(&format!("--{boundary}--\r\n"));
     out
@@ -1268,9 +1651,21 @@ pub fn build_forward_rfc822(parts: &ForwardParts) -> Result<Vec<u8>, WriteError>
         return Err(WriteError::Invalid("forward has no recipient".into()));
     }
 
-    let crlf = |s: &str| s.replace("\r\n", "\n").replace('\n', "\r\n");
-    let text = crlf(&forward_text_part(parts));
-    let html = crlf(&forward_html_part(parts));
+    // CRLF normalization in three steps, not two. A LONE `\r` IS THE REASON FOR
+    // THE MIDDLE ONE: `"\r\n" -> "\n"` then `"\n" -> "\r\n"` leaves a bare CR
+    // untouched, and a bare CR is illegal in an RFC 5322 message body. The text
+    // being normalized here is a stranger's decoded mail, so classic-Mac line
+    // endings and crafted stray CRs both arrive as a matter of course; folding
+    // them to LF first makes every one of them a real line break.
+    let crlf = |s: &str| {
+        s.replace("\r\n", "\n")
+            .replace('\r', "\n")
+            .replace('\n', "\r\n")
+    };
+    // Encoded HERE, before the probe: the boundary must be checked against the
+    // bytes that go on the wire, not against their pre-encoding source.
+    let text = qp_encode(&crlf(&forward_text_part(parts)));
+    let html = qp_encode(&crlf(&forward_html_part(parts)));
     let encoded: Vec<String> = parts
         .original
         .attachments
@@ -1280,7 +1675,9 @@ pub fn build_forward_rfc822(parts: &ForwardParts) -> Result<Vec<u8>, WriteError>
 
     // Both boundaries are checked against EVERY part, base64 chunks included.
     // Cheap, and it makes the guarantee one sentence long: no part of this
-    // message contains either delimiter.
+    // message contains either delimiter. (For the two encoded body parts this is
+    // now belt over braces — see [`alternative_section`] — but the base64 parts
+    // are still probed on their merits.)
     let mut probe: Vec<&str> = vec![text.as_str(), html.as_str()];
     probe.extend(encoded.iter().map(String::as_str));
     let alt = boundary_with_prefix(BOUNDARY_ALT, &probe);
@@ -2005,21 +2402,32 @@ mod tests {
         assert!(s.contains("To: carol@example.com\r\n"));
         assert!(s.contains("Subject: Fwd: Quarterly numbers\r\n"));
 
-        // The forwarded block appears in BOTH alternatives.
+        // BOTH body parts are quoted-printable: they carry a stranger's mail,
+        // whose html is routinely one line longer than RFC 5322 allows.
         assert_eq!(
-            s.matches("---------- Forwarded message ---------").count(),
+            s.matches("Content-Transfer-Encoding: quoted-printable\r\n")
+                .count(),
             2
         );
-        assert!(s.contains("From: Alice <alice@example.com>\r\n"));
-        assert!(s.contains("<b>From:</b> Alice &lt;alice@example.com&gt;<br>"));
-        assert!(s.contains("Date: Tue, 7 Jul 2026"));
-        assert!(s.contains("Subject: Quarterly numbers\r\n"));
-        assert!(s.contains("To: Me <me@example.com>, Bob <bob@example.com>\r\n"));
+
+        // The forwarded block appears in BOTH alternatives.
+        let (text, html) = forward_bodies(&s);
+        assert_eq!(
+            format!("{text}{html}")
+                .matches("---------- Forwarded message ---------")
+                .count(),
+            2
+        );
+        assert!(text.contains("From: Alice <alice@example.com>\r\n"));
+        assert!(html.contains("<b>From:</b> Alice &lt;alice@example.com&gt;<br>"));
+        assert!(text.contains("Date: Tue, 7 Jul 2026"));
+        assert!(text.contains("Subject: Quarterly numbers\r\n"));
+        assert!(text.contains("To: Me <me@example.com>, Bob <bob@example.com>\r\n"));
         // The note leads, before the quoted block, in both parts.
-        assert!(s.contains("worth a read\r\n\r\n----------"));
-        assert!(s.contains("<p>worth a read</p>"));
+        assert!(text.contains("worth a read\r\n\r\n----------"));
+        assert!(html.contains("<p>worth a read</p>"));
         // The original's html rides verbatim, cid reference and all.
-        assert!(s.contains("<p>chart below</p><img src=\"cid:logo@corp\">"));
+        assert!(html.contains("<p>chart below</p><img src=\"cid:logo@corp\">"));
 
         // ...and the part that reference resolves against rides with it.
         assert!(s.contains("Content-Type: image/png; name=\"logo.png\"\r\n"));
@@ -2051,18 +2459,12 @@ mod tests {
         let mut parts = fwd_parts("");
         parts.original.attachments.clear();
         let s = String::from_utf8(build_forward_rfc822(&parts).unwrap()).unwrap();
-        let (_h, mime) = parse_multipart_of(&s, "multipart/alternative");
+        let (text, html) = forward_bodies(&s);
+        assert!(text.starts_with("---------- Forwarded message ---------"));
         assert!(
-            mime[0]
-                .1
-                .starts_with("---------- Forwarded message ---------")
-        );
-        assert!(
-            mime[1]
-                .1
-                .starts_with("<html><body>\r\n<div class=\"passband_forward\">"),
+            html.starts_with("<html><body>\r\n<div class=\"passband_forward\">"),
             "no note means the quoted block opens the document: {:?}",
-            &mime[1].1[..60.min(mime[1].1.len())]
+            &html[..60.min(html.len())]
         );
     }
 
@@ -2127,19 +2529,33 @@ mod tests {
     }
 
     #[test]
-    fn a_forward_boundary_dodges_content_that_types_one_out() {
-        // Both levels bump, independently, off whichever part collides.
+    fn a_forward_body_cannot_imitate_a_delimiter_at_all_once_it_is_encoded() {
+        // THE WINDFALL of encoding the body parts quoted-printable: both
+        // boundary prefixes open `=_`, and QP output can never contain that
+        // sequence — `=` survives only as `=3D` or as a soft break's `=\r\n`. So
+        // content that types out a delimiter is neutralized before the probe
+        // ever looks at it, and the boundary stays at suffix 0.
         let mut parts = fwd_parts("look: =_passband_mix_0");
         parts.original.text = "and =_passband_alt_0 too".into();
         parts.original.html = Some("<p>=_passband_alt_0 =_passband_mix_0</p>".into());
         let s = String::from_utf8(build_forward_rfc822(&parts).unwrap()).unwrap();
-        assert!(s.contains("boundary=\"=_passband_mix_1\""));
-        assert!(s.contains("boundary=\"=_passband_alt_1\""));
-        // The message still parses: two alternatives inside, closing delimiters
-        // where they belong.
+        assert!(s.contains("boundary=\"=_passband_mix_0\""), "{s}");
+        assert!(s.contains("boundary=\"=_passband_alt_0\""), "{s}");
+        assert!(
+            !s.contains("=_passband_mix_0 "),
+            "no literal imitation left"
+        );
+
+        // The invariant the probe exists for still holds over every part...
         let (_h, mime) = parse_multipart_of(&s, "multipart/mixed");
         assert_eq!(mime.len(), 2, "the alternative section plus one attachment");
-        assert!(s.ends_with("--=_passband_mix_1--\r\n"));
+        assert!(s.ends_with("--=_passband_mix_0--\r\n"));
+        // ...and the typed-out text is still what the recipient reads: it was
+        // encoded, not edited.
+        let (text, html) = forward_bodies(&s);
+        assert!(text.contains("look: =_passband_mix_0"));
+        assert!(text.contains("and =_passband_alt_0 too"));
+        assert!(html.contains("<p>=_passband_alt_0 =_passband_mix_0</p>"));
     }
 
     #[test]
@@ -2189,12 +2605,10 @@ mod tests {
         parts.original.attachments.clear();
         parts.pixel_url = Some("https://p.passband.app/o/z.gif".into());
         let s = String::from_utf8(build_forward_rfc822(&parts).unwrap()).unwrap();
-        let (_h, mime) = parse_multipart_of(&s, "multipart/alternative");
-        assert!(!mime[0].1.contains("img"), "the text part carries nothing");
+        let (text, html) = forward_bodies(&s);
+        assert!(!text.contains("img"), "the text part carries nothing");
         assert!(
-            mime[1]
-                .1
-                .contains("<img src=\"https://p.passband.app/o/z.gif\" width=\"1\" height=\"1\"")
+            html.contains("<img src=\"https://p.passband.app/o/z.gif\" width=\"1\" height=\"1\"")
         );
     }
 
@@ -2210,53 +2624,65 @@ mod tests {
 
     #[test]
     fn a_boundary_search_stops_walking_and_derives_a_suffix_instead() {
-        // THE PROBE PARTS ARE ATTACKER-AUTHORED. Mail that types out every
+        // THE PROBE PARTS ARE ATTACKER-AUTHORED. Content that types out every
         // suffix the sequential bump is willing to try must not send it walking
         // — that is an unbounded full-body scan per step. Past the cap the
-        // suffix comes from a hash of the content, which the sender cannot aim
-        // at: to force even one bump there they would have to embed the hex of
-        // the hash of their own bytes inside those bytes.
-        let mut typed = String::new();
-        for n in 0..=BOUNDARY_BUMP_LIMIT {
-            typed.push_str(&format!("{BOUNDARY_ALT}{n} and {BOUNDARY_MIX}{n}\n"));
-        }
-        let mut parts = fwd_parts("look what I can type");
-        parts.original.text = typed.clone();
-        parts.original.html = Some(format!("<pre>{typed}</pre>"));
-        let s = String::from_utf8(build_forward_rfc822(&parts).unwrap()).unwrap();
-
-        let after = |marker: &str| -> String {
-            s.split(marker)
-                .nth(1)
-                .unwrap()
-                .split('"')
-                .next()
-                .unwrap()
-                .to_string()
+        // suffix comes from a hash of the parts.
+        //
+        // The fallback is NOT unpredictable and this test does not claim it is:
+        // `DefaultHasher` is zero-keyed SipHash, so the value below is exactly
+        // reproducible by anyone holding the same bytes. What makes it safe is
+        // that the digest covers the FINAL parts, imitation included — forcing a
+        // bump means writing the hex of the hash of bytes that contain that hex.
+        //
+        // Probed DIRECTLY rather than through a forward: a forward's body parts
+        // are quoted-printable now and structurally cannot spell `=_` at all
+        // (see `alternative_section`), so the crafted content never reaches the
+        // search. The REPLY path still feeds it raw text.
+        let typed = |prefix: &str| {
+            let mut s = String::new();
+            for n in 0..=BOUNDARY_BUMP_LIMIT {
+                s.push_str(&format!("{prefix}{n}\n"));
+            }
+            s
         };
-        let mix = after("multipart/mixed; boundary=\"");
-        let alt = after("multipart/alternative; boundary=\"");
+        let alt_parts = [typed(BOUNDARY_ALT)];
+        let mix_parts = [typed(BOUNDARY_MIX)];
+        let alt = boundary_with_prefix(BOUNDARY_ALT, &[alt_parts[0].as_str()]);
+        let mix = boundary_with_prefix(BOUNDARY_MIX, &[mix_parts[0].as_str()]);
+
         // Prefix + 16 hex digits + `_0`. The `_0` is the point: the fallback
         // needed no bump of its own, so the whole crafted case cost 17 scans per
         // level rather than however many the sender felt like typing.
-        for (prefix, boundary) in [(BOUNDARY_ALT, &mix), (BOUNDARY_ALT, &alt)] {
+        //
+        // EACH boundary is checked against ITS OWN prefix and ITS OWN parts. The
+        // pairing used to name `BOUNDARY_ALT` twice and passed only because the
+        // two prefixes happen to be the same length.
+        for (prefix, boundary, parts) in [
+            (BOUNDARY_ALT, &alt, &alt_parts),
+            (BOUNDARY_MIX, &mix, &mix_parts),
+        ] {
+            assert!(boundary.starts_with(prefix), "{boundary} / {prefix}");
             assert!(boundary.ends_with("_0"), "{boundary}");
             assert_eq!(boundary.len(), prefix.len() + 16 + 2, "{boundary}");
+            // The invariant the search exists for.
+            assert!(!parts[0].contains(boundary), "{boundary}");
         }
-        assert!(mix.starts_with(BOUNDARY_MIX) && alt.starts_with(BOUNDARY_ALT));
         assert_ne!(mix, alt, "the two levels must not share a delimiter");
 
-        // The invariant the search exists for, over every probed part.
-        for probe in [typed.as_str(), parts.note.as_str()] {
-            assert!(!probe.contains(&mix) && !probe.contains(&alt));
-        }
-        let (_h, mime) = parse_multipart_of(&s, "multipart/mixed");
-        assert_eq!(mime.len(), 2, "the alternative section plus one attachment");
-        for (_ph, pb) in &mime {
-            assert!(!pb.contains(&mix), "part must not contain {mix}");
-        }
+        // Deterministic, and this is the honest statement of it: same bytes,
+        // same boundary, in this process and in the sender's.
+        assert_eq!(
+            boundary_with_prefix(BOUNDARY_ALT, &[alt_parts[0].as_str()]),
+            alt
+        );
 
-        // ...and what came out is still a message a parser agrees with.
+        // ...and a forward built over the same crafted content still assembles
+        // into a message a parser agrees with.
+        let mut parts = fwd_parts("look what I can type");
+        parts.original.text = typed(BOUNDARY_ALT);
+        parts.original.html = Some(format!("<pre>{}</pre>", typed(BOUNDARY_MIX)));
+        let s = String::from_utf8(build_forward_rfc822(&parts).unwrap()).unwrap();
         let parsed = mail_parser::MessageParser::default()
             .parse(s.as_bytes())
             .expect("the assembled forward parses");
@@ -2491,14 +2917,369 @@ mod tests {
             .to_string(),
         );
         let s = String::from_utf8(build_forward_rfc822(&parts).unwrap()).unwrap();
-        assert!(!s.contains("iso-8859-1"), "{s}");
-        assert!(!s.contains("windows-1252"), "{s}");
-        assert!(!s.contains("HTTP-EQUIV"), "{s}");
+        let (_text, html) = forward_bodies(&s);
+        assert!(!html.contains("iso-8859-1"), "{html}");
+        assert!(!html.contains("windows-1252"), "{html}");
+        assert!(!html.to_ascii_lowercase().contains("http-equiv"), "{html}");
         // Everything else in the document survives byte for byte, `<meta>` tags
         // that declare nothing about charset included.
-        assert!(s.contains("<meta name=\"viewport\" content=\"width=device-width\">"));
-        assert!(s.contains("<metadata charset=\"x\">keep me</metadata>"));
-        assert!(s.contains("<p>café</p>"));
+        assert!(html.contains("<meta name=\"viewport\" content=\"width=device-width\">"));
+        assert!(html.contains("<metadata charset=\"x\">keep me</metadata>"));
+        assert!(html.contains("<p>café</p>"));
+    }
+
+    #[test]
+    fn a_meta_that_merely_mentions_a_charset_is_not_a_charset_declaration() {
+        // Substring-matching "charset" over the whole tag dropped a tag that
+        // declares nothing and SAYS something. Only a `charset` attribute proper,
+        // or the `http-equiv="content-type"` spelling, is a declaration.
+        let kept = concat!(
+            "<meta name=\"description\" content=\"how to pick a charset in html\">",
+            "<meta name=\"charset-guide\" content=\"x\">",
+            "<meta http-equiv=\"refresh\" content=\"5\">",
+        );
+        assert_eq!(strip_charset_meta(kept), kept);
+        // ...and the real declarations still go, in every spelling.
+        for dropped in [
+            "<meta charset=\"utf-8\">",
+            "<meta charset=utf-8>",
+            "<META CHARSET='utf-8'/>",
+            "<meta http-equiv=\"Content-Type\" content=\"text/html; charset=utf-8\">",
+        ] {
+            assert_eq!(
+                strip_charset_meta(&format!("<head>{dropped}</head>")),
+                "<head></head>",
+                "{dropped}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_quoted_attribute_value_holding_a_bracket_does_not_end_the_tag_early() {
+        // Stopping at the FIRST `>` cut the tag in half: the head was dropped
+        // (it contains "charset") and the tail of the quoted value leaked into
+        // the document as text. The scan has to skip over quoted values.
+        let html = concat!(
+            "<head><meta http-equiv=\"Content-Type\" ",
+            "content=\"text/html; charset=UTF-8\" data-note=\"a>b\"></head><p>hi</p>",
+        );
+        let out = strip_charset_meta(html);
+        assert_eq!(out, "<head></head><p>hi</p>", "no leaked tag tail: {out}");
+        // Single quotes count too.
+        assert_eq!(
+            strip_charset_meta("<head><meta charset='a>b'>tail</head>"),
+            "<head>tail</head>"
+        );
+        // A quote is a delimiter only straight after `=`. The apostrophe inside
+        // an UNQUOTED value is data — reading it as structure once made this
+        // one byte swallow the document to the next coincidental quote.
+        assert_eq!(
+            strip_charset_meta(
+                "<head><meta charset=\"utf-8\" data-x=it's cool></head><p>rest</p><p>don't</p>"
+            ),
+            "<head></head><p>rest</p><p>don't</p>"
+        );
+        // UNTERMINATED KEEPS THE DOCUMENT: an unbalanced quote (or a missing
+        // `>`) leaves the tag with no far edge, and the strip must fail toward
+        // mojibake risk, never toward deleting the newsletter.
+        assert_eq!(
+            strip_charset_meta(
+                "<head><meta charset=\"utf-8\" title=\"a>b</head><p>rest of the newsletter</p>"
+            ),
+            "<head><meta charset=\"utf-8\" title=\"a>b</head><p>rest of the newsletter</p>"
+        );
+        assert_eq!(
+            strip_charset_meta("<head><meta charset=\"utf-8\""),
+            "<head><meta charset=\"utf-8\""
+        );
+    }
+
+    // ---- CRLF, quoting, encodings ------------------------------------------
+
+    #[test]
+    fn a_lone_cr_becomes_a_line_break_instead_of_an_illegal_bare_one() {
+        // `"\r\n" -> "\n"` then `"\n" -> "\r\n"` walks straight past a bare CR,
+        // and a bare CR in a message body is illegal. The text is a stranger's
+        // decoded mail, so classic-Mac endings and crafted stray CRs both arrive.
+        let mut parts = fwd_parts("note\rwith a bare cr");
+        parts.original.text = "a\rb\r\nc".into();
+        parts.original.html = Some("<p>x\ry</p>".into());
+        let raw = build_forward_rfc822(&parts).unwrap();
+        for (i, b) in raw.iter().enumerate() {
+            if *b == b'\r' {
+                assert_eq!(raw.get(i + 1), Some(&b'\n'), "bare CR at byte {i}");
+            }
+            if *b == b'\n' {
+                assert_eq!(i.checked_sub(1).and_then(|p| raw.get(p)), Some(&b'\r'));
+            }
+        }
+        // ...and each one became a real line break, not a deletion.
+        let (text, _html) = forward_bodies(&String::from_utf8(raw).unwrap());
+        assert!(text.contains("a\r\nb\r\nc"), "{text:?}");
+        assert!(text.contains("note\r\nwith a bare cr"), "{text:?}");
+    }
+
+    #[test]
+    fn the_forwarded_block_states_the_cc_when_there_was_one() {
+        // The block's whole job is "who did this go to". Reading only To
+        // understated the audience on every mail that copied anyone.
+        let raw = concat!(
+            "From: Alice <alice@example.com>\r\n",
+            "To: Me <me@example.com>\r\n",
+            "Cc: Bob <bob@example.com>, carol@example.com\r\n",
+            "Subject: numbers\r\n",
+            "\r\n",
+            "body\r\n",
+        );
+        let mut parts = fwd_parts("");
+        parts.original = parse_forwarded_original(raw.as_bytes()).unwrap();
+        assert_eq!(
+            parts.original.cc,
+            "Bob <bob@example.com>, carol@example.com"
+        );
+        let s = String::from_utf8(build_forward_rfc822(&parts).unwrap()).unwrap();
+        let (text, html) = forward_bodies(&s);
+        // Cc comes after To in both renditions, the way Gmail's block writes it.
+        assert!(
+            text.contains(
+                "To: Me <me@example.com>\r\nCc: Bob <bob@example.com>, carol@example.com\r\n"
+            ),
+            "{text}"
+        );
+        assert!(
+            html.contains("<b>Cc:</b> Bob &lt;bob@example.com&gt;, carol@example.com<br>"),
+            "{html}"
+        );
+
+        // No Cc, no line: a bare `Cc:` would claim a copy that never happened.
+        let mut none = fwd_parts("");
+        none.original.cc = String::new();
+        let s = String::from_utf8(build_forward_rfc822(&none).unwrap()).unwrap();
+        let (text, html) = forward_bodies(&s);
+        assert!(!text.contains("Cc:"), "{text}");
+        assert!(!html.contains("Cc:"), "{html}");
+    }
+
+    #[test]
+    fn a_display_name_with_specials_is_one_quoted_mailbox_in_the_block() {
+        // Unquoted, `Doe, Jane <evil>` reads as two mailboxes and misstates the
+        // audience — which is the one thing this block exists to state.
+        let raw = concat!(
+            "From: \"Doe, Jane <evil>\" <jane@example.com>\r\n",
+            "To: \"Say \\\"hi\\\"\" <bob@example.com>, plain@example.com\r\n",
+            "Subject: s\r\n",
+            "\r\n",
+            "body\r\n",
+        );
+        let o = parse_forwarded_original(raw.as_bytes()).unwrap();
+        assert_eq!(o.from, "\"Doe, Jane <evil>\" <jane@example.com>");
+        // The embedded quotes are ESCAPED, not dropped: a mail client reads this
+        // string, so the name stays intact.
+        assert_eq!(
+            o.to,
+            "\"Say \\\"hi\\\"\" <bob@example.com>, plain@example.com"
+        );
+        // A name with nothing special in it is still bare.
+        assert_eq!(
+            address_display(
+                mail_parser::MessageParser::default()
+                    .parse("From: Jane Doe <jane@example.com>\r\n\r\n".as_bytes())
+                    .unwrap()
+                    .from()
+            ),
+            "Jane Doe <jane@example.com>"
+        );
+    }
+
+    #[test]
+    fn an_attached_message_is_relabelled_rather_than_base64_lied_about() {
+        // RFC 2046 §5.2.1 permits only 7bit/8bit/binary for `message/rfc822`,
+        // and every part a forward carries is re-encoded base64. Relabelling is
+        // the honest fix: the bytes are preserved and the recipient can still
+        // open the file, they just do not get an inline nested-message render.
+        let raw = concat!(
+            "From: alice@example.com\r\n",
+            "Subject: fyi\r\n",
+            "MIME-Version: 1.0\r\n",
+            "Content-Type: multipart/mixed; boundary=\"m\"\r\n",
+            "\r\n",
+            "--m\r\n",
+            "Content-Type: text/plain\r\n",
+            "\r\n",
+            "see attached\r\n",
+            "--m\r\n",
+            "Content-Type: message/rfc822\r\n",
+            "Content-Disposition: attachment; filename=\"complaint\"\r\n",
+            "\r\n",
+            "From: bob@example.com\r\nSubject: inner\r\n\r\ninner body\r\n",
+            "--m--\r\n",
+        );
+        let mut parts = fwd_parts("");
+        parts.original = parse_forwarded_original(raw.as_bytes()).unwrap();
+        let bytes = parts.original.attachments[0].data.clone();
+        let s = String::from_utf8(build_forward_rfc822(&parts).unwrap()).unwrap();
+        assert!(!s.contains("message/rfc822"), "{s}");
+        assert!(
+            s.contains("Content-Type: application/octet-stream; name=\"complaint.eml\"\r\n"),
+            "{s}"
+        );
+        assert!(s.contains("filename=\"complaint.eml\"\r\n"), "{s}");
+        assert!(
+            s.contains(&base64_body(&bytes).trim_end().to_string()),
+            "the bytes ride unchanged"
+        );
+
+        // An UNNAMED attached message gets a name rather than an extensionless
+        // file, and one already called `.eml` is left alone.
+        parts.original.attachments[0].filename = "attachment-1".into();
+        let s = String::from_utf8(build_forward_rfc822(&parts).unwrap()).unwrap();
+        assert!(s.contains("filename=\"attachment-1.eml\"\r\n"), "{s}");
+        parts.original.attachments[0].filename = "Thread.EML".into();
+        let s = String::from_utf8(build_forward_rfc822(&parts).unwrap()).unwrap();
+        assert!(s.contains("filename=\"Thread.EML\"\r\n"), "{s}");
+
+        // THE WHOLE message/ TREE, not just rfc822: RFC 2045 §6.4 forbids
+        // base64 on every composite type, and a forwarded BOUNCE carries
+        // `message/delivery-status`. Bounces are the most-forwarded mail
+        // there is.
+        parts.original.attachments[0].filename = "attachment-1".into();
+        parts.original.attachments[0].mime = "message/delivery-status".into();
+        let s = String::from_utf8(build_forward_rfc822(&parts).unwrap()).unwrap();
+        assert!(!s.contains("message/delivery-status"), "{s}");
+        assert!(s.contains("filename=\"attachment-1.eml\"\r\n"), "{s}");
+    }
+
+    #[test]
+    fn a_non_ascii_filename_goes_out_rfc2231_with_an_ascii_fallback() {
+        // mail-parser has ALREADY decoded any `=?utf-8?…?=` spelling, so what
+        // reaches the builder is real UTF-8 — and a forward is the first thing
+        // in squelch that ever emits a filename at all.
+        let mut parts = fwd_parts("");
+        parts.original.attachments[0].filename = "résumé.pdf".into();
+        parts.original.attachments[0].mime = "application/pdf".into();
+        let s = String::from_utf8(build_forward_rfc822(&parts).unwrap()).unwrap();
+        assert!(
+            s.contains(
+                "Content-Disposition: inline; filename*=utf-8''r%C3%A9sum%C3%A9.pdf; \
+                 filename=\"r_sum_.pdf\"\r\n"
+            ),
+            "{s}"
+        );
+        // `name=` is the legacy spelling with no 2231 story; it is dropped
+        // rather than emitted raw. (The disposition's `filename=` is the one
+        // that carries the name, so the type line has no parameters left.)
+        assert!(s.contains("Content-Type: application/pdf\r\n"), "{s}");
+        assert!(!s.contains("Content-Type: application/pdf;"), "{s}");
+        // The header line is pure ASCII — the whole point.
+        for line in s.split("\r\n").take_while(|l| !l.starts_with("aGVsbG8")) {
+            assert!(line.is_ascii(), "non-ascii header line: {line:?}");
+        }
+        // ...and a parser reads the real name back off it, accents intact.
+        let parsed = mail_parser::MessageParser::default()
+            .parse(s.as_bytes())
+            .expect("the assembled forward parses");
+        let names: Vec<String> = parsed
+            .attachments()
+            .filter_map(|p| p.attachment_name().map(str::to_string))
+            .collect();
+        assert_eq!(names, vec!["résumé.pdf".to_string()], "{s}");
+
+        // A STRANGER-LENGTH NAME CANNOT BREACH THE 998-OCTET HEADER LIMIT: 2231
+        // expands a CJK character 9x, so the name is capped (extension kept)
+        // before encoding and every emitted line stays legal.
+        parts.original.attachments[0].filename = format!("{}.pdf", "郵".repeat(200));
+        let s = String::from_utf8(build_forward_rfc822(&parts).unwrap()).unwrap();
+        for line in s.split("\r\n") {
+            assert!(
+                line.len() <= 998,
+                "line over 998 octets: {} bytes",
+                line.len()
+            );
+        }
+        assert!(s.contains(".pdf"), "the extension survives the trim: {s}");
+
+        // AN ASCII FILENAME IS BYTE-IDENTICAL to what it always was.
+        let s = String::from_utf8(build_forward_rfc822(&fwd_parts("")).unwrap()).unwrap();
+        assert!(s.contains("Content-Type: image/png; name=\"logo.png\"\r\n"));
+        assert!(s.contains("Content-Disposition: inline; filename=\"logo.png\"\r\n"));
+        assert!(!s.contains("filename*="));
+    }
+
+    #[test]
+    fn a_forwarded_newsletter_is_quoted_printable_and_round_trips() {
+        // The shape that forced this: quoted-printable html arrives DECODED from
+        // mail-parser as one enormous line. Re-emitted raw it was a single
+        // 3000-octet line of 8-bit bytes, past RFC 5322's 998-octet limit and on
+        // a transport never told to expect them.
+        let long = "x".repeat(3000);
+        let mut parts = fwd_parts("héllo\tworld ");
+        parts.original.attachments.clear();
+        parts.original.text = format!("café {long} naïve");
+        parts.original.html = Some(format!("<div style=\"width:100%\">{long}</div>"));
+        let s = String::from_utf8(build_forward_rfc822(&parts).unwrap()).unwrap();
+
+        assert!(s.contains("Content-Transfer-Encoding: quoted-printable\r\n"));
+        // EVERY line fits, including the boundary and header lines.
+        for line in s.split("\r\n") {
+            assert!(line.len() <= 78, "line of {} octets: {line:?}", line.len());
+        }
+        // ...and a parser puts it back exactly as it went in.
+        let (text, html) = forward_bodies(&s);
+        assert!(text.contains(&format!("café {long} naïve")), "text lost");
+        assert!(
+            html.contains(&format!("<div style=\"width:100%\">{long}</div>")),
+            "html lost"
+        );
+        // Trailing whitespace on the note's line survives, because it was
+        // encoded rather than left for an MTA to trim.
+        assert!(text.starts_with("héllo\tworld "), "{:?}", &text[..20]);
+    }
+
+    #[test]
+    fn qp_encoding_obeys_the_rules_it_claims_to() {
+        // `=` is the escape, so it always encodes; non-ASCII and controls encode;
+        // ordinary printables do not.
+        assert_eq!(qp_encode("a=b"), "a=3Db");
+        assert_eq!(qp_encode("café"), "caf=C3=A9");
+        assert_eq!(qp_encode("plain text"), "plain text");
+        // A hard break passes through and resets the line; trailing whitespace
+        // before it is encoded.
+        assert_eq!(qp_encode("a \r\nb\t"), "a=20\r\nb=09");
+        // A long run soft-breaks with `=\r\n`, never mid-token.
+        let out = qp_encode(&"é".repeat(60));
+        for line in out.split("\r\n") {
+            assert!(line.len() <= QP_MAX_LINE, "{line:?}");
+            assert!(
+                !line.trim_end_matches('=').ends_with('='),
+                "token split across a soft break: {line:?}"
+            );
+        }
+        // THE WINDFALL, asserted: QP output cannot spell a boundary prefix.
+        let typed = format!("{BOUNDARY_ALT}0 {BOUNDARY_MIX}0");
+        assert!(!qp_encode(&typed).contains("=_"));
+    }
+
+    /// The `(text, html)` a recipient's client would SEE in a built forward:
+    /// both alternatives, decoded back out of their quoted-printable transfer
+    /// encoding by the same parser that client would use.
+    ///
+    /// Content assertions go through this, because the forward's body parts are
+    /// no longer literal on the wire (see [`qp_encode`]). Structure and header
+    /// assertions still read the raw message — that is where they live.
+    fn forward_bodies(s: &str) -> (String, String) {
+        let parsed = mail_parser::MessageParser::default()
+            .parse(s.as_bytes())
+            .expect("the assembled forward parses");
+        (
+            parsed
+                .body_text(0)
+                .expect("a text alternative")
+                .into_owned(),
+            parsed
+                .body_html(0)
+                .expect("an html alternative")
+                .into_owned(),
+        )
     }
 
     /// [`parse_multipart`] for an arbitrary top-level multipart subtype.

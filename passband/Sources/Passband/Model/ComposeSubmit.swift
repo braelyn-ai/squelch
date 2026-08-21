@@ -115,7 +115,8 @@ enum ComposeCopy {
     /// What a forward is titled — the same mirror `replySubject` is, of the
     /// daemon's `gmail_write::forward_subject`, which prefixes "Fwd: " exactly
     /// once. Kept in step for a reason the reply side does not have: the daemon
-    /// only titles a forward itself when the field is ABSENT, and the composer
+    /// only titles a forward itself when the field arrives absent or holding
+    /// nothing but whitespace (it trims before deriving), and the composer
     /// opens holding this string, so this is what actually goes out. The two
     /// must agree or a forwarded forward reads "Fwd: Fwd: …".
     ///
@@ -126,9 +127,17 @@ enum ComposeCopy {
     /// An untitled original stays untitled: "Fwd:" alone, rather than borrowing
     /// the reply side's "(derived from thread)" stand-in, which would be a lie
     /// here. Nothing derives this one. THE ONE PLACE the mirror is deliberately
-    /// not byte-identical — the daemon's empty case keeps a trailing space —
-    /// and it is unreachable from here anyway: this string is always sent, so
-    /// the daemon's own titling never runs for a forward the client opened.
+    /// not byte-identical: the daemon's empty case keeps a trailing space.
+    ///
+    /// Called for two different jobs, and the second is why the mirror has to
+    /// stay honest. The composer PRE-FILLS with this, and that string is what
+    /// actually goes out. But a sender can clear the field (nil on the wire) or
+    /// blank it to spaces (sent, then discarded by the daemon's trim) — either
+    /// way titling lands back with the daemon — so the review pane calls this
+    /// again purely to SAY what the daemon will title it (see
+    /// `ComposePane.reviewSubject`). In that second use the trailing space is
+    /// display-invisible; in the first it never reaches the wire, because a
+    /// pre-filled field the sender left alone is non-empty and is sent verbatim.
     static func forwardSubject(_ originalSubject: String) -> String {
         let trimmed = originalSubject.trimmed
         guard !trimmed.isEmpty else { return "Fwd:" }
