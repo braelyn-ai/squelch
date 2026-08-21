@@ -445,13 +445,25 @@ struct NotificationsSection: View {
                 .buttonStyle(.glass)
                 .controlSize(.small)
             }
-            SettingsHint(
-                delivered == false
-                    ? "The system is refusing banners for Passband. Turn them back on in System Settings, Notifications."
-                    : "Posts one now, from Passband itself. Every banner carries the sender's own mark."
-            )
+            // Three states, because two of them look identical from the outside:
+            // a banner that never came because the grant is off, and one that
+            // never came because a focus mode ate it. Only the first is visible
+            // from in here, so the second is what the posted line points at.
+            SettingsHint(hint)
         }
         .onChange(of: prefs.notificationSound) { _, choice in preview(choice) }
+    }
+
+    private var hint: String {
+        switch delivered {
+        case .none:
+            return "Posts one now, from Passband itself. Every banner carries the sender's own mark."
+        case .some(true):
+            return "Posted. If nothing appeared, a focus mode or Do Not Disturb is holding it."
+        case .some(false):
+            return
+                "The system is refusing banners for Passband. Turn them back on in System Settings, Notifications."
+        }
     }
 
     private func preview(_ choice: NotificationSound) {

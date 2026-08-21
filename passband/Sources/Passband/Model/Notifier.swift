@@ -11,9 +11,10 @@
 // Every banner also carries the SENDER's mark as an attachment — see
 // NotificationIcon. The icon at the left of a notification is the app's and
 // always will be; the thumbnail beside the copy is the only place a banner gets
-// to say who the mail is from, so that is what goes there. Resolving it is the
-// one thing on this path that can touch the network, which is why `send` exists
-// and why posting is a Task rather than a straight-line call.
+// to say who the mail is from, so that is what goes there. Drawing it is
+// synchronous and stays that way: posting is the last thing that happens after
+// a caller has already recorded the event as seen, so a post that waits on
+// anything is a post that can be lost.
 //
 // EVERY BANNER NAMES ITS ACCOUNT. There is one event feed per account and the
 // ids on those feeds are per-daemon SQLite ints, so two accounts hand this
@@ -48,6 +49,11 @@ final class Notifier {
     /// "open the thread named in `threadKey`".
     nonisolated static let routeKey = "passband.route"
     nonisolated static let authRoute = "auth"
+    /// The Settings test banner. It routes nowhere, but it is marked because
+    /// the system has to be told to DRAW it — see `presentation` — and because
+    /// a tap on it is not a human opening their mail and must not be counted
+    /// as one.
+    nonisolated static let testRoute = "test"
 
     /// UNUserNotificationCenter holds its delegate WEAKLY. This property is the
     /// only strong reference in the process — assigning a freshly-made delegate
@@ -209,28 +215,43 @@ final class Notifier {
         // sharper reason than the group is: event ids are per-daemon SQLite
         // ints, so account B's event 41 would REPLACE account A's event 41 —
         // one banner silently eating the other.
-        send(content, identifier: "passband.event.\(account).\(event.id)", sender: event.sender)
+        // A read receipt draws NO tile. `copy(for:)` goes out of its way not to
+        // read as mail from yourself, and `sender` on an `.opened` row is the
+        // account's own address — so an avatar of the reader is exactly the
+        // impression the copy is avoiding, and if their own local-part happens
+        // to be a robot shape (support@, billing@, hello@) it would send their
+        // own domain out to be looked up to decorate a receipt about their own
+        // sent mail.
+        send(
+            content, identifier: "passband.event.\(account).\(event.id)",
+            sender: event.kind == .opened ? "" : event.sender)
     }
 
     /// Attach the sender's mark and hand the banner to the system.
     ///
-    /// Asynchronous for one reason: a service sender's tile can cost a network
-    /// round trip for the domain logo (once per domain per launch), and the SSE
-    /// reader that calls `post` must not sit on that. Two banners posted inside
-    /// that window can therefore land in the other order — Notification Center
-    /// sorts by delivery, and delivery is now "when the picture was ready".
-    /// That is a sub-second reshuffle of two simultaneous banners, traded for
-    /// the picture being there at all.
+    /// SYNCHRONOUS, and the comment is here because the other shape is so
+    /// tempting: waiting on a first-sight domain logo would make every banner
+    /// prettier and some of them late or missing. Both callers record the event
+    /// as seen BEFORE they post — `EventStream` writes its cursor, the auth
+    /// watcher saves its id set — so a post deferred behind anything at all is
+    /// a post a quit can swallow with nothing left to retry it. `postAuth`'s
+    /// callers also depend on the ORDER holding: they sort oldest-first so the
+    /// newest code lands on top of the stack, which only survives if posting is
+    /// straight-line. The tile draws with the logo already in hand, and `warm`
+    /// goes and gets the one that was not.
     private func send(_ content: UNMutableNotificationContent, identifier: String, sender: String) {
-        Task {
-            content.attachments = await NotificationIcon.attachments(
-                for: sender, id: identifier)
-            // `add` throws only for a malformed request — a bad trigger, an
-            // attachment the system decided it could not take. Nothing here can
-            // act on that, and a banner is not worth an alert of its own.
-            try? await UNUserNotificationCenter.current().add(
-                UNNotificationRequest(identifier: identifier, content: content, trigger: nil))
+        content.attachments = NotificationIcon.attachments(for: sender, id: identifier)
+        let request = UNNotificationRequest(identifier: identifier, content: content, trigger: nil)
+        // The system takes ownership of a tile only once it accepts the request
+        // carrying it. A rejected request leaves the bytes with us, and a PNG
+        // per refused banner is exactly the accumulation the tile root exists
+        // to prevent.
+        let tiles = content.attachments.map(\.url)
+        UNUserNotificationCenter.current().add(request) { error in
+            guard error != nil else { return }
+            Task { @MainActor in NotificationIcon.discard(tiles) }
         }
+        NotificationIcon.warm(sender)
     }
 
     /// Post one BACKGROUND auth banner: a mailbox that is not on screen has
@@ -284,13 +305,16 @@ final class Notifier {
     /// modes and Do Not Disturb — is not a question anyone should have to
     /// answer by waiting for mail.
     ///
-    /// It is addressed FROM PASSBAND, which is also the honest way to show what
-    /// the tile does when a domain has no logo to fetch: passband.app is not in
-    /// the icon service, so this one draws the initials fallback every time.
+    /// It is addressed FROM PASSBAND, so the tile it draws is the initials
+    /// fallback: `hello@` is a robot local-part, but passband.app is not in the
+    /// icon service, and a domain that answers nothing is remembered as such
+    /// for a week.
     ///
-    /// Returns false when the system will not show it. A refused grant is the
-    /// commonest reason a banner never arrives, and a test that does nothing at
-    /// all in exactly that case is not a test.
+    /// Returns whether the system will SHOW it, which is not the same as
+    /// whether it was posted — the grant is the one refusal worth reporting,
+    /// because a test that does nothing in exactly that case is not a test.
+    /// Focus modes and Do Not Disturb are not visible from here and are what
+    /// the Settings hint points at when this returns true and nothing appears.
     @discardableResult
     func postTest() async -> Bool {
         await requestAuthorizationIfNeeded()
@@ -307,11 +331,15 @@ final class Notifier {
         // The one banner that names no account, because it belongs to none.
         // Both identifiers are still unique against every real one — an event's
         // are "passband.event.<uuid>.<id>" and a group is "<uuid>.<thread>", so
-        // nothing this posts can group with, or replace, a piece of mail.
+        // nothing this posts can group with, or replace, a piece of mail. It
+        // does replace ITSELF, which is what a second press should do.
         //
-        // No userInfo either: a tap here has nowhere to go, and `deliver` reads
-        // a payload with no account as "front the app and stop", which is
-        // exactly right.
+        // The route marker is load-bearing twice over: `presentation` draws
+        // this one even with the app frontmost — Settings is a page in the main
+        // window, so the ordinary rule would file the test banner silently into
+        // Notification Center and the button would look broken — and the
+        // delegate reads it to keep a self-test out of the open-rate metric.
+        content.userInfo = [Self.routeKey: Self.testRoute]
         send(content, identifier: "passband.test", sender: "Passband <hello@passband.app>")
         return true
     }
@@ -323,10 +351,17 @@ final class Notifier {
     /// already looking at the sitrep the row is on. The window check matters —
     /// "active with zero visible windows" is a common state under residency, and
     /// there the banner is the app's only voice.
+    ///
+    /// The test banner is the exception, and it has to be: it is posted from a
+    /// button on a page INSIDE the main window, so the rule above would suppress
+    /// it every single time it is used. A banner nobody asked for is noise while
+    /// you are looking at the list it came from; a banner you just pressed a
+    /// button for is the whole point.
     nonisolated static func presentation(
-        appActive: Bool, windowVisible: Bool
+        appActive: Bool, windowVisible: Bool, isTest: Bool = false
     ) -> UNNotificationPresentationOptions {
-        (appActive && windowVisible) ? [.list] : [.banner, .sound, .list]
+        if isTest { return [.banner, .sound, .list] }
+        return (appActive && windowVisible) ? [.list] : [.banner, .sound, .list]
     }
 
     /// Where a tap lands once the right mailbox is on screen.
@@ -424,7 +459,9 @@ final class Notifier {
 
     /// Bring the app forward. AppKit-only, and a no-op elsewhere: on the phone
     /// the tap has already foregrounded the app by the time this runs.
-    private func front() {
+    ///
+    /// Not private: a tapped test banner does this and nothing else.
+    func front() {
         #if os(macOS)
             NSApp.activate(ignoringOtherApps: true)
             MainWindow.show()
@@ -456,6 +493,7 @@ final class NotificationDelegate: NSObject, UNUserNotificationCenterDelegate {
     func userNotificationCenter(
         _ center: UNUserNotificationCenter, willPresent notification: UNNotification
     ) async -> UNNotificationPresentationOptions {
+        let route = notification.request.content.userInfo[Notifier.routeKey] as? String
         let (active, visible) = await MainActor.run {
             #if os(macOS)
                 (NSApp.isActive, MainWindow.find()?.isVisible == true)
@@ -465,7 +503,8 @@ final class NotificationDelegate: NSObject, UNUserNotificationCenterDelegate {
                 (false, false)
             #endif
         }
-        return Notifier.presentation(appActive: active, windowVisible: visible)
+        return Notifier.presentation(
+            appActive: active, windowVisible: visible, isTest: route == Notifier.testRoute)
     }
 
     func userNotificationCenter(
@@ -480,11 +519,18 @@ final class NotificationDelegate: NSObject, UNUserNotificationCenterDelegate {
         let accountId = (userInfo[Notifier.accountKey] as? String).flatMap(UUID.init(uuidString:))
         // An auth banner carries no thread to open — routing it as an ordinary
         // one would front the app and then do nothing.
-        let isAuth = (userInfo[Notifier.routeKey] as? String) == Notifier.authRoute
+        let route = userInfo[Notifier.routeKey] as? String
         await MainActor.run {
-            if isAuth {
+            switch route {
+            case Notifier.authRoute:
                 Notifier.shared.handleAuthTap(accountId: accountId)
-            } else {
+            // A self-test opens nothing and is COUNTED as nothing: routing it
+            // through handleTap would file a `notification_opened` and quietly
+            // inflate the one metric that says whether banners are worth
+            // posting at all.
+            case Notifier.testRoute:
+                Notifier.shared.front()
+            default:
                 Notifier.shared.handleTap(threadId: threadId, accountId: accountId)
             }
         }
