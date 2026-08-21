@@ -46,7 +46,7 @@ use squelch_control::config::{
     BifrostConfig, Config, DEFAULT_ASSISTANT_BUDGET_USD, DEFAULT_LLM_BUDGET_USD,
 };
 use squelch_control::warden::HttpWarden;
-use squelch_control::{ControlState, invites, router, seal};
+use squelch_control::{ControlState, activation, invites, router, seal};
 use tower::ServiceExt as _;
 
 /// The throwaway Postgres schema every harness in this file is built on.
@@ -122,6 +122,13 @@ struct Recorder {
     /// The `scope` the mock Google reports on the token. `None` is the whole set
     /// signup asks for; `Some` is a user who unchecked something.
     granted_scope: Option<String>,
+    /// What `GET /v1/tenants/{label}/devices` answers, by label: a present
+    /// entry is a 200 with this `first_paired_at` (None = the null body,
+    /// nobody paired yet), an absent one is a 404. Labels listed in
+    /// `devices_unavailable` answer 503 `not_running` first — the mid-roll
+    /// tenant the poller must leave for the next pass.
+    devices_paired: BTreeMap<String, Option<String>>,
+    devices_unavailable: Vec<String>,
 }
 
 type Shared = Arc<Mutex<Recorder>>;
@@ -333,6 +340,24 @@ async fn spawn_warden(rec: Shared) -> String {
                         }
                         Some(_) => Json(json!({"status":"pending"})).into_response(),
                         None => json_status(StatusCode::NOT_FOUND, "unknown"),
+                    }
+                },
+            ),
+        )
+        .route(
+            "/v1/tenants/{label}/devices",
+            get(
+                |AxumState(rec): AxumState<Shared>,
+                 axum::extract::Path(label): axum::extract::Path<String>,
+                 headers: HeaderMap| async move {
+                    let mut r = rec.lock().unwrap();
+                    r.warden_bearers.push(bearer_of(&headers));
+                    if r.devices_unavailable.contains(&label) {
+                        return json_status(StatusCode::SERVICE_UNAVAILABLE, "not_running");
+                    }
+                    match r.devices_paired.get(&label) {
+                        Some(at) => Json(json!({ "first_paired_at": at })).into_response(),
+                        None => json_status(StatusCode::NOT_FOUND, "not_found"),
                     }
                 },
             ),
@@ -1716,4 +1741,77 @@ async fn the_landing_page_states_the_grant() {
     let (status, _, body) = h.get("/healthz", None).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body, "ok");
+}
+
+/// The activation poller end to end against the mock warden: a paired tenant
+/// is stamped ONCE with the daemon's own timestamp, a mid-roll tenant (503)
+/// is left for the next pass, and a stamped user leaves the candidate set
+/// forever — the follow-up pass stamps nobody and moves nothing.
+#[tokio::test]
+async fn the_activation_poller_stamps_once_and_quiesces() {
+    let h = Harness::new().await;
+
+    // Two signed-up people, seeded the way record_signup's CLI door works:
+    // no invite pointer, keyed on the Google account that redeemed.
+    let now = chrono::Utc::now();
+    h.state.store().insert_tenant("ada", "ada@example.com").await.unwrap();
+    h.state.store().insert_tenant("bea", "bea@example.com").await.unwrap();
+    h.state.store().record_signup(9001, "ada@example.com", "ada", now).await.unwrap();
+    h.state.store().record_signup(9002, "bea@example.com", "bea", now).await.unwrap();
+
+    // ada's daemon reports a pairing at ITS OWN timestamp; bea's pod is
+    // mid-roll and answers 503.
+    let paired_at = "2026-08-20T09:30:00Z";
+    {
+        let mut r = h.rec.lock().unwrap();
+        r.devices_paired.insert("ada".into(), Some(paired_at.into()));
+        r.devices_unavailable.push("bea".into());
+    }
+    assert_eq!(activation::poll_first_paired(&h.state).await, 1);
+
+    let stamps = |rows: Vec<tokio_postgres::Row>| -> Vec<(Option<String>, Option<String>)> {
+        rows.iter()
+            .map(|r| (r.get("tenant_label"), r.get("first_paired_at")))
+            .collect()
+    };
+    let read = || async {
+        stamps(
+            common::raw_client(&h.db_url)
+                .await
+                .query("SELECT tenant_label, first_paired_at FROM users ORDER BY id", &[])
+                .await
+                .unwrap(),
+        )
+    };
+    let after_first = read().await;
+    assert_eq!(after_first.len(), 2);
+    let ada_stamp = after_first[0].1.clone().expect("ada stamped");
+    // The DAEMON's instant survives re-serialization; the poller never
+    // substitutes its own clock.
+    assert_eq!(
+        chrono::DateTime::parse_from_rfc3339(&ada_stamp).unwrap(),
+        chrono::DateTime::parse_from_rfc3339(paired_at).unwrap()
+    );
+    assert_eq!(after_first[1], ("bea".to_string().into(), None));
+
+    // Next pass: ada has left the candidate set, and bea's warden now answers
+    // the null body — asked again, still honestly unstamped.
+    {
+        let mut r = h.rec.lock().unwrap();
+        r.devices_unavailable.clear();
+        r.devices_paired.insert("bea".into(), None);
+    }
+    assert_eq!(activation::poll_first_paired(&h.state).await, 0);
+    assert_eq!(read().await, after_first);
+
+    // bea finally pairs; only bea is stamped, and ada's first stamp stands.
+    h.rec
+        .lock()
+        .unwrap()
+        .devices_paired
+        .insert("bea".into(), Some("2026-08-21T00:00:00Z".into()));
+    assert_eq!(activation::poll_first_paired(&h.state).await, 1);
+    let after_third = read().await;
+    assert_eq!(after_third[0].1.as_deref(), Some(ada_stamp.as_str()));
+    assert!(after_third[1].1.is_some());
 }

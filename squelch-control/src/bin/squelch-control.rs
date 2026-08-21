@@ -39,6 +39,12 @@ use tracing_subscriber::EnvFilter;
 /// removes expired entries, so this only bounds what an idle process holds.
 const SWEEP_EVERY: Duration = Duration::from_secs(60);
 
+/// How often the activation poller runs. NOT the session sweep's 60s: each
+/// candidate costs a `pods/exec` in the cluster, and the stamp it lands is
+/// analytics — minutes of latency are free, so the slower cadence buys a 5x
+/// cut in exec traffic for nothing.
+const ACTIVATION_POLL_EVERY: Duration = Duration::from_secs(300);
+
 #[derive(Parser)]
 #[command(
     name = "squelch-control",
@@ -714,6 +720,19 @@ async fn serve_async(config: Config) -> anyhow::Result<()> {
                 // PRIVACY: a count. Never which sessions went.
                 tracing::debug!(swept, "expired signup sessions swept");
             }
+        }
+    });
+
+    // The activation poller (issue #89): its own ticker on its own cadence —
+    // see ACTIVATION_POLL_EVERY — because an exec-per-tenant probe does not
+    // belong on the session sweep's tight loop. All logging lives inside the
+    // pass; a quiet pass is the normal one.
+    let poller = state.clone();
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(ACTIVATION_POLL_EVERY);
+        loop {
+            ticker.tick().await;
+            squelch_control::activation::poll_first_paired(&poller).await;
         }
     });
 
