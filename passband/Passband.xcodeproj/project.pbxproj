@@ -109,6 +109,7 @@
 		765C0A73FABBBF4F7A041A83 /* HeroCache.swift in Sources */ = {isa = PBXBuildFile; fileRef = 20CA62DECFED05021D0C9964 /* HeroCache.swift */; };
 		778A9FBEDBA350092B770844 /* Actions.swift in Sources */ = {isa = PBXBuildFile; fileRef = 10544C7DF8CDBA851AF0D9D8 /* Actions.swift */; };
 		78F890FF424189B1CDC6C501 /* newsreader-italic-var.ttf in Resources */ = {isa = PBXBuildFile; fileRef = 83BF084E665545489EDF2D5E /* newsreader-italic-var.ttf */; };
+		7936BA935C085573F40A410E /* NotificationIcon.swift in Sources */ = {isa = PBXBuildFile; fileRef = 88151BD4CF9D97EE43150B72 /* NotificationIcon.swift */; };
 		79648FA43CA52620F1B9832E /* Sessions.swift in Sources */ = {isa = PBXBuildFile; fileRef = DA80DD18A355200FB6274585 /* Sessions.swift */; };
 		79BB8595545903AE279A319C /* Quotes.swift in Sources */ = {isa = PBXBuildFile; fileRef = 30CE0F7FB80B319544FD62FA /* Quotes.swift */; };
 		7AB1EAAA7F6332DE3B8FD5D2 /* SentRow.swift in Sources */ = {isa = PBXBuildFile; fileRef = EA2D959F49735AD9EDD13910 /* SentRow.swift */; };
@@ -178,6 +179,7 @@
 		BF2AD4F3EB9857AB051753D0 /* Typography.swift in Sources */ = {isa = PBXBuildFile; fileRef = B1E784321EA909951CA347A7 /* Typography.swift */; };
 		BF8200741E7C70B75C705CF5 /* Keychain.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1D19065EB7E9BFE9E846675B /* Keychain.swift */; };
 		BFBC16B9E116B690313D1B5C /* APIClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = 613B9741AD84024778FA8204 /* APIClient.swift */; };
+		C0A7430CA6A5C39AB995DD4E /* NotificationIcon.swift in Sources */ = {isa = PBXBuildFile; fileRef = 88151BD4CF9D97EE43150B72 /* NotificationIcon.swift */; };
 		C14EABCB7D1F6C3C4B800311 /* Markdown.swift in Sources */ = {isa = PBXBuildFile; fileRef = BE74212A3CE62E8F28EC8D7E /* Markdown.swift */; };
 		C208912136BEEE63FE2DBF28 /* SettingsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3BE1E84810E523707C4E2CC5 /* SettingsView.swift */; };
 		C2102B9052FF6E97DAAA2AB4 /* ImageProxy.swift in Sources */ = {isa = PBXBuildFile; fileRef = 39D5C019641DC37B55D7D922 /* ImageProxy.swift */; };
@@ -330,6 +332,7 @@
 		7AC123D7E906293F404D8353 /* newsreader-var.ttf */ = {isa = PBXFileReference; lastKnownFileType = file; path = "newsreader-var.ttf"; sourceTree = "<group>"; };
 		82CD5D3AEF359995F968DB53 /* Sparkle.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Sparkle.framework; path = vendor/Sparkle/Sparkle.framework; sourceTree = "<group>"; };
 		83BF084E665545489EDF2D5E /* newsreader-italic-var.ttf */ = {isa = PBXFileReference; lastKnownFileType = file; path = "newsreader-italic-var.ttf"; sourceTree = "<group>"; };
+		88151BD4CF9D97EE43150B72 /* NotificationIcon.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NotificationIcon.swift; sourceTree = "<group>"; };
 		8860DE0FE5AA0366C7BE9922 /* JSONValue.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = JSONValue.swift; sourceTree = "<group>"; };
 		89A44DCD12D99794B8DF43B0 /* AuthView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AuthView.swift; sourceTree = "<group>"; };
 		8DAF25E856CCAD8284AAA131 /* AttachmentKinds.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AttachmentKinds.swift; sourceTree = "<group>"; };
@@ -546,6 +549,7 @@
 				2569BA5D1461BBA2A95D77F3 /* ImageStore.swift */,
 				582A0094F147273BA003C4B6 /* ImageWarmer.swift */,
 				1D19065EB7E9BFE9E846675B /* Keychain.swift */,
+				88151BD4CF9D97EE43150B72 /* NotificationIcon.swift */,
 				B13A2C48EBA35F12689998E3 /* Notifier.swift */,
 				5512C13F456F49B6DF7B182B /* Pairing.swift */,
 				A31EE886D87910F0348A94AB /* SitrepPoller.swift */,
@@ -861,6 +865,7 @@
 				F203E4786137371093270AB6 /* MinimapGeometry.swift in Sources */,
 				6FFB126258C28AC3F2E63D01 /* Motion.swift in Sources */,
 				513F475DB3A83BED4F68A57D /* Newsletters.swift in Sources */,
+				7936BA935C085573F40A410E /* NotificationIcon.swift in Sources */,
 				414E8ACA8519A3B26F50F066 /* Notifier.swift in Sources */,
 				FE0C7D234C91B0DFCC7F4106 /* Opener.swift in Sources */,
 				DD971CBBDF48F7F74F7D1190 /* Pairing.swift in Sources */,
@@ -981,6 +986,7 @@
 				4BF112500D334A129834AAEB /* MobileToastHost.swift in Sources */,
 				D6C1F985EFED5530B73C27B8 /* Motion.swift in Sources */,
 				99E823237BD7F3F4EE5C26DF /* Newsletters.swift in Sources */,
+				C0A7430CA6A5C39AB995DD4E /* NotificationIcon.swift in Sources */,
 				5CE1E70309CEFF44F81AD969 /* Notifier.swift in Sources */,
 				0271C8CF8F2DDC03C1DEF095 /* Opener.swift in Sources */,
 				D8FAA331307EB4021EF60BE1 /* Pairing.swift in Sources */,

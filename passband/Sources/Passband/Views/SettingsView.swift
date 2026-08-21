@@ -415,11 +415,17 @@ struct AppearanceSection: View {
 }
 
 /// The banner chime. Picking an option plays it once, right here — judging a
-/// half-second sound from its name alone is not a thing.
+/// half-second sound from its name alone is not a thing. Same idea one row
+/// down: whether a banner ARRIVES depends on a grant, a focus mode and a Do
+/// Not Disturb schedule that all live outside this app, so there is a button
+/// that posts one.
 struct NotificationsSection: View {
     @Environment(Prefs.self) private var prefs
     /// Held for the duration of playback: the sound stops when deallocated.
     @State private var player: PlatformSound?
+    /// What the last test banner did, shown until the next one. nil before the
+    /// first press — no verdict to report yet.
+    @State private var delivered: Bool?
 
     var body: some View {
         @Bindable var prefs = prefs
@@ -431,6 +437,18 @@ struct NotificationsSection: View {
             }
             SettingsHint(
                 "Chimes on urgent and deadline banners. Surfaced mail stays silent either way."
+            )
+            InlineRow(key: "test") {
+                Button("post a banner") {
+                    Task { delivered = await Notifier.shared.postTest() }
+                }
+                .buttonStyle(.glass)
+                .controlSize(.small)
+            }
+            SettingsHint(
+                delivered == false
+                    ? "The system is refusing banners for Passband. Turn them back on in System Settings, Notifications."
+                    : "Posts one now, from Passband itself. Every banner carries the sender's own mark."
             )
         }
         .onChange(of: prefs.notificationSound) { _, choice in preview(choice) }

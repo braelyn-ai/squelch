@@ -8,6 +8,13 @@
 // from posting. On a dev machine the grant resets every recompile: an ad-hoc
 // signature's identity is a hash of the build.
 //
+// Every banner also carries the SENDER's mark as an attachment — see
+// NotificationIcon. The icon at the left of a notification is the app's and
+// always will be; the thumbnail beside the copy is the only place a banner gets
+// to say who the mail is from, so that is what goes there. Resolving it is the
+// one thing on this path that can touch the network, which is why `send` exists
+// and why posting is a Task rather than a straight-line call.
+//
 // EVERY BANNER NAMES ITS ACCOUNT. There is one event feed per account and the
 // ids on those feeds are per-daemon SQLite ints, so two accounts hand this
 // class the same event id and the same thread id for entirely unrelated mail.
@@ -202,9 +209,28 @@ final class Notifier {
         // sharper reason than the group is: event ids are per-daemon SQLite
         // ints, so account B's event 41 would REPLACE account A's event 41 —
         // one banner silently eating the other.
-        let request = UNNotificationRequest(
-            identifier: "passband.event.\(account).\(event.id)", content: content, trigger: nil)
-        UNUserNotificationCenter.current().add(request)
+        send(content, identifier: "passband.event.\(account).\(event.id)", sender: event.sender)
+    }
+
+    /// Attach the sender's mark and hand the banner to the system.
+    ///
+    /// Asynchronous for one reason: a service sender's tile can cost a network
+    /// round trip for the domain logo (once per domain per launch), and the SSE
+    /// reader that calls `post` must not sit on that. Two banners posted inside
+    /// that window can therefore land in the other order — Notification Center
+    /// sorts by delivery, and delivery is now "when the picture was ready".
+    /// That is a sub-second reshuffle of two simultaneous banners, traded for
+    /// the picture being there at all.
+    private func send(_ content: UNMutableNotificationContent, identifier: String, sender: String) {
+        Task {
+            content.attachments = await NotificationIcon.attachments(
+                for: sender, id: identifier)
+            // `add` throws only for a malformed request — a bad trigger, an
+            // attachment the system decided it could not take. Nothing here can
+            // act on that, and a banner is not worth an alert of its own.
+            try? await UNUserNotificationCenter.current().add(
+                UNNotificationRequest(identifier: identifier, content: content, trigger: nil))
+        }
     }
 
     /// Post one BACKGROUND auth banner: a mailbox that is not on screen has
@@ -244,9 +270,50 @@ final class Notifier {
         // unprefixed, account B's message 41 would silently REPLACE account A's
         // banner for message 41. Within one account, re-posting the same id
         // replaces its own banner rather than stacking a second copy.
-        let request = UNNotificationRequest(
-            identifier: "passband.auth.\(account).\(meta.id)", content: content, trigger: nil)
-        UNUserNotificationCenter.current().add(request)
+        //
+        // The tile is the SERVICE's logo, which is the one thing this banner is
+        // allowed to be specific about: it says who wants the code, while the
+        // code itself and the subject that so often contains it stay behind the
+        // audited reveal.
+        send(content, identifier: "passband.auth.\(account).\(meta.id)", sender: meta.sender)
+    }
+
+    /// Post a banner shaped exactly like the real thing, on demand. Settings
+    /// offers it for the same reason the sound picker plays its chime: whether
+    /// notifications actually arrive — past the system's own permission, focus
+    /// modes and Do Not Disturb — is not a question anyone should have to
+    /// answer by waiting for mail.
+    ///
+    /// It is addressed FROM PASSBAND, which is also the honest way to show what
+    /// the tile does when a domain has no logo to fetch: passband.app is not in
+    /// the icon service, so this one draws the initials fallback every time.
+    ///
+    /// Returns false when the system will not show it. A refused grant is the
+    /// commonest reason a banner never arrives, and a test that does nothing at
+    /// all in exactly that case is not a test.
+    @discardableResult
+    func postTest() async -> Bool {
+        await requestAuthorizationIfNeeded()
+        let status = await UNUserNotificationCenter.current()
+            .notificationSettings().authorizationStatus
+        guard status == .authorized || status == .provisional else { return false }
+
+        let content = UNMutableNotificationContent()
+        content.title = "Passband"
+        content.subtitle = "test banner"
+        content.body = "Notifications are working. This is what mail worth reading looks like."
+        content.threadIdentifier = "passband.test"
+        content.sound = Self.sound(for: Prefs.shared.notificationSound)
+        // The one banner that names no account, because it belongs to none.
+        // Both identifiers are still unique against every real one — an event's
+        // are "passband.event.<uuid>.<id>" and a group is "<uuid>.<thread>", so
+        // nothing this posts can group with, or replace, a piece of mail.
+        //
+        // No userInfo either: a tap here has nowhere to go, and `deliver` reads
+        // a payload with no account as "front the app and stop", which is
+        // exactly right.
+        send(content, identifier: "passband.test", sender: "Passband <hello@passband.app>")
+        return true
     }
 
     // MARK: - delegate behaviour
