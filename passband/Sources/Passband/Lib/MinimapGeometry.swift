@@ -59,10 +59,22 @@ enum MinimapGeometry {
     /// which is a conversation, which is text. A newsletter is one message in a
     /// thread of its own and has no rail to be wrong about.
     static func estimate(text: String, html: String? = nil, attachments: Int = 0) -> CGFloat {
-        let body =
-            cardChrome + textHeight(text: text, html: html)
-            + (attachments > 0 ? attachmentStrip : 0)
-        return min(max(body, minimumCard), longestGuess)
+        min(
+            card(bodyHeight: textHeight(text: text, html: html), attachments: attachments),
+            longestGuess)
+    }
+
+    /// A CARD AROUND A BODY OF A KNOWN HEIGHT — the chrome and the strip that
+    /// `estimate` adds to its guess, so a card whose body WebKit actually
+    /// measured is drawn on the same scale as one nobody has rendered yet.
+    ///
+    /// Uncapped, and that is the difference between the two: `longestGuess`
+    /// exists because a number derived from a character count has not earned
+    /// the whole rail. A measurement has. A newsletter that really is ten
+    /// screenfuls has to be drawn as ten screenfuls or the rail is lying about
+    /// the shape of the thread — which is the whole thing it is for.
+    static func card(bodyHeight: CGFloat, attachments: Int = 0) -> CGFloat {
+        max(cardChrome + bodyHeight + (attachments > 0 ? attachmentStrip : 0), minimumCard)
     }
 
     /// HOW TALL THIS BODY'S TEXT DRAWS, with no card around it. Split out of

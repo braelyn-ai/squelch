@@ -56,6 +56,10 @@ struct ThreadViewer: View {
     /// The rail's drawing for the thread that is loaded. Held rather than
     /// derived per render — see `marks(for:)`.
     @State private var marks: [ThreadMinimap.Mark] = []
+    /// The width a message BODY lays out at, measured off the column itself.
+    /// Every measured height is an answer for one width, so this is what the
+    /// measuring pass runs at and what the height memory is keyed to.
+    @State private var bodyWidth: CGFloat = 0
     /// Whether the opening landing has been taken for this thread. Until it has,
     /// the reader is wherever the initial anchor dropped it, which is not a
     /// position anybody chose.
@@ -66,6 +70,15 @@ struct ThreadViewer: View {
     @State private var handScrolling = false
 
     enum ConfirmMode: Equatable { case ask, noLink }
+
+    /// What a measuring pass is FOR. Any of the three changing means the
+    /// heights on file answer a question nobody is asking any more: another
+    /// thread, another message in this one, another column width.
+    private struct MeasurePass: Equatable {
+        let thread: String
+        let count: Int
+        let width: CGFloat
+    }
 
     /// Server order IS display order: chronological, oldest first. The reader
     /// opens parked on the last one.
@@ -161,6 +174,32 @@ struct ThreadViewer: View {
             await refreshOpens()
         }
         .task(id: newestSender) { await refreshUnsub() }
+        // SIZE THE THREAD UP BEFORE IT IS SCROLLED THROUGH. Nothing here waits
+        // on it: the pass runs off screen, fills the height memory message by
+        // message, and the reader simply finds the sizes already there when it
+        // gets to them. Keyed on the width too — a resized column is a
+        // different set of heights and has to be taken again.
+        .task(id: MeasurePass(thread: threadId, count: messages.count, width: bodyWidth)) {
+            // A window resize walks the width a pixel at a time, and each step
+            // is a different set of heights — so this task is restarted a
+            // hundred times during one drag. Waiting a beat first turns that
+            // into one pass at the width the drag ended on. It also lets the
+            // reader paint before anything starts measuring behind it.
+            try? await Task.sleep(for: .milliseconds(250))
+            guard !Task.isCancelled, bodyWidth > 0, !messages.isEmpty else { return }
+            let sized = messages
+            FrameMeasurer.shared.measure(
+                sized, width: bodyWidth, allowRemote: prefs.loadRemoteImages, token: threadId
+            ) {
+                // THE RAIL SWAPS ONCE, when every message is a measurement
+                // rather than a guess — see `marks(for:)`.
+                marks = Self.marks(for: sized)
+            }
+        }
+        // The pass outlives nothing: a reader that has left owns no thread to
+        // measure. Scoped by token because a thread SWITCH starts the next
+        // pass before this fires.
+        .onDisappear { FrameMeasurer.shared.cancel(token: threadId) }
         // NEW MAIL IN THIS VERY THREAD, from the poll that heard about it.
         // `onChange` rather than `.task(id:)`: a task keyed on the token would
         // also fire on mount, refetching the thread `load()` is already
@@ -477,6 +516,16 @@ struct ThreadViewer: View {
 
                             Color.clear.frame(height: tailSpace)
                         }
+                        // THE WIDTH THE MAIL LAYS OUT AT, taken from the column
+                        // rather than derived from the constants around it: it
+                        // is what every measured height is an answer FOR, and a
+                        // number computed from three paddings in two files
+                        // drifts the moment one of them changes. Measured
+                        // INSIDE the padding, so it is the card's own width;
+                        // the body is inset from that by the card's gutter.
+                        .onGeometryChange(for: CGFloat.self) { $0.size.width } action: { width in
+                            bodyWidth = max(0, width - MessageCard.bodyInset)
+                        }
                         .padding(.horizontal, Self.columnPadding)
                         .padding(.vertical, 4)
                         .frame(maxWidth: Self.columnWidth)
@@ -634,12 +683,35 @@ struct ThreadViewer: View {
     /// threshold, which happens repeatedly while you scroll. The messages are
     /// the only input, and they only change when a fetch replaces them.
     private static func marks(for messages: [ClientMessage]) -> [ThreadMinimap.Mark] {
-        messages.map { m in
+        // ALL MEASURED OR NONE, and that is not fussiness. A map drawn half
+        // from measurements and half from guesses redraws itself as each
+        // measurement lands, which is a rail that crawls while you read it. The
+        // measuring pass fills the whole set and says so once, so the rail
+        // changes scale exactly once per thread — and on the next open there is
+        // nothing left to change.
+        let sizes = messages.map(measuredCard)
+        let complete = sizes.allSatisfy { $0 != nil }
+        return messages.enumerated().map { i, m in
             ThreadMinimap.Mark(
                 attention: m.needsAttention,
                 tint: Palette.avatarColors(for: m.senderString).fg,
-                estimate: mapEstimate(m))
+                estimate: (complete ? sizes[i] : nil) ?? mapEstimate(m))
         }
+    }
+
+    /// This message's card at the size it really draws: the body as WebKit
+    /// measured it, plus the chrome the card puts around it. nil while nobody
+    /// has measured it.
+    ///
+    /// A PLAIN-TEXT message counts as measured. It has no web frame to measure
+    /// — and it is the one shape the guess is good at, being a count of lines
+    /// of text in a message that is nothing but lines of text. Holding the
+    /// whole rail hostage to a body no engine will ever be asked to lay out
+    /// would mean a thread with one plain reply never gets a true map at all.
+    private static func measuredCard(_ m: ClientMessage) -> CGFloat? {
+        guard let html = m.html, !html.isEmpty else { return mapEstimate(m) }
+        guard let body = FrameHeights.shared.get(String(m.id)) else { return nil }
+        return MinimapGeometry.card(bodyHeight: body, attachments: m.attachmentList.count)
     }
 
     /// WHAT THIS MESSAGE IS WORTH ON THE RAIL, from its own text and nothing
@@ -1359,6 +1431,11 @@ private struct MessageCard: View, Equatable {
     nonisolated let opens: [MessageOpen]
     let onSelect: () -> Void
 
+    /// The gutter the rules live in, which every body is inset by. Named
+    /// because the measuring pass has to render at exactly the width the mail
+    /// will be laid out at, and it derives that from the column minus this.
+    static let bodyInset: CGFloat = 13
+
     /// EVERYTHING BUT THE CALLBACK, which is what makes the card diffable at
     /// all — see the `.equatable()` at the call site. Rebuilding a card means
     /// rebuilding its sandboxed web frame's view value and running that frame's
@@ -1408,7 +1485,7 @@ private struct MessageCard: View, Equatable {
         }
         // The gutter is reserved whether or not this message is selected, so
         // j/k moves a rule rather than shifting every body left and right.
-        .padding(.leading, 13)
+        .padding(.leading, Self.bodyInset)
         .padding(.vertical, 16)
         .frame(maxWidth: .infinity, alignment: .leading)
         // BOTH rules stay mounted and only change opacity. A conditional

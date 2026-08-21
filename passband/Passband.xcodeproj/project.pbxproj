@@ -196,10 +196,12 @@
 		D52ECED560FD5574D03D0A08 /* EventStream.swift in Sources */ = {isa = PBXBuildFile; fileRef = CE462B9CE6C195F53B48B801 /* EventStream.swift */; };
 		D559CB25DC210A5DDEAA0D51 /* EmailsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6D358053F47CDAD2D0B7EAB5 /* EmailsView.swift */; };
 		D5661B76861FC80076B129EC /* ComposePane.swift in Sources */ = {isa = PBXBuildFile; fileRef = B97BB8DF0B7CB3C4E9EC791B /* ComposePane.swift */; };
+		D573F38D0D9CD3402667A0F2 /* FrameMeasurer.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7C0E91220FC27E7EC297FB40 /* FrameMeasurer.swift */; };
 		D5C30EC09B01E73DC6896AB8 /* TrackerToggle.swift in Sources */ = {isa = PBXBuildFile; fileRef = B2556C9BFD81BFC2EEAFB3B0 /* TrackerToggle.swift */; };
 		D5D9F05E11B3B8383ED792EB /* EmailWebView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 49697D28E02B833310EE2C12 /* EmailWebView.swift */; };
 		D5DB123B615F58369EAE3B7F /* AsyncMemo.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA0089253391F9BC0AE4818B /* AsyncMemo.swift */; };
 		D6C1F985EFED5530B73C27B8 /* Motion.swift in Sources */ = {isa = PBXBuildFile; fileRef = 30406C6A67318CD0CE71C1FF /* Motion.swift */; };
+		D71AFB170CE49A2A793EA34F /* FrameMeasurer.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7C0E91220FC27E7EC297FB40 /* FrameMeasurer.swift */; };
 		D83D2EEAF55EE8AC5B9EBEAE /* Concurrency.swift in Sources */ = {isa = PBXBuildFile; fileRef = E1C033DDA02DD344F437F943 /* Concurrency.swift */; };
 		D8F41B5F6FA8F83DAA537CB5 /* Prefs.swift in Sources */ = {isa = PBXBuildFile; fileRef = 163BEF63DE1359294AD2ADD8 /* Prefs.swift */; };
 		D8FAA331307EB4021EF60BE1 /* Pairing.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5512C13F456F49B6DF7B182B /* Pairing.swift */; };
@@ -328,6 +330,7 @@
 		759702EBD03C1CECFD041E57 /* ReadReceipt.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ReadReceipt.swift; sourceTree = "<group>"; };
 		78527CBD27E00907F26B9E79 /* Security.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Security.framework; path = System/Library/Frameworks/Security.framework; sourceTree = SDKROOT; };
 		7AC123D7E906293F404D8353 /* newsreader-var.ttf */ = {isa = PBXFileReference; lastKnownFileType = file; path = "newsreader-var.ttf"; sourceTree = "<group>"; };
+		7C0E91220FC27E7EC297FB40 /* FrameMeasurer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FrameMeasurer.swift; sourceTree = "<group>"; };
 		82CD5D3AEF359995F968DB53 /* Sparkle.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Sparkle.framework; path = vendor/Sparkle/Sparkle.framework; sourceTree = "<group>"; };
 		83BF084E665545489EDF2D5E /* newsreader-italic-var.ttf */ = {isa = PBXFileReference; lastKnownFileType = file; path = "newsreader-italic-var.ttf"; sourceTree = "<group>"; };
 		8860DE0FE5AA0366C7BE9922 /* JSONValue.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = JSONValue.swift; sourceTree = "<group>"; };
@@ -541,6 +544,7 @@
 				35991F651C60388C6D9BBEDF /* ComposeSubmit.swift */,
 				06A50E65F84872DFA0504B96 /* DraftSaver.swift */,
 				CE462B9CE6C195F53B48B801 /* EventStream.swift */,
+				7C0E91220FC27E7EC297FB40 /* FrameMeasurer.swift */,
 				20CA62DECFED05021D0C9964 /* HeroCache.swift */,
 				05270E444AAA1678F50EC0F0 /* ImageSchemeHandler.swift */,
 				2569BA5D1461BBA2A95D77F3 /* ImageStore.swift */,
@@ -838,6 +842,7 @@
 				D559CB25DC210A5DDEAA0D51 /* EmailsView.swift in Sources */,
 				88A8F0598E0AD01532B11B24 /* EventStream.swift in Sources */,
 				BD58A1B90A390D639D6D0AEB /* Format.swift in Sources */,
+				D71AFB170CE49A2A793EA34F /* FrameMeasurer.swift in Sources */,
 				EC7F67DBCCFA67E4FFC1A4C5 /* Glass.swift in Sources */,
 				85A1CC563396C7890FB07C1F /* HTMLImg.swift in Sources */,
 				F6CCF6C021CD68BA6BED3944 /* HeroCache.swift in Sources */,
@@ -951,6 +956,7 @@
 				4E260638B2736F4A91E83841 /* EmailsView.swift in Sources */,
 				D52ECED560FD5574D03D0A08 /* EventStream.swift in Sources */,
 				CDD154C0CEFB4D530E29DD34 /* Format.swift in Sources */,
+				D573F38D0D9CD3402667A0F2 /* FrameMeasurer.swift in Sources */,
 				7F575E0848A8BD54AF622141 /* Glass.swift in Sources */,
 				E796A08FD35B6AFC987CF6A6 /* HTMLImg.swift in Sources */,
 				9F54901230BBCD7044B85B48 /* Haptics.swift in Sources */,

@@ -218,6 +218,24 @@ final class FrameHeights {
     private var guesses: [String: CGFloat] = [:]
     private init() {}
 
+    /// THE WIDTH EVERY HEIGHT IN HERE WAS MEASURED AT. A height is only an
+    /// answer to a question that included the width — mail reflows, and a body
+    /// measured in a wide window is the wrong size in a narrow one. There is
+    /// exactly one reading column, so this is one number rather than part of
+    /// every key.
+    private(set) var width: CGFloat = 0
+
+    /// The reader declaring the width it is laying out at. A different one
+    /// discards the measurements, which is not a loss: the frames on screen
+    /// re-measure themselves as they reflow, and the ones that are not can be
+    /// measured again (see FrameMeasurer). The GUESSES survive — they are made
+    /// from the text and know nothing about the column.
+    func using(width: CGFloat) {
+        guard width > 0, abs(width - self.width) > 0.5 else { return }
+        self.width = width
+        heights.removeAll()
+    }
+
     func get(_ key: String) -> CGFloat? { heights[key] }
     func set(_ key: String, _ height: CGFloat) { heights[key] = height }
     func clear(_ key: String) {

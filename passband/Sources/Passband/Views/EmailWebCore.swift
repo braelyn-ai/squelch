@@ -497,6 +497,15 @@ enum EmailFrame {
               send({ kind: 'height', value: h });
             }
           }
+          // THE SAME NUMBER, ASKED FOR RATHER THAN SENT. A frame being
+          // measured off screen (FrameMeasurer) loads one document after
+          // another through one web view, and a pushed message carries no
+          // sign of which document it came from — the previous body's height
+          // lands in the next body's lap about a quarter of the time. A call
+          // has an answer, and the answer belongs to the document that was
+          // asked. Defined on the collapsed document, so it reports what the
+          // reader will actually show.
+          window.__passbandHeight = contentHeight;
           measure();
           requestAnimationFrame(measure);
           window.addEventListener('load', measure);
