@@ -157,23 +157,20 @@ struct EmailWebView: View {
 
     private var allowRemote: Bool { prefs.loadRemoteImages || optedIn }
 
-    /// Spin WebKit up BEFORE the first email is opened: the FIRST WKWebView in a
-    /// process pays for launching the content process, and that landed on the
-    /// first message the reader opened. Idempotent; the throwaway frame shares the
-    /// real one's data store (so its process pool) and is kept alive so the
-    /// process is not reaped. Loads nothing — a process warmer, not a cache.
+    /// Spin WebKit up BEFORE the first email is opened. Two separate costs are
+    /// being paid here, and only one of them used to be: the FIRST WKWebView the
+    /// app ever builds pays a one-off framework initialisation (measured at
+    /// 53-58ms), and EVERY new frame pays some seventy milliseconds of content
+    /// process launch before it can draw anything.
+    ///
+    /// It used to be a throwaway frame, which bought the first of those and
+    /// nothing else — the first message opened still faced a blank box while its
+    /// own process came up. The warmer is a SPARE instead: one real frame, the
+    /// same cost, held in the drawer the reader takes from. Idempotent.
     @MainActor
     static func warmProcess() {
-        guard warmFrame == nil else { return }
-        let config = WKWebViewConfiguration()
-        config.defaultWebpagePreferences.allowsContentJavaScript = false
-        config.websiteDataStore = EmailFrame.sharedDataStore
-        let frame = WKWebView(frame: .zero, configuration: config)
-        frame.loadHTMLString("<html><body></body></html>", baseURL: nil)
-        warmFrame = frame
+        WebFramePool.shared.seedSpare(EmailWebViewRepresentable.buildSpare)
     }
-
-    @MainActor private static var warmFrame: WKWebView?
 
     /// Frame height shown before the first successful measurement, for a body
     /// whose caller offered no guess at all. A LAST RESORT: a frame that opens
@@ -834,6 +831,16 @@ final class FrameRelay: NSObject, WKScriptMessageHandler, WKNavigationDelegate,
         }
     }
 
+    /// The empty document a SPARE is warmed with, which is loaded before this
+    /// relay is anybody's delegate and may still be at the policy gate when the
+    /// spare is handed out. It gets its own claim so that it can never spend
+    /// the COORDINATOR's: both are "a load we started", they are told apart by
+    /// who started them, and a warming load that consumed the real one's
+    /// permission would leave the message that took the spare permanently
+    /// blank.
+    private var pendingWarmLoads = 0
+    func expectWarmingLoad() { pendingWarmLoads += 1 }
+
     /// LAYER 4 — the policy itself is Coordinator.decideNavigation. NOTE the exact
     /// signature: the closure must be `@MainActor @Sendable` or Swift treats this
     /// as an unrelated near-miss method, the delegate requirement goes
@@ -842,6 +849,11 @@ final class FrameRelay: NSObject, WKScriptMessageHandler, WKNavigationDelegate,
         _ webView: WKWebView, decidePolicyFor navigationAction: WKNavigationAction,
         decisionHandler: @escaping @MainActor @Sendable (WKNavigationActionPolicy) -> Void
     ) {
+        if pendingWarmLoads > 0 {
+            pendingWarmLoads -= 1
+            decisionHandler(.allow)
+            return
+        }
         // No owner means the frame is parked in the pool: nobody is entitled to
         // navigate it, so nothing may.
         guard let owner else {
@@ -963,6 +975,65 @@ final class WebFramePool {
         for (_, entry) in frames { Self.discard(entry) }
         frames.removeAll()
         order.removeAll()
+        for spare in spares { Self.discard(spare) }
+        spares.removeAll()
+    }
+
+    // MARK: - warm spares
+
+    /// BLANK FRAMES, ALREADY WARM. A pool hit is a message you have already
+    /// read; this is for the ones you have not.
+    ///
+    /// Building a WKWebView is cheap (about three milliseconds of main thread).
+    /// What is not cheap is what happens after: a brand new frame takes some
+    /// seventy milliseconds to put anything on screen, because its content
+    /// process is starting up. That time is not a freeze — the main thread
+    /// stays responsive throughout — it is a BLANK BOX where a message should
+    /// be, and on a first scroll through a thread there is one per message.
+    ///
+    /// A frame that has already had a document through it renders the next one
+    /// in about five. So spares are built ahead of the scroll, put through an
+    /// empty document to wake their process, and handed out the moment a
+    /// message needs one. Construction alone warms nothing — measured: a spare
+    /// built and never loaded still pays the full seventy — so the empty load
+    /// IS the warming, and it holds: a spare that has sat idle for ninety
+    /// seconds is still within a millisecond or two of a hot one.
+    private static let spareTarget = 2
+    private var spares: [Entry] = []
+    private var refilling = false
+
+    /// ONE warm frame in the drawer, at launch, so the first message of the
+    /// session is not the one that waits for a content process. Does nothing
+    /// once there is anything to hand out.
+    func seedSpare(_ build: @MainActor () -> Entry) {
+        guard spares.isEmpty else { return }
+        spares.append(build())
+    }
+
+    /// A warm blank frame, or nil if none is ready. The caller wires its own
+    /// delegates: a spare is deliberately handed out UNWIRED (see the builders
+    /// in the two representables) — layer 4 refuses every navigation a frame's
+    /// relay does not own, which would include the empty one that warms it.
+    func takeSpare() -> Entry? {
+        spares.popLast()
+    }
+
+    /// Top the spares back up, NEXT TURN — never inside the mount that just
+    /// took one. The build is only a few milliseconds, but they are the same
+    /// few milliseconds the scroll is trying to use.
+    func replenishSpares(_ build: @escaping @MainActor () -> Entry) {
+        guard !refilling, spares.count < Self.spareTarget else { return }
+        refilling = true
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            defer { self.refilling = false }
+            while self.spares.count < Self.spareTarget {
+                self.spares.append(build())
+                // One per turn: two content processes starting at once, during
+                // a scroll, is the thing being avoided.
+                await Task.yield()
+            }
+        }
     }
 
     /// A dropped frame has to be UNWIRED, not just released: the content controller

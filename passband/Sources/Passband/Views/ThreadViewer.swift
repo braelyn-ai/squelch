@@ -185,7 +185,7 @@ struct ThreadViewer: View {
             // hundred times during one drag. Waiting a beat first turns that
             // into one pass at the width the drag ended on. It also lets the
             // reader paint before anything starts measuring behind it.
-            try? await Task.sleep(for: .milliseconds(250))
+            try? await Task.sleep(for: .milliseconds(120))
             guard !Task.isCancelled, bodyWidth > 0, !messages.isEmpty else { return }
             let sized = messages
             FrameMeasurer.shared.measure(
