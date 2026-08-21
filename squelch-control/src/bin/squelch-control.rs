@@ -111,6 +111,12 @@ enum LlmCommand {
 #[derive(Subcommand)]
 enum InviteCommand {
     /// Mint new codes. Each is printed once and stored only as a hash.
+    ///
+    /// A CLI CODE NAMES NOBODY, which is what makes it different from the
+    /// admin page's invite: there is no address to record, so no `users` row
+    /// exists yet. One appears at CONSUMPTION, keyed on the Google account that
+    /// redeems the code, and that account is the only identity this door ever
+    /// learns.
     Issue {
         /// How many to mint.
         #[arg(long, default_value_t = 1)]
@@ -654,15 +660,15 @@ fn reconcile(label: String) -> anyhow::Result<()> {
 /// Move a legacy SQLite control store into Postgres.
 ///
 /// COUNTS ONLY on the way out. Every row this touches is somebody's address —
-/// a tenant's mailbox, a waitlist entry — and the operator needs to know that
-/// the numbers match the old store, not who is in it.
+/// a tenant's mailbox, a person on the funnel — and the operator needs to know
+/// that the numbers match the old store, not who is in it.
 fn import_sqlite(path: PathBuf) -> anyhow::Result<()> {
     runtime()?.block_on(async {
         let store = open_store().await?;
         let report = import::import_sqlite(&store, &path).await?;
         eprintln!(
-            "squelch-control: imported {} tenants, {} invite codes, {} waitlist rows.",
-            report.tenants, report.invite_codes, report.waitlist
+            "squelch-control: imported {} tenants, {} invite codes, {} user rows.",
+            report.tenants, report.invite_codes, report.users
         );
         eprintln!(
             "squelch-control: check them with `tenants` and `invite list`, then keep the SQLite \

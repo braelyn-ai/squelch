@@ -439,6 +439,11 @@ struct Harness {
     state: ControlState,
     rec: Shared,
     invite_code: String,
+    /// The schema this harness's store lives in, for the assertions that read a
+    /// column no method returns. `ControlStore::client` is crate-private, so a
+    /// test needing raw SQL opens its own connection and can only land on the
+    /// same schema if it is given the same URL.
+    db_url: String,
 }
 
 /// How a harness is wired to Bifrost: not at all (the trio unset), a live
@@ -500,7 +505,7 @@ impl Harness {
             waitlist: None,
         };
 
-        let (store, _url) = common::fresh_store().await;
+        let (store, db_url) = common::fresh_store().await;
         let minted = invites::mint().unwrap();
         store
             .insert_invite(&minted.code_hash, default_expiry())
@@ -518,7 +523,26 @@ impl Harness {
             state,
             rec,
             invite_code: minted.code,
+            db_url,
         }
+    }
+
+    /// Every funnel row, as `(email, account_email, tenant_label, signed_up_at,
+    /// analytics_id)`. Read raw because `analytics_id` is deliberately not on
+    /// `UserRow`: it must never travel beside an address.
+    async fn funnel(&self) -> Vec<(String, Option<String>, Option<String>, Option<String>, String)> {
+        common::raw_client(&self.db_url)
+            .await
+            .query(
+                "SELECT email, account_email, tenant_label, signed_up_at, analytics_id
+                   FROM users ORDER BY id",
+                &[],
+            )
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| (r.get(0), r.get(1), r.get(2), r.get(3), r.get(4)))
+            .collect()
     }
 
     /// Mint another invite straight into the control store, the way
@@ -672,6 +696,20 @@ impl Harness {
     }
 }
 
+/// Whether a string is shaped like the UUIDv4 the store mints for
+/// `analytics_id`: 8-4-4-4-12 lowercase hex, version nibble 4, variant in
+/// `89ab`. The app holds an adopted id to this shape before it will adopt it.
+fn is_uuid_shaped(s: &str) -> bool {
+    let parts: Vec<&str> = s.split('-').collect();
+    parts.len() == 5
+        && parts.iter().map(|p| p.len()).collect::<Vec<_>>() == [8, 4, 4, 4, 12]
+        && parts
+            .iter()
+            .all(|p| p.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()))
+        && parts[2].starts_with('4')
+        && matches!(parts[3].as_bytes()[0], b'8' | b'9' | b'a' | b'b')
+}
+
 /// What `squelch-control invite issue` would stamp on a code minted now.
 fn default_expiry() -> chrono::DateTime<chrono::Utc> {
     chrono::Utc::now() + chrono::Duration::days(invites::DEFAULT_TTL_DAYS)
@@ -756,6 +794,24 @@ async fn signup_provisions_a_tenant_and_hands_back_a_pairing_code() {
         .collect::<Vec<_>>()
         .join("|");
     assert!(set_cookie.contains("Max-Age=0"), "{set_cookie}");
+
+    // THE FUNNEL, THROUGH THE CLI DOOR. The harness's invite is the shape
+    // `squelch-control invite issue` mints: a code addressed to nobody, so no
+    // row named this person before they redeemed it. One appears at the
+    // callback, keyed on the Google account, which is the only identity this
+    // door ever learns.
+    //
+    // BEFORE the recorder lock below, which is held to the end of this test: a
+    // std `MutexGuard` may not be alive across an await, and reading the funnel
+    // is one.
+    let funnel = h.funnel().await;
+    assert_eq!(funnel.len(), 1, "one person, one row: {funnel:?}");
+    let (email, account, label, signed_up, analytics_id) = &funnel[0];
+    assert_eq!(email, MAILBOX, "known by the account that redeemed it");
+    assert_eq!(account.as_deref(), Some(MAILBOX));
+    assert_eq!(label.as_deref(), Some("ada"));
+    assert!(signed_up.is_some(), "stamped at the callback");
+    assert!(is_uuid_shaped(analytics_id), "{analytics_id}");
 
     // ---- what the warden actually received ----
     let (put_label, armor) = h.credential_armor(0);
@@ -845,6 +901,70 @@ async fn signup_provisions_a_tenant_and_hands_back_a_pairing_code() {
         rec.warden_bearers
     );
     assert_eq!(rec.status_lookups, vec!["ada".to_string()]);
+}
+
+/// THE OTHER DOOR, and the case that made `account_email` a column: an invite
+/// MAILED to one address, redeemed by a Google account that is a different
+/// address. A bearer code cannot promise otherwise, and before this the board
+/// showed the invited address for a mailbox belonging to somebody else.
+///
+/// The row is seeded through the store the way the admin page seeds it —
+/// `invite_directly`, then `set_user_invite` with the id the mint returned — so
+/// the pointer under test is the one production writes.
+#[tokio::test]
+async fn a_mailed_invite_stamps_the_row_it_was_minted_for() {
+    let h = Harness::new().await;
+    let store = h.state.store();
+
+    const INVITED_AT: &str = "ada@work.example.com";
+    let user_id = store
+        .invite_directly(INVITED_AT, chrono::Utc::now())
+        .await
+        .unwrap()
+        .expect("a fresh address is approved by this call");
+    let minted = invites::mint().unwrap();
+    let invite_id = store
+        .insert_invite(&minted.code_hash, default_expiry())
+        .await
+        .unwrap();
+    assert!(
+        store
+            .set_user_invite(user_id, invite_id, None)
+            .await
+            .unwrap()
+    );
+    let before = h.funnel().await;
+    assert_eq!(before.len(), 1);
+    let analytics_id = before[0].4.clone();
+
+    // The mock Google always answers with MAILBOX, which is NOT the address the
+    // invite was addressed to. That is the whole point of this test.
+    let (status, body) = h.run_signup("ada", &minted.code).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let funnel = h.funnel().await;
+    assert_eq!(
+        funnel.len(),
+        1,
+        "the SAME row was stamped, not a second one: {funnel:?}"
+    );
+    let (email, account, label, signed_up, id_after) = &funnel[0];
+    assert_eq!(
+        email, INVITED_AT,
+        "still known by the address the invite went to"
+    );
+    assert_eq!(
+        account.as_deref(),
+        Some(MAILBOX),
+        "and the account that actually signed up is recorded beside it"
+    );
+    assert_ne!(email.as_str(), MAILBOX, "the mismatch this column exists for");
+    assert_eq!(label.as_deref(), Some("ada"));
+    assert!(signed_up.is_some());
+    assert_eq!(
+        id_after, &analytics_id,
+        "signing up is not a new person: the id is the one they were minted"
+    );
 }
 
 /// A failure on call 2 is the state wire v2 invents, so it gets the most
