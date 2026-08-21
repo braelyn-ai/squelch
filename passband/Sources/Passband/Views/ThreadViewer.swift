@@ -41,11 +41,6 @@ struct ThreadViewer: View {
     /// messageId -> recorded opens of the user's own tracked sends. Only sent,
     /// tracked messages ever have an entry; see `refreshOpens`.
     @State private var opens: [Int: [MessageOpen]] = [:]
-    /// Display indices of the rows on screen right now. The wheel moves what is
-    /// visible without touching the selection, and `refreshInPlace` must not
-    /// treat a wheel reader as "at the newest" just because they never pressed
-    /// `j` — see `anchorId`.
-    @State private var visibleIndices: Set<Int> = []
     /// WHERE THE MESSAGE CARDS ARE IN THE WINDOW, which is what the minimap
     /// draws. Kept in an object rather than in `@State` on purpose: it is
     /// rewritten on every scroll tick, and this view's body must not be
@@ -58,6 +53,9 @@ struct ThreadViewer: View {
     @State private var viewportHeight: CGFloat = 0
     /// The newest message card's laid-out height, the other half of `tailSpace`.
     @State private var newestHeight: CGFloat = 0
+    /// The rail's drawing for the thread that is loaded. Held rather than
+    /// derived per render — see `marks(for:)`.
+    @State private var marks: [ThreadMinimap.Mark] = []
     /// Whether the opening landing has been taken for this thread. Until it has,
     /// the reader is wherever the initial anchor dropped it, which is not a
     /// position anybody chose.
@@ -434,7 +432,7 @@ struct ThreadViewer: View {
                     #if os(macOS)
                         // Read-only: it draws where you are, and j/k move you.
                         ThreadMinimap(
-                            map: map, marks: minimapMarks, selected: index,
+                            map: map, marks: marks, selected: index,
                             viewport: viewportHeight)
                     #endif
 
@@ -461,13 +459,6 @@ struct ThreadViewer: View {
                                 // which had changed. See MessageCard's `==`.
                                 .equatable()
                                 .id(i)
-                                .onScrollVisibilityChange(threshold: 0.1) { visible in
-                                    if visible {
-                                        visibleIndices.insert(i)
-                                    } else {
-                                        visibleIndices.remove(i)
-                                    }
-                                }
                                 // WHERE THIS MESSAGE IS IN THE WINDOW, which is
                                 // the minimap's whole input — measured against
                                 // the viewport rather than the document because
@@ -636,7 +627,13 @@ struct ThreadViewer: View {
     /// messages up is visible from anywhere in the thread); and how long the
     /// message is about to be, which is what holds the map still for the mail the
     /// lazy stack has not laid out yet.
-    private var minimapMarks: [ThreadMinimap.Mark] {
+    ///
+    /// Derived WHEN THE THREAD LANDS (see `adopt`) and not on every render: it
+    /// is a walk of every message's text, and it was being re-walked whenever
+    /// anything at all invalidated the reader — a row crossing the visibility
+    /// threshold, which happens repeatedly while you scroll. The messages are
+    /// the only input, and they only change when a fetch replaces them.
+    private static func marks(for messages: [ClientMessage]) -> [ThreadMinimap.Mark] {
         messages.map { m in
             ThreadMinimap.Mark(
                 attention: m.needsAttention,
@@ -652,7 +649,7 @@ struct ThreadViewer: View {
     /// ones redraws itself as the measurements land, which is a rail that crawls
     /// while you read it. A map that is uniformly approximate holds still, and
     /// holding still is the whole job.
-    private func mapEstimate(_ m: ClientMessage) -> CGFloat {
+    private static func mapEstimate(_ m: ClientMessage) -> CGFloat {
         MinimapGeometry.estimate(
             text: m.content, html: m.html, attachments: m.attachmentList.count)
     }
@@ -1009,9 +1006,16 @@ struct ThreadViewer: View {
     /// would let a background refresh yank a wheel reader back to the newest.
     /// nil means the reader really is sitting on the newest, which is the one
     /// case a refresh may move them: onto the reply they are waiting for.
+    ///
+    /// Asked of the MAP rather than of a visibility flag per row. The map is
+    /// already tracking every mounted card's rectangle for the rail, and it
+    /// does it in an object — where a per-row `onScrollVisibilityChange` wrote
+    /// reader `@State`, so every message crossing the edge of the window
+    /// re-rendered the whole reader for an answer nothing needed until a
+    /// refresh landed.
     private var anchorId: Int? {
         if index != newestIndex { return messages[safe: index]?.id }
-        guard let top = visibleIndices.min(), top < newestIndex else { return nil }
+        guard let top = map.topmost, top < newestIndex else { return nil }
         return messages[safe: top]?.id
     }
 
@@ -1149,10 +1153,9 @@ struct ThreadViewer: View {
     // MARK: - data
 
     private func load() async {
-        // A fresh thread mounts fresh rows; what was visible of the LAST one
+        // A fresh thread mounts fresh rows; where the LAST one's cards were
         // must not anchor this one, and its shape must not be what the minimap
         // draws for a thread this one knows nothing about yet.
-        visibleIndices.removeAll()
         map.forget()
         newestHeight = 0
         landed = false
@@ -1179,6 +1182,8 @@ struct ThreadViewer: View {
     /// Take a loaded thread and derive its reader state.
     private func adopt(_ view: ClientThreadView) {
         thread = view
+        // The one place the messages change is the one place the rail is drawn.
+        marks = Self.marks(for: view.messages)
         // LAND ON THE NEWEST. It is last in the stack now, and `tailSpace` is
         // what lets the scroll put it at the top of the window rather than the
         // bottom.
