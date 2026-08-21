@@ -76,12 +76,28 @@ pub fn percent_encode(s: &str) -> String {
 /// Built HERE from this deployment's own tenant URL and the validated pairing
 /// code, never echoed from the warden's answer: an `href` assembled from a
 /// remote service's response is an open redirect with our domain in front of it.
-pub fn deep_link(tenant_url: &str, pair_code: &str) -> String {
-    format!(
-        "passband://pair?url={}&code={}",
-        percent_encode(tenant_url),
-        percent_encode(pair_code)
-    )
+pub fn deep_link(tenant_url: &str, pair_code: &str, analytics_id: Option<&str>) -> String {
+    // `aid` is the person's opaque analytics id, riding along so the app can
+    // adopt it as its PostHog distinct_id after a SUCCESSFUL pairing — the
+    // join between the funnel and app behavior that never names an address.
+    // Optional because a person can exist without the stamp having landed
+    // (the fail-soft record_signup window), and the pairing must never wait
+    // on analytics. Shipped app builds ignore unknown params, so the link
+    // stays backward compatible. The encoder is the rule, not the content: a
+    // UUID encodes to itself, and that is not a reason to skip it.
+    match analytics_id {
+        Some(aid) => format!(
+            "passband://pair?url={}&code={}&aid={}",
+            percent_encode(tenant_url),
+            percent_encode(pair_code),
+            percent_encode(aid)
+        ),
+        None => format!(
+            "passband://pair?url={}&code={}",
+            percent_encode(tenant_url),
+            percent_encode(pair_code)
+        ),
+    }
 }
 
 /// Where the client is downloaded from.
@@ -525,8 +541,13 @@ sync while you are away. Self-host if you would rather we did not.</p>"#,
 /// The code and the URL are `user-select: all` text rather than a copy button,
 /// because a copy button is JavaScript and this page has none. The deep link is
 /// the fast path; typing the code into the app is the path that always works.
-pub fn success(tenant_url: &str, pair_code: &str, minutes: i64) -> Response {
-    let link = deep_link(tenant_url, pair_code);
+pub fn success(
+    tenant_url: &str,
+    pair_code: &str,
+    minutes: i64,
+    analytics_id: Option<&str>,
+) -> Response {
+    let link = deep_link(tenant_url, pair_code, analytics_id);
     page(
         StatusCode::OK,
         "Your mailbox is ready",
@@ -578,8 +599,9 @@ pub fn app_signed_in(
     tenant_url: &str,
     pair_code: &str,
     minutes: i64,
+    analytics_id: Option<&str>,
 ) -> Response {
-    let link = deep_link(tenant_url, pair_code);
+    let link = deep_link(tenant_url, pair_code, analytics_id);
     page(
         StatusCode::OK,
         "Signed in",
@@ -1043,13 +1065,49 @@ mod tests {
         assert_eq!(percent_encode("a b"), "a%20b");
     }
 
-    /// The link shape the Swift client parses (`passband://pair?url=…&code=…`).
+    /// The link shape the Swift client parses (`passband://pair?url=…&code=…`),
+    /// with and without the analytics ride-along. The no-aid string is pinned
+    /// EXACTLY: self-host and the fail-soft window must keep producing the
+    /// link every shipped build already understands.
     #[test]
     fn builds_the_deep_link_the_app_expects() {
         assert_eq!(
-            deep_link("https://ada.passband.email", "ABCD-EFGH"),
+            deep_link("https://ada.passband.email", "ABCD-EFGH", None),
             "passband://pair?url=https%3A%2F%2Fada.passband.email&code=ABCD-EFGH"
         );
+        assert_eq!(
+            deep_link(
+                "https://ada.passband.email",
+                "ABCD-EFGH",
+                Some("0e51e11e-89ff-4c8f-a566-95a8f9b169b0"),
+            ),
+            "passband://pair?url=https%3A%2F%2Fada.passband.email&code=ABCD-EFGH&aid=0e51e11e-89ff-4c8f-a566-95a8f9b169b0"
+        );
+    }
+
+    /// Both flow-finishing pages carry the aid'd link when a person is known,
+    /// HTML-escaped like every href on them. The `&amp;` is the point of the
+    /// assertion: a raw `&` in an attribute is the kind of thing only a test
+    /// notices.
+    #[tokio::test]
+    async fn the_finishing_pages_carry_the_analytics_ride_along() {
+        let aid = "0e51e11e-89ff-4c8f-a566-95a8f9b169b0";
+        let expected = format!(
+            "passband://pair?url=https%3A%2F%2Fada.passband.email&amp;code=ABCD-EFGH&amp;aid={aid}"
+        );
+        let success_html =
+            body_of(success("https://ada.passband.email", "ABCD-EFGH", 10, Some(aid))).await;
+        let app_html = body_of(app_signed_in(
+            "ada@example.com",
+            "https://ada.passband.email",
+            "ABCD-EFGH",
+            10,
+            Some(aid),
+        ))
+        .await;
+        for html in [success_html, app_html] {
+            assert!(html.contains(&expected), "{html}");
+        }
     }
 
     /// The form is the only place the three grants are explained in the
@@ -1148,7 +1206,7 @@ mod tests {
 
     #[tokio::test]
     async fn the_success_page_carries_the_code_the_url_and_the_link() {
-        let html = body_of(success("https://ada.passband.email", "ABCD-EFGH", 10)).await;
+        let html = body_of(success("https://ada.passband.email", "ABCD-EFGH", 10, None)).await;
         assert!(html.contains("ABCD-EFGH"));
         assert!(html.contains("https://ada.passband.email"));
         assert!(
@@ -1174,12 +1232,13 @@ mod tests {
     #[tokio::test]
     async fn the_pages_that_finish_a_flow_hand_over_the_client() {
         for html in [
-            body_of(success("https://ada.passband.email", "ABCD-EFGH", 10)).await,
+            body_of(success("https://ada.passband.email", "ABCD-EFGH", 10, None)).await,
             body_of(app_signed_in(
                 "ada@example.com",
                 "https://ada.passband.email",
                 "ABCD-EFGH",
                 10,
+                None,
             ))
             .await,
         ] {
@@ -1511,7 +1570,7 @@ mod tests {
                 Some("no"),
             ))
             .await,
-            body_of(success("https://ada.passband.email", "ABCD-EFGH", 10)).await,
+            body_of(success("https://ada.passband.email", "ABCD-EFGH", 10, None)).await,
             body_of(problem(StatusCode::BAD_REQUEST, "Nope", "Try again.")).await,
             body_of(console_problem(
                 StatusCode::BAD_REQUEST,
@@ -1540,12 +1599,13 @@ mod tests {
     async fn every_page_wears_the_mark_and_fetches_nothing_to_do_it() {
         for html in [
             body_of(signup_form("passband.email", None, "", "", None)).await,
-            body_of(success("https://ada.passband.email", "ABCD-EFGH", 10)).await,
+            body_of(success("https://ada.passband.email", "ABCD-EFGH", 10, None)).await,
             body_of(app_signed_in(
                 "ada@example.com",
                 "https://ada.passband.email",
                 "ABCD-EFGH",
                 10,
+                None,
             ))
             .await,
             body_of(problem(StatusCode::BAD_REQUEST, "Nope", "Try again.")).await,
@@ -1590,7 +1650,7 @@ mod tests {
     async fn every_page_carries_the_security_headers() {
         for r in [
             signup_form("passband.email", None, "", "", None),
-            success("https://ada.passband.email", "ABCD-EFGH", 10),
+            success("https://ada.passband.email", "ABCD-EFGH", 10, None),
             problem(StatusCode::BAD_REQUEST, "Nope", "Try again."),
             console_problem(StatusCode::BAD_REQUEST, "Nope", "Try again."),
             admin_login(None),
