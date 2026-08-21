@@ -32,6 +32,18 @@ struct PairLink: Equatable, Sendable {
     var serverURL: String
     /// Already normalized (uppercase, no dashes), ready to send.
     var code: String
+    /// The `aid` the hosted control plane hangs off its sign-up and sign-in
+    /// links: the opaque per-person analytics id this install adopts as its
+    /// PostHog distinct_id once the pairing actually lands. Self-hosted links
+    /// carry none, and nil is the ordinary case rather than a fault.
+    ///
+    /// HELD TO UUID SHAPE, lowercased. This rides in from an untrusted URL that
+    /// any web page can open, and a UUID is the one string shape that cannot
+    /// carry anything: no separators to break a query out of, no path to
+    /// traverse, no room for a subject line or an address. A value that is not
+    /// one is dropped and the link STILL parses — pairing is the user's actual
+    /// errand and it must never fail over analytics decoration.
+    var analyticsId: String?
 
     /// Parse a link, or return nil for anything malformed. STRICT on purpose:
     /// this is untrusted input handed over by whatever app opened the URL, and
@@ -59,6 +71,10 @@ struct PairLink: Equatable, Sendable {
 
         serverURL = rawURL
         code = normalized
+        // Deliberately NOT part of the guard chain above: a missing or
+        // malformed `aid` costs the analytics join and nothing else, so it
+        // resolves to nil beside a link that is otherwise complete.
+        analyticsId = Pairing.analyticsId(from: value("aid"))
     }
 
 }
@@ -165,6 +181,23 @@ enum Pairing {
             let host = comps.host, !host.isEmpty
         else { return false }
         return true
+    }
+
+    /// The `aid` query value, or nil for anything that is not a UUID.
+    ///
+    /// The shape check IS the sanitization. The id is opaque to this app — it
+    /// is minted control-plane side, never decoded here, and its only
+    /// destination is the `distinct_id` envelope field of a PostHog event — so
+    /// there is nothing to validate about its MEANING, only about what it could
+    /// smuggle. `UUID(uuidString:)` reduces the accepted alphabet to hex and
+    /// dashes at fixed offsets, which is why no escaping is needed anywhere
+    /// downstream. Lowercased so the same person's id is one string whichever
+    /// case the link spelled it in.
+    static func analyticsId(from raw: String?) -> String? {
+        guard let trimmed = raw?.trimmingCharacters(in: .whitespacesAndNewlines),
+            UUID(uuidString: trimmed) != nil
+        else { return nil }
+        return trimmed.lowercased()
     }
 
     // MARK: - the claim
