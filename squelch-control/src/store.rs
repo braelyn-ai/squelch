@@ -13,7 +13,7 @@
 //! private network does on a blip. That client is then permanently broken and
 //! every request after it fails until the process is restarted. The pool
 //! notices and dials again. Every method here is still one short statement; the
-//! two that are not ([`ControlStore::init`] and [`ControlStore::list_waitlist`])
+//! two that are not ([`ControlStore::init`] and [`ControlStore::list_users`])
 //! say at their own definitions why they are a transaction.
 //!
 //! WHAT IS NOT IN THIS SCHEMA IS THE POINT: no tokens, no ciphertext, no
@@ -24,12 +24,22 @@
 //! armor addressed to one tenant. There is nothing at rest on Railway that opens a
 //! mailbox.
 //!
-//! THE ONE EXCEPTION IS `waitlist`, and it is a deliberate one: it holds the
-//! addresses of people who have asked for the hosted tier and are not tenants
-//! yet. They are stored through [`normalize_email`] like every other address
-//! here, they are shown only on the operator's admin page, and they never reach
-//! a log line: a waitlist log carries the ROW ID and a count, never the address
-//! and never the code that was mailed to it.
+//! THE ONE EXCEPTION IS `users`, and it is a deliberate one: it holds the
+//! addresses of people at every point of the hosted funnel, most of whom are not
+//! tenants. A row carries TWO of them now — the address the invite was
+//! addressed to and the Google account that redeemed it, which a bearer code
+//! does not promise are the same — and both are stored through
+//! [`normalize_email`] like every other address here, shown only on the
+//! operator's admin page, and never written to a log line: a funnel log carries
+//! the ROW ID and a count, never an address and never the code that was mailed
+//! to one.
+//!
+//! `analytics_id` IS OPAQUE, AND STAYS THAT WAY BY NOT BEING PUT NEXT TO AN
+//! ADDRESS. It is the distinct_id PostHog knows a person by, which is the whole
+//! reason PostHog is never told an address at all. Beside a row id or a label it
+//! is harmless; beside an address it is the join that undoes the separation, so
+//! no line in this crate may carry both, and it is deliberately NOT on
+//! [`UserRow`], which is the shape the page that renders addresses is handed.
 
 use chrono::{DateTime, SecondsFormat, Utc};
 use deadpool_postgres::{Client, Manager, ManagerConfig, Pool, RecyclingMethod};
@@ -70,24 +80,32 @@ const TENANTS_LABEL_KEY: &str = "tenants_label_key";
 /// of what the control plane last did, not a lock.
 pub const STATUS_ACTIVE: &str = "active";
 
-/// A waitlist row nobody has acted on yet.
-pub const WAITLIST_PENDING: &str = "pending";
+/// A user nobody has acted on yet: they asked, and that is all that has
+/// happened.
+pub const USER_PENDING: &str = "pending";
 
-/// A waitlist row an operator has approved. The invite may or may not have
-/// reached them; `notified_at` is what says which.
-pub const WAITLIST_APPROVED: &str = "approved";
+/// A user an operator has approved. The invite may or may not have reached
+/// them; `notified_at` is what says which. THE LAST STORED STATE: signed up and
+/// active are read off the stamps, never off this column (see [`SCHEMA`]).
+pub const USER_APPROVED: &str = "approved";
 
 /// How many APPROVED rows one listing carries as history. The pending half is
 /// NOT capped by this: a row that falls off the page is a person the operator
 /// never approves, and a repairable failed send is an approved row, so the
 /// history half is the only one a cap may touch.
-pub const WAITLIST_APPROVED_LIMIT: i64 = 50;
+pub const USER_APPROVED_LIMIT: i64 = 50;
 
 /// The ceiling on the pending half. Not a page size: a hundred-user beta cannot
 /// produce a pathological count, so this is the bound that stops one listing
 /// from being unbounded memory, set where reaching it means something other
 /// than signups happened.
-pub const WAITLIST_PENDING_LIMIT: i64 = 500;
+pub const USER_PENDING_LIMIT: i64 = 500;
+
+/// How far back [`ControlStore::users_awaiting_first_pair`] keeps asking. THE
+/// GIVE-UP, not a retention rule: somebody who signed up three months ago and
+/// never opened the app is not going to be answered by one more poll, and a
+/// window is what stops a poller from asking the cluster about them forever.
+const FIRST_PAIR_WINDOW_DAYS: i64 = 90;
 
 /// TIMESTAMPS ARE RFC3339 TEXT, AND EVERY ONE OF THEM IS `COLLATE "C"`.
 ///
@@ -141,23 +159,64 @@ CREATE TABLE IF NOT EXISTS invite_codes (
     reserved_until TEXT COLLATE \"C\"
 );
 
--- People who asked for the hosted tier before there was a code to give them.
--- One row per address, UNIQUE so a second submission of the same address is a
--- no-op rather than a second entry for the operator to work through.
-CREATE TABLE IF NOT EXISTS waitlist (
-    id          BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-    email       TEXT NOT NULL UNIQUE,
-    created_at  TEXT COLLATE \"C\" NOT NULL,
+-- Everybody the hosted tier knows of, wherever they have got to: waiting,
+-- invited, signed up, active. ONE ROW PER PERSON, keyed on an address and
+-- UNIQUE, so a second submission of the same address is a no-op rather than a
+-- second entry for the operator to work through.
+--
+-- ONLY THE FIRST TWO STATES ARE STORED, and that is the whole design of this
+-- table. `status` is 'pending' | 'approved' because those two are what the
+-- compare-and-swap guards swing on: one click has to mint exactly one invite,
+-- and a column is the only thing two racing statements can agree about.
+-- Everything past approval is DERIVED from the stamps below, read with the
+-- precedence active > signed up > invited > email not sent. A stored
+-- 'signed_up' would be a second copy of `signed_up_at`, and the two would
+-- disagree the first time a write half-landed.
+CREATE TABLE IF NOT EXISTS users (
+    id              BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    -- The address this person is KNOWN BY: the one that joined the list or that
+    -- an operator typed into the invite box, or — for somebody who arrived with
+    -- a CLI code that was addressed to nobody — the Google account they redeemed
+    -- it with. Normalized, like every address in this schema.
+    email           TEXT NOT NULL UNIQUE,
+    created_at      TEXT COLLATE \"C\" NOT NULL,
     -- 'pending' | 'approved'. The approval transition is the guard that makes
-    -- one click mint one invite; see `approve_waitlist`.
-    status      TEXT NOT NULL,
-    approved_at TEXT COLLATE \"C\",
-    -- The invite row minted for this person at approval. THE ID ONLY: the code
-    -- and its hash live where every other invite's do.
-    invite_id   BIGINT,
+    -- one click mint one invite; see `approve_user`.
+    status          TEXT NOT NULL,
+    approved_at     TEXT COLLATE \"C\",
+    -- The CURRENT invite minted for this person. THE ID ONLY, and a SOFT
+    -- POINTER: a re-send moves it, a CLI revoke leaves it naming nothing, and
+    -- the code and its hash live where every other invite's do.
+    invite_id       BIGINT,
     -- When Resend accepted the send. NULL on an approved row means the email
     -- did not go out and the operator has a button to try again.
-    notified_at TEXT COLLATE \"C\"
+    notified_at     TEXT COLLATE \"C\",
+    -- When the invite was spent and a mailbox came into existence, stamped at
+    -- the OAuth callback. Kept here as well as being joinable through
+    -- `invite_codes.used_at` because the join answers for the INVITED half of
+    -- the funnel only: a CLI code has no row pointing at it, so a signup that
+    -- came in that door is invisible to it.
+    signed_up_at    TEXT COLLATE \"C\",
+    -- The Google account that finished the signup, verified at consent. NOT
+    -- PROMISED TO EQUAL `email`: an invite is a bearer code, so whoever redeems
+    -- it may be the person it was mailed to, that person with a different
+    -- mailbox, or somebody they forwarded it to. The board shows both when they
+    -- differ rather than picking one to believe.
+    account_email   TEXT,
+    -- The mailbox that signup became, by label. HISTORY, NOT LIVENESS:
+    -- `tenants.status` stays the authority on whether it is still running, and
+    -- this keeps naming a tenant that was torn down.
+    tenant_label    TEXT,
+    -- Activation: the first time a device that is not the console paired with
+    -- this person's daemon. Stamped by the poller and nothing else, and only
+    -- ever once (see `mark_user_first_paired`).
+    first_paired_at TEXT COLLATE \"C\",
+    -- The id PostHog knows this person by. MINTED ONCE AND NEVER ROTATED: it is
+    -- what lets analytics join one person's sessions together without analytics
+    -- ever being told an address, and rotating it would split one person into
+    -- two strangers with no way back. UNIQUE so a collision is an error rather
+    -- than two people merging into one.
+    analytics_id    TEXT NOT NULL UNIQUE
 );
 ";
 
@@ -210,6 +269,13 @@ pub enum StoreError {
     /// than because anything is expected to produce it.
     #[error("control store: {0}")]
     Build(#[from] deadpool_postgres::BuildError),
+    /// The system random source would not answer, so no `analytics_id` could be
+    /// minted. A store error rather than a panic for the same reason
+    /// [`crate::invites::mint`] returns one: entropy failing is a machine
+    /// problem, and the caller above already knows how to fail a request
+    /// politely.
+    #[error("control store: {0}")]
+    Entropy(#[from] std::io::Error),
     /// The single-use guarantee lost a race, or the row was already spent.
     #[error("that invite code is no longer available")]
     InviteUnavailable,
@@ -236,18 +302,21 @@ pub struct InviteRow {
     pub used_by_label: Option<String>,
 }
 
-/// One waitlist row, as the admin page renders it.
+/// One user, as the admin page renders them.
 ///
-/// NO `Debug`: the whole row is somebody's address, and a derived `Debug` is
-/// how it would reach a log line the day a handler formats an error with the
-/// row in scope.
+/// NO `Debug`: the row is somebody's address, and now it is TWO of them, so a
+/// derived `Debug` is how they would reach a log line the day a handler formats
+/// an error with the row in scope. NO `analytics_id` either, and for the
+/// neighbouring reason the module doc gives: this is the shape handed to the one
+/// page that renders addresses, and the id must never be on a screen beside one.
 #[derive(Clone)]
-pub struct WaitlistRow {
+pub struct UserRow {
     pub id: i64,
     /// Normalized (lowercased, trimmed), the way it was stored.
     pub email: String,
     pub created_at: DateTime<Utc>,
-    /// [`WAITLIST_PENDING`] or [`WAITLIST_APPROVED`].
+    /// [`USER_PENDING`] or [`USER_APPROVED`]. The STORED half of the lifecycle;
+    /// the rest of it is the stamps below.
     pub status: String,
     pub approved_at: Option<DateTime<Utc>>,
     /// The invite minted at approval, by id.
@@ -255,18 +324,40 @@ pub struct WaitlistRow {
     /// When the invite email was accepted for delivery. `None` on an approved
     /// row is the "email not sent" case.
     pub notified_at: Option<DateTime<Utc>>,
-    /// When this row's invite was SPENT, from the code it was minted: the
-    /// moment somebody finished signup and a mailbox came into existence.
+    /// When somebody finished signup on this row and a mailbox came into
+    /// existence.
     ///
-    /// Joined rather than stored, because `invite_codes` is already the one
-    /// place redemption is written and a copy here would be a second truth to
-    /// keep in step. `None` means the code is still outstanding (or the row was
-    /// never approved, or its code was revoked from the CLI and the row now
+    /// COALESCED: the column first, then `invite_codes.used_at` through the
+    /// pointer. The column is written by `record_signup` and the join is what
+    /// answered before it existed, so the fallback covers both the rows that
+    /// pre-date the column and the fail-soft window where a signup completed and
+    /// its funnel write did not. `None` means the code is still outstanding (or
+    /// the row was never approved, or its code was revoked from the CLI and now
     /// points at nothing).
-    pub accepted_at: Option<DateTime<Utc>>,
-    /// The mailbox that code became, by label. Present exactly when
-    /// [`Self::accepted_at`] is.
-    pub accepted_label: Option<String>,
+    pub signed_up_at: Option<DateTime<Utc>>,
+    /// The mailbox that signup became, by label, coalesced the same way.
+    pub tenant_label: Option<String>,
+    /// The Google account that redeemed the invite, when one has. Not promised
+    /// to equal [`Self::email`]; the board says so when they differ.
+    pub account_email: Option<String>,
+    /// Activation: when a device that is not the console first paired with this
+    /// person's daemon. The top rung of the ladder.
+    pub first_paired_at: Option<DateTime<Utc>>,
+}
+
+/// What a recorded signup hands back: the row it landed on, and the id that row
+/// is known by outside this database.
+///
+/// `Debug` IS FINE HERE and is the difference between this and [`UserRow`]:
+/// neither field is an address. A row id and an analytics id together are two
+/// opaque handles, which is exactly the pair a log line may carry.
+#[derive(Debug, Clone)]
+pub struct SignupRecord {
+    pub user_id: i64,
+    /// The KEPT id, never a freshly minted one: a second signup on a row that
+    /// already has an analytics id gets the one it already had, or the person
+    /// splits into two strangers in PostHog.
+    pub analytics_id: String,
 }
 
 /// One tenant row.
@@ -351,7 +442,7 @@ impl ControlStore {
     /// weakens nothing: every guard in this file travels INSIDE the single
     /// statement it protects, so two handlers on two connections race exactly
     /// the way two handlers taking one mutex in turn did. The one place the
-    /// lock WAS the guarantee is [`Self::list_waitlist`], which says so and
+    /// lock WAS the guarantee is [`Self::list_users`], which says so and
     /// takes a transaction instead.
     ///
     /// `pub(crate)` rather than private, for the two callers that are not
@@ -778,7 +869,7 @@ impl ControlStore {
         Ok(changed == 1)
     }
 
-    // ---- waitlist --------------------------------------------------------
+    // ---- users -----------------------------------------------------------
 
     /// Record an address that asked for the hosted tier. `true` means this
     /// submission created the row.
@@ -790,6 +881,13 @@ impl ControlStore {
     /// boolean is for counting, not for the page: a route that said "already on
     /// the list" would tell a stranger who else is.
     ///
+    /// THE CONFLICT TARGET IS NAMED, which it did not need to be when `email`
+    /// was the only unique column. A bare `ON CONFLICT DO NOTHING` would now
+    /// also swallow an `analytics_id` collision, and that one must stay loud: it
+    /// is a one-in-2^122 event, so meeting it means the random source is broken,
+    /// and silently answering "already on the list" would drop a person on the
+    /// floor to hide it.
+    ///
     /// THE TIMING SIDE CHANNEL IS ACCEPTED, and named here so the acceptance is
     /// visible: an ignored conflict skips the heap write, so a duplicate answers
     /// measurably faster than a new address and a determined prober can ask
@@ -797,17 +895,19 @@ impl ControlStore {
     /// every submission (a row per guess) or padding the response, and neither
     /// is worth it for a list whose members are a marketing signup; the route's
     /// own rate bucket is what bounds the probing.
-    pub async fn add_to_waitlist(&self, email: &str) -> Result<bool> {
+    pub async fn add_user_waiting(&self, email: &str) -> Result<bool> {
         let changed = self
             .client()
             .await?
             .execute(
-                "INSERT INTO waitlist(email, created_at, status) VALUES($1, $2, $3)
-                 ON CONFLICT DO NOTHING",
+                "INSERT INTO users(email, created_at, status, analytics_id)
+                 VALUES($1, $2, $3, $4)
+                 ON CONFLICT (email) DO NOTHING",
                 &[
                     &normalize_email(email),
                     &stamp(Utc::now()),
-                    &WAITLIST_PENDING,
+                    &USER_PENDING,
+                    &mint_analytics_id()?,
                 ],
             )
             .await?;
@@ -821,32 +921,38 @@ impl ControlStore {
     ///
     /// ONE STATEMENT, because the operator typing an address and the operator
     /// clicking Approve on that same address are the same race
-    /// [`Self::approve_waitlist`] guards, and it has to hold across an INSERT
+    /// [`Self::approve_user`] guards, and it has to hold across an INSERT
     /// the second one turns into an UPDATE. The upsert's `WHERE` is the guard:
     /// it promotes a pending row and refuses an approved one, so two presses
     /// mint exactly one invite between them, and `RETURNING` hands back the
     /// winner's id without a second lookup that another writer could
     /// invalidate.
     ///
-    /// A direct invite is recorded as a waitlist row on purpose. The alternative
-    /// is a second ledger with the same columns, and then two places to look for
-    /// "did we already invite them", two things to page, and one of them
-    /// silently missing the re-send button.
+    /// THE UPDATE ARM NEVER TOUCHES `analytics_id`. Only the INSERT arm mints
+    /// one, and a mint that loses the conflict is thrown away unused: somebody
+    /// already on the list keeps the id analytics has been calling them all
+    /// along, because being invited does not make them a different person.
+    ///
+    /// A direct invite is recorded as an ordinary user row on purpose. The
+    /// alternative is a second ledger with the same columns, and then two places
+    /// to look for "did we already invite them", two things to page, and one of
+    /// them silently missing the re-send button.
     pub async fn invite_directly(&self, email: &str, now: DateTime<Utc>) -> Result<Option<i64>> {
         let row = self
             .client()
             .await?
             .query_opt(
-                "INSERT INTO waitlist(email, created_at, status, approved_at)
-                      VALUES($1, $2, $3, $2)
+                "INSERT INTO users(email, created_at, status, approved_at, analytics_id)
+                      VALUES($1, $2, $3, $2, $5)
                  ON CONFLICT(email) DO UPDATE SET status = $3, approved_at = $2
-                      WHERE waitlist.status = $4
+                      WHERE users.status = $4
                  RETURNING id",
                 &[
                     &normalize_email(email),
                     &stamp(now),
-                    &WAITLIST_APPROVED,
-                    &WAITLIST_PENDING,
+                    &USER_APPROVED,
+                    &USER_PENDING,
+                    &mint_analytics_id()?,
                 ],
             )
             .await?;
@@ -859,7 +965,7 @@ impl ControlStore {
     /// TWO STATEMENTS BECAUSE THE TWO HALVES ARE CAPPED DIFFERENTLY. One
     /// listing capped as a whole loses pending rows once the history fills it,
     /// and a pending row that is not on the page is a person nobody approves.
-    /// So the waiting half is bounded only by [`WAITLIST_PENDING_LIMIT`], which
+    /// So the waiting half is bounded only by [`USER_PENDING_LIMIT`], which
     /// a beta cannot reach, and the cap that bites is on history.
     ///
     /// TWO STATEMENTS, ONE SNAPSHOT, and on a pool that takes saying so. Under
@@ -872,7 +978,7 @@ impl ControlStore {
     /// Ordered by id rather than by `created_at` because the id IS the arrival
     /// order (an identity column, one insert per submission) and two rows
     /// written in the same millisecond would otherwise tie.
-    pub async fn list_waitlist(&self) -> Result<Vec<WaitlistRow>> {
+    pub async fn list_users(&self) -> Result<Vec<UserRow>> {
         let mut client = self.client().await?;
         let tx = client
             .build_transaction()
@@ -880,19 +986,19 @@ impl ControlStore {
             .read_only(true)
             .start()
             .await?;
-        let mut rows = select_waitlist(
+        let mut rows = select_users(
             &tx,
-            &format!("SELECT {WAITLIST_COLUMNS} WHERE w.status = $1 ORDER BY w.id ASC LIMIT $2"),
-            &[&WAITLIST_PENDING, &WAITLIST_PENDING_LIMIT],
+            &format!("SELECT {USER_COLUMNS} WHERE u.status = $1 ORDER BY u.id ASC LIMIT $2"),
+            &[&USER_PENDING, &USER_PENDING_LIMIT],
         )
         .await?;
         rows.extend(
-            select_waitlist(
+            select_users(
                 &tx,
                 &format!(
-                    "SELECT {WAITLIST_COLUMNS} WHERE w.status <> $1 ORDER BY w.id DESC LIMIT $2"
+                    "SELECT {USER_COLUMNS} WHERE u.status <> $1 ORDER BY u.id DESC LIMIT $2"
                 ),
-                &[&WAITLIST_PENDING, &WAITLIST_APPROVED_LIMIT],
+                &[&USER_PENDING, &USER_APPROVED_LIMIT],
             )
             .await?,
         );
@@ -906,17 +1012,14 @@ impl ControlStore {
         Ok(rows)
     }
 
-    /// One waitlist row by id, or `None` when there is no such row.
-    pub async fn waitlist_entry(&self, id: i64) -> Result<Option<WaitlistRow>> {
+    /// One user by row id, or `None` when there is no such row.
+    pub async fn user_entry(&self, id: i64) -> Result<Option<UserRow>> {
         let row = self
             .client()
             .await?
-            .query_opt(
-                &format!("SELECT {WAITLIST_COLUMNS} WHERE w.id = $1"),
-                &[&id],
-            )
+            .query_opt(&format!("SELECT {USER_COLUMNS} WHERE u.id = $1"), &[&id])
             .await?;
-        row.as_ref().map(waitlist_row).transpose()
+        row.as_ref().map(user_row).transpose()
     }
 
     /// Move a row from pending to approved, atomically. `true` means THIS call
@@ -927,20 +1030,20 @@ impl ControlStore {
     /// button (or a replayed POST) must mint exactly one. The loser gets
     /// `Ok(false)` and says "already approved" rather than minting a second
     /// code nobody asked for.
-    pub async fn approve_waitlist(&self, id: i64, now: DateTime<Utc>) -> Result<bool> {
+    pub async fn approve_user(&self, id: i64, now: DateTime<Utc>) -> Result<bool> {
         let changed = self
             .client()
             .await?
             .execute(
-                "UPDATE waitlist SET status = $1, approved_at = $2
+                "UPDATE users SET status = $1, approved_at = $2
                   WHERE id = $3 AND status = $4",
-                &[&WAITLIST_APPROVED, &stamp(now), &id, &WAITLIST_PENDING],
+                &[&USER_APPROVED, &stamp(now), &id, &USER_PENDING],
             )
             .await?;
         Ok(changed == 1)
     }
 
-    /// Point a waitlist row at the invite minted for it, CLEARING the notified
+    /// Point a user row at the invite minted for it, CLEARING the notified
     /// stamp in the same statement: a fresh code has not been delivered yet,
     /// and a stamp left over from the previous one would show "invited" for an
     /// email that has not gone out.
@@ -957,7 +1060,7 @@ impl ControlStore {
     /// `IS NOT DISTINCT FROM` rather than `=`, so a `None` expectation matches
     /// the NULL a row carries before its first invite; tokio-postgres binds
     /// `None` as NULL, and `= NULL` is NULL, which is not true.
-    pub async fn set_waitlist_invite(
+    pub async fn set_user_invite(
         &self,
         id: i64,
         invite_id: i64,
@@ -967,7 +1070,7 @@ impl ControlStore {
             .client()
             .await?
             .execute(
-                "UPDATE waitlist SET invite_id = $2, notified_at = NULL
+                "UPDATE users SET invite_id = $2, notified_at = NULL
                   WHERE id = $1 AND invite_id IS NOT DISTINCT FROM $3",
                 &[&id, &invite_id, &expected_prior],
             )
@@ -985,7 +1088,7 @@ impl ControlStore {
     /// The row would then read "invited" for an email that may still fail, and
     /// the badge that would have told the operator to press the button again is
     /// the one thing this page cannot afford to get wrong.
-    pub async fn mark_waitlist_notified(
+    pub async fn mark_user_notified(
         &self,
         id: i64,
         invite_id: i64,
@@ -995,28 +1098,213 @@ impl ControlStore {
             .client()
             .await?
             .execute(
-                "UPDATE waitlist SET notified_at = $3 WHERE id = $1 AND invite_id = $2",
+                "UPDATE users SET notified_at = $3 WHERE id = $1 AND invite_id = $2",
                 &[&id, &invite_id, &stamp(now)],
             )
             .await?;
         Ok(changed == 1)
     }
+
+    /// Put the person who has just finished signup on the funnel, and hand back
+    /// the id analytics knows them by.
+    ///
+    /// TWO DOORS, TRIED IN ORDER, because an invite code does not always name
+    /// somebody.
+    ///
+    /// ARM 1 IS THE POINTER, and it is the mailed-invite door: a code was minted
+    /// FOR a row, so the row naming this invite IS the person, whatever address
+    /// the Google account turned out to be. It promotes the row to approved with
+    /// `approved_at` COALESCEd, which is a no-op for every row an operator
+    /// approved and the repair for a row that reached an invite some other way.
+    ///
+    /// ARM 2 IS THE CLI DOOR: `invite issue` mints a code addressed to nobody,
+    /// so on a pointer miss the only identity in hand is the Google account, and
+    /// the row is found-or-created by it. `approved_at` is deliberately NOT
+    /// stamped there: nobody approved them, they had a code. When the account
+    /// matches somebody already waiting, this PROMOTES the row they have rather
+    /// than making a second one for one person.
+    ///
+    /// THE ANALYTICS ID IS NEVER RE-MINTED ON A RESOLVE. Both arms `RETURNING`
+    /// it off the row they landed on, and arm 2's conflict arm does not touch
+    /// the column, so a second signup by the same person answers with the id
+    /// they already had. A fresh one would split them into two strangers in
+    /// PostHog with no way back, which is the one analytics failure that cannot
+    /// be repaired after the fact.
+    ///
+    /// LAST WRITE WINS on the three funnel columns, on purpose: they describe
+    /// ONE signup between them, and the row records the mailbox this person is
+    /// using NOW. A first-write-wins `signed_up_at` beside a moving
+    /// `tenant_label` would be a stamp dating a different mailbox from the one
+    /// it sits next to.
+    pub async fn record_signup(
+        &self,
+        invite_id: i64,
+        account_email: &str,
+        tenant_label: &str,
+        now: DateTime<Utc>,
+    ) -> Result<SignupRecord> {
+        let email = normalize_email(account_email);
+        let at = stamp(now);
+        let client = self.client().await?;
+        // `query` rather than `query_opt`: one invite names one row by every
+        // path this crate has, and if a hand repair ever made that untrue, the
+        // first row is a recorded signup where `query_opt`'s "more than one row"
+        // error would be a lost one. This runs after the mailbox already exists,
+        // so the conservative direction is to record something.
+        let hit = client
+            .query(
+                "UPDATE users
+                    SET signed_up_at = $2, account_email = $3, tenant_label = $4,
+                        status = $5, approved_at = COALESCE(approved_at, $2)
+                  WHERE invite_id = $1
+                RETURNING id, analytics_id",
+                &[&invite_id, &at, &email, &tenant_label, &USER_APPROVED],
+            )
+            .await?;
+        if let Some(row) = hit.first() {
+            return Ok(SignupRecord {
+                user_id: row.try_get(0)?,
+                analytics_id: row.try_get(1)?,
+            });
+        }
+
+        let row = client
+            .query_one(
+                "INSERT INTO users(email, created_at, status, signed_up_at,
+                                   account_email, tenant_label, analytics_id)
+                      VALUES($1, $2, $3, $2, $1, $4, $5)
+                 ON CONFLICT (email) DO UPDATE
+                    SET status = $3,
+                        signed_up_at = EXCLUDED.signed_up_at,
+                        account_email = EXCLUDED.account_email,
+                        tenant_label = EXCLUDED.tenant_label
+                 RETURNING id, analytics_id",
+                &[
+                    &email,
+                    &at,
+                    &USER_APPROVED,
+                    &tenant_label,
+                    &mint_analytics_id()?,
+                ],
+            )
+            .await?;
+        Ok(SignupRecord {
+            user_id: row.try_get(0)?,
+            analytics_id: row.try_get(1)?,
+        })
+    }
+
+    /// Stamp activation: the first time a device that is not the console paired
+    /// with this person's daemon. `true` means THIS call stamped it.
+    ///
+    /// `first_paired_at IS NULL` is the whole guard, and FIRST STAMP WINS: the
+    /// poller asks the same question on a ticker, and a pairing that happened
+    /// months ago is still the same first pairing, so a later answer must not
+    /// move the date.
+    ///
+    /// `ts` IS THE DAEMON'S ANSWER, NOT `now`, and that distinction is the point
+    /// of the argument existing. It is when the pairing actually happened, read
+    /// out of the tenant's own device table and carried here through the warden;
+    /// stamping the moment of NOTICING instead would date every early adopter to
+    /// the day this feature shipped and make the funnel's most interesting
+    /// column a record of a deploy.
+    ///
+    /// One label is one person: `tenants.label` is unique for the life of the
+    /// database, so exactly one row can carry it.
+    pub async fn mark_user_first_paired(
+        &self,
+        tenant_label: &str,
+        ts: DateTime<Utc>,
+    ) -> Result<bool> {
+        let changed = self
+            .client()
+            .await?
+            .execute(
+                "UPDATE users SET first_paired_at = $2
+                  WHERE tenant_label = $1 AND first_paired_at IS NULL",
+                &[&tenant_label, &stamp(ts)],
+            )
+            .await?;
+        Ok(changed == 1)
+    }
+
+    /// The analytics id of whoever owns `tenant_label`, for the deep link a
+    /// re-pair builds.
+    ///
+    /// `None` covers "no such tenant" and "a tenant with no funnel row" alike,
+    /// and the caller renders a link without the decoration either way: pairing
+    /// must never fail over analytics.
+    ///
+    /// `LIMIT 1` on a lookup that is one row by construction, so that a row
+    /// somebody repaired by hand cannot turn a sign-in link into an error.
+    pub async fn analytics_id_for_label(&self, tenant_label: &str) -> Result<Option<String>> {
+        let row = self
+            .client()
+            .await?
+            .query_opt(
+                "SELECT analytics_id FROM users WHERE tenant_label = $1 ORDER BY id LIMIT 1",
+                &[&tenant_label],
+            )
+            .await?;
+        row.map(|r| Ok(r.try_get(0)?)).transpose()
+    }
+
+    /// The labels whose owners have signed up and have not paired a device yet,
+    /// oldest signup first, at most `limit` of them.
+    ///
+    /// SELF-QUIESCING BY CONSTRUCTION, which is what makes it safe to put on a
+    /// ticker: every answer that gets stamped drops out of the next one
+    /// (`first_paired_at IS NULL`), and every answer that never gets stamped
+    /// ages out of the window on its own. A fleet where everybody has paired
+    /// returns nothing, and the poller then does no cluster work at all.
+    ///
+    /// THE WINDOW IS THE GIVE-UP. Somebody who signed up three months ago and
+    /// has never opened the app will not be answered by one more exec into their
+    /// pod, and without a bound the poller would keep asking for as long as the
+    /// tenant exists. [`FIRST_PAIR_WINDOW_DAYS`] is where that stops.
+    ///
+    /// THE JOIN IS PART OF THE QUESTION, not a filter on the answer: asking the
+    /// warden about a tenant that was torn down is an exec that cannot succeed,
+    /// so only labels with an ACTIVE tenant row are candidates. It also makes
+    /// the NULL `tenant_label` case fall out for free.
+    ///
+    /// The window compare is a STRING compare, which is exactly what the
+    /// `COLLATE "C"` on the column is for (see [`SCHEMA`]).
+    pub async fn users_awaiting_first_pair(&self, limit: i64) -> Result<Vec<String>> {
+        let since = stamp(Utc::now() - chrono::Duration::days(FIRST_PAIR_WINDOW_DAYS));
+        let rows = self
+            .client()
+            .await?
+            .query(
+                "SELECT u.tenant_label
+                   FROM users u
+                   JOIN tenants t ON t.label = u.tenant_label AND t.status = $3
+                  WHERE u.signed_up_at IS NOT NULL
+                    AND u.first_paired_at IS NULL
+                    AND u.signed_up_at > $1
+                  ORDER BY u.signed_up_at ASC
+                  LIMIT $2",
+                &[&since, &limit, &STATUS_ACTIVE],
+            )
+            .await?;
+        rows.iter().map(|r| Ok(r.try_get(0)?)).collect()
+    }
 }
 
 /// Run one of the listing statements above inside a transaction the caller
 /// already opened, so both halves of a listing read the same snapshot.
-async fn select_waitlist(
+async fn select_users(
     tx: &Transaction<'_>,
     sql: &str,
     params: &[&(dyn ToSql + Sync)],
-) -> Result<Vec<WaitlistRow>> {
+) -> Result<Vec<UserRow>> {
     let rows = tx.query(sql, params).await?;
-    rows.iter().map(waitlist_row).collect()
+    rows.iter().map(user_row).collect()
 }
 
-/// One `waitlist` row in the column order every statement above selects.
-fn waitlist_row(r: &Row) -> Result<WaitlistRow> {
-    Ok(WaitlistRow {
+/// One `users` row in the column order every statement above selects.
+fn user_row(r: &Row) -> Result<UserRow> {
+    Ok(UserRow {
         id: r.try_get(0)?,
         email: r.try_get(1)?,
         created_at: parse_ts(r.try_get::<_, String>(2)?),
@@ -1024,8 +1312,10 @@ fn waitlist_row(r: &Row) -> Result<WaitlistRow> {
         approved_at: r.try_get::<_, Option<String>>(4)?.map(parse_ts),
         invite_id: r.try_get(5)?,
         notified_at: r.try_get::<_, Option<String>>(6)?.map(parse_ts),
-        accepted_at: r.try_get::<_, Option<String>>(7)?.map(parse_ts),
-        accepted_label: r.try_get(8)?,
+        signed_up_at: r.try_get::<_, Option<String>>(7)?.map(parse_ts),
+        tenant_label: r.try_get(8)?,
+        account_email: r.try_get(9)?,
+        first_paired_at: r.try_get::<_, Option<String>>(10)?.map(parse_ts),
     })
 }
 
@@ -1052,17 +1342,26 @@ fn tenant_row(r: &Row) -> Result<TenantRow> {
     })
 }
 
-/// The columns every waitlist statement selects, in the order
-/// [`waitlist_row`] reads them.
+/// The columns every user statement selects, in the order [`user_row`] reads
+/// them.
 ///
-/// The LEFT JOIN is what makes redemption visible without a second round trip
-/// and without a column of its own: `invite_codes` already records who spent a
-/// code and when, and `waitlist.invite_id` already points at the row. LEFT, not
-/// inner, because a pending row has no invite and an approved row whose code
-/// was revoked from the CLI points at nothing; both must still be listed.
-const WAITLIST_COLUMNS: &str = "w.id, w.email, w.created_at, w.status, w.approved_at,
-        w.invite_id, w.notified_at, i.used_at, i.used_by_label
-   FROM waitlist w LEFT JOIN invite_codes i ON i.id = w.invite_id";
+/// The LEFT JOIN is what made redemption visible before there was a column for
+/// it, and it stays as the belt to that column's braces: `invite_codes` already
+/// records who spent a code and when, and `users.invite_id` already points at
+/// the row, so `COALESCE(u.signed_up_at, i.used_at)` answers both for a row
+/// whose signup predates the column and for the fail-soft window where a mailbox
+/// was provisioned and the funnel write did not land. LEFT, not inner, because a
+/// pending row has no invite and an approved row whose code was revoked from the
+/// CLI points at nothing; both must still be listed.
+///
+/// NO `analytics_id` IN THIS LIST. It would be one `SELECT` away from the
+/// address beside it on the page, and the module doc says why that is the one
+/// join this crate does not make.
+const USER_COLUMNS: &str = "u.id, u.email, u.created_at, u.status, u.approved_at,
+        u.invite_id, u.notified_at,
+        COALESCE(u.signed_up_at, i.used_at), COALESCE(u.tenant_label, i.used_by_label),
+        u.account_email, u.first_paired_at
+   FROM users u LEFT JOIN invite_codes i ON i.id = u.invite_id";
 
 /// Bring an older database's tables up to the schema above.
 ///
@@ -1077,7 +1376,8 @@ const WAITLIST_COLUMNS: &str = "w.id, w.email, w.created_at, w.status, w.approve
 async fn migrate(tx: &Transaction<'_>) -> Result<()> {
     add_missing_columns(tx, "invite_codes", &ADDED_COLUMNS).await?;
     add_missing_columns(tx, "tenants", &TENANT_ADDED_COLUMNS).await?;
-    backfill_expiry(tx).await
+    backfill_expiry(tx).await?;
+    backfill_users(tx).await
 }
 
 /// `ADD COLUMN IF NOT EXISTS` per column, which is the whole of it on Postgres:
@@ -1132,6 +1432,235 @@ async fn backfill_expiry(tx: &Transaction<'_>) -> Result<()> {
         .await?;
     }
     Ok(())
+}
+
+/// Bring every person this control plane already knows about onto `users`.
+///
+/// THREE PASSES, RUN ON EVERY INIT, all of them idempotent. That is not
+/// belt-and-braces: `init` runs on every connect (every boot, every CLI
+/// invocation), so "runs once" is not a property anything here can have, and a
+/// pass that is not idempotent would be a pass that corrupts on the second boot.
+/// They run inside `init`'s advisory-locked transaction, so on Postgres — where
+/// DDL is transactional — the whole move either lands or does not.
+///
+/// THE ROLLBACK STORY, because this one drops a table. Redeploying a PR-1 binary
+/// after this has run recreates `waitlist` through its own `CREATE TABLE IF NOT
+/// EXISTS`, EMPTY: the old code then serves an empty waitlist page while every
+/// person is sitting in `users`, which reads as data loss and is not. Rolling
+/// forward again sweeps whatever that binary collected into `users` and drops
+/// the table a second time. THE ACCEPTED RESIDUAL is that an old binary's
+/// actions on an address that was already migrated do not merge forward: it
+/// would write a NEW `waitlist` row for somebody who already has a `users` row,
+/// and the sweep's `ON CONFLICT (email) DO NOTHING` keeps the newer truth in
+/// `users` and discards the older one. Floated invite codes expire on their own.
+async fn backfill_users(tx: &Transaction<'_>) -> Result<()> {
+    sweep_waitlist(tx).await?;
+    repair_signups(tx).await?;
+    adopt_cli_tenants(tx).await
+}
+
+/// PASS 1: move a `waitlist` table into `users`, then drop it.
+///
+/// `to_regclass` resolves through `search_path`, which is what makes this
+/// correct under the tests' throwaway schemas as well as in production: an
+/// unqualified name is the same name every other statement in this file uses. It
+/// answers NULL rather than raising for a table that is not there, which is the
+/// only catalog check that does not need its own error arm.
+///
+/// ROW BY ROW IN RUST, on the `backfill_expiry` precedent, and here for a
+/// stronger reason than the shape of a timestamp: every row needs its OWN
+/// `analytics_id`, and SQL has no way to mint one per row from this crate's
+/// random source.
+///
+/// IDS ARE DELIBERATELY NOT PRESERVED. Nothing points AT a waitlist row — the
+/// pointers all run the other way, `waitlist.invite_id` naming an invite — so
+/// renumbering costs nothing, while preserving would collide the day the
+/// rollback path above recreates the table and its identity restarts at 1.
+async fn sweep_waitlist(tx: &Transaction<'_>) -> Result<()> {
+    let present: bool = tx
+        .query_one("SELECT to_regclass('waitlist') IS NOT NULL", &[])
+        .await?
+        .try_get(0)?;
+    if !present {
+        return Ok(());
+    }
+
+    let rows = tx
+        .query(
+            "SELECT email, created_at, status, approved_at, invite_id, notified_at
+               FROM waitlist ORDER BY id",
+            &[],
+        )
+        .await?;
+    for row in &rows {
+        let email: String = row.try_get(0)?;
+        let created_at: String = row.try_get(1)?;
+        let status: String = row.try_get(2)?;
+        let approved_at: Option<String> = row.try_get(3)?;
+        let invite_id: Option<i64> = row.try_get(4)?;
+        let notified_at: Option<String> = row.try_get(5)?;
+        // DO NOTHING rather than DO UPDATE: a `users` row for this address is
+        // either the same person already swept (a second boot) or the newer
+        // truth (the rollback residual above), and neither wants an older
+        // waitlist row written over it.
+        tx.execute(
+            "INSERT INTO users(email, created_at, status, approved_at, invite_id,
+                               notified_at, analytics_id)
+                  VALUES($1, $2, $3, $4, $5, $6, $7)
+             ON CONFLICT (email) DO NOTHING",
+            &[
+                &normalize_email(&email),
+                &created_at,
+                &status,
+                &approved_at,
+                &invite_id,
+                &notified_at,
+                &mint_analytics_id()?,
+            ],
+        )
+        .await?;
+    }
+
+    // The table goes, and that is what makes the migration finished rather than
+    // ongoing: two tables holding the same people is the state where a write
+    // lands in the one nothing reads.
+    tx.batch_execute("DROP TABLE waitlist").await?;
+    Ok(())
+}
+
+/// PASS 2: fill in what the invite trail already knows.
+///
+/// The invited half of the funnel recorded redemption in `invite_codes` all
+/// along, and `users.invite_id` points at it, so a row whose code is SPENT has a
+/// signup date and a mailbox that were never copied onto it. This is the copy,
+/// and it runs on every init rather than only at the sweep: it is also the
+/// repair for the fail-soft window where a signup completed and its
+/// `record_signup` did not land.
+///
+/// TWO STATEMENTS, SET-BASED, because neither needs anything minted: the values
+/// are already in the database and this is a join, not a mint.
+///
+/// `signed_up_at IS NULL` and `account_email IS NULL` are the guards that make
+/// both idempotent AND keep them from overwriting live truth: a row
+/// `record_signup` has already written is left exactly alone.
+async fn repair_signups(tx: &Transaction<'_>) -> Result<()> {
+    tx.execute(
+        "UPDATE users u
+            SET signed_up_at = i.used_at, tenant_label = i.used_by_label
+           FROM invite_codes i
+          WHERE i.id = u.invite_id
+            AND u.signed_up_at IS NULL
+            AND i.used_at IS NOT NULL",
+        &[],
+    )
+    .await?;
+    // The address the tenant was provisioned for, which is the Google account
+    // that redeemed the code. NOT assumed equal to `users.email`: that
+    // assumption is exactly what a bearer invite breaks, and writing it down is
+    // how the board can say the two differ.
+    tx.execute(
+        "UPDATE users u
+            SET account_email = t.account_email
+           FROM tenants t
+          WHERE t.label = u.tenant_label
+            AND u.account_email IS NULL",
+        &[],
+    )
+    .await?;
+    Ok(())
+}
+
+/// PASS 3: give every tenant nobody has a row for one.
+///
+/// A CLI code names nobody, so a tenant provisioned from one has no waitlist
+/// ancestry at all: before this pass those people were invisible to the funnel
+/// even though they are the ones actually using the product. The tenant row is
+/// all the evidence there is, so it is what the row is built from — keyed on
+/// `tenants.account_email`, since that is the only address in the story.
+///
+/// `approved_at` STAYS NULL, deliberately. Nobody approved them; they had a
+/// code. `signed_up_at` is the tenant's `created_at`, which is the closest thing
+/// to the truth that survives: the moment their mailbox came into existence.
+///
+/// THE CONFLICT ARM IS ALL COALESCE, because this is a repair and not a signup:
+/// it fills blanks on a row that already exists (somebody who was waiting under
+/// this same address and redeemed a CLI code) and overwrites nothing. It never
+/// touches `analytics_id`.
+///
+/// SELF-LIMITING: only tenants no `users` row names are selected, and the upsert
+/// gives each of them a row that names them, so the candidate set empties. The
+/// one shape that does not quiesce is two tenants sharing one account address
+/// (a torn-down mailbox and its replacement): the second stays a candidate and
+/// costs one no-op upsert per boot, which is cheaper than the column that would
+/// be needed to remember it.
+async fn adopt_cli_tenants(tx: &Transaction<'_>) -> Result<()> {
+    let rows = tx
+        .query(
+            "SELECT t.label, t.account_email, t.created_at
+               FROM tenants t
+              WHERE NOT EXISTS (SELECT 1 FROM users u WHERE u.tenant_label = t.label)
+              ORDER BY t.id",
+            &[],
+        )
+        .await?;
+    for row in &rows {
+        let label: String = row.try_get(0)?;
+        let account_email: String = row.try_get(1)?;
+        let created_at: String = row.try_get(2)?;
+        tx.execute(
+            "INSERT INTO users(email, created_at, status, signed_up_at,
+                               account_email, tenant_label, analytics_id)
+                  VALUES($1, $2, $3, $2, $1, $4, $5)
+             ON CONFLICT (email) DO UPDATE
+                SET status = $3,
+                    signed_up_at  = COALESCE(users.signed_up_at, EXCLUDED.signed_up_at),
+                    account_email = COALESCE(users.account_email, EXCLUDED.account_email),
+                    tenant_label  = COALESCE(users.tenant_label, EXCLUDED.tenant_label)",
+            &[
+                &normalize_email(&account_email),
+                &created_at,
+                &USER_APPROVED,
+                &label,
+                &mint_analytics_id()?,
+            ],
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+/// Mint one `analytics_id`: 128 bits from the OS, dressed as a UUIDv4.
+///
+/// THE DRESS IS THE POINT, not the randomness. PostHog's `distinct_id` is an
+/// opaque string and would take any of them, but the app holds an adopted id to
+/// a UUID shape before it will adopt it (a cheap check that a link's decoration
+/// is one of ours), so the shape is a contract with the client rather than a
+/// convention. Version and variant bits are set so it is a WELL-FORMED v4 and
+/// not merely 32 hex characters with dashes in familiar places.
+///
+/// 16 bytes in one draw from [`getrandom::fill`], the house pattern
+/// ([`crate::invites::mint`]), and the same failure treatment: entropy failing
+/// is a machine problem the caller reports rather than a panic.
+///
+/// `pub(crate)` for one caller outside this file: [`crate::import`], which
+/// writes `users` rows the legacy SQLite store had no column for and must mint
+/// each of them an id the same way every other row here gets one.
+pub(crate) fn mint_analytics_id() -> Result<String> {
+    let mut bytes = [0u8; 16];
+    getrandom::fill(&mut bytes).map_err(std::io::Error::other)?;
+    // Version 4 in the high nibble of byte 6, RFC 4122 variant in the top two
+    // bits of byte 8.
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+    Ok(format!(
+        "{}-{}-{}-{}-{}",
+        &hex[0..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..32]
+    ))
 }
 
 /// Gmail addresses are compared case-insensitively, so the column stores one
@@ -1815,16 +2344,16 @@ SQUELCH_TEST_PG_URL is not set, and these tests run against a real Postgres.
     /// The public form can be submitted twice, from two tabs, with two
     /// capitalizations. The operator sees ONE person to approve.
     #[tokio::test]
-    async fn an_address_joins_the_waitlist_once() {
+    async fn an_address_joins_the_funnel_once() {
         let s = store().await;
-        assert!(s.add_to_waitlist("Ada@Example.com").await.unwrap());
-        assert!(!s.add_to_waitlist("ada@example.com").await.unwrap());
-        assert!(!s.add_to_waitlist("  ADA@EXAMPLE.COM  ").await.unwrap());
+        assert!(s.add_user_waiting("Ada@Example.com").await.unwrap());
+        assert!(!s.add_user_waiting("ada@example.com").await.unwrap());
+        assert!(!s.add_user_waiting("  ADA@EXAMPLE.COM  ").await.unwrap());
 
-        let rows = s.list_waitlist().await.unwrap();
+        let rows = s.list_users().await.unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].email, "ada@example.com");
-        assert_eq!(rows[0].status, WAITLIST_PENDING);
+        assert_eq!(rows[0].status, USER_PENDING);
         assert_eq!(rows[0].approved_at, None);
         assert_eq!(rows[0].invite_id, None);
         assert_eq!(rows[0].notified_at, None);
@@ -1833,26 +2362,26 @@ SQUELCH_TEST_PG_URL is not set, and these tests run against a real Postgres.
     /// THE RACE THE ADMIN PAGE IS ABOUT: one row, two clicks. Only the first
     /// transition wins, so only one invite is ever minted for one person.
     #[tokio::test]
-    async fn a_waitlist_row_is_approved_exactly_once() {
+    async fn a_user_row_is_approved_exactly_once() {
         let s = store().await;
-        s.add_to_waitlist("ada@example.com").await.unwrap();
-        let id = s.list_waitlist().await.unwrap()[0].id;
+        s.add_user_waiting("ada@example.com").await.unwrap();
+        let id = s.list_users().await.unwrap()[0].id;
         let now = now();
 
-        assert!(s.approve_waitlist(id, now).await.unwrap());
+        assert!(s.approve_user(id, now).await.unwrap());
         assert!(
-            !s.approve_waitlist(id, now + days(1)).await.unwrap(),
+            !s.approve_user(id, now + days(1)).await.unwrap(),
             "the second click mints nothing"
         );
-        let row = s.waitlist_entry(id).await.unwrap().expect("still there");
-        assert_eq!(row.status, WAITLIST_APPROVED);
+        let row = s.user_entry(id).await.unwrap().expect("still there");
+        assert_eq!(row.status, USER_APPROVED);
         assert_eq!(row.approved_at, Some(now), "and keeps the first stamp");
 
         assert!(
-            !s.approve_waitlist(id + 1, now).await.unwrap(),
+            !s.approve_user(id + 1, now).await.unwrap(),
             "no such row"
         );
-        assert!(s.waitlist_entry(id + 1).await.unwrap().is_none());
+        assert!(s.user_entry(id + 1).await.unwrap().is_none());
     }
 
     /// The invite pointer and the delivery stamp round-trip in the same
@@ -1862,43 +2391,43 @@ SQUELCH_TEST_PG_URL is not set, and these tests run against a real Postgres.
     #[tokio::test]
     async fn the_invite_and_its_delivery_stamp_ride_on_the_row() {
         let s = store().await;
-        s.add_to_waitlist("ada@example.com").await.unwrap();
-        let id = s.list_waitlist().await.unwrap()[0].id;
+        s.add_user_waiting("ada@example.com").await.unwrap();
+        let id = s.list_users().await.unwrap()[0].id;
         let now = now();
-        s.approve_waitlist(id, now).await.unwrap();
+        s.approve_user(id, now).await.unwrap();
 
-        assert!(s.set_waitlist_invite(id, 7, None).await.unwrap());
-        let row = s.waitlist_entry(id).await.unwrap().unwrap();
+        assert!(s.set_user_invite(id, 7, None).await.unwrap());
+        let row = s.user_entry(id).await.unwrap().unwrap();
         assert_eq!(row.invite_id, Some(7));
         assert_eq!(row.notified_at, None, "nothing sent yet");
 
-        assert!(s.mark_waitlist_notified(id, 7, now).await.unwrap());
+        assert!(s.mark_user_notified(id, 7, now).await.unwrap());
         assert_eq!(
-            s.waitlist_entry(id).await.unwrap().unwrap().notified_at,
+            s.user_entry(id).await.unwrap().unwrap().notified_at,
             Some(now)
         );
 
         // A fresh invite for the same person: new pointer, no stamp.
-        assert!(s.set_waitlist_invite(id, 9, Some(7)).await.unwrap());
-        let row = s.waitlist_entry(id).await.unwrap().unwrap();
+        assert!(s.set_user_invite(id, 9, Some(7)).await.unwrap());
+        let row = s.user_entry(id).await.unwrap().unwrap();
         assert_eq!(row.invite_id, Some(9));
         assert_eq!(row.notified_at, None, "the old delivery is not this one");
 
         // A send for the code the row has MOVED OFF stamps nothing: its
         // delivery is not the one this row is waiting on.
-        assert!(!s.mark_waitlist_notified(id, 7, now).await.unwrap());
+        assert!(!s.mark_user_notified(id, 7, now).await.unwrap());
         assert_eq!(
-            s.waitlist_entry(id).await.unwrap().unwrap().notified_at,
+            s.user_entry(id).await.unwrap().unwrap().notified_at,
             None,
             "the row still wants to hear about the code it names"
         );
-        assert!(s.mark_waitlist_notified(id, 9, now).await.unwrap());
+        assert!(s.mark_user_notified(id, 9, now).await.unwrap());
 
         assert!(
-            !s.set_waitlist_invite(id + 1, 7, None).await.unwrap(),
+            !s.set_user_invite(id + 1, 7, None).await.unwrap(),
             "no such row"
         );
-        assert!(!s.mark_waitlist_notified(id + 1, 7, now).await.unwrap());
+        assert!(!s.mark_user_notified(id + 1, 7, now).await.unwrap());
     }
 
     /// The reservation check has to travel WITH the delete, because two
@@ -1937,27 +2466,27 @@ SQUELCH_TEST_PG_URL is not set, and these tests run against a real Postgres.
     #[tokio::test]
     async fn a_stale_expectation_loses_the_pointer() {
         let s = store().await;
-        s.add_to_waitlist("ada@example.com").await.unwrap();
-        let id = s.list_waitlist().await.unwrap()[0].id;
-        s.approve_waitlist(id, now()).await.unwrap();
+        s.add_user_waiting("ada@example.com").await.unwrap();
+        let id = s.list_users().await.unwrap()[0].id;
+        s.approve_user(id, now()).await.unwrap();
 
         // Both callers read the same empty pointer. The first wins it.
-        assert!(s.set_waitlist_invite(id, 11, None).await.unwrap());
+        assert!(s.set_user_invite(id, 11, None).await.unwrap());
         assert!(
-            !s.set_waitlist_invite(id, 12, None).await.unwrap(),
+            !s.set_user_invite(id, 12, None).await.unwrap(),
             "the second read a pointer that has since moved"
         );
         assert_eq!(
-            s.waitlist_entry(id).await.unwrap().unwrap().invite_id,
+            s.user_entry(id).await.unwrap().unwrap().invite_id,
             Some(11),
             "and the loser left the row alone"
         );
 
         // A caller that read the CURRENT pointer replaces it, which is the
         // re-send path.
-        assert!(s.set_waitlist_invite(id, 13, Some(11)).await.unwrap());
+        assert!(s.set_user_invite(id, 13, Some(11)).await.unwrap());
         assert_eq!(
-            s.waitlist_entry(id).await.unwrap().unwrap().invite_id,
+            s.user_entry(id).await.unwrap().unwrap().invite_id,
             Some(13)
         );
     }
@@ -1969,19 +2498,19 @@ SQUELCH_TEST_PG_URL is not set, and these tests run against a real Postgres.
     async fn the_listing_puts_the_longest_wait_first() {
         let s = store().await;
         for who in ["a@example.com", "b@example.com", "c@example.com"] {
-            s.add_to_waitlist(who).await.unwrap();
+            s.add_user_waiting(who).await.unwrap();
         }
         let ids: Vec<i64> = s
-            .list_waitlist()
+            .list_users()
             .await
             .unwrap()
             .iter()
             .map(|r| r.id)
             .collect();
-        s.approve_waitlist(ids[0], now()).await.unwrap();
-        s.approve_waitlist(ids[1], now()).await.unwrap();
+        s.approve_user(ids[0], now()).await.unwrap();
+        s.approve_user(ids[1], now()).await.unwrap();
 
-        let rows = s.list_waitlist().await.unwrap();
+        let rows = s.list_users().await.unwrap();
         let emails: Vec<&str> = rows.iter().map(|r| r.email.as_str()).collect();
         assert_eq!(
             emails,
@@ -2013,5 +2542,541 @@ SQUELCH_TEST_PG_URL is not set, and these tests run against a real Postgres.
                 .unwrap(),
             None
         );
+    }
+
+    /// The raw `analytics_id` cell for a row.
+    ///
+    /// Read here rather than off a [`UserRow`] because no method returns it, on
+    /// purpose: the row type is what the page that renders addresses is handed,
+    /// and this id must never be on a screen or a log line beside one.
+    async fn analytics_id(s: &ControlStore, id: i64) -> String {
+        s.client()
+            .await
+            .unwrap()
+            .query_one("SELECT analytics_id FROM users WHERE id = $1", &[&id])
+            .await
+            .unwrap()
+            .get(0)
+    }
+
+    /// Whether a string is shaped like the UUIDv4 [`mint_analytics_id`] writes:
+    /// 8-4-4-4-12 lowercase hex, version nibble 4, variant in `89ab`. The app
+    /// holds an adopted id to this shape before it will adopt it, so the shape
+    /// is a contract with the client rather than a convention.
+    fn is_uuid_shaped(s: &str) -> bool {
+        let parts: Vec<&str> = s.split('-').collect();
+        parts.len() == 5
+            && parts.iter().map(|p| p.len()).collect::<Vec<_>>() == [8, 4, 4, 4, 12]
+            && parts
+                .iter()
+                .all(|p| p.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()))
+            && parts[2].starts_with('4')
+            && matches!(parts[3].as_bytes()[0], b'8' | b'9' | b'a' | b'b')
+    }
+
+    /// One id per person, shaped the way the app will insist on, and NEVER
+    /// rotated by anything an operator does to the row. A rotation would split
+    /// one person into two strangers in PostHog with no way back, so every act
+    /// on a row is checked against the id it started with.
+    #[tokio::test]
+    async fn an_analytics_id_is_minted_once_and_never_rotates() {
+        let s = store().await;
+        s.add_user_waiting("ada@example.com").await.unwrap();
+        s.add_user_waiting("grace@example.com").await.unwrap();
+        let rows = s.list_users().await.unwrap();
+        let (ada, grace) = (rows[0].id, rows[1].id);
+
+        let ada_id = analytics_id(&s, ada).await;
+        let grace_id = analytics_id(&s, grace).await;
+        assert!(is_uuid_shaped(&ada_id), "{ada_id}");
+        assert!(is_uuid_shaped(&grace_id), "{grace_id}");
+        assert_ne!(ada_id, grace_id, "one id per person");
+
+        // Approving them, pointing them at a code, and replacing that code with
+        // a fresh one are all acts on the SAME person.
+        s.approve_user(ada, now()).await.unwrap();
+        assert_eq!(analytics_id(&s, ada).await, ada_id, "approval keeps it");
+        s.set_user_invite(ada, 7, None).await.unwrap();
+        assert_eq!(analytics_id(&s, ada).await, ada_id, "the invite keeps it");
+        s.set_user_invite(ada, 9, Some(7)).await.unwrap();
+        assert_eq!(analytics_id(&s, ada).await, ada_id, "a re-send keeps it");
+
+        // A direct invite landing on somebody already waiting is the subtle one:
+        // its INSERT arm mints an id, and the UPDATE arm it actually takes has
+        // to throw that mint away rather than write it.
+        assert_eq!(
+            s.invite_directly("grace@example.com", now()).await.unwrap(),
+            Some(grace)
+        );
+        assert_eq!(
+            analytics_id(&s, grace).await,
+            grace_id,
+            "being invited does not make them a new person"
+        );
+    }
+
+    /// THE MAILED-INVITE DOOR: the row a code was minted for is the person who
+    /// spent it, whatever address the Google account turns out to be. That
+    /// mismatch is the whole reason `account_email` exists, and a bearer code is
+    /// why it cannot be assumed away.
+    #[tokio::test]
+    async fn a_signup_lands_on_the_row_its_invite_was_minted_for() {
+        let s = store().await;
+        s.add_user_waiting("ada@example.com").await.unwrap();
+        let id = s.list_users().await.unwrap()[0].id;
+        s.approve_user(id, now()).await.unwrap();
+        s.set_user_invite(id, 7, None).await.unwrap();
+        let before = analytics_id(&s, id).await;
+
+        let at = now();
+        let rec = s
+            .record_signup(7, "Ada.Work@Example.com", "ada", at)
+            .await
+            .unwrap();
+        assert_eq!(rec.user_id, id, "found by the pointer, not by the address");
+        assert_eq!(rec.analytics_id, before, "the id they already had");
+
+        let row = s.user_entry(id).await.unwrap().unwrap();
+        assert_eq!(row.email, "ada@example.com", "the invited address is kept");
+        assert_eq!(
+            row.account_email.as_deref(),
+            Some("ada.work@example.com"),
+            "and the one that signed up is recorded beside it, normalized"
+        );
+        assert_eq!(row.tenant_label.as_deref(), Some("ada"));
+        assert_eq!(row.signed_up_at, Some(at));
+        assert_eq!(row.status, USER_APPROVED);
+        assert_eq!(s.list_users().await.unwrap().len(), 1, "one person, one row");
+    }
+
+    /// THE CLI DOOR: `invite issue` mints a code addressed to nobody, so the
+    /// pointer misses and the Google account is the only identity in hand. The
+    /// row appears at consumption, and `approved_at` stays NULL because nobody
+    /// approved them.
+    #[tokio::test]
+    async fn a_cli_code_records_the_account_that_redeemed_it() {
+        let s = store().await;
+        let at = now();
+        let rec = s
+            .record_signup(404, "Hopper@Example.com", "hopper", at)
+            .await
+            .unwrap();
+
+        let row = s.user_entry(rec.user_id).await.unwrap().unwrap();
+        assert_eq!(row.email, "hopper@example.com", "known by their account");
+        assert_eq!(row.account_email.as_deref(), Some("hopper@example.com"));
+        assert_eq!(row.tenant_label.as_deref(), Some("hopper"));
+        assert_eq!(row.signed_up_at, Some(at));
+        assert_eq!(row.status, USER_APPROVED);
+        assert_eq!(
+            row.approved_at, None,
+            "nobody approved them, they had a code"
+        );
+        assert!(is_uuid_shaped(&rec.analytics_id), "{}", rec.analytics_id);
+
+        // The same signup recorded twice answers with the same id. A resolve
+        // that re-minted would be the one analytics failure nothing can repair.
+        let again = s
+            .record_signup(404, "hopper@example.com", "hopper", at + days(1))
+            .await
+            .unwrap();
+        assert_eq!(again.user_id, rec.user_id);
+        assert_eq!(again.analytics_id, rec.analytics_id, "never re-minted");
+        assert_eq!(s.list_users().await.unwrap().len(), 1);
+    }
+
+    /// The third shape: somebody who was already WAITING redeems a CLI code with
+    /// the address they joined under. The fallback has to find the row they have
+    /// and promote it, or the operator's board shows one person twice.
+    #[tokio::test]
+    async fn a_cli_signup_promotes_the_row_the_person_already_had() {
+        let s = store().await;
+        s.add_user_waiting("ada@example.com").await.unwrap();
+        let id = s.list_users().await.unwrap()[0].id;
+        let before = analytics_id(&s, id).await;
+
+        let at = now();
+        let rec = s
+            .record_signup(404, "ADA@example.com", "ada", at)
+            .await
+            .unwrap();
+        assert_eq!(rec.user_id, id, "found, not created");
+        assert_eq!(rec.analytics_id, before, "and kept");
+
+        let row = s.user_entry(id).await.unwrap().unwrap();
+        assert_eq!(row.status, USER_APPROVED, "promoted off the waiting half");
+        assert_eq!(row.signed_up_at, Some(at));
+        assert_eq!(row.tenant_label.as_deref(), Some("ada"));
+        assert_eq!(s.list_users().await.unwrap().len(), 1, "one person, one row");
+    }
+
+    /// Activation is stamped ONCE, with the date the daemon reported rather than
+    /// the moment the poller noticed. Stamping "now" would date every early
+    /// adopter to the day the feature shipped.
+    #[tokio::test]
+    async fn activation_is_stamped_once_with_the_daemons_own_date() {
+        let s = store().await;
+        s.insert_tenant("ada", "ada@example.com").await.unwrap();
+        let rec = s
+            .record_signup(404, "ada@example.com", "ada", now())
+            .await
+            .unwrap();
+
+        let paired = now() - days(30);
+        assert!(s.mark_user_first_paired("ada", paired).await.unwrap());
+        assert_eq!(
+            s.user_entry(rec.user_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .first_paired_at,
+            Some(paired),
+            "the daemon's date, a month before this poll"
+        );
+
+        // The next poll asks again. No second stamp, and the first one stands.
+        assert!(!s.mark_user_first_paired("ada", now()).await.unwrap());
+        assert_eq!(
+            s.user_entry(rec.user_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .first_paired_at,
+            Some(paired),
+            "the first stamp wins"
+        );
+
+        assert!(
+            !s.mark_user_first_paired("nobody", now()).await.unwrap(),
+            "a label with no funnel row takes nothing"
+        );
+    }
+
+    /// What a re-pair deep link asks: the id analytics knows this mailbox's owner
+    /// by. `None` for a label nobody signed up under, because a link must render
+    /// without the decoration rather than fail.
+    #[tokio::test]
+    async fn a_label_names_the_id_analytics_knows_its_owner_by() {
+        let s = store().await;
+        let rec = s
+            .record_signup(404, "ada@example.com", "ada", now())
+            .await
+            .unwrap();
+        assert_eq!(
+            s.analytics_id_for_label("ada").await.unwrap().as_deref(),
+            Some(rec.analytics_id.as_str())
+        );
+        assert_eq!(s.analytics_id_for_label("nobody").await.unwrap(), None);
+    }
+
+    /// What the activation poller asks for, and the four ways a row is not an
+    /// answer: never signed up, already stamped, no tenant row to exec into, and
+    /// a tenant that was torn down. Plus the window, which is the give-up.
+    #[tokio::test]
+    async fn only_signed_up_unpaired_live_tenants_are_polled() {
+        let s = store().await;
+        // Waiting, never signed up.
+        s.add_user_waiting("waiting@example.com").await.unwrap();
+        // Signed up with a live tenant: the one candidate.
+        s.insert_tenant("ada", "ada@example.com").await.unwrap();
+        s.record_signup(404, "ada@example.com", "ada", now())
+            .await
+            .unwrap();
+        // Signed up, but this control plane has no tenant row for the label, so
+        // there is nothing to ask and nowhere to ask it.
+        s.record_signup(405, "ghost@example.com", "ghost", now())
+            .await
+            .unwrap();
+        // Signed up, then torn down: an exec that cannot succeed.
+        s.insert_tenant("grace", "grace@example.com").await.unwrap();
+        s.record_signup(406, "grace@example.com", "grace", now())
+            .await
+            .unwrap();
+        s.client()
+            .await
+            .unwrap()
+            .execute(
+                "UPDATE tenants SET status = 'stopped' WHERE label = 'grace'",
+                &[],
+            )
+            .await
+            .unwrap();
+        // Signed up before the window: the give-up, not a filter on liveness.
+        s.insert_tenant("old", "old@example.com").await.unwrap();
+        s.record_signup(407, "old@example.com", "old", now() - days(91))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            s.users_awaiting_first_pair(25).await.unwrap(),
+            vec!["ada".to_string()]
+        );
+        assert_eq!(
+            s.users_awaiting_first_pair(0).await.unwrap().len(),
+            0,
+            "the limit is the limit"
+        );
+
+        // Stamping removes it from the next answer: the poller quiesces without
+        // anybody turning it off.
+        assert!(s.mark_user_first_paired("ada", now()).await.unwrap());
+        assert!(s.users_awaiting_first_pair(25).await.unwrap().is_empty());
+    }
+
+    /// The shape this crate wrote before `users` existed: a `waitlist` table
+    /// beside the two that survived.
+    ///
+    /// SPELLED OUT rather than derived from [`SCHEMA`], for the reason the
+    /// invite-era fixture gives: the database this migration meets in production
+    /// was written by a binary that no longer exists, and a fixture that tracked
+    /// the current schema would stop testing the migration the moment the schema
+    /// moved.
+    const PRE_USERS_SCHEMA: &str = "
+CREATE TABLE tenants (
+    id            BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    label         TEXT NOT NULL UNIQUE,
+    account_email TEXT NOT NULL,
+    status        TEXT NOT NULL,
+    created_at    TEXT NOT NULL
+);
+CREATE TABLE invite_codes (
+    id             BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    code_hash      TEXT NOT NULL UNIQUE,
+    created_at     TEXT NOT NULL,
+    expires_at     TEXT,
+    used_at        TEXT,
+    used_by_label  TEXT,
+    reserved_by    TEXT,
+    reserved_until TEXT
+);
+CREATE TABLE waitlist (
+    id          BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    email       TEXT NOT NULL UNIQUE,
+    created_at  TEXT NOT NULL,
+    status      TEXT NOT NULL,
+    approved_at TEXT,
+    invite_id   BIGINT,
+    notified_at TEXT
+);
+";
+
+    /// The old `waitlist` DDL on its own, for the rollback round trip: a PR-1
+    /// binary redeployed after this migration recreates exactly this through its
+    /// own `CREATE TABLE IF NOT EXISTS`.
+    const LEGACY_WAITLIST: &str = "
+CREATE TABLE waitlist (
+    id          BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    email       TEXT NOT NULL UNIQUE,
+    created_at  TEXT NOT NULL,
+    status      TEXT NOT NULL,
+    approved_at TEXT,
+    invite_id   BIGINT,
+    notified_at TEXT
+);
+";
+
+    /// Every row's `analytics_id`, by the address it belongs to.
+    async fn analytics_ids(client: &tokio_postgres::Client) -> Vec<(String, String)> {
+        client
+            .query("SELECT email, analytics_id FROM users ORDER BY email", &[])
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| (r.get(0), r.get(1)))
+            .collect()
+    }
+
+    /// Whether a table exists in the schema this URL points at. `to_regclass`
+    /// resolves through `search_path`, which is the same way every unqualified
+    /// name in this file resolves.
+    async fn table_exists(client: &tokio_postgres::Client, name: &str) -> bool {
+        client
+            .query_one("SELECT to_regclass($1) IS NOT NULL", &[&name])
+            .await
+            .unwrap()
+            .get(0)
+    }
+
+    /// THE MIGRATION, on a database from before the funnel table existed.
+    ///
+    /// Four shapes, which are the four a real one holds: somebody still waiting,
+    /// somebody invited whose code is outstanding, somebody who SIGNED UP with a
+    /// Google account that is not the address they were invited at, and a tenant
+    /// with no waitlist ancestry at all because their code came from the CLI.
+    /// The last two are the ones nothing could answer before: the mismatch was
+    /// invisible, and the CLI signup was not on any list.
+    ///
+    /// [`ControlStore::connect`] is the only entry point, exactly as a deploy
+    /// uses it: there is no test-only `init` to call.
+    #[tokio::test]
+    async fn a_waitlist_era_store_becomes_a_funnel() {
+        let url = fresh_schema().await;
+        let seed = raw_client(&url).await;
+        seed.batch_execute(PRE_USERS_SCHEMA).await.unwrap();
+
+        let joined = stamp(Utc::now() - days(20));
+        let approved = stamp(Utc::now() - days(10));
+        let spent = stamp(Utc::now() - days(5));
+        let provisioned = stamp(Utc::now() - days(3));
+
+        // An outstanding code, and the one that was spent.
+        seed.execute(
+            "INSERT INTO invite_codes(id, code_hash, created_at, expires_at)
+             OVERRIDING SYSTEM VALUE VALUES(1, 'hash-live', $1, $2)",
+            &[&joined, &stamp(Utc::now() + days(20))],
+        )
+        .await
+        .unwrap();
+        seed.execute(
+            "INSERT INTO invite_codes(id, code_hash, created_at, expires_at, used_at, used_by_label)
+             OVERRIDING SYSTEM VALUE VALUES(2, 'hash-spent', $1, $2, $3, 'bee')",
+            &[&joined, &stamp(Utc::now() + days(20)), &spent],
+        )
+        .await
+        .unwrap();
+
+        // 1: waiting. 2: invited, code outstanding. 3: invited at work, signed
+        // up from a personal mailbox.
+        seed.execute(
+            "INSERT INTO waitlist(email, created_at, status) VALUES('waiting@example.com', $1, 'pending')",
+            &[&joined],
+        )
+        .await
+        .unwrap();
+        seed.execute(
+            "INSERT INTO waitlist(email, created_at, status, approved_at, invite_id, notified_at)
+             VALUES('invited@example.com', $1, 'approved', $2, 1, $2)",
+            &[&joined, &approved],
+        )
+        .await
+        .unwrap();
+        seed.execute(
+            "INSERT INTO waitlist(email, created_at, status, approved_at, invite_id, notified_at)
+             VALUES('invited-at-work@example.com', $1, 'approved', $2, 2, $2)",
+            &[&joined, &approved],
+        )
+        .await
+        .unwrap();
+        // The mailbox that spent code 2, under an address the waitlist never saw.
+        seed.execute(
+            "INSERT INTO tenants(label, account_email, status, created_at)
+             VALUES('bee', 'personal@example.com', 'active', $1)",
+            &[&spent],
+        )
+        .await
+        .unwrap();
+        // 4: a CLI-code tenant with no waitlist row at all.
+        seed.execute(
+            "INSERT INTO tenants(label, account_email, status, created_at)
+             VALUES('cli', 'cli@example.com', 'active', $1)",
+            &[&provisioned],
+        )
+        .await
+        .unwrap();
+
+        let s = ControlStore::connect(&url).await.unwrap();
+        let rows = s.list_users().await.unwrap();
+        assert_eq!(rows.len(), 4, "everybody, from both doors");
+        let by_email = |addr: &str| {
+            rows.iter()
+                .find(|r| r.email == addr)
+                .unwrap_or_else(|| panic!("{addr} is on the funnel"))
+                .clone()
+        };
+
+        let waiting = by_email("waiting@example.com");
+        assert_eq!(waiting.status, USER_PENDING);
+        assert_eq!(waiting.signed_up_at, None);
+        assert_eq!(waiting.first_paired_at, None);
+
+        let invited = by_email("invited@example.com");
+        assert_eq!(invited.status, USER_APPROVED);
+        assert!(invited.notified_at.is_some(), "the mail went out");
+        assert_eq!(invited.invite_id, Some(1), "the pointer came across");
+        assert_eq!(
+            invited.signed_up_at, None,
+            "an outstanding code is not a signup"
+        );
+
+        // THE ROW THE MIGRATION EXISTS FOR: the invite trail knew this person
+        // had signed up and under which label, and the tenant row knew the
+        // address, and nothing had ever put the three together.
+        let mismatch = by_email("invited-at-work@example.com");
+        assert_eq!(mismatch.signed_up_at, Some(parse_ts(spent.clone())));
+        assert_eq!(mismatch.tenant_label.as_deref(), Some("bee"));
+        assert_eq!(
+            mismatch.account_email.as_deref(),
+            Some("personal@example.com"),
+            "the mailbox that actually signed up, not the address invited"
+        );
+
+        // ...and the person nothing recorded at all, keyed on the only address
+        // there was.
+        let cli = by_email("cli@example.com");
+        assert_eq!(cli.status, USER_APPROVED);
+        assert_eq!(cli.tenant_label.as_deref(), Some("cli"));
+        assert_eq!(cli.account_email.as_deref(), Some("cli@example.com"));
+        assert_eq!(cli.signed_up_at, Some(parse_ts(provisioned.clone())));
+        assert_eq!(
+            cli.approved_at, None,
+            "nobody approved them, they had a code"
+        );
+
+        let ids = analytics_ids(&seed).await;
+        assert_eq!(ids.len(), 4);
+        for (email, id) in &ids {
+            assert!(is_uuid_shaped(id), "{email}: {id}");
+        }
+        let distinct: std::collections::HashSet<&String> = ids.iter().map(|(_, id)| id).collect();
+        assert_eq!(distinct.len(), 4, "one id per person, not one per migration");
+
+        assert!(
+            !table_exists(&seed, "waitlist").await,
+            "the old table is gone, so no write can land where nothing reads"
+        );
+
+        // IDEMPOTENT, and it has to be: `init` runs on every connect, so "runs
+        // once" is not a property this migration can have.
+        let s = ControlStore::connect(&url).await.unwrap();
+        assert_eq!(s.list_users().await.unwrap().len(), 4, "no duplicates");
+        assert_eq!(
+            analytics_ids(&seed).await,
+            ids,
+            "and not one id was re-minted"
+        );
+
+        // THE ROLLBACK ROUND TRIP: a PR-1 binary redeployed here recreates the
+        // old table through its own `IF NOT EXISTS` and collects rows in it.
+        // Rolling forward again sweeps them in and drops it a second time.
+        seed.batch_execute(LEGACY_WAITLIST).await.unwrap();
+        seed.execute(
+            "INSERT INTO waitlist(email, created_at, status) VALUES('late@example.com', $1, 'pending')",
+            &[&stamp(Utc::now())],
+        )
+        .await
+        .unwrap();
+
+        let s = ControlStore::connect(&url).await.unwrap();
+        let rows = s.list_users().await.unwrap();
+        assert_eq!(rows.len(), 5, "the straggler was swept in");
+        assert_eq!(
+            rows.iter()
+                .find(|r| r.email == "late@example.com")
+                .expect("swept in")
+                .status,
+            USER_PENDING
+        );
+        assert!(
+            !table_exists(&seed, "waitlist").await,
+            "and the table is gone again"
+        );
+        let after = analytics_ids(&seed).await;
+        assert_eq!(after.len(), 5);
+        for (email, id) in &ids {
+            assert!(
+                after.contains(&(email.clone(), id.clone())),
+                "{email} kept the id it was migrated with"
+            );
+        }
     }
 }

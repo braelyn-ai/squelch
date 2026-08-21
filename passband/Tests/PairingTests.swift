@@ -26,6 +26,7 @@ struct PairingTests {
         serverURLs()
         linkParsing()
         linkRejection()
+        linkAnalyticsIds()
 
         if failures > 0 {
             print("FAILED: \(failures) of \(checks) checks")
@@ -129,6 +130,71 @@ struct PairingTests {
         nilLink("passband://pair?url=file%3A%2F%2F%2Ftmp%2Fx&code=ABCDEFGH", "file url")
         nilLink("passband://pair?url=javascript%3Aalert(1)&code=ABCDEFGH", "javascript url")
         nilLink("passband://pair?url=&code=ABCDEFGH", "empty server url")
+    }
+
+    /// The hosted control plane's `aid` ride-along. Two properties are asserted
+    /// here and they pull in opposite directions, which is why both are:
+    ///
+    /// 1. It is HELD TO UUID SHAPE. The id ends up as a PostHog `distinct_id`
+    ///    without passing the vocabulary gate every other outgoing string
+    ///    passes, and this check is the thing standing in for that gate.
+    /// 2. A bad one NEVER COSTS THE PAIRING. Analytics is decoration on a link
+    ///    whose actual job is connecting a person to their mail, so every
+    ///    rejected `aid` below is asserted to leave the url and code intact.
+    static func linkAnalyticsIds() {
+        let base = "passband://pair?url=https%3A%2F%2Fa.passband.email&code=ABCD-EFGH"
+        let aid = "8b1f2c34-5d6e-4a7b-8c9d-0e1f2a3b4c5d"
+
+        let hosted = parse("\(base)&aid=\(aid)")
+        equal(hosted?.analyticsId, aid, "aid parsed off a hosted link")
+        equal(hosted?.code, "ABCDEFGH", "aid does not disturb the code")
+
+        // Stored lowercased so one person's id is one string, whichever case
+        // the link happened to spell it in.
+        equal(
+            parse("\(base)&aid=\(aid.uppercased())")?.analyticsId, aid,
+            "uppercase aid is lowercased")
+
+        // Order is a query, not a format. The daemon's own links put no aid
+        // anywhere, and the control plane appends it last, but neither is a
+        // promise the parser is allowed to depend on.
+        equal(
+            parse("passband://pair?aid=\(aid)&code=abcdefgh&url=https%3A%2F%2Fa.passband.email")?
+                .analyticsId,
+            aid, "aid first in the query")
+        equal(
+            parse("passband:pair?url=https%3A%2F%2Fa.passband.email&aid=\(aid)&code=ABCDEFGH")?
+                .analyticsId,
+            aid, "aid in the middle, opaque form")
+
+        // The ordinary case. A self-hosted `squelchd pair` link has no aid and
+        // is not a degraded link for it.
+        equal(parse(base)?.analyticsId, nil, "no aid at all")
+        equal(parse(base)?.serverURL, "https://a.passband.email", "aid-less link is whole")
+
+        // Everything that is not a UUID, each asserted to leave a WORKING link
+        // behind rather than nilling the parse.
+        for (raw, label) in [
+            ("", "empty aid"),
+            ("not-a-uuid", "free text"),
+            ("8b1f2c34-5d6e-4a7b-8c9d-0e1f2a3b4c5", "one hex digit short"),
+            ("8b1f2c345d6e4a7b8c9d0e1f2a3b4c5d", "unhyphenated"),
+            ("%3Cscript%3Ealert(1)%3C%2Fscript%3E", "markup"),
+            ("..%2F..%2Fetc%2Fpasswd", "traversal"),
+            ("a%40example.com", "an address"),
+            ("8b1f2c34-5d6e-4a7b-8c9d-0e1f2a3b4c5d%20and%20more", "a uuid with a tail"),
+        ] {
+            let link = parse("\(base)&aid=\(raw)")
+            equal(link?.analyticsId, nil, "\(label) is refused")
+            equal(link?.code, "ABCDEFGH", "\(label) still pairs")
+            equal(link?.serverURL, "https://a.passband.email", "\(label) keeps the server url")
+        }
+
+        // Percent-encoded whitespace around an otherwise good id is trimmed
+        // rather than refused: it is the one damage a mail client wrapping a
+        // link can do that leaves the id itself intact.
+        equal(
+            parse("\(base)&aid=%20\(aid)%20")?.analyticsId, aid, "surrounding whitespace trimmed")
     }
 
     // MARK: - helpers
