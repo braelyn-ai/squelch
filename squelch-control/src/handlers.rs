@@ -484,7 +484,7 @@ pub async fn waitlist(State(state): State<ControlState>, body: Bytes) -> Respons
         return waitlist_answer(origin, StatusCode::BAD_REQUEST, INVALID_EMAIL);
     }
 
-    match state.store().add_to_waitlist(&email).await {
+    match state.store().add_user_waiting(&email).await {
         // PRIVACY: whether this submission created a row, and nothing else.
         // Never the address, on either branch.
         Ok(created) => {
@@ -1129,6 +1129,45 @@ pub async fn oauth_callback(
     {
         tracing::error!(error = %e, label = %label, "tenant provisioned but the invite was not consumed");
     }
+
+    // THE FUNNEL ROW, and the last thing on this path that is allowed to fail.
+    // A mailbox exists, the code is spent, and the person is looking at a
+    // pairing code; a database that will not take a row about it is a reporting
+    // problem, not their problem, so this logs loudly and costs them nothing.
+    //
+    // AFTER THE CONSUME, and that ordering is free rather than load-bearing:
+    // consuming moves neither `users.invite_id` (which keeps naming the code,
+    // spent or not) nor the invite row itself (spending updates it, and only a
+    // CLI revoke deletes it), so the pointer this resolves on is the same
+    // pointer either way. The other direction matters more: if a lapsed hold
+    // ever made the consume fail, the pointer would miss here and the CLI-door
+    // arm would still record this person by the Google account they signed up
+    // with, which is the outcome worth having.
+    //
+    // `let _user` because PR 4 is what consumes it: the analytics id rides the
+    // deep link on the success page below, and binding it here is what keeps
+    // that a one-line change rather than a re-plumb.
+    let _user = match state
+        .store()
+        .record_signup(invite_id, &grant.account_email, &label, chrono::Utc::now())
+        .await
+    {
+        Ok(record) => {
+            // PRIVACY: the row id and the label, which are handles. The address
+            // is in scope on this line and does not go in it, and neither does
+            // the analytics id, which must never be logged beside one.
+            tracing::info!(user_id = record.user_id, label = %label, "signup recorded on the funnel");
+            Some(record)
+        }
+        Err(e) => {
+            tracing::error!(
+                error = %e,
+                label = %label,
+                "PROVISIONED BUT NOT ON THE FUNNEL: the mailbox exists and no users row records it"
+            );
+            None
+        }
+    };
 
     tracing::info!(label = %label, "tenant provisioned");
 
