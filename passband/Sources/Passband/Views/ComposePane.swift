@@ -45,14 +45,10 @@ struct ComposePane: View {
                 header(compose)
 
                 VStack(alignment: .leading, spacing: 12) {
-                    // ABOVE the phase branch, so it is stated in both — and once
-                    // rather than twice, because the sentence must not drift
-                    // between what the editor promises and what review confirms.
-                    forwardChrome(compose)
                     if inReview {
                         reviewPane(compose)
                     } else {
-                        editPane
+                        editPane(compose)
                     }
                     if let error = compose.error {
                         Text(error).font(Typo.micro).foregroundStyle(Palette.danger)
@@ -122,37 +118,88 @@ struct ComposePane: View {
         return compose.replyToMessageId != nil ? "reply" : "new message"
     }
 
-    /// WHAT RIDES ALONG on a forward, in both phases.
-    ///
-    /// The quoted original and its files are assembled by the daemon and never
-    /// appear in the body box, so without this line the composer is an empty
-    /// new message that inexplicably sends a fat email — and review, whose
-    /// whole job is to promise what goes out, would be promising half of it.
-    /// Nothing here is on the wire; it is `ComposeState`'s display pair.
-    @ViewBuilder
-    private func forwardChrome(_ compose: ComposeState) -> some View {
-        if compose.forwardOfMessageId != nil {
-            Text(forwardChromeText(compose))
-                .font(Typo.micro)
-                .foregroundStyle(Palette.inkFaint)
-                .lineLimit(2)
-                // A long subject wraps instead of pushing the pane wider.
-                .fixedSize(horizontal: false, vertical: true)
-                .frame(maxWidth: .infinity, alignment: .leading)
-        }
-    }
+    // MARK: - the forwarded original
 
-    /// The chrome's sentence. A stranger's subject line, rendered as Text and
-    /// never as markup — the same rule every sender-supplied string here keeps.
-    private func forwardChromeText(_ compose: ComposeState) -> String {
-        let subject = compose.forwardedSubject?.trimmed ?? ""
-        var line = "forwarding: " + (subject.isEmpty ? "(no subject)" : subject)
-        let files = compose.forwardedAttachmentCount
-        // Only when there are some: a line saying "0 attachments" on every
-        // ordinary forward is a line nobody reads, the same reason the review's
-        // tracking row only appears when the pixel is armed.
-        if files > 0 { line += " · \(files) attachment\(files == 1 ? "" : "s")" }
-        return line
+    /// How tall the quote may grow in the EDIT phase before it starts scrolling
+    /// inside itself. One number for both platforms on purpose: it is a CEILING,
+    /// not a height — the editor above is greedy too, so a short pane (or a
+    /// phone sheet with the keyboard up) splits the space between them and the
+    /// quote simply gets less than this. Review has no ceiling at all; there is
+    /// nothing to type into by then, so the whole thing scrolls with the note.
+    private static let quoteEditHeight: CGFloat = 300
+
+    /// WHAT RIDES ALONG on a forward, in both phases: the message itself,
+    /// indented behind a rail the way every mail client draws included mail.
+    ///
+    /// The real quote is assembled by the DAEMON out of its own raw fetch, so
+    /// nothing here is on the wire — this is the reader's sanitized copy of the
+    /// same message (see `ComposeState.forwardedMessage`), shown so the composer
+    /// is not an empty new message that inexplicably sends a fat email, and so
+    /// review, whose whole job is promising what goes out, promises the whole of
+    /// it rather than the covering note.
+    ///
+    /// NO `to` OR `cc` LINES, and their absence is a fact about the client
+    /// rather than a choice: `ClientMessage` carries the sender and nothing else
+    /// about the audience, while the daemon's block writes `To:` and `Cc:` from
+    /// the raw headers. Inventing them from what is in reach would be inventing
+    /// recipients, and the one question a forwarded header block exists to
+    /// answer is who was on it.
+    @ViewBuilder
+    private func forwardedQuote(_ compose: ComposeState) -> some View {
+        if compose.forwardOfMessageId != nil, let message = compose.forwardedMessage {
+            VStack(alignment: .leading, spacing: 9) {
+                // The composer's mirror of the wire's
+                // "---------- Forwarded message ---------" banner: the same
+                // sentence the outgoing mail carries, said in the house's micro
+                // voice instead of in a row of hyphens.
+                Text("forwarded message")
+                    .font(Typo.micro)
+                    .foregroundStyle(Palette.inkFaintest)
+                    .textCase(.uppercase)
+
+                // The header lines of that banner, in review's own summary
+                // grammar — a header being checked, in mono. The subject comes
+                // off `forwardedSubject` rather than off the message, because
+                // that is the value the outgoing `Fwd: …` title was built from
+                // and the two must not read differently.
+                VStack(alignment: .leading, spacing: 3) {
+                    ComposeSummaryRow("from", message.senderString)
+                    ComposeSummaryRow("date", Fmt.dateTime(message.received_at))
+                    ComposeSummaryRow("subject", compose.forwardedSubject ?? "(no subject)")
+                }
+
+                // THE READER'S OWN BODY VIEWS, picked by the reader's own test
+                // (MessageCard) — html when there is any, plain text otherwise.
+                // Same `cacheKey` the reader passes, so this shares the frame
+                // pool and the image cache with the thread behind the pane
+                // rather than fetching every picture a second time, and the same
+                // tracker policy, so opening a composer cannot load a pixel the
+                // reader refused.
+                if let html = message.html, !html.isEmpty {
+                    EmailWebView(
+                        html: html, cacheKey: String(message.id),
+                        allowTrackers: message.allowsTrackers)
+                } else {
+                    PlainBody(content: message.content)
+                }
+
+                // Unconditional, exactly as the reader mounts it: the strip
+                // draws nothing at all when there are no files.
+                AttachmentStrip(attachments: message.attachmentList)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            // INDENTED LIKE QUOTED MAIL: the whole block sits behind a static
+            // bar in the hairline token. Same idiom as the reader's selection
+            // rail, minus the only thing that rail does — this one never moves
+            // and never changes color, because it marks a kind of content
+            // rather than where you are.
+            .padding(.leading, 12)
+            .overlay(alignment: .leading) {
+                RoundedRectangle(cornerRadius: 1, style: .continuous)
+                    .fill(Palette.hairlineStrong)
+                    .frame(width: 2)
+            }
+        }
     }
 
     private func footer(_ compose: ComposeState) -> some View {
@@ -196,7 +243,7 @@ struct ComposePane: View {
         .overlay(alignment: .top) { Hairline() }
     }
 
-    private var editPane: some View {
+    private func editPane(_ compose: ComposeState) -> some View {
         VStack(alignment: .leading, spacing: 12) {
             RecipientField(text: bind(\.to), focus: $focusedField, field: FocusTarget.to)
             Field(label: "subject") {
@@ -228,6 +275,20 @@ struct ComposePane: View {
                             .strokeBorder(Palette.hairlineStrong, lineWidth: 0.75))
             }
             .frame(maxHeight: .infinity)
+
+            // UNDER the editor, where the quote sits in the mail itself, and in
+            // a scroller of its own: the note is what you are writing and keeps
+            // the flexible remainder, while the original — which can be a whole
+            // newsletter — scrolls inside a bounded pocket instead of pushing
+            // the editor off the pane.
+            //
+            // The EDITOR is deliberately not the thing wrapped: MarkdownTextView
+            // is a platform text view that scrolls itself, and nesting it in a
+            // ScrollView breaks its own scrolling.
+            if compose.forwardOfMessageId != nil {
+                ScrollView { forwardedQuote(compose) }
+                    .frame(maxHeight: Self.quoteEditHeight)
+            }
         }
     }
 
@@ -281,11 +342,20 @@ struct ComposePane: View {
             }
 
             ScrollView {
-                // The scanner's own styling, so review shows the formatting the
-                // HTML half will carry — not a second interpretation of it.
-                Text(MarkdownStyle.attributed(compose.body))
-                    .textSelection(.enabled)
-                    .frame(maxWidth: .infinity, alignment: .leading)
+                VStack(alignment: .leading, spacing: 14) {
+                    // The scanner's own styling, so review shows the formatting
+                    // the HTML half will carry — not a second interpretation of
+                    // it.
+                    Text(MarkdownStyle.attributed(compose.body))
+                        .textSelection(.enabled)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                    // INSIDE this scroller rather than beside it, and under the
+                    // note exactly as it will sit in the mail: on a forward the
+                    // quote is most of what goes out, and review's whole job is
+                    // stating what goes out. No inner ScrollView here — one
+                    // scroll surface, the outer one.
+                    forwardedQuote(compose)
+                }
             }
             .frame(maxHeight: .infinity)
             .padding(10)

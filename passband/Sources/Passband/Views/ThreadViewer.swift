@@ -786,18 +786,14 @@ struct ThreadViewer: View {
             // half-written underneath is untouched.
             KeyBinding("f", "forward") {
                 guard let m = messages[safe: index] else { return }
-                // THE MESSAGE'S OWN SUBJECT, with the thread's as the fallback.
-                // `thread?.subject` is the CONVERSATION's title, and the daemon
-                // quotes the selected message's own header — so titling the
-                // forward from the thread would name one email while sending
-                // another, on exactly the threads where they differ (a retitled
-                // reply, a list that stamps its own prefix). The fallback is for
-                // a daemon too old to send per-message subjects; both the
-                // outgoing subject and the composer's "forwarding: …" line are
-                // built from this one value, so the two cannot drift.
-                store.openComposeForward(
-                    messageId: m.id, subject: m.subject ?? thread?.subject ?? "",
-                    attachmentCount: m.attachmentList.count)
+                // THE WHOLE MESSAGE goes over, not a handful of fields off it:
+                // the composer renders this same message underneath the note,
+                // with the reader's own body view, so what you are passing on is
+                // on screen while you write the covering line. Only its id
+                // reaches the wire. `thread?.subject` rides along as the
+                // FALLBACK title for a daemon too old to send per-message
+                // subject headers; `openComposeForward` resolves the two.
+                store.openComposeForward(message: m, fallbackSubject: thread?.subject ?? "")
             },
             // `s` = the search `f` used to be, moved rather than dropped: the
             // sender lookup is worth a key in here, it just is not worth THE
@@ -1297,7 +1293,13 @@ private struct MessageCard: View {
 /// A plain-text body with its trailing quoted history collapsed behind a chip.
 /// Mirrors the html-side collapse; the split heuristic is shared (Quotes) and
 /// conservative — when in doubt the full text renders.
-private struct PlainBody: View {
+///
+/// Internal rather than private because the FORWARD COMPOSER renders the message
+/// it is passing on with the reader's own pair of body views (this and
+/// `EmailWebView`), chosen by the reader's own test. A second plain-text
+/// renderer over there would be a second set of collapse rules, drifting from
+/// the one the reader spent this file getting right.
+struct PlainBody: View {
     let content: String
     @State private var open = false
 
