@@ -101,3 +101,15 @@ run_suite sitrep-window \
 run_suite remind-times \
   Sources/Passband/Lib/RemindTimes.swift \
   Tests/RemindTimesTests.swift
+
+# Which senders leave the device. `eligibleFaviconDomain` is the privacy
+# boundary in SenderIdentity — a human correspondent answers nil and that nil
+# is why the correspondent graph stays local — so the brand/robot heuristics
+# guarding it are asserted rather than reasoned about. Pure string work;
+# WireTypes and Format ride along for the Tier and the capitalizer.
+run_suite sender-identity \
+  Sources/Passband/Model/WireTypes.swift \
+  Sources/Passband/Lib/Format.swift \
+  Sources/Passband/Lib/AsyncMemo.swift \
+  Sources/Passband/Lib/SenderIdentity.swift \
+  Tests/SenderIdentityTests.swift

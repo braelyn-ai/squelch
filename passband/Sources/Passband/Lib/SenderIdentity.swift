@@ -2,8 +2,10 @@
 //
 // PRIVACY: human correspondents are NEVER resolved over the network (no
 // Gravatar, no favicon) — the human correspondent graph must not leave the
-// device. The only exception is ROBOT/BRAND senders, whose local-parts identify
-// a service rather than a person; those fetch the domain's favicon once.
+// device. The only exception is ROBOT/BRAND senders, which name a service
+// rather than a person — in the local-part (no-reply@) or in the display name
+// standing in for the domain ("Airbnb <express@airbnb.com>") — and those fetch
+// the domain's favicon once.
 
 import Foundation
 
@@ -234,14 +236,49 @@ enum SenderID {
         return first.isEmpty ? nil : first
     }
 
-    /// True if the local-part equals the domain's base label ("eBay@eBay.com").
-    /// These are brand mailboxes naming a service, not a person.
+    /// True when the sender presents itself AS the brand rather than as a
+    /// person, by either of the two ways mail actually does that:
+    ///
+    ///  1. the local-part equals the domain's base label ("eBay@eBay.com"), or
+    ///  2. the DISPLAY NAME equals it ("Airbnb <express@airbnb.com>").
+    ///
+    /// (2) is the common shape and (1) alone missed it: bulk mail goes out from
+    /// whatever routing mailbox the sender's ESP minted — express@, e@,
+    /// news-2938@ — under the brand's own name, and none of those local-parts
+    /// is on `robotLocals` either. So the brand went unrecognised and got a
+    /// human's treatment: initials, and no logo anywhere it appeared.
+    ///
+    /// It stays inside the privacy rule. A person does not sign their mail with
+    /// their employer's domain label, so this cannot reach a correspondent; the
+    /// nearest false positive is a role mailbox whose display name IS the
+    /// company ("Acme <bob@acme.com>"), which is a brand for this purpose
+    /// anyway. And the only thing that leaves the device is the DOMAIN, which
+    /// any no-reply@ at the same domain already discloses.
+    ///
+    /// Matched on letters and digits alone, and exactly: "Airbnb" is the brand,
+    /// "Airbnb Support" is not asserted to be. Conservative on purpose — a
+    /// prefix match would read "Samuel Smith <ssmith@sam.com>" as the brand Sam
+    /// and send a correspondent's domain out to be looked up.
+    ///
+    /// The name is matched against the label AND the whole domain, because some
+    /// brands are named with the TLD attached and mean it: "Booking.com" and
+    /// booking.com are the same assertion, and squashing the punctuation is
+    /// what lets them meet.
     static func isBrand(_ sender: String) -> Bool {
-        let addr = parse(sender).addr
-        let local = (addr.split(separator: "@").first.map(String.init) ?? "")
+        let parsed = parse(sender)
+        guard let domain = faviconDomain(sender) else { return false }
+        let base = domain.split(separator: ".").first.map(String.init) ?? ""
+        guard !base.isEmpty else { return false }
+
+        let local = (parsed.addr.split(separator: "@").first.map(String.init) ?? "")
             .split(separator: "+").first.map(String.init) ?? ""
-        guard !local.isEmpty, let base = baseLabel(sender) else { return false }
-        return local.lowercased() == base.lowercased()
+        if !local.isEmpty, local.lowercased() == base { return true }
+
+        // `parse().name`, never `displayName` — displayName asks THIS question
+        // on its way to an answer, and the two calling each other never returns.
+        let squashed = parsed.name.lowercased().filter { $0.isLetter || $0.isNumber }
+        guard !squashed.isEmpty else { return false }
+        return squashed == base || squashed == domain.filter { $0.isLetter || $0.isNumber }
     }
 
     /// The name to SHOW for a sender:
