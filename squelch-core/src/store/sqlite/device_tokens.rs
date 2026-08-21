@@ -169,6 +169,24 @@ pub fn normalize_pairing_code(input: &str) -> String {
         .collect()
 }
 
+/// The `device_tokens.name` every console session is claimed under, so
+/// `squelchd token list` and the console's own devices table both show a browser
+/// for what it is.
+///
+/// IT LIVES HERE, next to [`normalize_device_name`], and not in the console that
+/// writes it, because it now has two readers that must agree letter for letter.
+/// `squelch-api`'s console claims a pairing code under this name; the two
+/// readers below EXCLUDE it, because a browser session is not a device somebody
+/// paired. A second spelling anywhere would not fail loudly — it would quietly
+/// count a browser as a client, which is the one thing the activation signal
+/// exists to not do.
+///
+/// The flip side, accepted deliberately: a real device a user literally names
+/// "console" is invisible to both readers. That costs an analytics row, never
+/// access, and the alternative (a name the claim path reserves) would refuse a
+/// legitimate pairing over a label.
+pub const CONSOLE_DEVICE_NAME: &str = "console";
+
 /// Trim and cap a device name, or `None` when nothing is left. Truncation rather
 /// than refusal on the long end: the caller has already proved possession of a
 /// pairing code by the time this matters, and stranding that behind a label
@@ -374,6 +392,68 @@ impl SqliteStore {
             .query_map(params![account_id], map_device_token)?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(out)
+    }
+
+    /// When a CLIENT device first paired with this mailbox, or `None` if none
+    /// ever has.
+    ///
+    /// THE ACTIVATION FACT (issue #89): the hosted control plane can see who was
+    /// invited and who signed up, and could not see whether anybody ever
+    /// actually ran the app. This is the whole answer to that, and it is
+    /// deliberately ONE TIMESTAMP: no name, no count, no device list. What
+    /// leaves the pod is the smallest thing that answers the question.
+    ///
+    /// REVOKED ROWS COUNT. Revoking a device does not un-happen the pairing, and
+    /// this is a historical fact rather than a statement about right now — a
+    /// user who paired a phone in March and wiped it in April activated in
+    /// March. [`SqliteStore::count_client_devices`] is the other question.
+    ///
+    /// Console sessions are excluded by name ([`CONSOLE_DEVICE_NAME`]): a
+    /// browser signing in to the console is the hosted signup flow's own last
+    /// step on some tenants, so counting it would report every signup as an
+    /// activation and the signal would mean nothing.
+    ///
+    /// The minimum is folded in Rust over PARSED timestamps, never taken as
+    /// `MIN(created_at)` in SQL. `created_at` is RFC3339 TEXT, and this module
+    /// does not rest an ordering on string collation (see
+    /// [`SqliteStore::claim_pairing_code`], which decides expiry the same way):
+    /// a row written with a different offset or sub-second precision would sort
+    /// wrong and the answer would be silently early or late.
+    pub fn first_client_pairing_at(&self, account_id: AccountId) -> Result<Option<DateTime<Utc>>> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT created_at FROM device_tokens
+             WHERE account_id = ?1 AND name <> ?2",
+        )?;
+        let earliest = stmt
+            .query_map(params![account_id, CONSOLE_DEVICE_NAME], |r| dt(r, 0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?
+            .into_iter()
+            .min();
+        Ok(earliest)
+    }
+
+    /// How many client devices can connect RIGHT NOW: unrevoked, and not a
+    /// console session.
+    ///
+    /// A DIFFERENT QUESTION from [`SqliteStore::first_client_pairing_at`], on
+    /// purpose. That one is a fact about the past that nothing can take back;
+    /// this one is a gauge that goes down when somebody revokes a phone, and it
+    /// exists for the operator's dashboard
+    /// (`squelchd_devices_paired`) rather than for the activation stamp. Feeding
+    /// this into the stamp would make activation something a revocation could
+    /// undo.
+    pub fn count_client_devices(&self, account_id: AccountId) -> Result<u64> {
+        let conn = self.lock()?;
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM device_tokens
+             WHERE account_id = ?1 AND name <> ?2 AND revoked_at IS NULL",
+            params![account_id, CONSOLE_DEVICE_NAME],
+            |r| r.get(0),
+        )?;
+        // COUNT(*) is never negative; the clamp is so a gauge can never be built
+        // out of a wrapped cast.
+        Ok(count.max(0) as u64)
     }
 
     // ---- pairing ---------------------------------------------------------

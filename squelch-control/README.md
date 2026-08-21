@@ -19,17 +19,26 @@ table below; unset, none of it is mounted and both URLs are a 404):
 ```
 browser  ── GET  /  ──────────► "No invite code? Join the waitlist",
                                 linking to <WAITLIST_ORIGIN>/waitlist
-site     ── POST /waitlist ──► one row per address, same 200 for a duplicate
+site     ── POST /waitlist ──► one users row per address, same 200 for a duplicate
 operator ── GET  /admin ──────► token login, then the list
          ── POST /admin/approve ──► mint an invite, email it through Resend
          ── POST /admin/invite ───► the same, for an address that never joined
          ── POST /admin/send ─────► revoke that code, mint and mail a fresh one
 ```
 
-A direct invite is recorded as a waitlist row that starts out approved, so one
+A direct invite is recorded as a `users` row that starts out approved, so one
 table answers "have we invited them" however they arrived and the re-send button
 works on both. Typing an address that is already waiting approves the row it has
 rather than making a second one.
+
+`users` is the whole funnel in one table: waiting, invited, signed up. Only
+pending and approved are STORED, because those two are what the one-click-one-
+invite guards swing on; everything after is read off the stamps a signup writes,
+so there is no second copy to disagree with the first. A code minted from the
+CLI names nobody, so that row appears at consumption instead, keyed on the
+Google account that redeemed it. An invite is a bearer code, so the address it
+was mailed to and the account that signs up are two different facts and the
+board shows both when they differ.
 
 The emailed link is `/?invite=CODE`, and `GET /` fills the form in from it. That
 reverses this crate's first rule, which was that a code never appears in a URL:
