@@ -105,10 +105,11 @@ extension ThreadStyle {
         /// True for the user's own copy, false for received, nil for a daemon too
         /// old to say — and unknown is not participation, see `automatic`.
         var fromMe: Bool?
-        /// Length of the message's OWN words, with the quoted history it replies
-        /// under already stripped (Quotes.splitText). A one-line "yes" under
-        /// forty lines of chain is a one-line message.
-        var freshChars: Int
+        /// UTF-8 length of the message's OWN words, with the quoted history it
+        /// replies under already stripped (Quotes.splitText). A one-line "yes"
+        /// under forty lines of chain is a one-line message. Bytes and not
+        /// characters, for the reason `chatMedianBytes` gives.
+        var freshBytes: Int
         /// Whether this message is a document rather than a note — see
         /// `htmlHeavy`. One of these vetoes the whole thread.
         var htmlHeavy: Bool
@@ -117,9 +118,17 @@ extension ThreadStyle {
     }
 
     /// Half the messages must be shorter than this for the thread to read as
-    /// talk. A paragraph is about 400 characters, so the line is drawn at "most
-    /// of these are shorter than a paragraph".
-    static let chatMedianChars = 400
+    /// talk, so the line is drawn at "most of these are shorter than a
+    /// paragraph".
+    ///
+    /// MEASURED IN UTF-8 BYTES, which is what makes the line hold in a script
+    /// that is not English: a paragraph of English is about 400 bytes, and CJK
+    /// spends about three bytes on a glyph that carries several English ones,
+    /// so a CJK paragraph lands in the same range. Counted as characters, a
+    /// substantial page of hanzi read as a one-liner and the thread flipped
+    /// itself to chat. `htmlHeavy` counts bytes for its own reasons; this file
+    /// is in one unit throughout.
+    static let chatMedianBytes = 400
     /// Two people and one interloper. A fourth voice is a group, and a group
     /// reads as a list of contributions rather than as two sides.
     static let chatMaxSenders = 3
@@ -146,8 +155,11 @@ extension ThreadStyle {
         // BOTH SIDES SPOKE. A thread the reader has never answered is mail about
         // them, not with them, however short and however chatty it reads.
         guard participated(samples.map(\.fromMe)) else { return .classic }
-        // A SMALL CAST, by canonical address — the same trim-and-lower the rest
-        // of the app calls a sender's identity.
+        // A SMALL CAST, by canonical address. The canonicalization is LOCAL and
+        // deliberately so: this file builds from source alone (see the header),
+        // so the app's own sender-identity helpers are not reachable from here.
+        // Trim and lower is all this test needs — it is counting voices, not
+        // matching a contact.
         let senders = Set(
             samples.map { $0.sender.trimmingCharacters(in: .whitespaces).lowercased() })
         guard senders.count <= chatMaxSenders else { return .classic }
@@ -156,7 +168,7 @@ extension ThreadStyle {
         guard !samples.contains(where: \.htmlHeavy) else { return .classic }
         // SHORT, ON BALANCE. The median and not the mean: one long message in a
         // chatty thread is a chatty thread, and the mean says otherwise.
-        guard median(samples.map(\.freshChars)) < chatMedianChars else { return .classic }
+        guard median(samples.map(\.freshBytes)) < chatMedianBytes else { return .classic }
         return .bubbles
     }
 
@@ -184,17 +196,24 @@ extension ThreadStyle {
         return imageTags(html) > chatMaxImages
     }
 
-    /// `<img` occurrences, counted no further than it takes to answer the
-    /// question: a newsletter has hundreds and the third one has already decided.
+    /// `<img` TAGS, counted no further than it takes to answer the question: a
+    /// newsletter has hundreds and the third one has already decided.
+    ///
+    /// A tag name ends where the tag does or where its attributes begin, so the
+    /// match only counts with whitespace, `/` or `>` behind it — otherwise
+    /// prose about `<imgur.com/abc>` is three pictures.
     private static func imageTags(_ html: String) -> Int {
         var found = 0
         var from = html.startIndex
         while let hit = html.range(
             of: "<img", options: .caseInsensitive, range: from..<html.endIndex)
         {
+            from = hit.upperBound
+            guard hit.upperBound < html.endIndex else { break }
+            let next = html[hit.upperBound]
+            guard next.isWhitespace || next == "/" || next == ">" else { continue }
             found += 1
             if found > chatMaxImages { return found }
-            from = hit.upperBound
         }
         return found
     }

@@ -24,6 +24,7 @@ struct ThreadStyleTests {
         nobodyRepliedIsEmail()
         aCrowdIsEmail()
         longMessagesAreEmail()
+        theLineIsDrawnInBytes()
         oneHeavyMessageVetoesTheThread()
         quotedHistoryIsNotTheMessage()
         anOldDaemonKnowsNoSides()
@@ -105,16 +106,37 @@ struct ThreadStyleTests {
         equal(
             ThreadStyle.automatic([theirs(essay), mine(essay), theirs("ok")]), .classic,
             "mostly essays does")
-        // The line is 400 and it is a `<`: exactly at it is not under it.
-        let atTheLine = String(repeating: "x", count: ThreadStyle.chatMedianChars)
+        // The line is 400 and it is a `<`: exactly at it is not under it. Held
+        // in ASCII on purpose — one byte per character is what makes the
+        // boundary readable as a number.
+        let atTheLine = String(repeating: "x", count: ThreadStyle.chatMedianBytes)
         equal(
             ThreadStyle.automatic([theirs(atTheLine), mine(atTheLine)]), .classic,
             "the median is a floor, not a ceiling")
         equal(
             ThreadStyle.automatic([
-                theirs(String(repeating: "x", count: ThreadStyle.chatMedianChars - 1)),
-                mine(String(repeating: "x", count: ThreadStyle.chatMedianChars - 1)),
-            ]), .bubbles, "and one character under it passes")
+                theirs(String(repeating: "x", count: ThreadStyle.chatMedianBytes - 1)),
+                mine(String(repeating: "x", count: ThreadStyle.chatMedianBytes - 1)),
+            ]), .bubbles, "and one byte under it passes")
+    }
+
+    /// THE UNIT IS BYTES, and the whole reason is mail that is not in English:
+    /// a hanzi costs three bytes and carries what several English characters
+    /// would, so counting graphemes read a substantial page of Chinese as a
+    /// one-liner and flipped the thread to chat.
+    static func theLineIsDrawnInBytes() {
+        // About two hundred hanzi each: a paragraph in anybody's language, and
+        // 600 bytes of it.
+        let page = String(repeating: "字", count: 200)
+        equal(page.count < ThreadStyle.chatMedianBytes, true, "and it counts short as characters")
+        equal(
+            ThreadStyle.automatic([theirs(page), mine(page), theirs(page)]), .classic,
+            "a page of hanzi is a page")
+        // The short exchange the feature is for, in the same script: well under
+        // the 133 glyphs the line allows, so it reads as talk either way.
+        equal(
+            ThreadStyle.automatic([theirs("吃饭了吗"), mine("还没"), theirs("一点见")]), .bubbles,
+            "and a short one is still talk")
     }
 
     /// ONE VETO IS THE WHOLE THREAD. A receipt or a newsletter dropped into a
@@ -138,7 +160,9 @@ struct ThreadStyleTests {
         let reply = { (fresh: String) in fresh + "\n\n" + quoted }
 
         // The fixture is only worth anything if the raw bodies WOULD have failed.
-        equal(reply("sounds good").count > ThreadStyle.chatMedianChars, true, "raw bodies are long")
+        equal(
+            reply("sounds good").utf8.count > ThreadStyle.chatMedianBytes, true,
+            "raw bodies are long")
 
         equal(
             ThreadStyle.automatic([
@@ -153,7 +177,8 @@ struct ThreadStyleTests {
     /// mail it has always drawn. Not a fallback — there is nothing to right-align.
     static func anOldDaemonKnowsNoSides() {
         let unknown = { (text: String, from: String) in
-            ThreadStyle.Sample(fromMe: nil, freshChars: text.count, htmlHeavy: false, sender: from)
+            ThreadStyle.Sample(
+                fromMe: nil, freshBytes: text.utf8.count, htmlHeavy: false, sender: from)
         }
         equal(
             ThreadStyle.automatic([
@@ -205,6 +230,12 @@ struct ThreadStyleTests {
             ThreadStyle.htmlHeavy(
                 html: "<p>\(text)</p><IMG src=a><img src=b><img src=c>", plain: text), true,
             "three is a layout")
+        // `<img` is only a picture when the tag name ENDS there: a message that
+        // talks about an image host is a message.
+        equal(
+            ThreadStyle.htmlHeavy(
+                html: "<p>\(text) <imgur.com/a> <imgur.com/b> <imgur.com/c></p>",
+                plain: text), false, "a word starting with img is not a tag")
     }
 
     // MARK: - the splitter that feeds the length
@@ -246,20 +277,20 @@ struct ThreadStyleTests {
 
     static func mine(_ text: String) -> ThreadStyle.Sample {
         ThreadStyle.Sample(
-            fromMe: true, freshChars: text.count, htmlHeavy: false, sender: "me@example.com")
+            fromMe: true, freshBytes: text.utf8.count, htmlHeavy: false, sender: "me@example.com")
     }
 
     static func theirs(_ text: String, from: String = "alice@example.com") -> ThreadStyle.Sample {
         ThreadStyle.Sample(
-            fromMe: false, freshChars: text.count, htmlHeavy: false, sender: from)
+            fromMe: false, freshBytes: text.utf8.count, htmlHeavy: false, sender: from)
     }
 
     /// A sample built the way ThreadViewer builds one: from a whole body, with
-    /// the quoted history stripped out of the length.
+    /// the quoted history stripped out of the length, counted in utf8.
     static func body(_ fromMe: Bool, _ content: String) -> ThreadStyle.Sample {
         ThreadStyle.Sample(
             fromMe: fromMe,
-            freshChars: Quotes.splitText(content).visible.count,
+            freshBytes: Quotes.splitText(content).visible.utf8.count,
             htmlHeavy: false,
             sender: fromMe ? "me@example.com" : "alice@example.com")
     }

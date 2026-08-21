@@ -207,7 +207,16 @@ final class FrameHeights {
 
     func get(_ key: String) -> CGFloat? { heights[key] }
     func set(_ key: String, _ height: CGFloat) { heights[key] = height }
-    func clear(_ key: String) { heights.removeValue(forKey: key) }
+
+    /// Forget a message, in EVERY SPELLING OF ITS KEY. The same message has one
+    /// height per thread style (ThreadStyle.frameKey: a bubble is measured at a
+    /// narrower measure than a card), so a caller that cleared the one spelling
+    /// it happened to know left the other to paint a reopened message at a size
+    /// nothing on screen is using. The loop lives here so no caller has to know
+    /// there are two.
+    func clear(messageId: Int) {
+        for style in ThreadStyle.allCases { heights.removeValue(forKey: style.frameKey(messageId)) }
+    }
 
     /// Forget every height. An account switch: the keys are message ids, one
     /// daemon's, so a surviving entry paints the new account's mail at the old

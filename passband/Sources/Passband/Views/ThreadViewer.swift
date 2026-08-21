@@ -34,6 +34,12 @@ struct ThreadViewer: View {
     /// this thread's own answer if it has ever been given one, else the global
     /// default. Held in state so the toggle can flip it under the reader.
     @State private var style: ThreadStyle = .classic
+    /// The thread id `style` was resolved FOR. The toggle pins forever, so it
+    /// must know the difference between an answer and a leftover: on a switch
+    /// this view stays mounted and holds the LAST thread's style until the new
+    /// one's `adopt` runs — a gap the load flag does not cover, because the
+    /// prefetch-cache path never raises it.
+    @State private var styledFor: String?
     /// Selected message: j/k move it, click selects, the rail highlights it.
     @State private var index = 0
     /// Existing unsubscribe record for THIS thread's sender; drives the header
@@ -70,6 +76,10 @@ struct ThreadViewer: View {
     /// the reader is wherever the initial anchor dropped it, which is not a
     /// position anybody chose.
     @State private var landed = false
+    /// The re-aiming loop, held so the next one can end it: two live settles
+    /// issue competing `scrollTo`s at two targets, which is a column that
+    /// judders rather than lands. See `settle`.
+    @State private var settleTask: Task<Void, Never>?
 
     enum ConfirmMode: Equatable { case ask, noLink }
 
@@ -390,6 +400,10 @@ struct ThreadViewer: View {
                 }
             }
             .buttonStyle(.textAction)
+            // Same gate as `b` (see `toggleStyle`): the flip is a permanent
+            // answer, and there is nothing to answer about until the thread
+            // on screen is this one.
+            .disabled(!styleReady)
             .help(style.flipped.actionHelp)
 
             Button { openSenderRule() } label: {
@@ -579,6 +593,15 @@ struct ThreadViewer: View {
                 // Only for a thread that has already landed. Before that, the
                 // style is being resolved by the load that is about to land it,
                 // and two hands on the scroll is a fight.
+                //
+                // KNOWN LIMITATION: a reader deep inside a NEWEST message that
+                // is taller than the window has no row to name — `anchorId` is
+                // nil there, because the selection is the newest and the topmost
+                // visible row is that same message — so the flip re-lands them at
+                // its top rather than at the paragraph they were on. Anchoring
+                // finer than a message would mean asking the web frame where the
+                // reader is inside its document, which the frame is not asked
+                // anything else.
                 .onChange(of: style) { _, _ in
                     guard landed else { return }
                     let target = anchorId.flatMap { id in messages.firstIndex { $0.id == id } } ?? index
@@ -626,16 +649,29 @@ struct ThreadViewer: View {
     /// abandoned the moment the selection moves off it, because somebody who has
     /// moved on owns the scroll; left nil, the target is the selection, as it is
     /// for every jump.
+    ///
+    /// ONE SETTLE AT A TIME: each call ends the previous loop first. Two live
+    /// loops can hold the same selection and different targets — a flip while a
+    /// rail jump is still landing — and would issue competing `scrollTo`s on
+    /// alternating ticks. And THE WHEEL ENDS IT TOO: the selection guard cannot
+    /// see a wheel scroll, so on macOS each loop watches for one and stands
+    /// down — the reader's own hand always outranks the aim. The watch is the
+    /// loop's alone and dies with it, so a loop ending late can never take a
+    /// newer loop's watch down with it.
     private func settle(
         on target: Int, proxy: ScrollViewProxy, tries: Int = 8,
         every: Duration = .milliseconds(25), hold: Int = 1, under selection: Int? = nil
     ) {
+        settleTask?.cancel()
         proxy.scrollTo(target, anchor: .top)
-        Task { @MainActor in
+        settleTask = Task { @MainActor in
+            let wheel = WheelYield()
+            wheel.watch()
+            defer { wheel.end() }
             var steady = 0
             for _ in 0..<tries {
-                try? await Task.sleep(for: every)
-                guard index == (selection ?? target) else { return }
+                do { try await Task.sleep(for: every) } catch { return }
+                guard !wheel.tripped, index == (selection ?? target) else { return }
                 if let frame = map.frames[target], abs(frame.minY) < 2 {
                     steady += 1
                     if steady >= hold { return }
@@ -923,10 +959,28 @@ struct ThreadViewer: View {
     /// open, so a thread left following it would go back to the guess the next
     /// time a reply changes what the guess says. A reader who has answered the
     /// question should not be asked it again.
+    ///
+    /// AND IT IS A NO-OP UNTIL THERE IS A THREAD TO ANSWER FOR. `style` holds
+    /// its placeholder `.classic` until `adopt` resolves it, and the pin is for
+    /// good — the ledger has no un-answering — so a `b` pressed into the load
+    /// window would pin the placeholder, for a thread nobody has read yet, and
+    /// nothing would ever ask again.
     private func toggleStyle() {
+        guard styleReady else { return }
         style = style.flipped
         styles.set(threadId, style)
     }
+
+    /// Whether `style` is THIS thread's resolved answer rather than the state's
+    /// starting value or another thread's leftover. Asked of `styledFor`, not of
+    /// the load flag: a switch to another thread keeps this view mounted with
+    /// the previous answer in `style`, and the prefetch-cache path of `load`
+    /// never raises `loading` at all — the id is the only thing that says which
+    /// thread the answer in hand belongs to.
+    ///
+    /// The header button disables on the same test, so both doors to the flip
+    /// say the same thing.
+    private var styleReady: Bool { thread != nil && styledFor == threadId }
 
     /// HOW THIS THREAD IS DRAWN, in the one order that matters: what the reader
     /// said about THIS thread, then what Settings says about every thread, and
@@ -949,14 +1003,15 @@ struct ThreadViewer: View {
     /// A message reduced to what the guess asks about. The fresh length is the
     /// message WITHOUT the history it is quoting — the same split PlainBody
     /// collapses behind the chip, because "how long is this message" and "how
-    /// much of it is this message" are the same question.
+    /// much of it is this message" are the same question. In UTF-8 bytes, for
+    /// the reason `chatMedianBytes` gives.
     private func sample(_ m: ClientMessage) -> ThreadStyle.Sample {
         ThreadStyle.Sample(
             // `is_sent` and not `fromMe`: the accessor answers the drawing
             // question, where an unknown side is drawn as theirs. The guess
             // needs to know it is unknown.
             fromMe: m.is_sent,
-            freshChars: Quotes.splitText(m.content).visible.count,
+            freshBytes: Quotes.splitText(m.content).visible.utf8.count,
             htmlHeavy: ThreadStyle.htmlHeavy(html: m.html, plain: m.content),
             sender: m.from_addr)
     }
@@ -1101,6 +1156,7 @@ struct ThreadViewer: View {
                     // Same unpin as Actions.done — this path resolves the
                     // message without going through it.
                     await ImageStore.shared.release(messageId: newest.id)
+                    FrameHeights.shared.clear(messageId: newest.id)
                     // And the same optimistic drop: the surface underneath is
                     // still mounted, so without this the reader closes back
                     // onto a row for mail that is already done.
@@ -1202,7 +1258,10 @@ struct ThreadViewer: View {
     /// that moved the paragraph somebody was on.
     private func adopt(_ view: ClientThreadView, opening: Bool = false) {
         thread = view
-        if opening { style = resolvedStyle(view.messages) }
+        if opening {
+            style = resolvedStyle(view.messages)
+            styledFor = threadId
+        }
         // LAND ON THE NEWEST. It is last in the stack now, and `tailSpace` is
         // what lets the scroll put it at the top of the window rather than the
         // bottom.
@@ -1349,14 +1408,28 @@ private struct MessageCard: View {
     private var mine: Bool { message.fromMe }
     private var side: HorizontalAlignment { mine ? .trailing : .leading }
     private var edge: Alignment { mine ? .trailing : .leading }
+    private var chat: Bool { style == .bubbles }
 
     var body: some View {
-        Group {
-            switch style {
-            case .classic: card
-            case .bubbles: bubble
-            }
+        // ONE TREE FOR BOTH STYLES, and it is load-bearing: a `switch style`
+        // here would make the two styles separate view identities, and a flip
+        // would tear down every message's subtree — the web frame's remote-image
+        // grant, the expanded quoted history, the measured heights, all of it
+        // @State that only survives while its structural position does. So the
+        // style is expressed entirely in VALUES (alignments, paddings, widths)
+        // on one stack whose stateful children never move. The header/caption
+        // swap is the one conditional, and nothing in either holds state worth
+        // keeping.
+        VStack(alignment: chat ? side : .leading, spacing: chat ? 5 : 9) {
+            if chat { caption } else { cardHeader }
+            mail
+            AttachmentStrip(attachments: message.attachmentList)
         }
+        .frame(
+            maxWidth: chat ? ThreadViewer.bubbleWidth : .infinity,
+            alignment: chat ? edge : .leading
+        )
+        .frame(maxWidth: .infinity, alignment: chat ? edge : .leading)
         // The gutter is reserved whether or not this message is selected, so
         // j/k moves a rule rather than shifting every body left and right. The
         // chat style reserves the far side too, or a sent bubble would sit
@@ -1403,49 +1476,31 @@ private struct MessageCard: View {
     /// a card's or there would be nothing left of it to see.
     private var railInset: CGFloat { style == .bubbles ? 6 : 11 }
 
-    // MARK: - the email card
+    // MARK: - the email card's header
 
-    private var card: some View {
-        VStack(alignment: .leading, spacing: 9) {
-            HStack(spacing: 9) {
-                Avatar(sender: message.senderString, size: 24)
-                Text(SenderCache.resolved(message.senderString).displayName)
-                    .font(.system(size: 13, weight: .semibold))
-                    .foregroundStyle(Palette.ink)
-                Spacer(minLength: 8)
-                attentionChip
-                ReadReceiptMark(opens: opens)
-                Text(Fmt.dateTime(message.received_at))
-                    .font(Typo.num(11))
-                    .foregroundStyle(Palette.inkFaintest)
-            }
-
-            mail(fills: true)
-
-            AttachmentStrip(attachments: message.attachmentList)
+    private var cardHeader: some View {
+        HStack(spacing: 9) {
+            Avatar(sender: message.senderString, size: 24)
+            Text(SenderCache.resolved(message.senderString).displayName)
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundStyle(Palette.ink)
+            Spacer(minLength: 8)
+            attentionChip
+            ReadReceiptMark(opens: opens)
+            Text(Fmt.dateTime(message.received_at))
+                .font(Typo.num(11))
+                .foregroundStyle(Palette.inkFaintest)
         }
     }
 
-    // MARK: - the chat bubble
+    // MARK: - the chat bubble's caption
 
-    /// The caption over the mail, both hung on the sender's own side. The outer
-    /// frame is the whole measure so the block can be pushed to that side; the
-    /// inner one is the bubble's, and everything inside takes only the width it
-    /// needs — which is what makes a two-word reply a two-word bubble.
-    private var bubble: some View {
-        VStack(alignment: side, spacing: 5) {
-            caption
-            mail(fills: false)
-            AttachmentStrip(attachments: message.attachmentList)
-        }
-        .frame(maxWidth: ThreadViewer.bubbleWidth, alignment: edge)
-        .frame(maxWidth: .infinity, alignment: edge)
-    }
-
-    /// Who and when, small, over the bubble. The avatar is the received side's
-    /// alone — a face beside every one of your own lines is a face you already
-    /// know — and the read receipt is the sent side's, for the same reason it is
-    /// in the card: only a tracked send of yours can have one.
+    /// Who and when, small, over the bubble on the sender's own side. The avatar
+    /// is the received side's alone — a face beside every one of your own lines
+    /// is a face you already know. The read receipt is NOT gated on the side:
+    /// the card renders it unconditionally, `is_sent` is absent on an older
+    /// daemon (which draws everything as theirs), and the mark already no-ops on
+    /// empty opens — a gate would only hide receipts the card shows.
     private var caption: some View {
         HStack(spacing: 6) {
             if !mine {
@@ -1456,9 +1511,7 @@ private struct MessageCard: View {
                 .foregroundStyle(Palette.inkDim)
                 .lineLimit(1)
             attentionChip
-            if mine {
-                ReadReceiptMark(opens: opens)
-            }
+            ReadReceiptMark(opens: opens)
             Text(captionTime)
                 .font(Typo.num(10))
                 .foregroundStyle(Palette.inkFaintest)
@@ -1498,23 +1551,30 @@ private struct MessageCard: View {
     /// The frame key carries the style (see ThreadStyle.frameKey) because a
     /// document measured at 620 points is not the one a full-width card wants
     /// back out of the pool.
+    ///
+    /// ONE PlainBody FOR BOTH STYLES, for the same identity reason as `body`:
+    /// a card branch and a bubble branch would be two positions in the same
+    /// conditional, and a flip would collapse the quoted history the reader
+    /// opened. The bubble's chrome is values on that one view — zero padding
+    /// and a clear fill ARE the card.
     @ViewBuilder
-    private func mail(fills: Bool) -> some View {
+    private var mail: some View {
         if let html = message.html, !html.isEmpty {
             EmailWebView(
                 html: html, cacheKey: style.frameKey(message.id),
                 allowTrackers: message.allowsTrackers)
-        } else if fills {
-            PlainBody(content: message.content)
         } else {
-            PlainBody(content: message.content, fills: false)
-                .padding(.horizontal, 12)
-                .padding(.vertical, 9)
+            PlainBody(content: message.content, fills: !chat)
+                .padding(.horizontal, chat ? 12 : 0)
+                .padding(.vertical, chat ? 9 : 0)
                 // The same corner the web frame clips itself to, so a plain
                 // reply and an html one are the same shape on the same side.
                 .background(
                     RoundedRectangle(cornerRadius: 10, style: .continuous)
-                        .fill(mine ? Palette.accentSoft : Palette.hairline)
+                        .fill(
+                            !chat
+                                ? Color.clear
+                                : mine ? Palette.accentSoft : Palette.hairline)
                 )
         }
     }
@@ -1684,5 +1744,40 @@ private struct TriageDebugOverlay: View {
         .keyBindings(.modal, [
             KeyBinding("Escape", "close", allowInInput: true) { onClose() }
         ])
+    }
+}
+
+/// A settle loop's watch for the reader's own wheel, macOS only: the loop
+/// re-aims for up to a second after a style flip, and a wheel scroll never
+/// moves the selection its guard is watching, so without this the loop drags
+/// the reader back to its target for the rest of the leash. A LOCAL monitor
+/// sees the event before the scroll view does, trips the flag, and passes the
+/// event through untouched.
+///
+/// Owned by ONE loop and ended by it on every exit path — a leaked monitor
+/// watches every scroll the app ever makes, and a SHARED one would let a loop
+/// ending late tear down its successor's watch. On iOS the flip is a header
+/// tap and the leash is a second; there is no monitor to install and the flag
+/// simply never trips.
+@MainActor
+private final class WheelYield {
+    private(set) var tripped = false
+    private var monitor: Any?
+
+    func watch() {
+        #if os(macOS)
+            monitor = NSEvent.addLocalMonitorForEvents(matching: .scrollWheel) {
+                [weak self] event in
+                MainActor.assumeIsolated { self?.tripped = true }
+                return event
+            }
+        #endif
+    }
+
+    func end() {
+        #if os(macOS)
+            if let monitor { NSEvent.removeMonitor(monitor) }
+        #endif
+        monitor = nil
     }
 }
