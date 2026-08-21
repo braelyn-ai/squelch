@@ -71,6 +71,16 @@ pub enum BifrostError {
     /// gets a key until it is fixed.
     #[error("the LLM gateway refused our admin credentials")]
     Unauthorized,
+    /// 409 on a mint: the gateway already holds a key with this name and
+    /// enforces unique names, so "mint a replacement, revoke the old one
+    /// later" cannot work — the old key must go FIRST. `llm mint` revokes the
+    /// keys the store records before minting; this surfaces only when the
+    /// gateway holds a key the store never recorded (an orphaned mint).
+    #[error(
+        "the LLM gateway already holds a key with this name (409) and the store does not \
+         record it; revoke the orphan in the gateway's own UI, then re-run"
+    )]
+    Conflict,
     /// Any other non-success status.
     #[error("the LLM gateway refused the request")]
     Failed,
@@ -358,6 +368,7 @@ impl BifrostClient {
                 Ok(key)
             }
             401 | 403 => Err(BifrostError::Unauthorized),
+            409 => Err(BifrostError::Conflict),
             _ => Err(BifrostError::Failed),
         }
     }
