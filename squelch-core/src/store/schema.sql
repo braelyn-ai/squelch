@@ -92,6 +92,8 @@ CREATE TABLE IF NOT EXISTS sender_rules (
 --                resolved_at.
 --   surfaced_at  first time any door surfaced this row, NULL until then.
 --   resolved_at  when the row reached status='done'.
+--   remind_at    a PENDING reminder (see the column comments below).
+--   reminded_at  a reminder that already fired.
 -- Sealed rows carry these columns but are structurally absent from every
 -- non-local surface, so they are never surfaced or stamped.
 CREATE TABLE IF NOT EXISTS triage (
@@ -175,6 +177,20 @@ CREATE TABLE IF NOT EXISTS triage (
     -- the same row can re-enter a queue months later through a revisit, and a
     -- permanent stamp would quietly buy every one of those a frontier call.
     retriage_at     TEXT,
+    -- "REMIND ME LATER" (RFC3339 UTC), NULL when no reminder is pending. Setting
+    -- it also marks the thread done, so a snoozed mail leaves every band at once
+    -- instead of sitting there nagging until its date arrives. The sweep in the
+    -- sync loop is what un-defers it: at `remind_at <= now` the row goes back to
+    -- status='open' and the stamp MOVES to `reminded_at`, so exactly one of the
+    -- two is ever set — pending or fired, never both.
+    remind_at       TEXT,
+    -- WHEN A PENDING REMINDER FIRED, NULL until one does. Read as a standing-band
+    -- arm (see `STANDING_BAND`): a fired reminder outranks tier, because the user
+    -- personally declared this mail owed attention and the triage model's opinion
+    -- of it stopped mattering at that moment. Cleared when a NEW reminder is set,
+    -- and left alone by a plain clear — clearing a pending reminder says nothing
+    -- about one that already came due.
+    reminded_at     TEXT,
     status          TEXT NOT NULL DEFAULT 'new',
     surfaced_at     TEXT,
     resolved_at     TEXT,
@@ -183,6 +199,11 @@ CREATE TABLE IF NOT EXISTS triage (
 
 CREATE INDEX IF NOT EXISTS idx_triage_sensitivity ON triage(account_id, sensitivity);
 CREATE INDEX IF NOT EXISTS idx_triage_status ON triage(account_id, status);
+-- `idx_triage_remind_at ON triage(account_id, remind_at) WHERE remind_at IS NOT
+-- NULL` is created in migrate.rs, NOT here, for the same reason as
+-- `idx_shipments_order_ref` below: this file runs in full on every open, BEFORE
+-- the column migrations, so an index over a migrated column would fail ("no such
+-- column: remind_at") on every pre-existing DB and make the store unopenable.
 
 CREATE TABLE IF NOT EXISTS deadlines (
     id         INTEGER PRIMARY KEY,
@@ -656,6 +677,13 @@ CREATE TABLE IF NOT EXISTS attachments (
     mime        TEXT NOT NULL,
     size_bytes  INTEGER NOT NULL,
     data        BLOB,              -- NULL when over the ingest cap (metadata only)
+    -- The part's normalized Content-ID (brackets stripped), NULL when it declared
+    -- none. What an <img src="cid:..."> in the stored body_html resolves against.
+    -- Deliberately NOT in the UNIQUE key below: widening that key would re-open
+    -- the duplicate-file ingest DoS it exists to absorb. Two inline parts alike in
+    -- everything but their cid therefore still collapse to one row, and the
+    -- second img is simply dropped from the body rather than painted broken.
+    content_id  TEXT,
     UNIQUE(account_id, message_id, filename, size_bytes)
 );
 

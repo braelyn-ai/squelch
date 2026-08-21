@@ -193,6 +193,19 @@ pub struct AttentionUpdate {
     pub status: AttentionStatus,
     pub surfaced_at: Option<DateTime<Utc>>,
     pub resolved_at: Option<DateTime<Utc>>,
+    /// A PENDING reminder: when the user asked to see this again, `None` when
+    /// they never did or the reminder already fired. HUMAN-DOOR ONLY, like the
+    /// two fields above — a reminder is a statement the user made about their
+    /// own attention, and the agent door serializes the leaner [`Update`], which
+    /// has no place to put it.
+    ///
+    /// Serialized even when `None` (no `skip_serializing_if`, same as
+    /// `surfaced_at`): the client decodes these as optionals and "absent" and
+    /// "null" must not become two different readings of "no reminder".
+    pub remind_at: Option<DateTime<Utc>>,
+    /// A reminder that ALREADY FIRED, `None` until one does. Exactly one of this
+    /// and `remind_at` is ever set: the sweep moves the stamp across.
+    pub reminded_at: Option<DateTime<Utc>>,
 }
 
 /// A single sanitized message body (HTML flattened to text).
@@ -237,9 +250,13 @@ pub struct ClientMessage {
     /// AUTHORED BY THIS ACCOUNT: `true` when the account itself wrote this
     /// message — the stored outbound copy, OR a received copy whose `from_addr`
     /// is the account's own address — and `false` for mail from anyone else.
-    /// The reader uses it to right-align the user's side of the conversation, so
-    /// it is ALWAYS on the wire as a plain bool — never skipped — and a client
-    /// that never learns about it simply ignores the key.
+    /// The reader aligns every chat bubble on it, and an action aimed at "the
+    /// message" — remind me about this, reply to this — must land on inbound
+    /// mail, and a thread ends on the user's own reply often enough that aiming
+    /// at the last message would aim at themselves. So it is ALWAYS on the wire
+    /// as a plain bool — never skipped, defaulting to false for a row an older
+    /// daemon serialized — and a client that never learns about it simply
+    /// ignores the key.
     ///
     /// NOT the stored `messages.is_sent` column alone. That column is a
     /// VISIBILITY flag, sticky to 0 on upsert and deliberately lost to the INBOX
@@ -278,7 +295,7 @@ pub struct ClientMessage {
 
 /// One attachment's metadata on the HUMAN DOOR. Carries NO bytes.
 ///
-/// WIRE CONTRACT: `{ id, filename, mime, size, downloadable }`.
+/// WIRE CONTRACT: `{ id, filename, mime, size, downloadable, content_id? }`.
 /// `downloadable == false` means the bytes were never stored (the part exceeded
 /// the ingest cap) and the byte endpoint returns 410 for it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -290,6 +307,14 @@ pub struct ClientAttachment {
     /// Decoded size in bytes (the real part size, whether or not bytes were kept).
     pub size: i64,
     pub downloadable: bool,
+    /// The part's normalized Content-ID (see [`AttachmentInfo::content_id`]) —
+    /// what an `<img src="cid:...">` in the sanitized HTML resolves against, so
+    /// the client can point the tag at this attachment's bytes instead of
+    /// painting a broken image. `None` when the part declared none, and
+    /// structurally ABSENT then: a pre-`content_id` daemon omits the key too, so
+    /// the client cannot tell the two apart and must not try.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_id: Option<String>,
 }
 
 /// A full thread for the HUMAN DOOR (`GET /client/thread/{id}`), carrying
@@ -594,6 +619,11 @@ pub struct AttachmentInfo {
     pub size_bytes: i64,
     /// The decoded bytes, or `None` when the part was over the ingest cap.
     pub data: Option<Vec<u8>>,
+    /// The part's Content-ID, NORMALIZED: whitespace trimmed and one surrounding
+    /// `<...>` pair stripped, so it compares directly against the token in an
+    /// `<img src="cid:...">`. `None` when the part declares none (every real
+    /// attachment) or declares an empty one.
+    pub content_id: Option<String>,
 }
 
 /// One row of the human door's unsubscribe ledger (`GET /client/unsubscribes`).
@@ -751,19 +781,30 @@ mod tests {
                     received_at: Utc::now(),
                     content: "text".into(),
                     html: Some("<p>hi</p>".into()),
-                    attachments: vec![ClientAttachment {
-                        id: 7,
-                        filename: "doc.pdf".into(),
-                        mime: "application/pdf".into(),
-                        size: 1234,
-                        downloadable: true,
-                    }],
-                    is_sent: false,
+                    attachments: vec![
+                        ClientAttachment {
+                            id: 7,
+                            filename: "doc.pdf".into(),
+                            mime: "application/pdf".into(),
+                            size: 1234,
+                            downloadable: true,
+                            content_id: None,
+                        },
+                        ClientAttachment {
+                            id: 8,
+                            filename: "logo.png".into(),
+                            mime: "image/png".into(),
+                            size: 99,
+                            downloadable: true,
+                            content_id: Some("logo@squelch".into()),
+                        },
+                    ],
                     tier: Some(Tier::PastDue),
                     deadline: None,
                     attention_open: Some(true),
                     one_line: Some("bill is 12 days past due".into()),
                     auth_pass: Some(true),
+                    is_sent: false,
                 },
                 ClientMessage {
                     id: 2,
@@ -773,12 +814,12 @@ mod tests {
                     content: "plain".into(),
                     html: None,
                     attachments: vec![],
-                    is_sent: true,
                     tier: None,
                     deadline: None,
                     attention_open: None,
                     one_line: None,
                     auth_pass: None,
+                    is_sent: true,
                 },
             ],
         };
@@ -794,6 +835,19 @@ mod tests {
         assert_eq!(
             v["messages"][0]["attachments"][0]["downloadable"],
             serde_json::json!(true)
+        );
+        // content_id rides along on a cid-inline part and is structurally ABSENT
+        // on a part that declared none — the same shape a pre-content_id daemon
+        // sends, which is what lets the client treat both as "no cid".
+        assert_eq!(
+            v["messages"][0]["attachments"][1]["content_id"],
+            serde_json::json!("logo@squelch")
+        );
+        assert!(
+            v["messages"][0]["attachments"][0]
+                .get("content_id")
+                .is_none(),
+            "None content_id must not serialize"
         );
         assert_eq!(v["messages"][1]["attachments"], serde_json::json!([]));
         // Triage highlight fields: present when set, structurally ABSENT when
@@ -812,6 +866,19 @@ mod tests {
         // auth_pass is an internal gate for the human door's `sender_known`
         // bit, never a wire field, even when it holds a verdict.
         assert!(v["messages"][0].get("auth_pass").is_none());
+        // `is_sent` is the opposite: ALWAYS on the wire, both ways, because the
+        // reader has to aim its actions at inbound mail on every message.
+        assert_eq!(v["messages"][0]["is_sent"], serde_json::json!(false));
+        assert_eq!(v["messages"][1]["is_sent"], serde_json::json!(true));
+
+        // ...and the key is OPTIONAL inbound too, so a payload minted by a
+        // pre-content_id daemon still decodes.
+        let old: ClientAttachment = serde_json::from_value(serde_json::json!({
+            "id": 7, "filename": "doc.pdf", "mime": "application/pdf",
+            "size": 1234, "downloadable": true
+        }))
+        .expect("attachment without content_id must decode");
+        assert!(old.content_id.is_none());
     }
 
     fn base_update() -> Update {

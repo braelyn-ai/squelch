@@ -205,6 +205,19 @@ pub struct SyncMetrics {
     stage2_retryable: AtomicU64,
     stage2_stale_skipped: AtomicU64,
 
+    /// Config-level LLM failures (a 4xx shared by every row: bad key,
+    /// disallowed model, spent gateway budget — see
+    /// [`crate::triage::llm::is_config_failure`]), counted across every pass.
+    /// The 2026-08-19 outage was ~900 of these a day reading as generic
+    /// retryables; this is the series a dashboard alerts on.
+    llm_config_failures: AtomicU64,
+    /// Unix seconds of the last LLM call ANY pass got a real verdict from.
+    /// 0 = never, so `time() - metric` fires on a daemon whose LLM path has
+    /// never worked rather than evaluating to nothing. Stamped from the Ok
+    /// arms of [`Self::record_stage1`]/[`Self::record_stage2`]/
+    /// [`Self::record_revisit`], so no call site can forget it.
+    llm_last_ok_unix: AtomicI64,
+
     /// Carrier polls as `[carrier][outcome]`, both axes closed enums — 20
     /// series, fixed forever, no matter how many shipments or tracking numbers
     /// pass through. A TRACKING NUMBER IS NEVER A LABEL: it names a parcel and
@@ -267,6 +280,9 @@ impl SyncMetrics {
             Stage1Verdict::StaleSkipped => &self.stage1_stale_skipped,
         };
         slot.fetch_add(1, Ordering::Relaxed);
+        if verdict == Stage1Verdict::Ok {
+            self.stamp_llm_ok();
+        }
     }
 
     pub fn record_revisit(&self, verdict: RevisitVerdict) {
@@ -275,6 +291,9 @@ impl SyncMetrics {
             RevisitVerdict::Fallback => &self.revisit_fallback,
         };
         slot.fetch_add(1, Ordering::Relaxed);
+        if verdict == RevisitVerdict::Ok {
+            self.stamp_llm_ok();
+        }
     }
 
     pub fn record_stage2(&self, verdict: Stage2Verdict) {
@@ -286,6 +305,22 @@ impl SyncMetrics {
             Stage2Verdict::StaleSkipped => &self.stage2_stale_skipped,
         };
         slot.fetch_add(1, Ordering::Relaxed);
+        if verdict == Stage2Verdict::Ok {
+            self.stamp_llm_ok();
+        }
+    }
+
+    /// One config-level LLM failure (see [`crate::triage::llm::is_config_failure`]):
+    /// the pass stopped, rows stayed queued, and no verdict landed. Every pass
+    /// that breaks on a config failure counts here, so one series answers "is
+    /// this tenant's LLM path broken" no matter which pass noticed first.
+    pub fn record_llm_config_failure(&self) {
+        self.llm_config_failures.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn stamp_llm_ok(&self) {
+        self.llm_last_ok_unix
+            .store(Utc::now().timestamp(), Ordering::Relaxed);
     }
 
     /// Count one carrier-API poll. A successful one ALSO moves the freshness
@@ -639,6 +674,24 @@ pub fn render(metrics: &SyncMetrics, db: Option<&StoreSnapshot>) -> String {
         );
     }
 
+    e.scalar(
+        "squelchd_llm_config_failures_total",
+        MetricKind::Counter,
+        "Config-level LLM failures (4xx shared by every row: bad key, disallowed model, \
+         spent gateway budget) across all passes. Rows stay queued; alert on any rate.",
+        metrics.get(&metrics.llm_config_failures),
+    );
+
+    // 0 until an LLM call has ever answered, for the same reason the sync
+    // stamp is: `time() - metric` must fire on a daemon whose LLM path has
+    // never worked, not evaluate to nothing.
+    e.scalar(
+        "squelchd_llm_last_success_timestamp_seconds",
+        MetricKind::Gauge,
+        "Unix timestamp of the last LLM call any pass got a verdict from; 0 if none ever has.",
+        metrics.llm_last_ok_unix.load(Ordering::Relaxed) as f64,
+    );
+
     // ALL 20 series are emitted, including carriers this daemon has no
     // credentials for: an absent series is indistinguishable from a scraper
     // problem, and a flat 0 is what makes `rate(...)` on a carrier that just
@@ -841,6 +894,34 @@ mod tests {
         assert!(text.contains(
             "squelchd_triage_verdicts_total{stage=\"stage2\",outcome=\"retryable\"} 1\n"
         ));
+    }
+
+    /// The LLM-health pair the 2026-08-19 outage went two days without: the
+    /// config-failure counter moves on every pass that broke on a shared 4xx,
+    /// and the freshness stamp moves ONLY on a real verdict — a fallback or a
+    /// refusal proves the gateway spoke, not that triage works.
+    #[test]
+    fn llm_config_failures_count_and_the_freshness_stamp_moves_only_on_a_verdict() {
+        let m = SyncMetrics::new();
+        m.record_llm_config_failure();
+        m.record_llm_config_failure();
+        m.record_stage1(Stage1Verdict::Fallback);
+        m.record_stage2(Stage2Verdict::Refused);
+        assert_eq!(
+            m.llm_last_ok_unix.load(Ordering::Relaxed),
+            0,
+            "a fallback or refusal is not a working LLM path"
+        );
+
+        let text = render(&m, None);
+        assert!(text.contains("squelchd_llm_config_failures_total 2\n"));
+        assert!(text.contains("squelchd_llm_last_success_timestamp_seconds 0\n"));
+
+        m.record_stage2(Stage2Verdict::Ok);
+        assert!(m.llm_last_ok_unix.load(Ordering::Relaxed) > 0);
+        m.record_stage1(Stage1Verdict::Ok);
+        m.record_revisit(RevisitVerdict::Ok);
+        assert!(m.llm_last_ok_unix.load(Ordering::Relaxed) > 0);
     }
 
     /// The carrier axis is closed: every carrier/outcome pair is exported, a

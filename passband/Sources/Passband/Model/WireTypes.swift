@@ -164,8 +164,21 @@ struct AttentionUpdate: Codable, Sendable, Identifiable, Hashable {
     var status: AttentionStatus
     var surfaced_at: String?
     var resolved_at: String?
+    /// A PENDING reminder: when the daemon will pull this back into the bands.
+    /// Non-nil implies the row is done — setting a reminder resolves the thread
+    /// — so a row carrying one is not "unfinished", it is parked. HUMAN DOOR
+    /// ONLY: the agent door never serves either of these fields, which is why
+    /// both are optional rather than merely nullable.
+    var remind_at: String?
+    /// A reminder that FIRED, cleared the next time the row is resolved. It is
+    /// what re-enters the standing band regardless of tier: a reminder is the
+    /// user declaring the mail owed attention, and that outranks a verdict.
+    var reminded_at: String?
 
     var hasAttachments: Bool { has_attachments ?? false }
+
+    /// Whether a reminder is waiting to fire on this row.
+    var hasPendingReminder: Bool { !(remind_at ?? "").isEmpty }
 }
 
 /// The wire calls the address `sender` here and `from_addr` everywhere else, so
@@ -185,6 +198,12 @@ struct Attachment: Codable, Sendable, Identifiable, Hashable {
     var mime: String
     var size: Int
     var downloadable: Bool
+    /// The part's Content-ID with its angle brackets already off, which is what
+    /// a body's `<img src="cid:…">` names — see CidImages. ABSENT on a daemon
+    /// that predates the field and null for a part that declared none, so it
+    /// stays optional: the client's answer to both is the same, which is to drop
+    /// the reference rather than paint a broken image.
+    var content_id: String?
 }
 
 /// core::types::ClientMessage — the HUMAN-door message shape. `html` is a
@@ -197,10 +216,12 @@ struct ClientMessage: Codable, Sendable, Identifiable, Hashable, SenderStringCon
     var content: String
     var html: String?
     var attachments: [Attachment]?
-    /// True for the user's OWN outbound copy of this message, false for
-    /// anything received. ABSENT on a pre-bubble daemon, which reads as
-    /// unknown — and unknown is drawn as theirs, which is where every message
-    /// sat before the chat style existed.
+    /// True for a message the USER authored, false for anything received.
+    /// ABSENT on an older daemon, which reads as unknown — and unknown is
+    /// drawn as theirs (see `fromMe`), which is where every message sat before
+    /// the chat style existed, and must not make the reader treat a reply as
+    /// somebody else's mail. Aligns the chat bubbles, and picks which message
+    /// in a thread a reminder lands on: see ThreadViewer's `h`.
     var is_sent: Bool?
     /// This message's OWN triage verdict — ABSENT on a pre-highlight daemon.
     /// Drives the in-thread attention highlight: the bands show one row per
@@ -718,6 +739,14 @@ struct LabelBody: Codable, Sendable {
 
 struct SendBody: Codable, Sendable {
     var reply_to_message_id: Int?
+    /// The message being PASSED ON, and the whole of a forward on this wire:
+    /// the daemon quotes the original, carries its attachments over and starts
+    /// a NEW thread from it. MUTUALLY EXCLUSIVE with `reply_to_message_id` —
+    /// the daemon rejects a body naming both — and it requires a non-empty
+    /// `to`, because a forward has nobody to derive a recipient from. An empty
+    /// `body` is fine here and only here: passing mail on without a word of
+    /// your own is the ordinary case.
+    var forward_of_message_id: Int?
     var to: String?
     /// Omitted (not "") on a reply: the daemon derives `Re: <parent subject>`
     /// only when the field is absent — `Some("")` is an explicit empty subject.
@@ -956,6 +985,12 @@ struct UpdatesParams: Sendable {
     var band: Band?
     var limit: Int?
     var cursor: String?
+    /// Narrow to rows with a PENDING reminder, soonest first. Named for the
+    /// flag rather than the query value (`reminders=pending`) because unlike
+    /// every field above it, it is a filter with its own ORDER: the server
+    /// sorts these by remind_at, not by arrival, and it serves done rows —
+    /// which every other read here would have excluded.
+    var remindersPending: Bool
 
     init(
         since: String? = nil,
@@ -964,7 +999,8 @@ struct UpdatesParams: Sendable {
         status: AttentionStatus? = nil,
         band: Band? = nil,
         limit: Int? = nil,
-        cursor: String? = nil
+        cursor: String? = nil,
+        remindersPending: Bool = false
     ) {
         self.since = since
         self.min_importance = min_importance
@@ -973,5 +1009,6 @@ struct UpdatesParams: Sendable {
         self.band = band
         self.limit = limit
         self.cursor = cursor
+        self.remindersPending = remindersPending
     }
 }

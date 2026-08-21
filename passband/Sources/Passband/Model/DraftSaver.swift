@@ -68,6 +68,11 @@ final class DraftSaver {
     /// setters — the single funnel every edit passes through, so there is no way
     /// to type into a draft without arming its save.
     func noteChange(_ slot: Slot) {
+        // A FORWARD IS NEVER AUTOSAVED — see `save`. Refused at the door rather
+        // than at the write, so the slot is never even marked touched: a flush
+        // is gated on that mark, and an untouched slot cannot be talked into a
+        // save by any exit path.
+        guard state(of: slot)?.forwardOfMessageId == nil else { return }
         touched.insert(slot)
         pending[slot]?.cancel()
         pending[slot] = Task { [weak self] in
@@ -97,6 +102,11 @@ final class DraftSaver {
         // Nothing typed => nothing to write. `remove` both tests and clears, so a
         // second exit path firing on the same close cannot double-save.
         guard touched.remove(slot) != nil, let state else { return }
+        // Forwards do not autosave — see `save`. Unreachable while `noteChange`
+        // refuses to mark them touched, and kept because a flush takes the
+        // state from the CALLER: the day something hands this a forward it did
+        // not type into, the answer must still be no.
+        guard state.forwardOfMessageId == nil else { return }
         let ticket = nextFlush
         nextFlush &+= 1
         flushes[ticket] = Task { [weak self] in
@@ -153,6 +163,17 @@ final class DraftSaver {
     }
 
     private func save(_ slot: Slot, _ state: ComposeState) async {
+        // A FORWARD IS NEVER SAVED. THE reason, stated once here because every
+        // other guard in this file points at it: `PUT /client/drafts` has no
+        // field for the forwarded message, and the row it writes is keyed by
+        // `reply_to_message_id` — which a forward leaves nil, exactly like a
+        // plain new message. So an autosaved forward would come back as the
+        // account's one new-message draft on the next `c`, wearing its
+        // "Fwd: …" subject with the original it was forwarding silently gone,
+        // and the reader would send a quote of nothing. Losing an unsent
+        // forward is the cheaper failure: the original is still in the mailbox,
+        // one `f` away.
+        guard state.forwardOfMessageId == nil else { return }
         // A body that is only the seeded signature counts as blank: saving it
         // would mint a draft of nothing, and every later `c` would restore it.
         let blank =
@@ -189,7 +210,14 @@ final class DraftSaver {
     private func adopt(_ id: Int?, slot: Slot, key: Int?) {
         switch slot {
         case .compose:
-            guard var next = store.compose, next.replyToMessageId == key else { return }
+            // A forward also has `replyToMessageId == nil`, so the key alone
+            // cannot tell it from the new-message draft this save was keyed to.
+            // Forwards never save (see `save`), so an id landing on one is always
+            // a stale flush from the composer before it — stamped on, it would
+            // ride the forward's send and DELETE that half-written draft.
+            guard var next = store.compose, next.replyToMessageId == key,
+                next.forwardOfMessageId == nil
+            else { return }
             next.draftId = id
             store.compose = next
         case .inlineReply:

@@ -55,6 +55,113 @@ enum Actions {
         }
     }
 
+    /// Remind (undo-first): park the thread until `date`. The daemon resolves it
+    /// exactly the way `done` does and re-opens the message when the stamp comes
+    /// due, so this row leaves every band NOW — a reminder you still have to
+    /// look at is not a reminder, it is a second inbox.
+    ///
+    /// `label` is the phrase the undo chip shows, and callers pass the row's
+    /// ABSOLUTE `detail` ("tomorrow 9:00 AM") rather than the words that were
+    /// typed: the one thing the confirmation has to answer is when this comes
+    /// back, and "next week" does not answer it.
+    /// Takes a message id rather than a row because the reader can press `h` on
+    /// mail it never had an `AttentionUpdate` for (a thread opened from search
+    /// has no queue). The row is looked up where it exists, and where it does
+    /// not the parked list is simply invalidated instead of guessed at.
+    ///
+    /// RETURNS WHETHER THE STAMP LANDED. Callers choreograph off this: the
+    /// palette is still on screen when this returns, and the reader's walk to
+    /// the next email is the app saying "the reminder took". Both of those on a
+    /// 400 would leave the user watching the mail leave while a toast says it
+    /// did not. Deliberately NOT `@discardableResult`: swallowing this is the
+    /// exact bug the return value exists to prevent.
+    static func remind(_ messageId: Int, at date: Date, label: String) async -> Bool {
+        let row = store.update(id: messageId)
+        // The stamp this is moving OFF, read BEFORE the call: a second `h` on
+        // already-parked mail is a reschedule, and after the POST the row's own
+        // remind_at is the new one. See the undo below.
+        let prior = Fmt.date(row?.remind_at)
+        let restore = store.removeFromBands(messageId)
+        do {
+            let result = try await APIClient.shared.setReminder(messageId, at: date)
+            Analytics.capture("email_remind")
+            // Off the mail pages too: `removeFromBands` only covers the sitrep,
+            // and the row is done from this moment on either way.
+            store.removeFromMail(messageId)
+            // The server's own stamp when it sent one — it is the value the
+            // parked list will be re-fetched with, and a local string that
+            // disagrees would make the row jump on the next poll.
+            let stamp = result.remind_at ?? APIClient.rfc3339(date)
+            if let row {
+                store.noteReminder(row, remindAt: stamp)
+            } else {
+                store.invalidateReminders()
+            }
+            // Same as `done`: the message leaves the working set. The undo five
+            // seconds away re-pins it.
+            FrameHeights.shared.clear(messageId: messageId)
+            await ImageStore.shared.release(messageId: messageId)
+            store.pushUndo(kind: .remind, messageId: messageId, label: "reminder set for \(label)")
+            {
+                // A RESCHEDULE UNDOES TO THE REMINDER IT MOVED OFF. "Move
+                // tomorrow's reminder to next week" undone has to mean parked
+                // until tomorrow again — clearing it outright would take the
+                // undo of a MOVE and turn it into a delete of something the
+                // user never asked to lose. Only a stamp still in the future is
+                // worth restoring; one that came due while the toast was up is
+                // just the clear below.
+                if let prior, prior > Date() {
+                    let back = try await APIClient.shared.setReminder(messageId, at: prior)
+                    let stamp = back.remind_at ?? APIClient.rfc3339(prior)
+                    await MainActor.run {
+                        if let row {
+                            AppStore.shared.noteReminder(row, remindAt: stamp)
+                        } else {
+                            AppStore.shared.invalidateReminders()
+                        }
+                    }
+                    // Still parked, so the mail stays out of the working set:
+                    // no repin, and the row belongs on the parked list.
+                    return
+                }
+                // BOTH halves, REOPEN FIRST: a failure between the two then
+                // leaves an open row still carrying its stamp, and a stamp that
+                // fires on mail already back in the inbox costs nothing. The
+                // other order leaves the mail marked done with no reminder left
+                // to unpark it, which is mail that silently never comes back.
+                try await APIClient.shared.setStatus(messageId, .open)
+                try await APIClient.shared.clearReminder(messageId)
+                await ImageStore.shared.repin(messageId: messageId)
+                await MainActor.run { AppStore.shared.dropReminder(messageId) }
+            }
+            return true
+        } catch {
+            restore()
+            store.pushToast(errText(error, "could not set the reminder"), .error)
+            return false
+        }
+    }
+
+    /// Cancel a pending reminder WITHOUT reopening the mail. The thread was
+    /// resolved when the reminder was set, and cancelling is a statement about
+    /// the reminder only: "no, I do not need to see this again."
+    static func cancelReminder(_ u: AttentionUpdate) async {
+        store.dropReminder(u.id)
+        do {
+            try await APIClient.shared.clearReminder(u.id)
+            // The local list is now ahead of the cached one's TTL. Make the
+            // next tick go and ask, so the truth arrives on its own rather than
+            // up to a TTL later.
+            store.invalidateReminders()
+            store.pushToast("reminder cancelled", .info)
+        } catch {
+            // Put it back: the daemon still holds the stamp, and a row missing
+            // from this list is a reminder the user believes is gone.
+            store.noteReminder(u, remindAt: u.remind_at ?? "")
+            store.pushToast(errText(error, "could not cancel the reminder"), .error)
+        }
+    }
+
     /// Reopen a done item. No undo toast; it's already a recovery.
     static func reopen(_ u: AttentionUpdate) async {
         do {

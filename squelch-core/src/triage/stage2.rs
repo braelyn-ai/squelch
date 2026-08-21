@@ -533,6 +533,24 @@ pub struct Stage2Output {
 /// cannot loop.
 pub type ClassifyOutcome = LlmOutcome<Stage2Output>;
 
+/// The `model_used` stamp for a row whose Stage-2 call the model REFUSED. The
+/// Stage-1 (or seed) verdict stands; this records that Stage-2 asked and got no
+/// answer. NEVER the model id: stamping the model on a fallback made a
+/// heuristic verdict read as an LLM verdict, which is the same
+/// two-opposite-facts-one-stamp mistake [`super::STALE_SKIP_MODEL`] exists to
+/// prevent — and it sent the 2026-08-19 outage diagnosis chasing a model that
+/// never spoke.
+pub const STAGE2_REFUSED: &str = "stage2-refused";
+
+/// The `model_used` stamp for a row whose Stage-2 call died on a ROW-LEVEL
+/// permanent failure (truncation, unparseable verdict): `stage2-failed:<kind>`,
+/// so the row itself answers the first question anyone asks of a wrong verdict
+/// — what exactly happened. Config-level failures never stamp at all (the row
+/// stays queued); see [`crate::triage::llm::is_config_failure`].
+pub fn failed_stamp(kind: &str) -> String {
+    format!("stage2-failed:{kind}")
+}
+
 classify_entrypoint!(
     /// Classify one email against the configured Stage-2 provider, parsing the
     /// verdict into a [`Stage2Output`]. Both providers consume the IDENTICAL

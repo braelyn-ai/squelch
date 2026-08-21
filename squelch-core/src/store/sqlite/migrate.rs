@@ -106,6 +106,26 @@ pub(super) fn migrate(conn: &Connection) -> Result<()> {
     // tick — the exact opposite of what the age-based stale skip is for.
     add_column_if_missing(conn, "triage", "retriage_at", "TEXT")?;
 
+    // "REMIND ME LATER": the pending stamp and the fired one. NULL on every
+    // pre-existing row and NOT backfilled — nobody has asked to be reminded of
+    // anything, and a backfilled `reminded_at` would drag the whole mailbox into
+    // the standing band (that column is one of its arms).
+    add_column_if_missing(conn, "triage", "remind_at", "TEXT")?;
+    add_column_if_missing(conn, "triage", "reminded_at", "TEXT")?;
+    // AND THE SWEEP'S INDEX, HERE rather than in schema.sql, for the reason
+    // spelled out at that file's `idx_triage_remind_at` note: it runs before this
+    // function, so an index over a just-migrated column takes the open down. The
+    // partial index is deliberate — the sweep asks only "what is due?", and every
+    // row in a real mailbox has `remind_at IS NULL`, so a full index would be
+    // almost entirely dead weight scanned on every poll tick.
+    if has_columns(conn, "triage", &["remind_at"])? {
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_triage_remind_at
+             ON triage(account_id, remind_at) WHERE remind_at IS NOT NULL",
+            [],
+        )?;
+    }
+
     // stage2_usage grew `category` INSIDE ITS PRIMARY KEY. ALTER ADD COLUMN
     // cannot change a PK, and the bump upsert's ON CONFLICT(account_id, day,
     // category) needs that exact unique index, so an old table must be REBUILT —
@@ -305,6 +325,12 @@ pub(super) fn migrate(conn: &Connection) -> Result<()> {
     // cleared anything yet — and needs no backfill. Read-side only; see the
     // column comment in schema.sql.
     add_column_if_missing(conn, "shipments", "cleared_at", "TEXT")?;
+
+    // The cid an inline image part declared. NULL on every pre-existing row and
+    // NOT backfillable from here — the Content-ID lives in the RFC822, which the
+    // store never kept — so already-synced mail keeps painting its inline images
+    // as tiles below the body until a re-sync re-ingests it.
+    add_column_if_missing(conn, "attachments", "content_id", "TEXT")?;
 
     // Adding `stage1_model_used` leaves it NULL on every historical row — exactly
     // the Stage-1 queue predicate — so without this backfill the whole mailbox

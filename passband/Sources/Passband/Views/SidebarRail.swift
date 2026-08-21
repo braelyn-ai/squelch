@@ -171,23 +171,63 @@ struct SidebarRail: View {
         }
     }
 
+    /// The one rounded corner the rail owns: the top-trailing shoulder, where
+    /// the material tucks under the top bar. The other three corners meet
+    /// window edges and stay square.
+    private static let shoulderRadius: CGFloat = 12
+
     private var railMaterial: some View {
             // The most translucent surface in the window, but not arbitrarily
             // thin: it must hold its value over any wallpaper or its icons stop
             // being legible. It runs up into the top safe area and stops under
             // the TOP BAR — the same line the page's own header ends on, so the
             // rail's top edge and that header's rule read as one rule across the
-            // window. Above it is the strip the traffic lights live in, left
-            // unpainted: material running up BEHIND the dots reads as the dots
-            // clipping the rail.
-            Rectangle()
+            // window, dipping only for the shoulder. Above it is the strip the
+            // traffic lights live in, left unpainted: material running up BEHIND
+            // the dots reads as the dots clipping the rail.
+            //
+            // FULLSCREEN HAS NO TRAFFIC LIGHTS — the strip they live in is not
+            // on screen, so the rail runs to the true top instead of reserving
+            // it, and the shoulder goes square: a corner on a window edge, like
+            // the other three.
+            let fullscreen = WindowState.shared.isFullscreen
+            let radius = fullscreen ? 0 : Self.shoulderRadius
+            let shape = UnevenRoundedRectangle(
+                topLeadingRadius: 0, bottomLeadingRadius: 0,
+                bottomTrailingRadius: 0, topTrailingRadius: radius,
+                style: .continuous)
+            return shape
                 .fill(.thinMaterial)
-                .overlay(Palette.glassTint.opacity(0.5))
-                .overlay(alignment: .trailing) {
-                    Rectangle().fill(Palette.hairline).frame(width: 0.5)
-                }
-                .padding(.top, TopBar.height)
+                .overlay(shape.fill(Palette.glassTint.opacity(0.5)))
+                // The hairline follows the silhouette — trailing edge, shoulder,
+                // top — where a straight trailing rule would cut the curve.
+                .overlay(
+                    RailEdge(radius: radius)
+                        .stroke(Palette.hairline, lineWidth: 0.5)
+                )
+                .padding(.top, fullscreen ? 0 : TopBar.height)
                 .ignoresSafeArea(edges: [.top, .bottom])
+    }
+}
+
+/// The rail material's visible edge: up the trailing side, around the
+/// top-trailing shoulder, and along the top to the window's edge. The leading
+/// and bottom edges sit on window edges and draw nothing.
+private struct RailEdge: Shape {
+    var radius: CGFloat
+
+    func path(in rect: CGRect) -> Path {
+        var p = Path()
+        p.move(to: CGPoint(x: rect.maxX, y: rect.maxY))
+        p.addLine(to: CGPoint(x: rect.maxX, y: rect.minY + radius))
+        // Square (fullscreen): the top edge IS the window's edge, and window
+        // edges draw nothing.
+        guard radius > 0 else { return p }
+        p.addQuadCurve(
+            to: CGPoint(x: rect.maxX - radius, y: rect.minY),
+            control: CGPoint(x: rect.maxX, y: rect.minY))
+        p.addLine(to: CGPoint(x: rect.minX, y: rect.minY))
+        return p
     }
 }
 

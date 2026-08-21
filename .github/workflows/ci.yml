@@ -34,6 +34,23 @@ permissions:
 jobs:
   rust:
     runs-on: ubuntu-latest
+    # squelch-control's store tests run against a real Postgres — the store IS
+    # Postgres now, and a fake would test the fake. The container boots in
+    # parallel with checkout/toolchain; everything else in the workspace
+    # ignores it. Clippy compiles the tests but runs none, so only the test
+    # step gets the URL.
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
     steps:
       - uses: actions/checkout@v4
 
@@ -54,3 +71,5 @@ jobs:
 
       - name: test
         run: cargo test --workspace
+        env:
+          SQUELCH_TEST_PG_URL: postgres://postgres:postgres@localhost:5432/postgres

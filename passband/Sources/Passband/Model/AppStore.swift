@@ -14,10 +14,11 @@ import SwiftUI
 /// Which primary surface the rail is showing. `sitrep` is the abstracted
 /// dashboard (the default on launch); `emails` is the classic band list.
 enum MainView: String, Sendable, Hashable, CaseIterable {
-    case sitrep, emails, auth, rules, audit, usage, settings
+    case sitrep, emails, auth, rules, audit, usage, settings, process
 
     /// The TOP rail group — also the 1..5 number-key mapping. Usage/Settings are
-    /// excluded so that adding them never renumbers 1..5.
+    /// excluded so that adding them never renumbers 1..5. `process` is off the
+    /// rail entirely: its one door is the all-mail header's peer-review chip.
     static let mainViews: [MainView] = [.sitrep, .emails, .auth, .rules, .audit]
     /// The BOTTOM rail group, pinned below a divider.
     static let bottomViews: [MainView] = [.usage, .settings]
@@ -31,6 +32,7 @@ enum MainView: String, Sendable, Hashable, CaseIterable {
         case .audit: "Audit"
         case .usage: "Usage"
         case .settings: "Settings"
+        case .process: "Process"
         }
     }
 
@@ -43,6 +45,7 @@ enum MainView: String, Sendable, Hashable, CaseIterable {
         case .audit: "scroll"
         case .usage: "waveform.path.ecg"
         case .settings: "gearshape"
+        case .process: "checkmark.seal"
         }
     }
 }
@@ -180,7 +183,10 @@ struct RefreshError: Equatable, Sendable {
 
 // MARK: - undo / toasts
 
-enum UndoKind: Sendable { case archive, done, label, ruleDelete }
+/// `remind` is its own kind rather than a flavour of `done`: the forward action
+/// resolves the thread AND schedules its return, so the inverse is two calls,
+/// and "undo_fired kind=done" would count a reminder as a completion.
+enum UndoKind: Sendable { case archive, done, label, ruleDelete, remind }
 
 /// A queued undo. `revert` is the exact inverse call to fire on `u`/toast-click;
 /// the forward action has already gone out.
@@ -231,6 +237,16 @@ let ringSeconds: TimeInterval = 60
 struct ComposeState: Sendable, Equatable {
     enum Phase: Sendable { case edit, review }
     var replyToMessageId: Int?
+    /// The message this composer PASSES ON. Mutually exclusive with
+    /// `replyToMessageId` — a send names a parent to answer or an original to
+    /// forward, never both — and the daemon rejects a body carrying the pair.
+    ///
+    /// Nothing of the original travels with it: the daemon reads the message
+    /// out of its own store, quotes it, re-attaches its files and starts a NEW
+    /// thread. So this id is the whole of the forward on the wire, and the
+    /// composer's body is only what the sender adds on top of it (which may be
+    /// nothing at all).
+    var forwardOfMessageId: Int?
     var to: String = ""
     var subject: String = ""
     var body: String = ""
@@ -253,6 +269,22 @@ struct ComposeState: Sendable, Equatable {
     /// without `replyToMessageId`, and fixed when the composer opens: which key
     /// opened it is the whole choice, so there is no switch to flip afterwards.
     var replyAll = false
+    /// What the forwarded original is called, and how many files it drags with
+    /// it. DISPLAY ONLY, both of them: they NEVER reach the wire — the daemon
+    /// builds the quoted original from `forwardOfMessageId` alone, and a client
+    /// that shipped its own copy of the subject would be inviting the two to
+    /// disagree. They exist so the composer can state what rides along, which
+    /// is otherwise invisible: the body box shows only what the sender types.
+    var forwardedSubject: String?
+    var forwardedAttachmentCount: Int = 0
+
+    /// The one word both compose events use for what this draft IS —
+    /// `compose_opened` and `compose_send` must not disagree about that.
+    /// Analytics only; nothing on the wire reads it.
+    var analyticsKind: String {
+        if forwardOfMessageId != nil { return "forward" }
+        return replyToMessageId == nil ? "new" : "reply"
+    }
 }
 
 /// The email currently being reclassified by the `v` palette.
@@ -265,6 +297,25 @@ struct TriageFixTarget: Sendable, Equatable {
     /// as "unset" — which would claim a fact we never fetched.
     var tier: String??
     var category: String??
+}
+
+/// The email currently being scheduled by the `h` palette.
+///
+/// Identifiable rather than Equatable (the shape TriageFixTarget takes) because
+/// it carries a callback: the reader has to advance its queue after a reminder
+/// lands, and the palette is a global overlay that knows nothing about which
+/// surface opened it.
+struct RemindTarget: Identifiable, Sendable {
+    let id = UUID()
+    var messageId: Int
+    var sender: String
+    var subject: String
+    /// The reminder ALREADY on this row, when this is a reschedule. Shown so a
+    /// second `h` reads as "moving it" rather than as setting a first one.
+    var remindAt: String?
+    /// Called after the reminder is set, on the surface that opened the
+    /// palette. The reader uses it to walk its queue the way `e`/`d` do.
+    var onScheduled: (@MainActor @Sendable () -> Void)?
 }
 
 /// The rule editor's open request. Three shapes: tune (`sender`), create from
@@ -436,6 +487,7 @@ final class AppStore {
     /// gesture: navigate, then compose. One-shot — the viewer clears it.
     var pendingReplyMessageId: Int?
     var triageFix: TriageFixTarget?
+    var remindTarget: RemindTarget?
     var ruleEditor: RuleEditorRequest?
     var processModeOpen = false
     var askBarOpen = false
@@ -979,6 +1031,10 @@ final class AppStore {
         mailPages = [:]
         mailLoadedAt = [:]
         mailRefreshes = [:]
+        reminderRows = .loading
+        remindersLoadedAt = nil
+        remindersRefresh = nil
+        reminderFilter = false
         search = SearchSession()
         resolvedIds = []
         selectedId = nil
@@ -999,6 +1055,7 @@ final class AppStore {
         // across a switch would save the old account's rule to the new
         // account's daemon.
         triageFix = nil
+        remindTarget = nil
         ruleEditor = nil
         // Every revert closure targets the old account's daemon.
         undos = []
@@ -1218,8 +1275,8 @@ final class AppStore {
     /// they are ringing would defeat them.
     var modalOverlayOpen: Bool {
         askBarOpen || shortcutsOpen || processModeOpen
-            || triageFix != nil || ruleEditor != nil || !authQueue.isEmpty
-            || tour.wantsBlur
+            || triageFix != nil || remindTarget != nil || ruleEditor != nil
+            || !authQueue.isEmpty || tour.wantsBlur
     }
 
     // MARK: - sitrep zones
@@ -1596,6 +1653,125 @@ final class AppStore {
         sentRows.isLoading = false
     }
 
+    // MARK: - the pending-reminder filter
+
+    /// Whether the all-mail page is narrowed to mail with a reminder waiting.
+    /// A FILTER, not a fourth MailMode: the segments are three pages of mail,
+    /// and this is a lens over one of them that the Escape ladder sheds first.
+    var reminderFilter = false
+
+    /// Parked mail, in its OWN cache for the same reason the sent page has one:
+    /// these rows are all `done`, so `refreshMail`'s pages — which every list
+    /// filters through `resolvedIds` — would hide every one of them the moment
+    /// it was set. Ordered by the DAEMON (remind_at ASC, soonest first), and
+    /// never re-sorted here.
+    private var reminderRows: Loadable<[AttentionUpdate]> = .loading
+    private var remindersLoadedAt: Date?
+    private var remindersRefresh: Task<Void, Never>?
+
+    /// Counts every optimistic write to the list above. A GET that left before
+    /// one landed is answering a question about a list that no longer exists,
+    /// and its rows are OLDER than the local ones: without this, cancelling a
+    /// reminder while the poll's fetch is in flight puts the row back on screen
+    /// for the rest of the tick, which reads as the cancel not working.
+    private var remindersMutations = 0
+
+    var remindersPage: Loadable<[AttentionUpdate]> { reminderRows }
+
+    /// Same TTL-plus-join shape as `refreshMail` and `refreshSent`.
+    func refreshReminders(force: Bool = false) async {
+        if !force, let loadedAt = remindersLoadedAt,
+            Date().timeIntervalSince(loadedAt) < Self.mailTTL
+        {
+            return
+        }
+        if let running = remindersRefresh {
+            await running.value
+            if !force { return }
+        }
+        let refresh = Task { await performRemindersRefresh() }
+        remindersRefresh = refresh
+        await refresh.value
+        if remindersRefresh == refresh { remindersRefresh = nil }
+    }
+
+    private func performRemindersRefresh() async {
+        let e = epoch
+        let mutations = remindersMutations
+        reminderRows.isLoading = true
+        do {
+            // `peek` because this page is a REVIEW of things already dealt
+            // with: showing a parked row is not the app surfacing that mail,
+            // and stamping the seen-ledger here would spend the one "new"
+            // state the row still has left for when the reminder fires.
+            let page = try await APIClient.shared.getUpdates(
+                UpdatesParams(limit: Self.mailLimit, remindersPending: true), peek: true)
+            // The rows belong to the account that asked for them. Both exits
+            // below return rather than fall through, so the `isLoading` write
+            // at the bottom is only ever reached by the live epoch: an account
+            // switch mid-fetch would otherwise park A's rows in B's lens, where
+            // Backspace deletes a reminder on B's daemon by colliding id.
+            guard e == epoch else { return }
+            // And to the list as it stood when the fetch left. A cancel that
+            // landed while it was in flight is the newer truth of the two.
+            guard mutations == remindersMutations else {
+                reminderRows.isLoading = false
+                return
+            }
+            if page.items != reminderRows.value { reminderRows.value = page.items }
+            reminderRows.error = nil
+            remindersLoadedAt = Date()
+        } catch {
+            guard e == epoch else { return }
+            reminderRows.error = errText(error, "load failed")
+        }
+        reminderRows.isLoading = false
+    }
+
+    /// Land a reminder on the local rows without waiting for a round trip: the
+    /// row joins (or moves within) the parked list at its new place in the
+    /// queue, and leaves every surface that shows unfinished mail.
+    ///
+    /// The insert keeps the server's own order — remind_at ascending — so the
+    /// optimistic list and the next fetch agree on where the row sits.
+    func noteReminder(_ update: AttentionUpdate, remindAt: String) {
+        remindersMutations &+= 1
+        var row = update
+        row.remind_at = remindAt
+        row.reminded_at = nil
+        row.status = .done
+        var rows = (reminderRows.value ?? []).filter { $0.id != update.id }
+        let due = Fmt.date(remindAt) ?? .distantFuture
+        let at = rows.firstIndex { (Fmt.date($0.remind_at) ?? .distantFuture) > due } ?? rows.count
+        rows.insert(row, at: at)
+        reminderRows.value = rows
+    }
+
+    /// Drop a row from the parked list — a cancelled reminder, or an undone one.
+    func dropReminder(_ messageId: Int) {
+        remindersMutations &+= 1
+        reminderRows.value?.removeAll { $0.id == messageId }
+    }
+
+    /// Make the next read of the parked list go to the daemon. For the caller
+    /// that changed a reminder without holding the row it changed.
+    func invalidateReminders() { remindersLoadedAt = nil }
+
+    /// The cached row for a message id, wherever it currently sits. A lookup
+    /// rather than a parameter because the surfaces that act on a message do not
+    /// all hold one: the reader has `ClientMessage`s, and a thread opened from
+    /// search has no queue behind it at all. nil means genuinely uncached, which
+    /// callers treat as "ask the daemon", never as "no such mail".
+    func update(id: Int) -> AttentionUpdate? {
+        for band in [sitrep.standing, sitrep.new, sitrep.open] {
+            if let hit = band.first(where: { $0.id == id }) { return hit }
+        }
+        for mode in MailMode.allCases {
+            if let hit = mailPage(mode).value?.first(where: { $0.id == id }) { return hit }
+        }
+        return reminderRows.value?.first { $0.id == id }
+    }
+
     /// Preload the emails behind the records the columns show, so clicking one
     /// opens instantly.
     private func warmZoneThreads() {
@@ -1653,9 +1829,7 @@ final class AppStore {
         if next.body.isEmpty { next.body = Prefs.shared.signatureSeed }
         compose = next
         DraftSaver.shared.noteOpened(.compose)
-        Analytics.capture(
-            "compose_opened",
-            ["kind": state.replyToMessageId == nil ? "new" : "reply"])
+        Analytics.capture("compose_opened", ["kind": next.analyticsKind])
     }
 
     /// `c` / ⌘N — the new-message composer, RESTORED. The account holds at most
@@ -1673,6 +1847,45 @@ final class AppStore {
         Task { await restoreNewMessage() }
     }
 
+    /// `f` in the reader — pass THIS message on to someone else, in the pane
+    /// composer. The pane rather than the reader's inline slot because a
+    /// forward needs the two fields a reply does not have: a recipient (nobody
+    /// is derivable from the original) and a subject.
+    ///
+    /// `subject` and `attachmentCount` are the CHROME's, not the wire's: the
+    /// daemon quotes the original and re-attaches its files from the id alone
+    /// (see `ComposeState.forwardedSubject`).
+    ///
+    /// Two deliberate absences:
+    ///
+    /// - No `restoreNewMessage`. That draft is the account's ONE plain new
+    ///   message, keyed `reply_to_message_id == nil` server-side, and adopting
+    ///   it here would drop a stranger's half-written mail into a forward of
+    ///   something else — and take its subject line with it.
+    /// - No autosave at all, for the mirror of the same reason: the drafts wire
+    ///   cannot record what is being forwarded, so a saved forward would come
+    ///   back as an ordinary new message with the original silently gone. See
+    ///   `DraftSaver.save`.
+    func openComposeForward(messageId: Int, subject: String, attachmentCount: Int) {
+        // A composer already up is not something a repeated `f` gets to blank
+        // out — the same rule `openComposeNew` and the inline reply keep.
+        guard compose == nil else { return }
+        var state = ComposeState()
+        state.forwardOfMessageId = messageId
+        // The subject is SENT, not derived: the daemon only titles a forward
+        // itself when the field is absent, and the composer shows one, so what
+        // is on screen has to be what goes out.
+        state.subject = ComposeCopy.forwardSubject(subject)
+        // Nil rather than "" when the original was untitled, so the chrome has
+        // one thing to test.
+        let original = subject.trimmed
+        state.forwardedSubject = original.isEmpty ? nil : original
+        state.forwardedAttachmentCount = attachmentCount
+        // Through `openCompose` so the tracker default and the signature are
+        // seeded by the one place that seeds them, and the open is counted.
+        openCompose(state)
+    }
+
     /// Fill the just-opened new-message composer from its saved draft. Silent on
     /// failure: a restore that cannot happen leaves a blank composer, which is
     /// what the reader asked for anyway.
@@ -1688,7 +1901,14 @@ final class AppStore {
         // window, and overwriting live keystrokes is worse than not restoring.
         // "Untouched" rather than empty: the composer opens holding the seeded
         // signature, and a seed nobody typed must not block the restore.
-        guard var next = compose, next.replyToMessageId == nil, next.draftId == nil,
+        //
+        // A FORWARD is not a candidate either, and it would otherwise pass every
+        // test above: `f` opens a composer with no reply parent, no draft id and
+        // an untouched body, so a `c` fired a moment earlier could land its
+        // restore in it and quietly re-address someone else's mail. The subject
+        // this seeds would survive as the only visible trace.
+        guard var next = compose, next.replyToMessageId == nil, next.forwardOfMessageId == nil,
+            next.draftId == nil,
             next.to.isEmpty, next.subject.isEmpty, Prefs.shared.isBodyUntouched(next.body)
         else { return }
         next.to = draft.to
@@ -1787,6 +2007,9 @@ final class AppStore {
 
     func openTriageFix(_ target: TriageFixTarget) { triageFix = target }
     func closeTriageFix() { triageFix = nil }
+
+    func openRemind(_ target: RemindTarget) { remindTarget = target }
+    func closeRemind() { remindTarget = nil }
 
     func openRuleEditor(_ request: RuleEditorRequest) { ruleEditor = request }
     func closeRuleEditor() { ruleEditor = nil }

@@ -64,6 +64,60 @@ fn ingest_message_persists_attachments_and_thread_view_carries_them() {
 }
 
 #[test]
+fn cid_inline_part_carries_its_content_id_to_the_thread_view() {
+    // The whole point of the column: the body keeps <img src="cid:logo@squelch">,
+    // so the attachment row that fills it has to be findable BY that token.
+    use crate::config::Stage1Config;
+    let (store, acct) = store();
+
+    let eml = "From: S <s@ex.com>\r\n\
+               To: me@example.com\r\n\
+               Subject: newsletter\r\n\
+               Date: Mon, 7 Jul 2026 10:00:00 +0000\r\n\
+               MIME-Version: 1.0\r\n\
+               Content-Type: multipart/related; boundary=\"B\"\r\n\
+               \r\n\
+               --B\r\nContent-Type: text/html\r\n\r\n\
+               <p><img src=\"cid:logo@squelch\"></p>\r\n\
+               --B\r\nContent-Type: image/png\r\n\
+               Content-ID: <logo@squelch>\r\n\
+               Content-Disposition: inline\r\n\
+               Content-Transfer-Encoding: base64\r\n\r\naW5saW5l\r\n\
+               --B\r\nContent-Type: application/pdf\r\n\
+               Content-Disposition: attachment; filename=\"doc.pdf\"\r\n\
+               Content-Transfer-Encoding: base64\r\n\r\nSGVsbG8=\r\n\
+               --B--\r\n";
+    let fetched = crate::sync::ingest::RawFetched {
+        account_id: acct,
+        gmail_msg_id: "g-cid".into(),
+        gmail_thread_id: Some("t-cid".into()),
+        raw: eml.as_bytes().to_vec(),
+        internal_date: Some(Utc::now()),
+        is_sent: false,
+        account_addr: "me@example.com".into(),
+    };
+    let t = crate::sync::ingest::ingest(&fetched, &Stage1Config::default(), Utc::now(), |_| false);
+    store.ingest_message(&t).unwrap();
+
+    let view = store.thread_view_with_html(acct, "t-cid").unwrap();
+    let atts = &view.messages[0].attachments;
+    assert_eq!(atts.len(), 2, "inline image + pdf");
+    let inline = atts
+        .iter()
+        .find(|a| a.mime == "image/png")
+        .expect("inline image row");
+    assert_eq!(inline.content_id.as_deref(), Some("logo@squelch"));
+    let pdf = atts
+        .iter()
+        .find(|a| a.filename == "doc.pdf")
+        .expect("pdf row");
+    assert!(
+        pdf.content_id.is_none(),
+        "a real attachment carries no cid to resolve"
+    );
+}
+
+#[test]
 fn double_attached_identical_file_cannot_kill_ingest() {
     // REMOTE INGEST DoS: two parts with the SAME filename and size violate
     // the UNIQUE key, which must collapse to one row rather than roll back
@@ -223,6 +277,34 @@ fn thread_view_is_sent_is_authorship_not_the_sticky_stored_flag() {
 }
 
 #[test]
+fn the_thread_view_says_which_messages_are_the_users_own() {
+    // The reader aims its actions — remind me about this, reply to this — at
+    // INBOUND mail, and a conversation ends on the user's own reply often
+    // enough that "the last message" would aim at themselves. So `is_sent`
+    // rides on every message, always present on the wire.
+    let (store, acct) = store();
+    let at = |n: i64| Utc::now() - chrono::Duration::minutes(10 - n);
+    triaged(acct, "g-in", "t-mine")
+        .received_at(at(1))
+        .seed(&store);
+    triaged(acct, "g-out", "t-mine")
+        .received_at(at(2))
+        .from("me@example.com")
+        .is_sent(true)
+        .upsert(&store);
+
+    let view = store.thread_view_with_html(acct, "t-mine").unwrap();
+    assert_eq!(
+        view.messages.iter().map(|m| m.is_sent).collect::<Vec<_>>(),
+        vec![false, true]
+    );
+    // A plain bool, never absent: an old client decoding it gets `false`, which
+    // is the safe reading (aim at it) rather than a missing key.
+    let wire = serde_json::to_value(&view.messages[0]).unwrap();
+    assert_eq!(wire["is_sent"], serde_json::Value::Bool(false));
+}
+
+#[test]
 fn attachment_bytes_guards_sealed_overcap_and_unknown() {
     let (store, acct) = store();
 
@@ -302,6 +384,7 @@ fn field_reasons_roundtrip_through_ingest_and_attention_updates() {
             None,
             None,
             None,
+            false,
         )
         .unwrap();
     let u = ups.iter().find(|u| u.update.id == id).expect("row present");
@@ -360,6 +443,7 @@ fn predating_triage_row_reads_back_as_none() {
             None,
             None,
             None,
+            false,
         )
         .unwrap();
     let u = ups.iter().find(|u| u.update.id == mid).unwrap();

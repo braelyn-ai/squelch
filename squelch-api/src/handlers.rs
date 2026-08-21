@@ -29,8 +29,9 @@ use std::time::Duration;
 
 use crate::error::ApiError;
 use crate::gmail_write::{
-    GmailWriteClient, ReplyParts, SentRef, WriteError, build_references, build_reply_rfc822,
-    cc_excluding, derive_reply_recipients, reply_subject,
+    ForwardParts, GmailWriteClient, ReplyParts, SentRef, WriteError, build_forward_rfc822,
+    build_references, build_reply_rfc822, cc_excluding, derive_reply_recipients, forward_subject,
+    parse_forwarded_original, reply_subject,
 };
 use crate::guard;
 use crate::state::ApiState;
@@ -140,6 +141,13 @@ pub struct UpdatesQuery {
     status: Option<String>,
     /// Server-side sitrep bucket: standing|new|open.
     band: Option<String>,
+    /// THE REMINDER SCHEDULE: `pending` narrows to mail with a reminder still
+    /// owed, soonest-first. Deliberately not a `band` value — every row in it is
+    /// `done` (setting a reminder resolves the thread), so it composes with the
+    /// other filters rather than sitting alongside them, and it is the one
+    /// listing that never stamps the seen-ledger: a schedule the user is
+    /// reviewing is not the mail being shown to them.
+    reminders: Option<String>,
     limit: Option<u32>,
     cursor: Option<String>,
     /// READ WITHOUT SURFACING. Default false, so every existing client keeps the
@@ -179,17 +187,34 @@ pub async fn get_updates(
                 .ok_or_else(|| ApiError::bad_request("band must be one of: standing, new, open"))?,
         ),
     };
+    // One accepted value, and an unknown one is a 400 rather than a silent
+    // full listing: a client asking for the schedule and quietly getting the
+    // whole mailbox back is the worst possible failure mode for this parameter.
+    let pending_reminders = match q.reminders.as_deref() {
+        None => false,
+        Some("pending") => true,
+        Some(_) => return Err(ApiError::bad_request("reminders must be: pending")),
+    };
     let since = q
         .since
         .unwrap_or_else(|| Utc::now() - chrono::Duration::days(DEFAULT_UPDATES_WINDOW_DAYS));
     let min_importance = q.min_importance;
-    let peek = q.peek;
+    // A pending-reminder listing NEVER stamps, whatever `peek` says. Its rows are
+    // deferred mail the user is reviewing the schedule of; stamping them surfaced
+    // would report as seen exactly the mail they asked not to be shown yet.
+    let peek = q.peek || pending_reminders;
 
     let items = store_call(&state, move |store, account_id| {
-        // attention_updates excludes sealed rows in SQL. status/band filter
-        // server-side; tier and pagination apply over the ranked slice here.
-        let mut all =
-            store.attention_updates(account_id, since, min_importance, status_filter, band)?;
+        // attention_updates excludes sealed rows in SQL. status/band/reminders
+        // filter server-side; tier and pagination apply over the ranked slice here.
+        let mut all = store.attention_updates(
+            account_id,
+            since,
+            min_importance,
+            status_filter,
+            band,
+            pending_reminders,
+        )?;
         if let Some(t) = tier_filter {
             all.retain(|u| u.update.tier == t);
         }
@@ -258,6 +283,78 @@ pub async fn set_update_status(
     Ok(Json(
         json!({ "status": status.as_str(), "message_id": message_id }),
     ))
+}
+
+// --- POST/DELETE /client/updates/{message_id}/reminder ----------------------
+
+#[derive(Debug, Deserialize)]
+pub struct ReminderBody {
+    /// When to bring this mail back, RFC3339. Any offset is accepted and
+    /// normalized to UTC — the client owns the user's timezone, the store does
+    /// not.
+    remind_at: String,
+}
+
+/// "Remind me about this at T." Also marks the thread done: deferring mail is
+/// resolving it until the date arrives, so one round trip both hides it and
+/// schedules its return.
+pub async fn set_update_reminder(
+    State(state): State<ApiState>,
+    Path(message_id): Path<i64>,
+    Json(body): Json<ReminderBody>,
+) -> Result<impl IntoResponse, ApiError> {
+    let remind_at = DateTime::parse_from_rfc3339(&body.remind_at)
+        .map(|d| d.with_timezone(&Utc))
+        .map_err(|_| ApiError::bad_request("remind_at must be an RFC3339 timestamp"))?;
+    // A PAST DATE IS A CLIENT BUG, not a reminder that fires immediately: the
+    // sweep would fire it on the next tick, so accepting it silently turns a
+    // timezone mistake into mail reappearing for no visible reason.
+    if remind_at <= Utc::now() {
+        return Err(ApiError::bad_request("remind_at must be in the future"));
+    }
+
+    let updated = store_call(&state, move |store, account_id| {
+        store.set_reminder(account_id, message_id, remind_at)
+    })
+    .await?;
+    if !updated {
+        // Missing OR sealed => NotFound, keeping the two indistinguishable.
+        return Err(ApiError::not_found());
+    }
+
+    // Audited; the timestamp is the user's own scheduling decision, not content.
+    audit_action(
+        &state,
+        "set_reminder",
+        Some(message_id.to_string()),
+        &remind_at.to_rfc3339(),
+    )
+    .await;
+
+    Ok(Json(
+        json!({ "message_id": message_id, "remind_at": remind_at.to_rfc3339() }),
+    ))
+}
+
+/// Un-schedule a pending reminder. Idempotent: a message with no reminder is a
+/// 200, because the caller's intent ("no reminder on this") is already true.
+/// Deliberately does NOT reopen the thread — undoing the deferral is what the
+/// status route is for.
+pub async fn clear_update_reminder(
+    State(state): State<ApiState>,
+    Path(message_id): Path<i64>,
+) -> Result<impl IntoResponse, ApiError> {
+    let cleared = store_call(&state, move |store, account_id| {
+        store.clear_reminder(account_id, message_id)
+    })
+    .await?;
+    if !cleared {
+        return Err(ApiError::not_found());
+    }
+
+    audit_action(&state, "clear_reminder", Some(message_id.to_string()), "").await;
+
+    Ok(Json(json!({ "message_id": message_id, "cleared": true })))
 }
 
 // --- POST /client/refresh ---------------------------------------------------
@@ -2173,6 +2270,13 @@ pub struct SendBody {
     /// Reply to a stored message (thread + recipient + subject derived from it).
     #[serde(default)]
     reply_to_message_id: Option<i64>,
+    /// Forward a stored message: its raw bytes are re-fetched from Gmail and
+    /// composed into a NEW conversation (no threading, no derived audience), with
+    /// `body` riding along as the user's note above the quoted original. Mutually
+    /// exclusive with `reply_to_message_id`, and `to` is required — nobody on the
+    /// original is the person a forward is meant for.
+    #[serde(default)]
+    forward_of_message_id: Option<i64>,
     /// Explicit recipient (overrides the reply default).
     #[serde(default)]
     to: Option<String>,
@@ -2408,34 +2512,26 @@ async fn link_tracker(state: &ApiState, token: &str, message_id: i64) {
     }
 }
 
-pub async fn action_send(
-    State(state): State<ApiState>,
-    Json(body): Json<SendBody>,
-) -> Result<impl IntoResponse, ApiError> {
-    let target = body.reply_to_message_id.map(|id| id.to_string());
-
-    if !body.confirm {
-        audit_action(&state, "send", target, "rejected:confirm").await;
-        return Err(ApiError::bad_request(CONFIRM_HINT));
+/// The outbound guard's verdict on a set of REDACTED match kinds: `Some` is the
+/// 422 that stops the send, `None` clears it (writing the `guard_override` row on
+/// the way past when there was something to override).
+///
+/// ONE VERDICT PER SEND. A forward unions its note's kinds with the original's
+/// before calling this, so the user is asked once and overrides once — two
+/// separate blocks on one composition would read as the first override having
+/// been ignored.
+async fn guard_verdict(
+    state: &ApiState,
+    matches: &[&'static str],
+    override_guard: bool,
+    target: Option<String>,
+) -> Option<ApiError> {
+    if matches.is_empty() {
+        return None;
     }
-    if body.body.trim().is_empty() {
-        audit_action(&state, "send", target, "rejected:empty_body").await;
-        return Err(ApiError::bad_request("send requires a non-empty body"));
-    }
-    // Reply-all has nothing to widen without a parent to read the audience off.
-    // Checked here, with the other body validations, so it costs no Gmail call.
-    if body.reply_all && body.reply_to_message_id.is_none() {
-        audit_action(&state, "send", target, "rejected:reply_all_no_parent").await;
-        return Err(ApiError::bad_request(
-            "reply_all requires `reply_to_message_id`",
-        ));
-    }
-
-    // OUTBOUND GUARD: report only REDACTED kinds, never the matched text.
-    let matches = guard::scan_kinds(&body.body);
-    if !matches.is_empty() && !body.override_guard {
-        audit_action(&state, "send", target, "blocked:guard").await;
-        return Err(ApiError {
+    if !override_guard {
+        audit_action(state, "send", target, "blocked:guard").await;
+        return Some(ApiError {
             status: StatusCode::UNPROCESSABLE_ENTITY,
             message: format!(
                 "outbound guard blocked send; matched (redacted) kinds: {}. \
@@ -2444,15 +2540,76 @@ pub async fn action_send(
             ),
         });
     }
-    if !matches.is_empty() {
-        // Overridden: record that the guard was bypassed (kinds only).
-        audit_action(
-            &state,
-            "send",
-            target.clone(),
-            &format!("guard_override:{}", matches.join(",")),
-        )
-        .await;
+    // Overridden: record that the guard was bypassed (kinds only).
+    audit_action(
+        state,
+        "send",
+        target,
+        &format!("guard_override:{}", matches.join(",")),
+    )
+    .await;
+    None
+}
+
+pub async fn action_send(
+    State(state): State<ApiState>,
+    Json(body): Json<SendBody>,
+) -> Result<impl IntoResponse, ApiError> {
+    // AUDIT TARGET: the stored message this send is ABOUT — the original for a
+    // forward, the parent for a reply, nothing at all for a cold send.
+    let target = body
+        .forward_of_message_id
+        .or(body.reply_to_message_id)
+        .map(|id| id.to_string());
+
+    if !body.confirm {
+        audit_action(&state, "send", target, "rejected:confirm").await;
+        return Err(ApiError::bad_request(CONFIRM_HINT));
+    }
+    // A send is a reply OR a forward, never both: they disagree about threading,
+    // about the subject, and about whose conversation the mail joins.
+    if body.forward_of_message_id.is_some() && body.reply_to_message_id.is_some() {
+        audit_action(&state, "send", target, "rejected:forward_and_reply").await;
+        return Err(ApiError::bad_request(
+            "a send is either a reply or a forward, not both",
+        ));
+    }
+    // AN EMPTY NOTE IS A LEGITIMATE FORWARD — "here, look at this" is most of
+    // what forwarding is for, and the original is the body. Every other send
+    // still needs something typed in it.
+    if body.forward_of_message_id.is_none() && body.body.trim().is_empty() {
+        audit_action(&state, "send", target, "rejected:empty_body").await;
+        return Err(ApiError::bad_request("send requires a non-empty body"));
+    }
+    // A forward derives NOTHING about its audience from the original: everyone
+    // on it is someone the mail already reached. The recipient is the one thing
+    // only the user knows.
+    if body.forward_of_message_id.is_some()
+        && body.to.as_deref().map(str::trim).unwrap_or("").is_empty()
+    {
+        audit_action(&state, "send", target, "rejected:no_recipient").await;
+        return Err(ApiError::bad_request("forward requires `to`"));
+    }
+    // Reply-all has nothing to widen without a parent to read the audience off.
+    // Checked here, with the other body validations, so it costs no Gmail call.
+    // (This is also what refuses reply_all on a forward: no parent, no widening.)
+    if body.reply_all && body.reply_to_message_id.is_none() {
+        audit_action(&state, "send", target, "rejected:reply_all_no_parent").await;
+        return Err(ApiError::bad_request(
+            "reply_all requires `reply_to_message_id`",
+        ));
+    }
+
+    // OUTBOUND GUARD: report only REDACTED kinds, never the matched text. Scanned
+    // here, before any Gmail spend. A FORWARD'S VERDICT WAITS — most of what it
+    // sends is the original, which has not been read yet — so its kinds are
+    // unioned in and judged once, in `forward_send`.
+    let matches = guard::scan_kinds(&body.body);
+    if body.forward_of_message_id.is_none()
+        && let Some(err) =
+            guard_verdict(&state, &matches, body.override_guard, target.clone()).await
+    {
+        return Err(err);
     }
 
     let client = match write_client(&state) {
@@ -2462,6 +2619,10 @@ pub async fn action_send(
             return Err(e);
         }
     };
+
+    if let Some(original_id) = body.forward_of_message_id {
+        return forward_send(&state, &body, &client, target, original_id, matches).await;
+    }
 
     let (parent, thread_id) = match body.reply_to_message_id {
         Some(id) => match resolve_target(&state, id).await {
@@ -2627,6 +2788,185 @@ pub async fn action_send(
                 discard_tracker(&state, token, target.clone()).await;
             }
             audit_action(&state, "send", target, "failed:gmail").await;
+            Err(write_error(&e))
+        }
+    }
+}
+
+/// The largest original a forward will carry, in DECODED RFC822 bytes.
+///
+/// A forward re-encodes everything it reads: the raw is base64-decoded, then
+/// base64'd back out into a MIME body, then serialized into a JSON request that
+/// reqwest buffers — four to five copies of the original alive at the peak. A
+/// 25 MB message (Gmail's own attachment ceiling) therefore costs well over
+/// 100 MB of daemon memory and then fails somewhere deep in that pipeline as an
+/// opaque 502 pointing at Gmail. Refuse it up front, with a status that says
+/// which side the problem is on.
+const MAX_FORWARD_RAW_BYTES: usize = 20 * 1024 * 1024;
+
+/// Whether a fetched original is past the forward ceiling. Its own function so
+/// the boundary is testable without moving twenty megabytes through a socket.
+fn forward_raw_too_large(len: usize) -> bool {
+    len > MAX_FORWARD_RAW_BYTES
+}
+
+/// The FORWARD path of `action_send`, entered once the confirm gate, the body
+/// validations and the write credential are behind it.
+///
+/// Shape: read the original's raw bytes with the write token, guard what they
+/// contain, compose, send UNTHREADED. Two invariants earn their own sentences:
+///
+/// - FORWARDING IS THE CLASSIC EXFIL SHAPE, so the original's own text goes
+///   through the same guard the note does, and `override_guard` is the ceremony's
+///   second act rather than a formality. What is scanned is what is SENT: the
+///   scan runs on the parse of the raw fetch, never on the stored row, because
+///   the stored body is a sanitized, flattened memory of the message and the
+///   bytes on the wire are the original.
+/// - The fetch failing is LOUD (502), like reply-all's audience read: what is
+///   forwarded IS the request, so there is nothing to degrade to.
+async fn forward_send(
+    state: &ApiState,
+    body: &SendBody,
+    client: &GmailWriteClient,
+    target: Option<String>,
+    original_id: i64,
+    note_kinds: Vec<&'static str>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    // Sealed and unknown ids are the same 404 every message-target route returns.
+    let original_ref = match resolve_target(state, original_id).await {
+        Ok(m) => m,
+        Err(e) => {
+            audit_action(state, "send", target, "failed:target").await;
+            return Err(e);
+        }
+    };
+
+    let raw = match client.fetch_raw(&original_ref.gmail_msg_id).await {
+        Ok(f) => decode_raw_b64url(&f.raw_b64).unwrap_or_default(),
+        // A DEAD WRITE CREDENTIAL IS NOT A GMAIL OUTAGE. The fetch runs on the
+        // write token too, so an expired or revoked one fails HERE, before any
+        // send — and collapsing it into the 502 tells the composer to blame
+        // Gmail when the fix is `squelchd auth --write`. Answer it with the same
+        // 403 every other write path answers it with, so the client's existing
+        // "no write credential" handling fires.
+        Err(e @ WriteError::MissingCredential(_)) => {
+            audit_action(state, "send", target, "rejected:no_write_credential").await;
+            return Err(write_error(&e));
+        }
+        Err(_) => Vec::new(),
+    };
+    // A forward of a 25 MB message is a memory spike and then an opaque failure
+    // (see [`MAX_FORWARD_RAW_BYTES`]). Checked on the DECODED length, before the
+    // parse allocates its own copy of every part.
+    if forward_raw_too_large(raw.len()) {
+        audit_action(state, "send", target, "rejected:too_large").await;
+        return Err(ApiError::new(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "original message is too large to forward",
+        ));
+    }
+    // Empty bytes, undecodable bytes and unparseable bytes are one outcome:
+    // there is no original to forward.
+    let Some(original) = (!raw.is_empty())
+        .then(|| parse_forwarded_original(&raw))
+        .flatten()
+    else {
+        audit_action(state, "send", target, "failed:fetch_original").await;
+        return Err(ApiError::new(
+            StatusCode::BAD_GATEWAY,
+            "could not fetch the original message; forward was not sent",
+        ));
+    };
+
+    // ONE verdict over the note AND what it quotes (kinds only, deduped).
+    //
+    // BOTH VIEWS OF THE ORIGINAL ARE SCANNED. When a text/plain part exists,
+    // mail-parser hands back exactly that part and never converts the html
+    // alternative down — so a message whose text half is innocuous and whose html
+    // half holds the PEM block would ship with the secret unread. The html view
+    // goes through the same html-to-text converter mail-parser uses internally,
+    // which is what makes the scan see the words a recipient would see.
+    let html_text = original
+        .html
+        .as_deref()
+        .map(mail_parser::decoders::html::html_to_text)
+        .unwrap_or_default();
+    let mut kinds = note_kinds;
+    for kind in guard::scan_kinds(&original.text)
+        .into_iter()
+        .chain(guard::scan_kinds(&html_text))
+    {
+        if !kinds.contains(&kind) {
+            kinds.push(kind);
+        }
+    }
+    if let Some(err) = guard_verdict(state, &kinds, body.override_guard, target.clone()).await {
+        return Err(err);
+    }
+
+    // Validated non-empty before any Gmail spend (see `action_send`).
+    let to = body.to.clone().unwrap_or_default();
+    // The STORED subject is what the user saw in the reader, so it is what the
+    // `Fwd:` goes in front of.
+    let subject = body
+        .subject
+        .clone()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| forward_subject(&original_ref.subject));
+
+    // Last thing before composing, so every rejection above costs no token.
+    let tracker = mint_tracker(state, body.include_tracker.unwrap_or(false), target.clone()).await;
+
+    let parts = ForwardParts {
+        to,
+        subject,
+        note: body.body.clone(),
+        note_html: match body.body_format.as_deref() {
+            Some("markdown") => Some(crate::markdown::render_email_html(&body.body)),
+            _ => None,
+        },
+        pixel_url: tracker.as_ref().map(|(_, url)| url.clone()),
+        original,
+    };
+    let raw = match build_forward_rfc822(&parts) {
+        Ok(r) => r,
+        Err(e) => {
+            if let Some((token, _)) = &tracker {
+                discard_tracker(state, token, target.clone()).await;
+            }
+            audit_action(state, "send", target, "rejected:compose").await;
+            return Err(write_error(&e));
+        }
+    };
+
+    // NO threadId: a forward opens a new conversation rather than filing the
+    // user's "look at this" inside the correspondence it came out of.
+    match client.send(&raw, None).await {
+        Ok(sent) => {
+            // NO `resolve_done`: passing a message on to someone else is not
+            // handling it, and the attention row is the only place the user's
+            // own outstanding action is remembered.
+            if let Some(draft_id) = body.draft_id {
+                discard_sent_draft(state, draft_id).await;
+            }
+            audit_action(state, "send", target.clone(), "ok:forward").await;
+            // The mail is away; everything below is bookkeeping that cannot fail
+            // the request.
+            let echo_message_id = echo_sent(state, client, target, &sent).await;
+            if let (Some((token, _)), Some(message_id)) = (&tracker, echo_message_id) {
+                link_tracker(state, token, message_id).await;
+            }
+            Ok(Json(json!({
+                "status": "sent",
+                "echo_message_id": echo_message_id,
+                "thread_id": sent.thread_id,
+            })))
+        }
+        Err(e) => {
+            if let Some((token, _)) = &tracker {
+                discard_tracker(state, token, target.clone()).await;
+            }
+            audit_action(state, "send", target, "failed:gmail").await;
             Err(write_error(&e))
         }
     }
@@ -3162,6 +3502,22 @@ mod shred_policy_tests {
                 "{raw:?} must not read as enabled"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod forward_ceiling_tests {
+    use super::*;
+
+    #[test]
+    fn the_ceiling_is_twenty_mebibytes_and_it_is_a_ceiling_not_a_floor() {
+        // Exactly at the limit still forwards: the number is what we promise to
+        // carry, and an off-by-one here silently refuses a legal 20 MiB message.
+        assert!(!forward_raw_too_large(0));
+        assert!(!forward_raw_too_large(MAX_FORWARD_RAW_BYTES - 1));
+        assert!(!forward_raw_too_large(MAX_FORWARD_RAW_BYTES));
+        assert!(forward_raw_too_large(MAX_FORWARD_RAW_BYTES + 1));
+        assert_eq!(MAX_FORWARD_RAW_BYTES, 20 * 1024 * 1024);
     }
 }
 

@@ -38,6 +38,13 @@ actor APIClient {
     /// mid-request hangs forever and wedges a poller's in-flight guard with it.
     private static let requestTimeout: TimeInterval = 15
     private static let attachmentTimeout: TimeInterval = 30
+    /// A forward is the one send that moves the whole original — the daemon
+    /// fetches it back from Gmail and uploads it again, attachments and all —
+    /// so 15s would report slow-but-successful forwards as failures and invite
+    /// a second, duplicate send. The session's 60s resource ceiling (set in
+    /// `init`) is the real upper bound; this matches it rather than pretending
+    /// to exceed it.
+    private static let forwardTimeout: TimeInterval = 60
 
     init() {
         session = Sessions.ephemeral(
@@ -157,14 +164,14 @@ actor APIClient {
 
     private func post<T: Decodable>(
         _ path: String, body: Encodable? = nil, query: [String: String?] = [:],
-        as type: T.Type = T.self
+        as type: T.Type = T.self, timeout: TimeInterval = APIClient.requestTimeout
     ) async throws -> T {
         var payload: Data? = nil
         if let body { payload = try Self.encoder.encode(AnyEncodable(body)) }
         // Routes that take no body still need `{}` on some handlers; callers
         // pass an explicit empty struct where that matters.
         let req = try buildRequest(
-            path: path, method: .POST, query: query, body: payload, timeout: Self.requestTimeout)
+            path: path, method: .POST, query: query, body: payload, timeout: timeout)
         let (data, _) = try await perform(req)
         return try decode(T.self, from: data)
     }
@@ -214,6 +221,7 @@ actor APIClient {
                 "limit": params.limit.map(String.init),
                 "cursor": params.cursor,
                 "peek": peek ? "true" : nil,
+                "reminders": params.remindersPending ? "pending" : nil,
             ])
     }
 
@@ -410,6 +418,49 @@ actor APIClient {
             "/client/updates/\(messageId)/status", body: StatusBody(status: status.rawValue))
     }
 
+    // MARK: - reminders
+
+    struct ReminderBody: Codable, Sendable { var remind_at: String }
+    struct ReminderResult: Codable, Sendable {
+        var message_id: Int
+        var remind_at: String?
+    }
+
+    /// RFC3339 in UTC, which is the only shape the daemon parses. Reminders are
+    /// CHOSEN in local time ("tomorrow morning" is a wall clock, not an
+    /// offset), so this conversion is the one place the two meet.
+    nonisolated(unsafe) private static let wireStamp: ISO8601DateFormatter = {
+        let f = ISO8601DateFormatter()
+        f.formatOptions = [.withInternetDateTime]
+        f.timeZone = TimeZone(secondsFromGMT: 0)
+        return f
+    }()
+    private static let wireStampLock = NSLock()
+
+    /// The same rendering, for a caller that has to name the instant it just
+    /// asked for (an optimistic row) rather than send it.
+    nonisolated static func rfc3339(_ date: Date) -> String {
+        wireStampLock.lock()
+        defer { wireStampLock.unlock() }
+        return wireStamp.string(from: date)
+    }
+
+    /// Park this thread until `date`. The daemon marks the thread done now and
+    /// re-opens the message when the stamp comes due — so this is a resolve and
+    /// a schedule in one call, and the caller's optimistic removal is correct.
+    @discardableResult
+    func setReminder(_ messageId: Int, at date: Date) async throws -> ReminderResult {
+        try await post(
+            "/client/updates/\(messageId)/reminder",
+            body: ReminderBody(remind_at: Self.rfc3339(date)))
+    }
+
+    /// Drop a pending reminder. Idempotent server-side: a row with none already
+    /// answers 200, which is what lets an undo fire without checking first.
+    func clearReminder(_ messageId: Int) async throws {
+        try await deleteNoContent("/client/updates/\(messageId)/reminder")
+    }
+
     @discardableResult
     func actionArchive(_ messageId: Int) async throws -> StatusResult {
         try await post(
@@ -433,12 +484,17 @@ actor APIClient {
     func actionSend(
         body: String, replyToMessageId: Int? = nil, to: String? = nil, subject: String? = nil,
         overrideGuard: Bool = false, draftId: Int? = nil, includeTracker: Bool = false,
-        replyAll: Bool = false
+        replyAll: Bool = false, forwardOfMessageId: Int? = nil
     ) async throws -> SendResult {
         try await post(
             "/client/actions/send",
             body: SendBody(
-                reply_to_message_id: replyToMessageId, to: to, subject: subject, body: body,
+                reply_to_message_id: replyToMessageId,
+                // Omitted when absent, like every other optional here — and
+                // never set beside `reply_to_message_id`: the daemon refuses a
+                // send that claims to be both an answer and a forward.
+                forward_of_message_id: forwardOfMessageId,
+                to: to, subject: subject, body: body,
                 // Both composers write markdown; the daemon renders the HTML
                 // half from this same source after the guard has scanned it.
                 body_format: "markdown",
@@ -448,7 +504,8 @@ actor APIClient {
                 include_tracker: includeTracker ? true : nil,
                 // Same omission rule, and the daemon expands the set itself —
                 // this is a flag, never a recipient list.
-                reply_all: replyAll ? true : nil))
+                reply_all: replyAll ? true : nil),
+            timeout: forwardOfMessageId == nil ? Self.requestTimeout : Self.forwardTimeout)
     }
 
     /// The recipients a reply to `messageId` would carry, derived server-side.

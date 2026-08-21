@@ -130,11 +130,17 @@ final class ThreadPrefetch {
                 // warmer must key on the SAME one the card will render under or
                 // every known-sender body misses and re-scans on the main path.
                 let allow = message.allowsTrackers
-                let key = EmailWebView.Prepared.cacheKey(html, allow)
+                // The PARTS are part of that identity too — the cid rewrite
+                // resolves against them — so they are passed for the same
+                // reason: warm under a different key and every body with an
+                // attachment misses and re-scans on the main path.
+                let parts = message.attachmentList
+                let key = EmailWebView.Prepared.cacheKey(html, allow, parts)
                 guard PreparedBodies.shared.get(key) == nil else { continue }
                 PreparedBodies.shared.set(
                     key,
-                    EmailWebView.Prepared.make(from: html, allowTrackers: allow))
+                    EmailWebView.Prepared.make(
+                        from: html, allowTrackers: allow, attachments: parts))
             }
         }
     }

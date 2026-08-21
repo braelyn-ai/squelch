@@ -149,6 +149,39 @@ enum Fmt {
         return DeadlineChip(text: "due \(shortDate(iso))", overdue: false)
     }
 
+    /// When a pending reminder comes back, at row scale: "in 40m", "in 3h",
+    /// "tomorrow 9am", "Sat 9am", "aug 30".
+    ///
+    /// The scale changes with the distance because the useful fact does. Inside
+    /// the day what matters is how long you have; past it, which day; past the
+    /// week, the date — a countdown of "in 214h" answers nothing anybody asked.
+    static func remindChip(_ iso: String?, now: Date = Date()) -> String {
+        guard let then = date(iso) else { return "" }
+        let secs = then.timeIntervalSince(now)
+        // A reminder whose moment has passed but whose sweep has not run yet.
+        if secs <= 0 { return "due" }
+        if secs < 12 * 3600 {
+            let mins = Int((secs / 60).rounded())
+            return mins < 60 ? "in \(max(1, mins))m" : "in \(Int((secs / 3600).rounded()))h"
+        }
+        if Calendar.current.isDateInTomorrow(then) { return "tomorrow \(clock(then))" }
+        if secs < 7 * 86400 { return "\(weekday(iso)) \(clock(then))" }
+        return shortDate(iso).lowercased()
+    }
+
+    /// Compact wall clock: "9am", "6:30pm". Hand-built rather than run through a
+    /// date style because at chip size ":00 AM" is three characters of nothing —
+    /// and because 12-hour is what every other string in this app assumes.
+    private static func clock(_ then: Date, calendar: Calendar = .current) -> String {
+        let parts = calendar.dateComponents([.hour, .minute], from: then)
+        let hour24 = parts.hour ?? 0
+        let minute = parts.minute ?? 0
+        let suffix = hour24 < 12 ? "am" : "pm"
+        let hour = hour24 % 12 == 0 ? 12 : hour24 % 12
+        return minute == 0
+            ? "\(hour)\(suffix)" : "\(hour):\(String(format: "%02d", minute))\(suffix)"
+    }
+
     /// Rendered stamps, memoized like the parsed dates above and for the same
     /// reason: `Date.formatted` builds a format style and runs ICU on every call,
     /// and these run for every visible row on every render — a deadline chip

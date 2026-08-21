@@ -118,8 +118,15 @@ struct UpdateRow: View {
 
                     // A third line only when there is something to put on it —
                     // most rows are two lines and stay two lines.
-                    if chip != nil || update.matched_rule != nil || showAgeBadge {
+                    if chip != nil || update.matched_rule != nil || showAgeBadge
+                        || update.hasPendingReminder
+                    {
                         HStack(spacing: 7) {
+                            if update.hasPendingReminder {
+                                Chip(
+                                    text: Fmt.remindChip(update.remind_at), tone: Palette.accent,
+                                    symbol: "bell.fill")
+                            }
                             if let chip {
                                 Chip(
                                     text: chip.text,
@@ -190,6 +197,15 @@ struct UpdateRow: View {
                             .foregroundStyle(Palette.accent.opacity(0.8))
                             .help("matched a sender rule")
                     }
+                    // WHEN IT COMES BACK. Rendered off the row itself rather
+                    // than passed in, so a parked row says so on whatever
+                    // surface it turns up on. Bands never carry one: a pending
+                    // reminder means the thread is done, and they exclude done.
+                    if update.hasPendingReminder {
+                        Chip(
+                            text: Fmt.remindChip(update.remind_at), tone: Palette.accent,
+                            symbol: "bell.fill")
+                    }
                     if let chip {
                         Chip(
                             text: chip.text, tone: chip.overdue ? Palette.danger : Palette.warn,
@@ -217,24 +233,3 @@ struct UpdateRow: View {
     #endif
 }
 
-/// The header sun/moon theme toggle. Mirrors the `\` keybinding, both routed
-/// through the same Prefs so every mount stays in sync.
-struct ThemeToggle: View {
-    @Environment(Prefs.self) private var prefs
-
-    private var isDark: Bool {
-        switch prefs.theme {
-        case .dark: true
-        case .light: false
-        case .system: Platform.isDarkAppearance
-        }
-    }
-
-    var body: some View {
-        ChromeChip(
-            icon: isDark ? "sun.max" : "moon", font: .system(size: 12),
-            help: "\(isDark ? "light" : "dark") mode (\\)"
-        ) { prefs.flipTheme() }
-        .accessibilityLabel("switch to \(isDark ? "light" : "dark") mode")
-    }
-}

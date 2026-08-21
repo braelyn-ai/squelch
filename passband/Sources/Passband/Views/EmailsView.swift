@@ -12,6 +12,13 @@
 // holds outbound mail, which nothing triaged and no verb here can resolve. So
 // the rows are SentRows, j/k/Enter work exactly as they do everywhere else, and
 // r/e/d/v/f are inert rather than acting on a row they have no meaning for.
+//
+// AND A LENS OVER THE INBOX: the reminder filter, which swaps the rows for mail
+// that is parked (`h`) and waiting to come back. A lens rather than a fourth
+// page because it is not a place you navigate to — the first Escape sheds it and
+// you are back on the mail you were reading. Its rows come from their own cache
+// for one reason worth stating: every one of them is `done`, so the ordinary
+// page — which filters through `resolvedIds` — would hide them all.
 
 import SwiftUI
 
@@ -25,16 +32,27 @@ struct EmailsView: View {
     @State private var hovering = false
 
     private var mode: MailMode { store.mailMode }
+    /// The reminder lens, which only the inbox page has. Read through here so
+    /// every row/verb/key below asks one question rather than two.
+    private var reminders: Bool { store.reminderFilter && mode == .inbox }
     /// The cached page for whichever INBOX-shaped mode is showing (sent has its
-    /// own wire type and its own cache — see `sentPage`).
-    private var page: Loadable<[AttentionUpdate]> { store.mailPage(mode) }
+    /// own wire type and its own cache — see `sentPage`), or the parked list
+    /// when the lens is on.
+    private var page: Loadable<[AttentionUpdate]> {
+        reminders ? store.remindersPage : store.mailPage(mode)
+    }
     private var sentPage: Loadable<[SentItem]> { store.sentPage }
 
     /// The cached page MINUS anything resolved since it was fetched: the page
     /// only reloads on the 10s `store.lastRefresh` poll, so without this filter
     /// mail finished from the reader sits here visibly undone until the next tick.
+    ///
+    /// The parked rows skip it entirely, and must: setting a reminder resolves
+    /// the thread, so every id on that list is in `resolvedIds` by construction
+    /// and the filter would empty the page it just filled.
     private var rows: [AttentionUpdate] {
-        (page.value ?? []).filter { !store.resolvedIds.contains($0.id) }
+        let cached = page.value ?? []
+        return reminders ? cached : cached.filter { !store.resolvedIds.contains($0.id) }
     }
     /// Sent rows are NOT filtered against `resolvedIds`: a resolve is an inbox
     /// verdict, and it must never delete a record of something you sent.
@@ -69,8 +87,10 @@ struct EmailsView: View {
         // being shown is refreshed, so the noise page costs nothing until you go
         // there. The store's short TTL is what makes the mount half free when a
         // tick just landed; the tick half always outruns it and refreshes for real.
-        .task(id: RefreshKey(tick: store.lastRefresh, mode: mode)) {
-            if mode == .sent {
+        .task(id: RefreshKey(tick: store.lastRefresh, mode: mode, reminders: reminders)) {
+            if reminders {
+                await store.refreshReminders()
+            } else if mode == .sent {
                 await store.refreshSent()
             } else {
                 await store.refreshMail(mode)
@@ -90,11 +110,14 @@ struct EmailsView: View {
         }
         // A mode switch replaces every row, so the cursor cannot keep its index —
         // it would land on an unrelated email, and the verbs act on the highlight.
+        // Flipping the lens replaces them just as completely.
+        // The lens goes with it: a page switch is a fresh page, and a filter
+        // that survived one would silently re-narrow the inbox on the way back.
         .onChange(of: mode) { _, _ in
-            index = 0
-            kbActive = false
-            hovering = false
+            store.reminderFilter = false
+            resetCursor()
         }
+        .onChange(of: reminders) { _, _ in resetCursor() }
         // Jump to (and highlight) a hand-off target from the sitrep rails.
         .onChange(of: store.selectedId) { _, id in
             guard let id, let i = rows.firstIndex(where: { $0.id == id }) else { return }
@@ -115,11 +138,16 @@ struct EmailsView: View {
         if let error = page.error, page.value == nil {
             BandNote(error)
         } else if page.value == nil {
-            BandNote(mode == .noise ? "loading noise…" : "loading mail…")
+            BandNote(
+                reminders ? "loading reminders…" : mode == .noise ? "loading noise…" : "loading mail…"
+            )
         } else if rows.isEmpty {
             // The window the daemon answers with is 30 days, so an empty noise
             // page says so rather than implying "ever".
-            BandNote(mode == .noise ? "No noise in the last 30 days." : "No mail.")
+            BandNote(
+                reminders
+                    ? "No pending reminders."
+                    : mode == .noise ? "No noise in the last 30 days." : "No mail.")
         }
     }
 
@@ -245,10 +273,13 @@ struct EmailsView: View {
     // MARK: - header
 
     /// A Mac's page header is also the app's chrome bar: wordmark, counts, the
-    /// freshness stamp, and the doors to auth / audit / shortcuts / theme. A
-    /// phone has a navigation bar for the name and a tab bar for the doors, so
-    /// all that is left up here is the one thing this page owns — which of the
-    /// two lists you are looking at, and how much is in the other one.
+    /// freshness stamp, and the door to the process page. The auth / audit /
+    /// shortcuts / theme chips that used to line up here are gone, not moved:
+    /// every one of them already has a rail button or a global key (g, A, ?, \),
+    /// and a second door in the chrome was chrome for its own sake. A phone has
+    /// a navigation bar for the name and a tab bar for the doors, so all that is
+    /// left up here is the one thing this page owns — which of the two lists you
+    /// are looking at, and how much is in the other one.
     @ViewBuilder
     private var header: some View {
         #if os(macOS)
@@ -339,23 +370,23 @@ struct EmailsView: View {
                         .font(Typo.micro).foregroundStyle(Palette.inkFaintest)
                 }
             }
-            RetriageButton()
-            if !store.sitrep.sealed.isEmpty {
+            // The reminder lens. Inbox only: `noise` and `sent` are pages, and
+            // narrowing either of them to parked mail would answer a question
+            // nobody asked from there.
+            if mode == .inbox {
                 ChromeChip(
-                    text: "\(store.sitrep.sealed.count)", icon: "key.fill",
-                    tone: Palette.lock,
-                    help: "login codes, password resets & sign-in alerts (g)"
-                ) { store.setView(.auth) }
+                    icon: reminders ? "bell.fill" : "bell",
+                    font: .system(size: 12),
+                    tone: reminders ? Palette.accent : Palette.inkFaint,
+                    help: "mail with pending reminders (h sets one)"
+                ) { store.reminderFilter.toggle() }
+                .accessibilityLabel(reminders ? "showing pending reminders" : "pending reminders")
             }
+            RetriageButton()
             ChromeChip(
-                icon: "scroll", font: .system(size: 12),
-                help: "audit log — agent & app actions (A)"
-            ) { store.setView(.audit) }
-            ChromeChip(
-                text: "?", font: .system(size: 12, weight: .semibold),
-                help: "keyboard shortcuts (?)"
-            ) { store.shortcutsOpen = true }
-            ThemeToggle()
+                text: "peer-review", font: .system(size: 12),
+                help: "the process page: verify how your mail was sorted"
+            ) { store.setView(.process) }
         }
         // These metrics must match the sitrep masthead's: every page's bar ends
         // on the line the rail's top edge is cut to.
@@ -374,10 +405,13 @@ struct EmailsView: View {
             KeyBinding("ArrowDown", "next") { moveByKey(+1) },
             KeyBinding("ArrowUp", "prev") { moveByKey(-1) },
             // A LADDER, the same shape as the reader closing over a still-open
-            // side panel: from any page that is not the inbox Escape steps back
-            // to it, and only a second press leaves the tab.
+            // side panel: the lens comes off first, then any page that is not
+            // the inbox steps back to it, and only then does Escape leave the
+            // tab. Each rung undoes the narrowing you did last.
             KeyBinding("Escape", "back") {
-                if mode != .inbox {
+                if reminders {
+                    store.reminderFilter = false
+                } else if mode != .inbox {
                     store.mailMode = .inbox
                 } else {
                     store.setView(.sitrep)
@@ -423,6 +457,23 @@ struct EmailsView: View {
             },
             KeyBinding("e", "done") { resolveSelected() },
             KeyBinding("d", "done") { resolveSelected() },
+            // On the lens it reschedules the row it is already showing — the
+            // palette is the same either way.
+            KeyBinding("h", "remind me later") {
+                guard triageable, let u = selected else { return }
+                store.openRemind(
+                    RemindTarget(
+                        messageId: u.id, sender: u.sender, subject: u.one_line,
+                        remindAt: u.remind_at))
+            },
+            // Cancel a reminder WITHOUT reopening the mail — it was resolved
+            // when the reminder was set, and "I do not need to see this again"
+            // is a statement about the reminder, not about the email. Bound
+            // only on the lens: everywhere else Backspace has no row to mean.
+            KeyBinding("Backspace", "cancel reminder") {
+                guard reminders, actionable, let u = selected else { return }
+                Task { await Actions.cancelReminder(u) }
+            },
             KeyBinding("a", "browse all") { store.openSide(.browse) },
             KeyBinding("T", "rules") { store.setView(.rules) },
             KeyBinding("A", "audit log") { store.setView(.audit) },
@@ -437,11 +488,18 @@ struct EmailsView: View {
     private struct RefreshKey: Hashable {
         var tick: Date?
         var mode: MailMode
+        var reminders: Bool
     }
 
     private func moveByKey(_ delta: Int) {
         kbActive = true
         index = max(0, min(rowCount - 1, index + delta))
+    }
+
+    private func resetCursor() {
+        index = 0
+        kbActive = false
+        hovering = false
     }
 
     private func resolveSelected() {

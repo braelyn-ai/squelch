@@ -22,10 +22,10 @@
 //! ever exist; the real control plane never sees an identity at all.
 //!
 //! Nothing here touches a real Google endpoint, a real cluster, a real port
-//! 8848, or any store outside an in-memory SQLite. `Config` is constructed
-//! directly rather than read from the environment, which is exactly why
-//! `token_url`/`profile_url` are fields: `Config::from_env` pins Google's and
-//! nothing can move them.
+//! 8848, or any store outside the throwaway Postgres schema `common` makes.
+//! `Config` is constructed directly rather than read from the environment,
+//! which is exactly why `token_url`/`profile_url` are fields:
+//! `Config::from_env` pins Google's and nothing can move them.
 
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
@@ -46,8 +46,11 @@ use squelch_control::config::{
     BifrostConfig, Config, DEFAULT_ASSISTANT_BUDGET_USD, DEFAULT_LLM_BUDGET_USD,
 };
 use squelch_control::warden::HttpWarden;
-use squelch_control::{ControlState, ControlStore, invites, router, seal};
+use squelch_control::{ControlState, invites, router, seal};
 use tower::ServiceExt as _;
+
+/// The throwaway Postgres schema every harness in this file is built on.
+mod common;
 
 /// The refresh token the mock Google hands out. Every assertion that this
 /// never leaves the process in the clear greps for this exact string.
@@ -473,7 +476,7 @@ impl Harness {
             cookie_key: vec![42; 32],
             warden_url: warden_url.clone(),
             warden_token: "warden-bearer".into(),
-            db_path: ":memory:".into(),
+            database_url: "postgres://unused".into(),
             trusted_proxy_hops: 0,
             token_url: format!("{google}/token"),
             auth_url: format!("{google}/authorize"),
@@ -497,10 +500,11 @@ impl Harness {
             waitlist: None,
         };
 
-        let store = ControlStore::open_in_memory().unwrap();
+        let (store, _url) = common::fresh_store().await;
         let minted = invites::mint().unwrap();
         store
             .insert_invite(&minted.code_hash, default_expiry())
+            .await
             .unwrap();
 
         let warden = Arc::new(
@@ -519,17 +523,18 @@ impl Harness {
 
     /// Mint another invite straight into the control store, the way
     /// `squelch-control invite issue` does.
-    fn issue_invite(&self) -> String {
-        self.issue_invite_expiring(default_expiry())
+    async fn issue_invite(&self) -> String {
+        self.issue_invite_expiring(default_expiry()).await
     }
 
     /// ...with an expiry of the test's choosing. A past one is a code that ran
     /// out before the test started.
-    fn issue_invite_expiring(&self, expires_at: chrono::DateTime<chrono::Utc>) -> String {
+    async fn issue_invite_expiring(&self, expires_at: chrono::DateTime<chrono::Utc>) -> String {
         let minted = invites::mint().unwrap();
         self.state
             .store()
             .insert_invite(&minted.code_hash, expires_at)
+            .await
             .unwrap();
         minted.code
     }
@@ -537,19 +542,20 @@ impl Harness {
     /// Whether the code the harness minted is available to be held right now.
     /// The reservation is invisible from the outside, so this is how a test
     /// asserts a failed signup handed it back.
-    fn invite_is_available(&self) -> bool {
+    async fn invite_is_available(&self) -> bool {
         self.state
             .store()
             .find_available_invite(&invites::hash(&self.invite_code), chrono::Utc::now())
+            .await
             .unwrap()
             .is_some()
     }
 
     /// How the store recorded the invite: `(used_by_label, still available)`.
-    fn invite_row(&self) -> (Option<String>, bool) {
-        let rows = self.state.store().list_invites().unwrap();
+    async fn invite_row(&self) -> (Option<String>, bool) {
+        let rows = self.state.store().list_invites().await.unwrap();
         let row = rows.last().expect("the harness minted one").clone();
-        (row.used_by_label, self.invite_is_available())
+        (row.used_by_label, self.invite_is_available().await)
     }
 
     /// The recipient the mock warden minted for `label`.
@@ -860,13 +866,13 @@ async fn a_failed_credential_install_leaves_a_retriable_signup() {
 
     // Nothing was recorded here: the tenant does not exist as far as this
     // control plane is concerned, so its own label check will not block a retry.
-    assert!(!h.state.store().label_exists("ada").unwrap());
+    assert!(!h.state.store().label_exists("ada").await.unwrap());
     // ...and the code was handed back THE MOMENT the provision failed, not left
     // held until the session would have expired ten minutes from now. The page
     // above tells this person to start again with the same code; this is what
     // makes that sentence true.
     assert!(
-        h.invite_is_available(),
+        h.invite_is_available().await,
         "the failed signup released its hold"
     );
     {
@@ -900,14 +906,15 @@ async fn a_failed_credential_install_leaves_a_retriable_signup() {
         );
     }
 
-    let rec = h.rec.lock().unwrap();
-    assert_eq!(rec.tenants.len(), 1, "no orphaned second tenant");
-    assert_eq!(rec.create_bodies.len(), 2, "call 1 ran again");
-    assert!(rec.tenants["ada"].provisioned);
+    {
+        let rec = h.rec.lock().unwrap();
+        assert_eq!(rec.tenants.len(), 1, "no orphaned second tenant");
+        assert_eq!(rec.create_bodies.len(), 2, "call 1 ran again");
+        assert!(rec.tenants["ada"].provisioned);
+    }
     // The invite is spent now, and only now.
-    assert!(h.state.store().label_exists("ada").unwrap());
-    drop(rec);
-    assert_eq!(h.invite_row(), (Some("ada".to_string()), false));
+    assert!(h.state.store().label_exists("ada").await.unwrap());
+    assert_eq!(h.invite_row().await, (Some("ada".to_string()), false));
 }
 
 /// THE RACE: one code, two tabs. The second is refused at the form, before it
@@ -968,14 +975,18 @@ async fn a_lapsed_hold_does_not_strand_the_code() {
             then,
             then + chrono::Duration::minutes(10),
         )
+        .await
         .unwrap()
         .expect("the abandoned signup held it");
-    assert!(h.invite_is_available(), "and the hold has since lapsed");
+    assert!(
+        h.invite_is_available().await,
+        "and the hold has since lapsed"
+    );
 
     let invite = h.invite_code.clone();
     let (status, body) = h.run_signup("ada", &invite).await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(h.invite_row(), (Some("ada".to_string()), false));
+    assert_eq!(h.invite_row().await, (Some("ada".to_string()), false));
 }
 
 /// A code that ran out is refused exactly the way a wrong one is, and nothing
@@ -983,7 +994,9 @@ async fn a_lapsed_hold_does_not_strand_the_code() {
 #[tokio::test]
 async fn an_expired_code_is_refused_like_any_other() {
     let h = Harness::new().await;
-    let expired = h.issue_invite_expiring(chrono::Utc::now() - chrono::Duration::seconds(1));
+    let expired = h
+        .issue_invite_expiring(chrono::Utc::now() - chrono::Duration::seconds(1))
+        .await;
 
     let (status, _, body) = h
         .post_form(
@@ -1064,7 +1077,7 @@ async fn a_mailbox_gets_one_daemon() {
     let (status, body) = h.run_signup("ada", &invite).await;
     assert_eq!(status, StatusCode::OK, "{body}");
 
-    let second_code = h.issue_invite();
+    let second_code = h.issue_invite().await;
     let (status, body) = h.run_signup("grace", &second_code).await;
     assert_eq!(status, StatusCode::CONFLICT, "{body}");
     assert!(body.contains("already"), "{body}");
@@ -1087,7 +1100,7 @@ async fn an_invite_code_works_once() {
     // the whole way, so the consume at the end cannot have lost a race. If it
     // had, the row would carry no label and this signup would have made a
     // tenant for free.
-    assert_eq!(h.invite_row(), (Some("ada".to_string()), false));
+    assert_eq!(h.invite_row().await, (Some("ada".to_string()), false));
 
     let (status, _, body) = h
         .post_form(
@@ -1116,7 +1129,7 @@ async fn a_refused_credential_body_is_not_reported_as_an_address_problem() {
     assert!(!body.contains("refused"), "{body}");
 
     // Retriable means retriable: the code went straight back.
-    assert!(h.invite_is_available());
+    assert!(h.invite_is_available().await);
     assert_eq!(h.rec.lock().unwrap().credential_puts.len(), 1);
 }
 
@@ -1299,14 +1312,15 @@ async fn a_partial_consent_provisions_nothing_and_says_so() {
         assert!(body.contains("Nothing was set up"), "{body}");
 
         // The exchange happened; nothing past it did.
-        let rec = h.rec.lock().unwrap();
-        assert!(!rec.token_form.is_empty(), "the exchange was attempted");
-        assert!(rec.create_bodies.is_empty(), "no tenant was created");
-        assert!(rec.credential_puts.is_empty(), "nothing was sealed");
-        drop(rec);
-        assert!(!h.state.store().label_exists("ada").unwrap());
+        {
+            let rec = h.rec.lock().unwrap();
+            assert!(!rec.token_form.is_empty(), "the exchange was attempted");
+            assert!(rec.create_bodies.is_empty(), "no tenant was created");
+            assert!(rec.credential_puts.is_empty(), "nothing was sealed");
+        }
+        assert!(!h.state.store().label_exists("ada").await.unwrap());
         // ...and the code is spendable again, which is what "start again" means.
-        assert!(h.invite_is_available(), "{partial:?}");
+        assert!(h.invite_is_available().await, "{partial:?}");
     }
 }
 
@@ -1345,62 +1359,63 @@ async fn signup_mints_and_installs_a_tenant_llm_key() {
         "the assistant key value must never reach a page"
     );
 
-    let rec = h.rec.lock().unwrap();
-    // FOUR governance requests — a provider-key listing then a mint, twice —
-    // all carrying HTTP Basic with the admin `username:password`.
-    assert_eq!(rec.bifrost_auths, vec![bifrost_basic_auth(); 4]);
-    assert_eq!(rec.bifrost_mint_bodies.len(), 2);
-    let mint = &rec.bifrost_mint_bodies[0];
-    assert_eq!(mint["name"], "tenant-ada");
-    // `budgets` is an ARRAY on the live gateway; a singular `budget` object
-    // is silently ignored and mints an unbudgeted key.
-    assert_eq!(mint["budgets"].as_array().unwrap().len(), 1);
-    assert_eq!(mint["budgets"][0]["max_limit"], DEFAULT_LLM_BUDGET_USD);
-    assert_eq!(mint["budgets"][0]["reset_duration"], "1M");
-    assert_eq!(mint["is_active"], true);
-    // The provider config pins the listed key ids and a non-empty model
-    // allow-list; without both the key cannot serve inference.
-    let pc = &mint["provider_configs"][0];
-    assert_eq!(pc["provider"], "anthropic");
-    assert_eq!(pc["key_ids"], json!([PROVIDER_KEY_ID]));
-    assert_eq!(
-        pc["allowed_models"],
-        json!(["claude-haiku-4-5", "claude-sonnet-5"])
-    );
-    // The SECOND mint is the assistant's: its own name, its own budget, its
-    // own model list.
-    let mint = &rec.bifrost_mint_bodies[1];
-    assert_eq!(mint["name"], "tenant-ada-assistant");
-    assert_eq!(mint["budgets"].as_array().unwrap().len(), 1);
-    assert_eq!(
-        mint["budgets"][0]["max_limit"],
-        DEFAULT_ASSISTANT_BUDGET_USD
-    );
-    assert_eq!(mint["budgets"][0]["reset_duration"], "1M");
-    let pc = &mint["provider_configs"][0];
-    assert_eq!(pc["provider"], "anthropic");
-    assert_eq!(pc["key_ids"], json!([PROVIDER_KEY_ID]));
-    assert_eq!(
-        pc["allowed_models"],
-        json!(["claude-haiku-4-5", "claude-opus-4-8"])
-    );
-    // BOTH values went to the warden, in ONE put, for this tenant.
-    assert_eq!(rec.llm_key_puts.len(), 1);
-    let (label, put) = &rec.llm_key_puts[0];
-    assert_eq!(label, "ada");
-    assert_eq!(put["api_key"], vk_value_for("tenant-ada"));
-    assert_eq!(
-        put["assistant_api_key"],
-        vk_value_for("tenant-ada-assistant")
-    );
-    drop(rec);
+    {
+        let rec = h.rec.lock().unwrap();
+        // FOUR governance requests — a provider-key listing then a mint, twice —
+        // all carrying HTTP Basic with the admin `username:password`.
+        assert_eq!(rec.bifrost_auths, vec![bifrost_basic_auth(); 4]);
+        assert_eq!(rec.bifrost_mint_bodies.len(), 2);
+        let mint = &rec.bifrost_mint_bodies[0];
+        assert_eq!(mint["name"], "tenant-ada");
+        // `budgets` is an ARRAY on the live gateway; a singular `budget` object
+        // is silently ignored and mints an unbudgeted key.
+        assert_eq!(mint["budgets"].as_array().unwrap().len(), 1);
+        assert_eq!(mint["budgets"][0]["max_limit"], DEFAULT_LLM_BUDGET_USD);
+        assert_eq!(mint["budgets"][0]["reset_duration"], "1M");
+        assert_eq!(mint["is_active"], true);
+        // The provider config pins the listed key ids and a non-empty model
+        // allow-list; without both the key cannot serve inference.
+        let pc = &mint["provider_configs"][0];
+        assert_eq!(pc["provider"], "anthropic");
+        assert_eq!(pc["key_ids"], json!([PROVIDER_KEY_ID]));
+        assert_eq!(
+            pc["allowed_models"],
+            json!(["claude-haiku-4-5", "claude-sonnet-5"])
+        );
+        // The SECOND mint is the assistant's: its own name, its own budget, its
+        // own model list.
+        let mint = &rec.bifrost_mint_bodies[1];
+        assert_eq!(mint["name"], "tenant-ada-assistant");
+        assert_eq!(mint["budgets"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            mint["budgets"][0]["max_limit"],
+            DEFAULT_ASSISTANT_BUDGET_USD
+        );
+        assert_eq!(mint["budgets"][0]["reset_duration"], "1M");
+        let pc = &mint["provider_configs"][0];
+        assert_eq!(pc["provider"], "anthropic");
+        assert_eq!(pc["key_ids"], json!([PROVIDER_KEY_ID]));
+        assert_eq!(
+            pc["allowed_models"],
+            json!(["claude-haiku-4-5", "claude-opus-4-8"])
+        );
+        // BOTH values went to the warden, in ONE put, for this tenant.
+        assert_eq!(rec.llm_key_puts.len(), 1);
+        let (label, put) = &rec.llm_key_puts[0];
+        assert_eq!(label, "ada");
+        assert_eq!(put["api_key"], vk_value_for("tenant-ada"));
+        assert_eq!(
+            put["assistant_api_key"],
+            vk_value_for("tenant-ada-assistant")
+        );
+    }
     // The store kept the IDS, and only the IDS.
     assert_eq!(
-        h.state.store().tenant_vk("ada").unwrap(),
+        h.state.store().tenant_vk("ada").await.unwrap(),
         Some(vk_id_for("tenant-ada"))
     );
     assert_eq!(
-        h.state.store().tenant_assistant_vk("ada").unwrap(),
+        h.state.store().tenant_assistant_vk("ada").await.unwrap(),
         Some(vk_id_for("tenant-ada-assistant"))
     );
 }
@@ -1436,15 +1451,15 @@ async fn a_failed_key_install_still_records_the_vk_id() {
     // The ids are on the row for the manual `llm revoke` or `llm mint` the log
     // line points the operator at.
     assert_eq!(
-        h.state.store().tenant_vk("ada").unwrap(),
+        h.state.store().tenant_vk("ada").await.unwrap(),
         Some(vk_id_for("tenant-ada"))
     );
     assert_eq!(
-        h.state.store().tenant_assistant_vk("ada").unwrap(),
+        h.state.store().tenant_assistant_vk("ada").await.unwrap(),
         Some(vk_id_for("tenant-ada-assistant"))
     );
     // ...and the signup was a real one: the invite is spent.
-    assert_eq!(h.invite_row(), (Some("ada".to_string()), false));
+    assert_eq!(h.invite_row().await, (Some("ada".to_string()), false));
 }
 
 /// THE FAIL-SOFT PROMISE: a Bifrost outage costs the tenant its LLM keys,
@@ -1457,20 +1472,24 @@ async fn a_bifrost_outage_does_not_refuse_a_signup() {
     assert_eq!(status, StatusCode::OK, "{body}");
     assert!(body.contains("ABCD-EFGH"), "{body}");
 
-    let rec = h.rec.lock().unwrap();
-    assert!(rec.llm_key_puts.is_empty(), "no key existed to install");
-    assert_eq!(
-        rec.credential_puts.len(),
-        1,
-        "the mailbox still provisioned"
-    );
-    drop(rec);
+    {
+        let rec = h.rec.lock().unwrap();
+        assert!(rec.llm_key_puts.is_empty(), "no key existed to install");
+        assert_eq!(
+            rec.credential_puts.len(),
+            1,
+            "the mailbox still provisioned"
+        );
+    }
     // Nothing was minted, so nothing is recorded: both pointers stay empty
     // rather than naming keys that do not exist.
-    assert_eq!(h.state.store().tenant_vk("ada").unwrap(), None);
-    assert_eq!(h.state.store().tenant_assistant_vk("ada").unwrap(), None);
+    assert_eq!(h.state.store().tenant_vk("ada").await.unwrap(), None);
+    assert_eq!(
+        h.state.store().tenant_assistant_vk("ada").await.unwrap(),
+        None
+    );
     // ...and the signup was a real one: the invite is spent.
-    assert_eq!(h.invite_row(), (Some("ada".to_string()), false));
+    assert_eq!(h.invite_row().await, (Some("ada".to_string()), false));
 }
 
 /// THE INDEPENDENCE PROMISE, one way: the assistant mint fails, and the tenant
@@ -1509,11 +1528,14 @@ async fn an_assistant_mint_failure_still_installs_the_triage_key() {
         );
     }
     assert_eq!(
-        h.state.store().tenant_vk("ada").unwrap(),
+        h.state.store().tenant_vk("ada").await.unwrap(),
         Some(vk_id_for("tenant-ada"))
     );
-    assert_eq!(h.state.store().tenant_assistant_vk("ada").unwrap(), None);
-    assert_eq!(h.invite_row(), (Some("ada".to_string()), false));
+    assert_eq!(
+        h.state.store().tenant_assistant_vk("ada").await.unwrap(),
+        None
+    );
+    assert_eq!(h.invite_row().await, (Some("ada".to_string()), false));
 }
 
 /// ...and the other way: the triage mint fails, and the assistant key is still
@@ -1551,12 +1573,12 @@ async fn a_triage_mint_failure_still_installs_the_assistant_key() {
             vk_value_for("tenant-ada-assistant")
         );
     }
-    assert_eq!(h.state.store().tenant_vk("ada").unwrap(), None);
+    assert_eq!(h.state.store().tenant_vk("ada").await.unwrap(), None);
     assert_eq!(
-        h.state.store().tenant_assistant_vk("ada").unwrap(),
+        h.state.store().tenant_assistant_vk("ada").await.unwrap(),
         Some(vk_id_for("tenant-ada-assistant"))
     );
-    assert_eq!(h.invite_row(), (Some("ada".to_string()), false));
+    assert_eq!(h.invite_row().await, (Some("ada".to_string()), false));
 }
 
 /// The form and the health check are the only things reachable without a

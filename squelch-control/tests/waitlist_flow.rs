@@ -18,9 +18,9 @@
 //! - and the admin cookie is a different credential from the signup cookie,
 //!   signed with the same key.
 //!
-//! Nothing here touches Resend, Google, a warden, or any store outside an
-//! in-memory SQLite. `Config` is constructed directly, which is why `resend_url`
-//! is a field: `Config::from_env` pins the real one.
+//! Nothing here touches Resend, Google, a warden, or any store outside the
+//! throwaway Postgres schema `common` makes. `Config` is constructed directly,
+//! which is why `resend_url` is a field: `Config::from_env` pins the real one.
 
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
@@ -40,8 +40,11 @@ use squelch_control::cookie::{
     self, ADMIN_COOKIE_NAME, ADMIN_COOKIE_TTL_SECS, AdminClaim, COOKIE_NAME, SessionClaim,
 };
 use squelch_control::warden::HttpWarden;
-use squelch_control::{ControlState, ControlStore, invites, router};
+use squelch_control::{ControlState, invites, router};
 use tower::ServiceExt as _;
+
+/// The throwaway Postgres schema every harness in this file is built on.
+mod common;
 
 /// The operator's password. Thirty-two characters, the floor `from_env`
 /// enforces, because a test that signs in with a short one would not be
@@ -148,7 +151,7 @@ impl Harness {
             // refused rather than a silently mocked success.
             warden_url: "http://127.0.0.1:1".into(),
             warden_token: "warden-bearer".into(),
-            db_path: ":memory:".into(),
+            database_url: "postgres://unused".into(),
             trusted_proxy_hops: 0,
             token_url: "http://127.0.0.1:1/token".into(),
             auth_url: "http://127.0.0.1:1/authorize".into(),
@@ -166,7 +169,7 @@ impl Harness {
             }),
         };
 
-        let store = ControlStore::open_in_memory().unwrap();
+        let (store, _url) = common::fresh_store().await;
         let warden = Arc::new(
             HttpWarden::new(
                 "http://127.0.0.1:1".into(),
@@ -252,27 +255,29 @@ impl Harness {
     }
 
     /// The id of the single waitlist row.
-    fn only_row_id(&self) -> i64 {
-        let rows = self.state.store().list_waitlist().unwrap();
+    async fn only_row_id(&self) -> i64 {
+        let rows = self.state.store().list_waitlist().await.unwrap();
         assert_eq!(rows.len(), 1, "expected exactly one waitlist row");
         rows[0].id
     }
 
     /// `(status, invite_id, notified)` for one row, read from the store.
-    fn row_state(&self, id: i64) -> (String, Option<i64>, bool) {
+    async fn row_state(&self, id: i64) -> (String, Option<i64>, bool) {
         let row = self
             .state
             .store()
             .waitlist_entry(id)
+            .await
             .unwrap()
             .expect("the row is there");
         (row.status.clone(), row.invite_id, row.notified_at.is_some())
     }
 
-    fn invite_ids(&self) -> Vec<i64> {
+    async fn invite_ids(&self) -> Vec<i64> {
         self.state
             .store()
             .list_invites()
+            .await
             .unwrap()
             .iter()
             .map(|r| r.id)
@@ -281,10 +286,11 @@ impl Harness {
 
     /// Whether a plaintext code is redeemable right now, asked exactly the way
     /// `POST /signup` asks it.
-    fn code_is_available(&self, code: &str) -> bool {
+    async fn code_is_available(&self, code: &str) -> bool {
         self.state
             .store()
             .find_available_invite(&invites::hash(code), chrono::Utc::now())
+            .await
             .unwrap()
             .is_some()
     }
@@ -361,7 +367,7 @@ async fn a_submission_lands_on_the_list_once() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body, r#"{"ok":true}"#);
 
-    let rows = h.state.store().list_waitlist().unwrap();
+    let rows = h.state.store().list_waitlist().await.unwrap();
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].email, APPLICANT, "stored normalized");
     assert_eq!(rows[0].status, "pending");
@@ -383,7 +389,7 @@ async fn a_malformed_address_is_refused_readably() {
         );
         assert_eq!(header_of(&headers, header::CACHE_CONTROL), "no-store");
     }
-    assert!(h.state.store().list_waitlist().unwrap().is_empty());
+    assert!(h.state.store().list_waitlist().await.unwrap().is_empty());
 
     // The preflight the site does not currently need, answered anyway.
     let resp = h
@@ -441,7 +447,7 @@ async fn the_admin_page_opens_only_to_the_token() {
     let (status, _, body) = h.get("/admin", Some(&cookie)).await;
     assert_eq!(status, StatusCode::OK);
     assert!(body.contains(APPLICANT), "{body}");
-    assert!(body.contains("Approve and email invite"), "{body}");
+    assert!(body.contains(">Approve</button>"), "{body}");
 }
 
 /// An address that is an injection attempt is rendered as text, on the one page
@@ -477,7 +483,7 @@ async fn the_dashboard_escapes_what_a_stranger_typed() {
 async fn approving_mails_a_code_that_redeems() {
     let h = Harness::new().await;
     h.join(APPLICANT).await;
-    let id = h.only_row_id();
+    let id = h.only_row_id().await;
     let cookie = h.sign_in().await;
 
     let (status, headers, _) = h
@@ -486,11 +492,11 @@ async fn approving_mails_a_code_that_redeems() {
     assert_eq!(status, StatusCode::SEE_OTHER);
     assert_eq!(header_of(&headers, header::LOCATION), "/admin");
 
-    let (row_status, invite_id, notified) = h.row_state(id);
+    let (row_status, invite_id, notified) = h.row_state(id).await;
     assert_eq!(row_status, "approved");
     assert!(notified, "the provider accepted it, so the row is stamped");
     assert_eq!(
-        h.invite_ids(),
+        h.invite_ids().await,
         vec![invite_id.expect("an invite was minted")]
     );
 
@@ -505,7 +511,10 @@ async fn approving_mails_a_code_that_redeems() {
     // THE ASSERTION THE FEATURE RESTS ON: what was mailed is a live invite,
     // asked of the store exactly as `POST /signup` will ask it.
     let code = code_in(body);
-    assert!(h.code_is_available(&code), "the mailed code must redeem");
+    assert!(
+        h.code_is_available(&code).await,
+        "the mailed code must redeem"
+    );
     assert!(
         body["html"].as_str().unwrap().contains(&code),
         "both parts carry it"
@@ -534,12 +543,12 @@ async fn approving_mails_a_code_that_redeems() {
 async fn a_replayed_approval_mints_nothing() {
     let h = Harness::new().await;
     h.join(APPLICANT).await;
-    let id = h.only_row_id();
+    let id = h.only_row_id().await;
     let cookie = h.sign_in().await;
 
     h.post_form("/admin/approve", format!("id={id}"), Some(&cookie))
         .await;
-    let after_first = h.invite_ids();
+    let after_first = h.invite_ids().await;
 
     let (status, _, body) = h
         .post_form("/admin/approve", format!("id={id}"), Some(&cookie))
@@ -550,7 +559,7 @@ async fn a_replayed_approval_mints_nothing() {
         "the replay renders, it does not act"
     );
     assert!(body.contains("already approved"), "{body}");
-    assert_eq!(h.invite_ids(), after_first, "no second code");
+    assert_eq!(h.invite_ids().await, after_first, "no second code");
     assert_eq!(h.sends().len(), 1, "no second email");
 }
 
@@ -560,21 +569,21 @@ async fn a_replayed_approval_mints_nothing() {
 async fn a_failed_send_leaves_a_row_the_operator_can_repair() {
     let h = Harness::new().await;
     h.join(APPLICANT).await;
-    let id = h.only_row_id();
+    let id = h.only_row_id().await;
     let cookie = h.sign_in().await;
 
     h.fail_sends(true);
     h.post_form("/admin/approve", format!("id={id}"), Some(&cookie))
         .await;
 
-    let (row_status, first_invite, notified) = h.row_state(id);
+    let (row_status, first_invite, notified) = h.row_state(id).await;
     assert_eq!(row_status, "approved", "the person is approved either way");
     assert!(!notified, "nothing was accepted, so nothing is stamped");
     let first_invite = first_invite.expect("the code was minted before the send");
 
     let (_, _, page) = h.get("/admin", Some(&cookie)).await;
     assert!(page.contains("email not sent"), "{page}");
-    assert!(page.contains("Send new invite"), "{page}");
+    assert!(page.contains("Send invite"), "{page}");
 
     // The repair: the code nobody received is revoked, and a new one is minted
     // in its place. Two live invites for one approval would be one mailbox more
@@ -585,16 +594,20 @@ async fn a_failed_send_leaves_a_row_the_operator_can_repair() {
         .await;
     assert_eq!(status, StatusCode::SEE_OTHER);
 
-    let (_, second_invite, notified) = h.row_state(id);
+    let (_, second_invite, notified) = h.row_state(id).await;
     let second_invite = second_invite.expect("a fresh code");
     assert_ne!(second_invite, first_invite);
-    assert_eq!(h.invite_ids(), vec![second_invite], "the old one is gone");
+    assert_eq!(
+        h.invite_ids().await,
+        vec![second_invite],
+        "the old one is gone"
+    );
     assert!(notified, "the second send was accepted");
 
     let sends = h.sends();
     assert_eq!(sends.len(), 2);
     let mailed = code_in(&sends[1].1);
-    assert!(h.code_is_available(&mailed));
+    assert!(h.code_is_available(&mailed).await);
     assert_ne!(mailed, code_in(&sends[0].1), "a re-send is a new code");
 }
 
@@ -604,7 +617,7 @@ async fn a_failed_send_leaves_a_row_the_operator_can_repair() {
 async fn a_spent_invite_is_not_replaced() {
     let h = Harness::new().await;
     h.join(APPLICANT).await;
-    let id = h.only_row_id();
+    let id = h.only_row_id().await;
     let cookie = h.sign_in().await;
     h.post_form("/admin/approve", format!("id={id}"), Some(&cookie))
         .await;
@@ -620,11 +633,13 @@ async fn a_spent_invite_is_not_replaced() {
             chrono::Utc::now(),
             chrono::Utc::now() + chrono::Duration::minutes(10),
         )
+        .await
         .unwrap()
         .unwrap();
     h.state
         .store()
         .consume_invite(invite_id, "ada", "holder")
+        .await
         .unwrap();
 
     let (status, _, body) = h
@@ -634,7 +649,7 @@ async fn a_spent_invite_is_not_replaced() {
     assert!(body.contains("already been used"), "{body}");
     assert_eq!(h.sends().len(), 1, "no second email");
     assert_eq!(
-        h.invite_ids(),
+        h.invite_ids().await,
         vec![invite_id],
         "the spent row is untouched"
     );
@@ -647,24 +662,24 @@ async fn a_spent_invite_is_not_replaced() {
 async fn a_revoked_invite_is_replaced_rather_than_refused() {
     let h = Harness::new().await;
     h.join(APPLICANT).await;
-    let id = h.only_row_id();
+    let id = h.only_row_id().await;
     let cookie = h.sign_in().await;
     h.post_form("/admin/approve", format!("id={id}"), Some(&cookie))
         .await;
 
-    let (_, first, _) = h.row_state(id);
-    assert!(h.state.store().revoke_invite(first.unwrap()).unwrap());
-    assert!(h.invite_ids().is_empty());
+    let (_, first, _) = h.row_state(id).await;
+    assert!(h.state.store().revoke_invite(first.unwrap()).await.unwrap());
+    assert!(h.invite_ids().await.is_empty());
 
     let (status, _, _) = h
         .post_form("/admin/send", format!("id={id}"), Some(&cookie))
         .await;
     assert_eq!(status, StatusCode::SEE_OTHER);
-    let (_, second, notified) = h.row_state(id);
+    let (_, second, notified) = h.row_state(id).await;
     assert_ne!(second, first);
     assert!(notified);
     assert_eq!(h.sends().len(), 2);
-    assert!(h.code_is_available(&code_in(&h.sends()[1].1)));
+    assert!(h.code_is_available(&code_in(&h.sends()[1].1)).await);
 }
 
 /// Unconfigured means UNMOUNTED. A deployment with no admin token answers 404
@@ -696,7 +711,7 @@ async fn an_unconfigured_deployment_has_no_waitlist_and_no_admin() {
 async fn a_signup_cookie_is_not_an_admin_cookie() {
     let h = Harness::new().await;
     h.join(APPLICANT).await;
-    let id = h.only_row_id();
+    let id = h.only_row_id().await;
 
     let signup = cookie::sign(
         COOKIE_KEY,
@@ -722,8 +737,8 @@ async fn a_signup_cookie_is_not_an_admin_cookie() {
             .await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
     }
-    assert_eq!(h.row_state(id).0, "pending", "nothing was approved");
-    assert!(h.invite_ids().is_empty());
+    assert_eq!(h.row_state(id).await.0, "pending", "nothing was approved");
+    assert!(h.invite_ids().await.is_empty());
 }
 
 /// A session that aged out is a session: the action is refused, the stale
@@ -732,7 +747,7 @@ async fn a_signup_cookie_is_not_an_admin_cookie() {
 async fn an_expired_admin_cookie_is_refused() {
     let h = Harness::new().await;
     h.join(APPLICANT).await;
-    let id = h.only_row_id();
+    let id = h.only_row_id().await;
     let now = chrono::Utc::now().timestamp();
 
     let stale = admin_cookie_at(now - ADMIN_COOKIE_TTL_SECS - 1);
@@ -745,7 +760,7 @@ async fn an_expired_admin_cookie_is_refused() {
         header_of(&headers, header::SET_COOKIE).contains("Max-Age=0"),
         "the stale cookie is cleared"
     );
-    assert_eq!(h.row_state(id).0, "pending");
+    assert_eq!(h.row_state(id).await.0, "pending");
 
     // A tampered one fails the same way, and one inside the window works.
     let forged = format!("{}x", admin_cookie_at(now));
@@ -775,7 +790,7 @@ async fn an_expired_admin_cookie_is_refused() {
 async fn a_sibling_subdomain_cannot_press_the_buttons() {
     let h = Harness::new().await;
     h.join(APPLICANT).await;
-    let id = h.only_row_id();
+    let id = h.only_row_id().await;
     let cookie = h.sign_in().await;
 
     for origin in ["https://warden.passband.test", "https://passband.test"] {
@@ -789,8 +804,8 @@ async fn a_sibling_subdomain_cannot_press_the_buttons() {
             .await;
         assert_eq!(status, StatusCode::FORBIDDEN, "from {origin}");
     }
-    assert_eq!(h.row_state(id).0, "pending", "nothing was approved");
-    assert!(h.invite_ids().is_empty(), "and nothing was minted");
+    assert_eq!(h.row_state(id).await.0, "pending", "nothing was approved");
+    assert!(h.invite_ids().await.is_empty(), "and nothing was minted");
     assert!(h.sends().is_empty(), "and nothing was mailed");
 
     // The service's own page is the one that may.
@@ -803,7 +818,7 @@ async fn a_sibling_subdomain_cannot_press_the_buttons() {
         )
         .await;
     assert_eq!(status, StatusCode::SEE_OTHER);
-    assert_eq!(h.row_state(id).0, "approved");
+    assert_eq!(h.row_state(id).await.0, "approved");
     assert_eq!(h.sends().len(), 1);
 }
 
@@ -814,11 +829,11 @@ async fn a_sibling_subdomain_cannot_press_the_buttons() {
 async fn two_racing_sends_mail_one_code() {
     let h = Harness::new().await;
     h.join(APPLICANT).await;
-    let id = h.only_row_id();
+    let id = h.only_row_id().await;
     let cookie = h.sign_in().await;
     h.post_form("/admin/approve", format!("id={id}"), Some(&cookie))
         .await;
-    let first = h.row_state(id).1.expect("approved with an invite");
+    let first = h.row_state(id).await.1.expect("approved with an invite");
     assert_eq!(h.sends().len(), 1);
 
     // Both presses read the pointer the approval wrote. The store is serialized,
@@ -828,7 +843,7 @@ async fn two_racing_sends_mail_one_code() {
         .post_form("/admin/send", format!("id={id}"), Some(&cookie))
         .await;
     assert_eq!(status, StatusCode::SEE_OTHER);
-    let second = h.row_state(id).1.expect("a fresh invite");
+    let second = h.row_state(id).await.1.expect("a fresh invite");
     assert_ne!(second, first, "a re-send replaces the code");
     assert_eq!(h.sends().len(), 2);
 
@@ -838,13 +853,17 @@ async fn two_racing_sends_mail_one_code() {
     let expires = chrono::Utc::now() + chrono::Duration::days(30);
     let loser = store
         .insert_invite(&invites::hash("LOSE-RRRR-RRRR-RRRR"), expires)
+        .await
         .unwrap();
     assert!(
-        !store.set_waitlist_invite(id, loser, Some(first)).unwrap(),
+        !store
+            .set_waitlist_invite(id, loser, Some(first))
+            .await
+            .unwrap(),
         "the pointer moved, so this write is refused"
     );
     assert_eq!(
-        h.row_state(id).1,
+        h.row_state(id).await.1,
         Some(second),
         "and the row still names the winner"
     );
@@ -857,11 +876,11 @@ async fn two_racing_sends_mail_one_code() {
 async fn a_held_invite_is_left_alone() {
     let h = Harness::new().await;
     h.join(APPLICANT).await;
-    let id = h.only_row_id();
+    let id = h.only_row_id().await;
     let cookie = h.sign_in().await;
     h.post_form("/admin/approve", format!("id={id}"), Some(&cookie))
         .await;
-    let invite_id = h.row_state(id).1.unwrap();
+    let invite_id = h.row_state(id).await.1.unwrap();
 
     // The applicant pastes the code and is redirected to Google.
     let code = code_in(&h.sends()[0].1);
@@ -875,6 +894,7 @@ async fn a_held_invite_is_left_alone() {
             now,
             now + chrono::Duration::minutes(10),
         )
+        .await
         .unwrap();
     assert_eq!(held, Some(invite_id), "the store handed out the hold");
 
@@ -883,8 +903,16 @@ async fn a_held_invite_is_left_alone() {
         .await;
     assert_eq!(status, StatusCode::OK, "a banner, not a redirect");
     assert!(body.contains("redeeming that code right now"), "{body}");
-    assert_eq!(h.row_state(id).1, Some(invite_id), "the hold survived");
-    assert_eq!(h.invite_ids(), vec![invite_id], "and nothing was minted");
+    assert_eq!(
+        h.row_state(id).await.1,
+        Some(invite_id),
+        "the hold survived"
+    );
+    assert_eq!(
+        h.invite_ids().await,
+        vec![invite_id],
+        "and nothing was minted"
+    );
     assert_eq!(h.sends().len(), 1, "and nothing extra was mailed");
 }
 
@@ -901,8 +929,8 @@ async fn an_address_that_never_joined_can_be_invited_directly() {
     let (status, body) = invite_directly(&h, &cookie, "grace@example.com").await;
     assert_eq!(status, StatusCode::SEE_OTHER, "{body}");
 
-    let id = h.only_row_id();
-    let (row_status, invite_id, notified) = h.row_state(id);
+    let id = h.only_row_id().await;
+    let (row_status, invite_id, notified) = h.row_state(id).await;
     assert_eq!(row_status, "approved", "it skips the waiting half entirely");
     assert!(notified, "and the invite went out");
 
@@ -911,13 +939,19 @@ async fn an_address_that_never_joined_can_be_invited_directly() {
     assert_eq!(sends[0].1["to"][0], "grace@example.com");
 
     let code = code_in(&sends[0].1);
-    assert!(h.code_is_available(&code), "the mailed code must redeem");
-    assert_eq!(h.invite_ids(), vec![invite_id.expect("one was minted")]);
+    assert!(
+        h.code_is_available(&code).await,
+        "the mailed code must redeem"
+    );
+    assert_eq!(
+        h.invite_ids().await,
+        vec![invite_id.expect("one was minted")]
+    );
 
     // And the row is on the page with the same button as everybody else.
     let (_, _, page) = h.get("/admin", Some(&cookie)).await;
     assert!(page.contains("grace@example.com"), "{page}");
-    assert!(page.contains("Send fresh invite"), "{page}");
+    assert!(page.contains("Re-send"), "{page}");
 }
 
 /// Typing an address that is already waiting APPROVES that row rather than
@@ -926,14 +960,14 @@ async fn an_address_that_never_joined_can_be_invited_directly() {
 async fn inviting_someone_already_waiting_approves_the_row_they_have() {
     let h = Harness::new().await;
     h.join(APPLICANT).await;
-    let id = h.only_row_id();
+    let id = h.only_row_id().await;
     let cookie = h.sign_in().await;
 
     let (status, body) = invite_directly(&h, &cookie, APPLICANT).await;
     assert_eq!(status, StatusCode::SEE_OTHER, "{body}");
-    assert_eq!(h.row_state(id).0, "approved");
+    assert_eq!(h.row_state(id).await.0, "approved");
     assert_eq!(h.sends().len(), 1, "one person, one invite");
-    assert_eq!(h.invite_ids().len(), 1);
+    assert_eq!(h.invite_ids().await.len(), 1);
 
     // Twice is not twice. The second press says so and mints nothing, which is
     // the same guard a double-clicked Approve meets.
@@ -941,7 +975,7 @@ async fn inviting_someone_already_waiting_approves_the_row_they_have() {
     assert_eq!(status, StatusCode::OK, "a banner, not a redirect");
     assert!(body.contains("already been invited"), "{body}");
     assert_eq!(h.sends().len(), 1, "and nothing extra was mailed");
-    assert_eq!(h.invite_ids().len(), 1);
+    assert_eq!(h.invite_ids().await.len(), 1);
 }
 
 /// A direct invite is an admin action, so it meets every guard the buttons do.
@@ -972,7 +1006,10 @@ async fn a_direct_invite_takes_a_session_a_same_origin_and_an_address() {
     assert!(body.contains("not an email address"), "{body}");
 
     assert!(h.sends().is_empty(), "none of that mailed anything");
-    assert!(h.invite_ids().is_empty(), "and none of it minted anything");
+    assert!(
+        h.invite_ids().await.is_empty(),
+        "and none of it minted anything"
+    );
 }
 
 /// The emailed link lands on a form with the code already in the field, and a

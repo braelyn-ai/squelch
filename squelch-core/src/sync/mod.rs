@@ -629,6 +629,11 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
             // bounce the whole lifecycle, and a mailbox stuck in that retry loop
             // should still have a fresh unread count for the human door.
             self.refresh_inbox_unread().await;
+            // BEFORE the walk too, and for the same reason: the sweep is purely
+            // local — one indexed UPDATE, no Gmail, no model spend — so hanging
+            // it off a call that can Err would let a bad credential or a Gmail
+            // outage starve it for as long as the outage lasts.
+            self.reminder_pass();
             self.poll_once().await?;
             // THE freshness stamp for a healthy daemon: `run()` only records one
             // on its way out, and a mailbox that polls happily for a month never
@@ -1514,6 +1519,34 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
         }
     }
 
+    /// Bring back the mail whose reminders have come due.
+    ///
+    /// The poll tick is the clock: there is no timer per reminder, because a
+    /// reminder is stored state and the daemon may well have been off when the
+    /// moment passed. Whatever is due when the loop next runs fires then, so a
+    /// restart costs punctuality and never a reminder.
+    ///
+    /// A CREDENTIAL OUTAGE COSTS NO MORE THAN A RESTART DOES, which is why the
+    /// loop runs this AHEAD of `poll_once` rather than after it: nothing here
+    /// talks to Gmail, so a mailbox stuck retrying an `invalid_grant` — or a
+    /// weekend of Gmail being down — must not be what swallows Saturday's
+    /// reminder. It still lands before `revisit_pass`, so a mail that comes back
+    /// this tick is already `open` when the re-evaluation sweep reads the
+    /// standing band.
+    ///
+    /// Synchronous and infallible from the loop's point of view: one indexed
+    /// UPDATE, and an error is logged and dropped. A store hiccup must not bounce
+    /// the whole sync lifecycle over a feature that will retry in a minute.
+    fn reminder_pass(&self) {
+        match self.store.fire_due_reminders(self.account_id, Utc::now()) {
+            Ok(ids) if !ids.is_empty() => {
+                eprintln!("squelch: {} reminder(s) came due", ids.len())
+            }
+            Ok(_) => {}
+            Err(e) => eprintln!("squelch: reminder sweep failed ({e}); skipping"),
+        }
+    }
+
     /// Re-evaluate verdicts whose moment has passed.
     ///
     /// Two things feed this pass. Messages whose classifier named a date, and
@@ -1693,14 +1726,17 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
                     }
                 }
                 Ok(stage1_llm::ClassifyOutcome::Failed(kind))
-                    if crate::triage::llm::is_auth_failure(&kind) =>
+                    if crate::triage::llm::is_config_failure(&kind) =>
                 {
-                    // A bad credential is a config problem shared by every row,
-                    // not a verdict about this one: leave the revisit PENDING
-                    // (no `fire`) so it is retried once the key is fixed.
+                    // A config-level rejection (bad credential, disallowed
+                    // model, spent gateway budget) is shared by every row, not
+                    // a verdict about this one: leave the revisit PENDING
+                    // (no `fire`) so it is retried once the config is fixed.
                     eprintln!(
-                        "squelch: revisit auth failure ({kind}); re-evaluations stay scheduled"
+                        "squelch: revisit config-level failure ({kind}); \
+                         re-evaluations stay scheduled"
                     );
+                    self.metrics.record_llm_config_failure();
                     break;
                 }
                 Ok(stage1_llm::ClassifyOutcome::Refused)
@@ -1879,17 +1915,20 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
                     }
                 }
                 Ok(stage1_llm::ClassifyOutcome::Failed(kind))
-                    if crate::triage::llm::is_auth_failure(&kind) =>
+                    if crate::triage::llm::is_config_failure(&kind) =>
                 {
-                    // AUTH FAILURE (401/403): a config problem shared by every
-                    // row. Heuristic fallback is for verdicts about THIS row; a
-                    // bad credential is not one, so leave the row queued
+                    // CONFIG-LEVEL FAILURE (4xx shared by every row: bad key,
+                    // disallowed model, spent gateway budget). Heuristic
+                    // fallback is for verdicts about THIS row; a rejected
+                    // config is not one, so leave the row queued
                     // (stage1_model_used stays NULL) and stop the pass instead
                     // of burning the cap on calls that fail identically.
                     eprintln!(
-                        "squelch: stage-1 auth failure ({kind}); the resolved LLM key is \
-                         wrong for the endpoint; rows stay queued"
+                        "squelch: stage-1 config-level failure ({kind}) at message {}; the \
+                         resolved key/endpoint/model is wrong for the gateway; rows stay queued",
+                        row.message_id
                     );
+                    self.metrics.record_llm_config_failure();
                     break;
                 }
                 Ok(stage1_llm::ClassifyOutcome::Refused)
@@ -2080,16 +2119,18 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
                             }
                         }
                         Ok(marketing::ExtractOutcome::Failed(kind))
-                            if crate::triage::llm::is_auth_failure(&kind) =>
+                            if crate::triage::llm::is_config_failure(&kind) =>
                         {
-                            // AUTH FAILURE: a fact about the CREDENTIAL, not
-                            // about this row. Marking it processed would
-                            // foreclose the row forever even after the key is
-                            // fixed, so leave it queued and stop the pass.
+                            // CONFIG-LEVEL FAILURE: a fact about the key,
+                            // model, or gateway budget, not about this row.
+                            // Marking it processed would foreclose the row
+                            // forever even after the config is fixed, so leave
+                            // it queued and stop the pass.
                             eprintln!(
-                                "squelch: extract auth failure ({kind}); the resolved LLM key \
-                                 is wrong for the endpoint; rows stay queued"
+                                "squelch: extract config-level failure ({kind}); the resolved \
+                                 key/endpoint/model is wrong for the gateway; rows stay queued"
                             );
+                            self.metrics.record_llm_config_failure();
                             auth_failed = true;
                             break;
                         }
@@ -2144,15 +2185,16 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
                             }
                         }
                         Ok(banking::ExtractOutcome::Failed(kind))
-                            if crate::triage::llm::is_auth_failure(&kind) =>
+                            if crate::triage::llm::is_config_failure(&kind) =>
                         {
-                            // See the marketing arm: a bad credential is not a
-                            // verdict about this row, and marking it processed
-                            // would forfeit it permanently.
+                            // See the marketing arm: a config-level rejection is
+                            // not a verdict about this row, and marking it
+                            // processed would forfeit it permanently.
                             eprintln!(
-                                "squelch: extract auth failure ({kind}); the resolved LLM key \
-                                 is wrong for the endpoint; rows stay queued"
+                                "squelch: extract config-level failure ({kind}); the resolved \
+                                 key/endpoint/model is wrong for the gateway; rows stay queued"
                             );
+                            self.metrics.record_llm_config_failure();
                             auth_failed = true;
                             break;
                         }
@@ -2258,15 +2300,16 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
                     }
                 }
                 Ok(shipments::ExtractOutcome::Failed(kind))
-                    if crate::triage::llm::is_auth_failure(&kind) =>
+                    if crate::triage::llm::is_config_failure(&kind) =>
                 {
-                    // See the marketing arm: the credential is wrong for every
+                    // See the marketing arm: the config is wrong for every
                     // row, so stamping this one would forfeit a shipping email
                     // permanently over a config mistake.
                     eprintln!(
-                        "squelch: ship-extract auth failure ({kind}); the resolved LLM key \
-                         is wrong for the endpoint; rows stay queued"
+                        "squelch: ship-extract config-level failure ({kind}); the resolved \
+                         key/endpoint/model is wrong for the gateway; rows stay queued"
                     );
+                    self.metrics.record_llm_config_failure();
                     break;
                 }
                 Ok(shipments::ExtractOutcome::Refused)
@@ -2526,39 +2569,49 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
                 }
                 Ok(ClassifyOutcome::Refused) => {
                     // Keep Stage-1 values; mark processed so it doesn't loop.
-                    // Redacted: no body/subject logged.
+                    // Redacted: no body/subject logged. The stamp is
+                    // STAGE2_REFUSED, never the model id: a row stamped with
+                    // the model reads as "the model said this", and during the
+                    // 2026-08-19 outage that lie cost the diagnosis its first
+                    // hour. Same lesson as stale-skip vs heuristic-only.
                     eprintln!("squelch: stage-2 refusal (redacted); keeping stage-1 values");
                     self.metrics.record_stage2(Stage2Verdict::Refused);
                     let _ = self.store.stage2_mark_processed(
                         self.account_id,
                         row.message_id,
-                        &cfg.model,
+                        stage2::STAGE2_REFUSED,
                     );
                 }
                 Ok(ClassifyOutcome::Failed(kind)) => {
-                    // AUTH FAILURE (401/403): the key is wrong for the endpoint,
-                    // a config problem shared by every row — not a fact about
-                    // this one. Leave the row queued and STOP the pass: the
-                    // remaining rows would fail identically while burning the
-                    // daily caps, and a row marked processed here would be
-                    // foreclosed from triage even after the credential is fixed
-                    // (the legacy shared-key-plus-gateway pod is exactly this).
-                    if crate::triage::llm::is_auth_failure(&kind) {
+                    // CONFIG-LEVEL FAILURE (4xx shared by every row: bad key,
+                    // disallowed model, spent gateway budget). Leave the row
+                    // queued and STOP the pass: the remaining rows would fail
+                    // identically while burning the daily caps, and a row
+                    // marked processed here would be foreclosed from triage
+                    // even after the config is fixed (the 2026-08-19
+                    // model-allowlist outage foreclosed two days of mail
+                    // exactly this way).
+                    if crate::triage::llm::is_config_failure(&kind) {
                         eprintln!(
-                            "squelch: stage-2 auth failure ({kind}); the resolved LLM key is \
-                             wrong for the endpoint; rows stay queued"
+                            "squelch: stage-2 config-level failure ({kind}) at message {}; the \
+                             resolved key/endpoint/model is wrong for the gateway; rows stay \
+                             queued",
+                            row.message_id
                         );
+                        self.metrics.record_llm_config_failure();
                         self.metrics.record_stage2(Stage2Verdict::Retryable);
                         break;
                     }
-                    // Permanent failure (400/truncation/parse): mark the row
-                    // processed so it cannot loop. `kind` is already redacted.
+                    // Row-level permanent failure (truncation/parse): mark the
+                    // row processed so it cannot loop, stamped with the failure
+                    // kind rather than the model id — the model never answered.
+                    // `kind` is already redacted.
                     eprintln!("squelch: stage-2 permanent failure ({kind}); marking row failed");
                     self.metrics.record_stage2(Stage2Verdict::Failed);
                     let _ = self.store.stage2_mark_processed(
                         self.account_id,
                         row.message_id,
-                        &cfg.model,
+                        &stage2::failed_stamp(&kind),
                     );
                 }
                 Err(e) => {
@@ -2594,7 +2647,7 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
     async fn refresh_inbox_unread(&self) {
         let url = format!("{}/labels/{LABEL_INBOX}", self.api_base);
         // Both halves land in one Result so both go through the one latch:
-        // whichever way this fails, it fails every 45s, and a branch that
+        // whichever way this fails, it fails every poll tick, and a branch that
         // printed on its own would be the branch that spams.
         let outcome = match self.get_json::<LabelResp>(&url).await {
             Ok(label) => self
@@ -2780,7 +2833,7 @@ mod tests {
     use super::*;
     use crate::config::Stage1Config;
     use crate::store::SqliteStore;
-    use crate::types::{Disposition, Tier, TriageAxis};
+    use crate::types::{Disposition, NewMessage, Tier, TriageAxis};
 
     /// REGRESSION GUARD: the shipments section must NOT age rows out on the
     /// shared Stage-2 clock. A 30-day-old order confirmation is exactly what the
@@ -4519,5 +4572,80 @@ mod tests {
             .unwrap()
             .expect("zero is an answer");
         assert_eq!((zeroed.messages, zeroed.threads), (0, 0));
+    }
+
+    #[tokio::test]
+    async fn a_gmail_outage_cannot_starve_the_reminder_sweep() {
+        // THE SWEEP IS LOCAL, so it runs AHEAD of the walk. A tick that bounces
+        // — an expired credential, a Gmail outage — takes everything after
+        // `poll_once` with it, and a reminder hung off the far side of that call
+        // would sit unfired for as long as the outage lasts: a weekend of Gmail
+        // being down means Saturday's reminder never arrives.
+        let (store, acct) = store_at_cursor(Some(100));
+        let mid = store
+            .upsert_message(&NewMessage {
+                account_id: acct,
+                gmail_msg_id: "g-parked".into(),
+                thread_id: "t-parked".into(),
+                from_addr: "alice@friends.com".into(),
+                from_name: None,
+                subject: "the thing you parked".into(),
+                received_at: Utc::now() - ChronoDuration::days(1),
+                snippet: String::new(),
+                body: "body".into(),
+                body_html: None,
+                is_sent: false,
+                to_addrs: None,
+                list_unsubscribe: None,
+                list_unsub_one_click: false,
+                auth_pass: None,
+            })
+            .unwrap();
+        store
+            .set_triage(
+                mid,
+                acct,
+                0,
+                Tier::Noise,
+                crate::types::Sensitivity::Normal,
+                None,
+                "",
+                "",
+                None,
+            )
+            .unwrap();
+        store
+            .set_reminder(acct, mid, Utc::now() - ChronoDuration::minutes(1))
+            .unwrap();
+
+        // Gmail is down for this mailbox: the INBOX walk 500s, so the tick
+        // returns Err and the loop hands it to the caller's backoff.
+        let g = MockGmail::default();
+        g.history(LABEL_INBOX, LabelHistory::broken());
+        let base = serve_mock(g.clone()).await;
+        let (_tx, mut shutdown) = tokio::sync::watch::channel(false);
+        assert!(
+            engine(store.clone(), acct, &base)
+                .poll_loop(&mut shutdown)
+                .await
+                .is_err(),
+            "the poll itself failed, which is the whole premise"
+        );
+
+        // ...and the reminder fired anyway.
+        let rows = store
+            .attention_updates(
+                acct,
+                Utc::now() - ChronoDuration::days(30),
+                None,
+                None,
+                None,
+                false,
+            )
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].status, crate::types::AttentionStatus::Open);
+        assert!(rows[0].remind_at.is_none(), "the pending stamp MOVED");
+        assert!(rows[0].reminded_at.is_some(), "it came back on time");
     }
 }

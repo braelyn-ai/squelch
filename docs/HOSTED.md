@@ -1,10 +1,13 @@
 # Hosted squelch: the plan
 
-Status: planned 2026-08-03. Phase 1 shipped; Phase 2's code shipped 2026-08-09/10 and
-its first deployment is going up now. This is the decision record and roadmap
-for offering squelch beyond "clone the repo and run cargo" — what was decided and
-why. What is actually deployed, box by box and secret by secret, is
-`deploy/hosted/PRODUCTION.md`.
+Status: planned 2026-08-03. Phase 1 shipped; Phase 2 is deployed and serving —
+signup, the waitlist and its invite mail, one daemon per tenant on `carrier`, and a
+CronJob that rolls the fleet onto today's image one tenant at a time. Phase 0's
+Google verification is still open and is still the gate on user 101. This is the
+decision record and roadmap for offering squelch beyond "clone the repo and run
+cargo" — what was decided and why. What is actually deployed, box by box and secret
+by secret, is `deploy/hosted/PRODUCTION.md`; rolling a new image onto it is
+`deploy/hosted/ROLLOUT.md`.
 
 ## Naming (decided 2026-08-03)
 
@@ -302,7 +305,7 @@ The actual path, in order:
    this size and buys a control loop, encrypted-at-rest Secrets, NetworkPolicy
    and admission control for free. This gets embarrassingly far, and the
    100-user verification cap makes it moot anyway.
-2. **Next — Gmail push.** Hosted daemons switch from 45s polling to `users.watch` +
+2. **Next — Gmail push.** Hosted daemons switch from 5s polling to `users.watch` +
    Pub/Sub; the control plane receives pushes and pokes the right daemon. Idle
    tenants become nearly free and API quota stays flat as users grow. This is the
    single highest-leverage scaling change, not orchestration. (Self-host keeps
@@ -329,11 +332,18 @@ The actual path, in order:
    The broker is implemented in-repo as `squelch-broker` (2026-08-04) per
    `docs/BROKER.md` but blocked for this tier; it ships with the hosted callback
    instead.
-3. **Phase 2 — hosted MVP: code shipped 2026-08-09/10, first deployment in
-   progress.** `squelch-control` and `squelch-warden` provisioning onto single-node
-   k3s, per-tenant age identities and two-phase provisioning, human-door issued
-   tokens, web signup → app pairing, invite codes. The cluster half is going up on
-   `carrier` now; `deploy/hosted/PRODUCTION.md` is the record of that install.
+3. **Phase 2 — hosted MVP: SHIPPED and running.** `squelch-control` and
+   `squelch-warden` provisioning onto single-node k3s, per-tenant age identities and
+   two-phase provisioning, human-door issued tokens, web signup → app pairing,
+   invite codes. `deploy/hosted/PRODUCTION.md` is the record of that install.
+   Landed after the original list and worth naming: the **waitlist** (a public form
+   on `passband.app`, approval and invite mail from `/admin` through Resend, one
+   table answering "have we invited them" however they arrived), **console SSO**
+   through the control plane, and **fleet convergence** — `squelch-warden roll`, a
+   CronJob on the warden image that walks tenants onto the current render one per
+   tick, refuses to roll a fleet holding a casualty, and exits 4 on a frozen fleet
+   so the one condition worth paging on has its own code
+   (`deploy/hosted/ROLLOUT.md`).
    Still open from this phase's original list:
    - **`/mcp` bearer auth.** Routed around, not solved: the tenant Ingress simply
      does not publish the agent door. See "Changes to existing code" above.

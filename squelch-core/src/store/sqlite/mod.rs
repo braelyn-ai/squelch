@@ -368,6 +368,8 @@ impl SqliteStore {
     /// Test/local helper: insert one attachment row directly (real ones come from
     /// [`Store::ingest_message`]), so tests can seed the byte-serving endpoint —
     /// including an over-cap `data == None` row — without an RFC822 fixture.
+    /// Lands a NULL `content_id`, the shape of a real (non-inline) attachment;
+    /// seed a cid-inline part with [`Self::insert_inline_attachment`].
     pub fn insert_attachment(
         &self,
         account_id: AccountId,
@@ -377,11 +379,37 @@ impl SqliteStore {
         size_bytes: i64,
         data: Option<&[u8]>,
     ) -> Result<i64> {
+        self.insert_inline_attachment(
+            account_id, message_id, filename, mime, size_bytes, data, None,
+        )
+    }
+
+    /// [`Self::insert_attachment`] plus the part's normalized `content_id` — the
+    /// seam a test needs to stand up a cid-inline image without an RFC822 fixture.
+    #[allow(clippy::too_many_arguments)] // the columns of one attachment row
+    pub fn insert_inline_attachment(
+        &self,
+        account_id: AccountId,
+        message_id: i64,
+        filename: &str,
+        mime: &str,
+        size_bytes: i64,
+        data: Option<&[u8]>,
+        content_id: Option<&str>,
+    ) -> Result<i64> {
         let conn = self.lock()?;
         conn.execute(
-            "INSERT INTO attachments(account_id, message_id, filename, mime, size_bytes, data)
-             VALUES(?1,?2,?3,?4,?5,?6)",
-            params![account_id, message_id, filename, mime, size_bytes, data],
+            "INSERT INTO attachments(account_id, message_id, filename, mime, size_bytes, data, content_id)
+             VALUES(?1,?2,?3,?4,?5,?6,?7)",
+            params![
+                account_id,
+                message_id,
+                filename,
+                mime,
+                size_bytes,
+                data,
+                content_id
+            ],
         )?;
         Ok(conn.last_insert_rowid())
     }
@@ -757,8 +785,16 @@ impl Store for SqliteStore {
         min_importance: Option<u8>,
         status: Option<AttentionStatus>,
         band: Option<SitrepBand>,
+        pending_reminders: bool,
     ) -> Result<Vec<AttentionUpdate>> {
-        self.attention_updates(account_id, since, min_importance, status, band)
+        self.attention_updates(
+            account_id,
+            since,
+            min_importance,
+            status,
+            band,
+            pending_reminders,
+        )
     }
 
     fn mark_surfaced(&self, account_id: AccountId, message_ids: &[i64]) -> Result<usize> {
@@ -772,6 +808,23 @@ impl Store for SqliteStore {
         status: AttentionStatus,
     ) -> Result<bool> {
         self.set_attention_status(account_id, message_id, status)
+    }
+
+    fn set_reminder(
+        &self,
+        account_id: AccountId,
+        message_id: i64,
+        remind_at: DateTime<Utc>,
+    ) -> Result<bool> {
+        self.set_reminder(account_id, message_id, remind_at)
+    }
+
+    fn clear_reminder(&self, account_id: AccountId, message_id: i64) -> Result<bool> {
+        self.clear_reminder(account_id, message_id)
+    }
+
+    fn fire_due_reminders(&self, account_id: AccountId, now: DateTime<Utc>) -> Result<Vec<i64>> {
+        self.fire_due_reminders(account_id, now)
     }
 
     fn resolve_sender(&self, account_id: AccountId, sender_addr: &str) -> Result<usize> {

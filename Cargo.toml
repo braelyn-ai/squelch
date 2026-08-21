@@ -43,7 +43,10 @@ tiny_http = "0.12"
 webbrowser = "1"
 url = "2"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
-mail-parser = "0.11"
+# full_encoding is LOAD-BEARING: mail-parser's default feature set has no
+# GBK/GB2312/Big5/Shift-JIS/EUC decoders, so without it every CJK-charset
+# header and body ingests as U+FFFD replacement characters ("??" senders).
+mail-parser = { version = "0.11", features = ["full_encoding"] }
 futures = "0.3"
 base64 = "0.22"
 # Local on-box semantic recall (v1). fastembed runs ONNX embeddings on CPU with
