@@ -347,9 +347,15 @@ impl SqliteStore {
         // Per-message triage rides along for in-thread attention highlighting.
         // LEFT JOIN: a message somehow missing its triage row still renders,
         // just unhighlighted.
+        // `m.subject` rides along per message. The view's own `subject` is the
+        // OLDEST message's (see `thread_guard_and_subject`), which titles the
+        // conversation correctly and titles one message inside it WRONGLY the
+        // moment somebody renames the thread — and a forward is composed from
+        // one message, not from the conversation.
         let mut stmt = conn.prepare(
             "SELECT m.id, m.from_addr, m.from_name, m.received_at, m.body, m.body_html,
-                    t.tier, t.deadline, t.status, t.one_line, m.auth_pass, m.is_sent
+                    t.tier, t.deadline, t.status, t.one_line, m.auth_pass, m.subject,
+                    m.is_sent
              FROM messages m
              LEFT JOIN triage t ON t.message_id = m.id
              WHERE m.account_id=?1 AND m.thread_id=?2
@@ -364,6 +370,7 @@ impl SqliteStore {
                     from_addr: r.get(1)?,
                     from_name: r.get(2)?,
                     received_at: dt(r, 3)?,
+                    subject: r.get(11)?,
                     content: r.get(4)?,
                     html: r.get(5)?,
                     attachments: Vec::new(), // filled below, once `stmt` is gone
@@ -378,7 +385,7 @@ impl SqliteStore {
                     // The thread carries the user's own replies (that is what
                     // makes it a conversation); the reader is where "which of
                     // these is mine" gets answered.
-                    is_sent: r.get::<_, i64>(11)? != 0,
+                    is_sent: r.get::<_, i64>(12)? != 0,
                 })
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;

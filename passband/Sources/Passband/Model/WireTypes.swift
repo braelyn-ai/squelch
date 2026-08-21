@@ -215,6 +215,16 @@ struct ClientMessage: Codable, Sendable, Identifiable, Hashable, SenderStringCon
     var received_at: String
     var content: String
     var html: String?
+    /// THIS MESSAGE'S OWN subject header, not the thread's. ABSENT on a daemon
+    /// too old to send it, which is why the reader falls back to
+    /// `ClientThreadView.subject` rather than showing nothing.
+    ///
+    /// They differ more often than a thread view suggests: a reply that retitled
+    /// the conversation, a forward pulled back in, a list that stamps its own
+    /// prefix. `f` forwards THE SELECTED MESSAGE, so the chrome and the outgoing
+    /// subject have to name the message rather than the conversation it landed
+    /// in — the daemon's own fallback quotes this same header.
+    var subject: String?
     var attachments: [Attachment]?
     /// This message's OWN triage verdict — ABSENT on a pre-highlight daemon.
     /// Drives the in-thread attention highlight: the bands show one row per
@@ -553,6 +563,14 @@ struct StoreStats: Codable, Sendable, Hashable {
     /// (POST /client/assistant/messages). ABSENT on a daemon too old to say —
     /// and nil reads exactly like false: BYOK is the only assistant door.
     var assistant_relay: Bool?
+    /// Whether `forward_of_message_id` on /client/actions/send MEANS anything
+    /// here. ABSENT on a daemon too old to say, and nil must read as false for a
+    /// reason no other capability flag has: serde ignores unknown fields, so an
+    /// old daemon handed a forward answers a cheerful 200 "sent" having dropped
+    /// the id on the floor and mailed the covering note ALONE. There is no error
+    /// to catch and no undo for a send, so the only place to stop it is before
+    /// the composer opens. See `AppStore.forwardingAvailable`.
+    var forwarding: Bool?
 }
 
 // MARK: - usage

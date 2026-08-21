@@ -104,7 +104,7 @@ enum Analytics {
     private static let allowedStrings: Set<String> =
         Set(MainView.allCases.map(\.rawValue)).union([
             // compose_send / compose_opened
-            "new", "reply", "sent", "guard_blocked", "forbidden", "failure",
+            "new", "reply", "forward", "sent", "guard_blocked", "forbidden", "failure",
             // undo_fired kinds
             "archive", "done", "label", "ruleDelete", "remind",
             // triage_corrected axes and wire values — the daemon's closed
