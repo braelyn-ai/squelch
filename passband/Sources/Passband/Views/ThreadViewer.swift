@@ -411,25 +411,6 @@ struct ThreadViewer: View {
                 .help("dev: reset this email's LLM verdicts and re-run triage")
             }
 
-            // The style switch names the style you are one press AWAY from, so
-            // the button says where it takes you rather than where you are.
-            Button { toggleStyle() } label: {
-                HStack(spacing: 4) {
-                    #if os(macOS)
-                        Kbd("b")
-                    #endif
-                    Image(systemName: style.flipped.symbol)
-                        .font(.system(size: 10, weight: .semibold))
-                    Text(style.flipped.actionLabel).font(Typo.micro)
-                }
-            }
-            .buttonStyle(.textAction)
-            // Same gate as `b` (see `toggleStyle`): the flip is a permanent
-            // answer, and there is nothing to answer about until the thread
-            // on screen is this one.
-            .disabled(!styleReady)
-            .help(style.flipped.actionHelp)
-
             Button { openSenderRule() } label: {
                 HStack(spacing: 4) {
                     // The key chip is the Mac's promise that a key does this.
@@ -632,6 +613,14 @@ struct ThreadViewer: View {
                     settle(
                         on: target, proxy: proxy, tries: 24, every: .milliseconds(40), hold: 3,
                         under: index)
+                }
+                // The style radio rides the mail's own top-right corner rather
+                // than the header row: it is a verdict about the mail below it,
+                // and the header is already a sentence of verbs.
+                .overlay(alignment: .topTrailing) {
+                    StyleRadio(style: style, ready: styleReady) { chooseStyle($0) }
+                        .padding(.top, 10)
+                        .padding(.trailing, 12)
                 }
             }
         }
@@ -1019,22 +1008,26 @@ struct ThreadViewer: View {
         index = min(newestIndex, max(0, index + delta))
     }
 
-    /// `b` and the header button, which are the same flip. The answer is kept
-    /// for THIS thread and PINNED THERE, even when it agrees with the default of
-    /// the moment: with Automatic in Settings the default is re-read on every
-    /// open, so a thread left following it would go back to the guess the next
-    /// time a reply changes what the guess says. A reader who has answered the
+    /// `b` walks the radio: same choice, keyboard spelling.
+    private func toggleStyle() { chooseStyle(style.flipped) }
+
+    /// The radio and `b`, which are the same answer. It is kept for THIS thread
+    /// and PINNED THERE, even when it agrees with the default of the moment:
+    /// with Automatic in Settings the default is re-read on every open, so a
+    /// thread left following it would go back to the guess the next time a
+    /// reply changes what the guess says. A reader who has answered the
     /// question should not be asked it again.
     ///
     /// AND IT IS A NO-OP UNTIL THERE IS A THREAD TO ANSWER FOR. `style` holds
     /// its placeholder `.classic` until `adopt` resolves it, and the pin is for
-    /// good — the ledger has no un-answering — so a `b` pressed into the load
-    /// window would pin the placeholder, for a thread nobody has read yet, and
-    /// nothing would ever ask again.
-    private func toggleStyle() {
+    /// good — the ledger has no un-answering — so a press into the load window
+    /// would pin the placeholder, for a thread nobody has read yet, and nothing
+    /// would ever ask again.
+    private func chooseStyle(_ chosen: ThreadStyle) {
         guard styleReady else { return }
-        style = style.flipped
-        styles.set(threadId, style)
+        styles.set(threadId, chosen)
+        guard style != chosen else { return }
+        style = chosen
     }
 
     /// Whether `style` is THIS thread's resolved answer rather than the state's
@@ -1688,6 +1681,11 @@ private struct MessageCard: View {
                 html: html, cacheKey: style.frameKey(message.id),
                 allowTrackers: message.allowsTrackers,
                 attachments: message.attachmentList)
+                // The web frame's document is hardcoded #fff (EmailFrame), so
+                // white IS this bubble's fill, in either theme.
+                .overlay(alignment: mine ? .bottomTrailing : .bottomLeading) {
+                    tail(Color.white)
+                }
         } else {
             PlainBody(content: message.content, fills: !chat)
                 .padding(.horizontal, chat ? 12 : 0)
@@ -1701,7 +1699,22 @@ private struct MessageCard: View {
                                 ? Color.clear
                                 : mine ? Palette.accentSoft : Palette.hairline)
                 )
+                .overlay(alignment: mine ? .bottomTrailing : .bottomLeading) {
+                    tail(mine ? Palette.accentSoft : Palette.hairline)
+                }
         }
+    }
+
+    /// The speech tail, hung under the bubble's OUTER bottom corner and poking
+    /// past it — the message's side said twice, once by alignment and once by
+    /// the point. Mounted in both styles and merely clear in classic, for the
+    /// same identity reason as everything else on this card.
+    private func tail(_ color: Color) -> some View {
+        BubbleTail(mine: mine)
+            .fill(chat ? color : Color.clear)
+            .frame(width: 12, height: 11)
+            .offset(x: mine ? 7 : -7)
+            .allowsHitTesting(false)
     }
 
     /// The parts the BODY already shows, because a `cid:` reference in the html
@@ -1723,6 +1736,89 @@ private struct MessageCard: View {
         else { return [] }
         let body = message.allowsTrackers ? html : Trackers.strip(html).html
         return CidImages.referencedAttachmentIDs(html: body, attachments: message.attachmentList)
+    }
+}
+
+/// The little point under a bubble's OUTER bottom corner — the part that makes
+/// a rounded rectangle read as speech. Drawn for the trailing (sent) side and
+/// mirrored for the leading one. The box's inner edge tucks a few points under
+/// the bubble, where its straight left side sits inside the fill, so the two
+/// shapes meet behind the corner radius without a seam.
+private struct BubbleTail: Shape {
+    var mine: Bool
+
+    func path(in rect: CGRect) -> Path {
+        var p = Path()
+        p.move(to: CGPoint(x: 0, y: 0))
+        p.addQuadCurve(
+            to: CGPoint(x: rect.maxX, y: rect.maxY),
+            control: CGPoint(x: rect.maxX * 0.55, y: rect.maxY * 0.35))
+        p.addQuadCurve(
+            to: CGPoint(x: 0, y: rect.maxY),
+            control: CGPoint(x: rect.maxX * 0.45, y: rect.maxY))
+        p.closeSubpath()
+        guard !mine else { return p }
+        return p.applying(
+            CGAffineTransform(scaleX: -1, y: 1).translatedBy(x: -rect.width, y: 0))
+    }
+}
+
+/// The style switch, riding the mail's own top-right corner: two icon slots —
+/// text above, talk below — and one highlight that travels between them. A
+/// radio rather than a flip because two icons can SAY both answers where the
+/// old header button could only name the other one. Same crossing time as
+/// GlassSegmented, so every selector in the app moves at one speed.
+private struct StyleRadio: View {
+    let style: ThreadStyle
+    let ready: Bool
+    let choose: (ThreadStyle) -> Void
+
+    private static let slot: CGFloat = 26
+    private static let gap: CGFloat = 2
+    private static let pad: CGFloat = 3
+
+    var body: some View {
+        VStack(spacing: Self.gap) {
+            option(.classic, icon: "text.alignleft", help: "read this thread as email cards")
+            option(.bubbles, icon: "bubble.left", help: "read this thread as chat bubbles")
+        }
+        .padding(Self.pad)
+        .background(alignment: .top) { highlight }
+        .animation(.smooth(duration: 0.32), value: style)
+        .background(
+            RoundedRectangle(cornerRadius: 9, style: .continuous)
+                .fill(Palette.hairline.opacity(0.5)))
+        // Same gate as `b` (see `chooseStyle`): the pin is permanent, and there
+        // is nothing to answer about until the thread on screen is this one.
+        .opacity(ready ? 1 : 0.35)
+        .disabled(!ready)
+    }
+
+    private func option(_ value: ThreadStyle, icon: String, help: String) -> some View {
+        Button { choose(value) } label: {
+            Image(systemName: icon)
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundStyle(style == value ? .white : Palette.inkDim)
+                .frame(width: Self.slot, height: Self.slot)
+                .contentShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+        }
+        .buttonStyle(.plain)
+        .help(help)
+    }
+
+    /// The travelling pane, one view for the life of the control — the slots
+    /// are fixed squares, so the offset is arithmetic rather than measurement.
+    private var highlight: some View {
+        Color.clear
+            .frame(width: Self.slot, height: Self.slot)
+            .glassEffect(
+                .regular.tint(Palette.accent.opacity(0.55)),
+                in: RoundedRectangle(cornerRadius: 6, style: .continuous)
+            )
+            // Sits over the active slot — an interactive material would eat
+            // that option's clicks.
+            .allowsHitTesting(false)
+            .offset(y: Self.pad + (style == .bubbles ? Self.slot + Self.gap : 0))
     }
 }
 

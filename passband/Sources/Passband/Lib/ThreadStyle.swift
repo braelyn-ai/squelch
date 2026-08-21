@@ -35,29 +35,6 @@ enum ThreadStyle: String, CaseIterable, Sendable {
         self == .classic ? .bubbles : .classic
     }
 
-    /// Named for where the button GOES, not for where it is: the control shows
-    /// the style you are one press away from.
-    var symbol: String {
-        switch self {
-        case .classic: "list.bullet.rectangle"
-        case .bubbles: "bubble.left.and.bubble.right"
-        }
-    }
-
-    var actionLabel: String {
-        switch self {
-        case .classic: "email style"
-        case .bubbles: "chat style"
-        }
-    }
-
-    var actionHelp: String {
-        switch self {
-        case .classic: "read this thread as email cards"
-        case .bubbles: "read this thread as chat bubbles"
-        }
-    }
-
     /// The per-message key the frame pool and the height memory file a rendered
     /// document under. THE STYLE IS PART OF IT because both are width-dependent:
     /// a bubble measures its document at the bubble's measure, and handing that
