@@ -1,4 +1,12 @@
-import { useEffect, useMemo, useRef, useState, type FormEvent } from "react";
+import {
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type FormEvent,
+  type MouseEvent,
+  type PointerEvent,
+} from "react";
 
 // The background is a procedurally repeated fake inbox: the drudgery Passband
 // exists to kill, blurred into wallpaper so the pitch sits on top of it.
@@ -115,62 +123,33 @@ const styles = {
     textAlign: "center",
     padding: "0 1.5rem",
   },
-  card: {
+  // The mark and the wordmark become a way home once the page is in its
+  // waitlist state, and stay inert text before that: a link to the page you
+  // are already on is not a link.
+  homeLink: {
     display: "flex",
     flexDirection: "column",
     alignItems: "center",
     gap: "1rem",
-    padding: "1.25rem 1.5rem 1.5rem",
-    borderRadius: "1rem",
-    background: "rgba(255, 255, 255, 0.055)",
-    border: "1px solid rgba(255, 255, 255, 0.11)",
+    textDecoration: "none",
   },
-  cardLabel: {
-    fontSize: "0.72rem",
-    fontWeight: 600,
-    letterSpacing: "0.12em",
-    textTransform: "uppercase",
-    color: "#8a8a90",
-  },
-  cardCopy: {
-    margin: 0,
-    maxWidth: "22rem",
-    color: "#b8b8bd",
-    fontSize: "0.95rem",
-    lineHeight: 1.5,
-    textAlign: "center",
-  },
-  pill: {
-    padding: "0.28rem 0.8rem",
-    borderRadius: "999px",
-    border: "1px solid #3a3a3f",
-    color: "#b8b8bd",
-    fontSize: "0.75rem",
-    background: "transparent",
-    fontFamily: "inherit",
-  },
-  waitlistForm: {
-    display: "flex",
-    flexWrap: "wrap",
-    alignItems: "center",
-    justifyContent: "center",
-    gap: "0.5rem",
-  },
-  waitlistInput: {
-    padding: "0.4rem 0.75rem",
-    borderRadius: "0.6rem",
-    border: "1px solid rgba(255, 255, 255, 0.14)",
-    background: "rgba(255, 255, 255, 0.04)",
+  // The one line that answers the press. Brighter than the detail under it and
+  // quieter than the tagline above it, which stays the page's loudest line in
+  // every state.
+  confirm: {
+    margin: "0.65rem 0 0",
     color: "#f5f5f7",
-    fontSize: "0.9rem",
-    fontFamily: "inherit",
-    minWidth: "15rem",
+    fontSize: "1rem",
+    textAlign: "center",
   },
   status: {
     margin: 0,
-    color: "#b8b8bd",
+    maxWidth: "26rem",
+    color: "#8a8a90",
     fontSize: "0.9rem",
+    lineHeight: 1.5,
     textAlign: "center",
+    padding: "0 1.5rem",
   },
   corner: {
     position: "absolute",
@@ -270,21 +249,25 @@ const BRASS = "240, 204, 128";
 // limit from it and the draw loop sizes the curve from it.
 const FULL_W = 0.19;
 
-const DOWNLOAD_CSS = `
-.pb-dl {
+const CTA_CSS = `
+.pb-cta {
   position: relative;
   isolation: isolate;
   display: inline-flex;
   align-items: center;
+  justify-content: center;
   gap: 0.6rem;
   margin-top: 0.65rem;
   padding: 0.9rem 1.9rem 1.3rem;
   border-radius: 0.9rem;
   overflow: hidden;
   text-decoration: none;
+  font-family: inherit;
   font-size: 0.95rem;
   font-weight: 600;
   letter-spacing: 0.015em;
+  cursor: pointer;
+  appearance: none;
   color: #e9e2d4;
   background: linear-gradient(180deg, #1e1e22, #131315);
   border: 1px solid rgba(${BRASS}, 0.22);
@@ -297,8 +280,8 @@ const DOWNLOAD_CSS = `
     box-shadow 0.4s ease,
     color 0.4s ease;
 }
-.pb-dl:hover,
-.pb-dl:focus-visible {
+.pb-cta:hover,
+.pb-cta:focus-visible {
   color: #fff6e4;
   transform: translateY(-2px);
   border-color: rgba(${BRASS}, 0.62);
@@ -307,13 +290,13 @@ const DOWNLOAD_CSS = `
     0 0 34px -6px rgba(${BRASS}, 0.45),
     0 16px 38px rgba(0, 0, 0, 0.55);
 }
-.pb-dl:active { transform: translateY(0) scale(0.995); }
-.pb-dl:focus-visible {
+.pb-cta:active { transform: translateY(0) scale(0.995); }
+.pb-cta:focus-visible {
   outline: 2px solid rgba(${BRASS}, 0.75);
   outline-offset: 3px;
 }
 /* Machined top edge: a filament that comes up with the rest of the hardware. */
-.pb-dl::before {
+.pb-cta::before {
   content: "";
   position: absolute;
   inset: 0 0 auto;
@@ -323,35 +306,145 @@ const DOWNLOAD_CSS = `
   background: linear-gradient(90deg, transparent, rgba(${BRASS}, 0.8), transparent);
   transition: opacity 0.4s ease;
 }
-.pb-dl:hover::before,
-.pb-dl:focus-visible::before { opacity: 1; }
-.pb-dl-meter {
+.pb-cta:hover::before,
+.pb-cta:focus-visible::before { opacity: 1; }
+.pb-cta-meter {
   position: absolute;
   inset: 0;
   z-index: 0;
   width: 100%;
   height: 100%;
+  /* Ground, never a target. Inside the rig it lies across the address field,
+     and a canvas that swallowed the click would leave the field unfocusable. */
+  pointer-events: none;
 }
-.pb-dl-arrow,
-.pb-dl-label { position: relative; z-index: 1; }
-.pb-dl-arrow { transition: transform 0.4s cubic-bezier(0.2, 0.8, 0.2, 1); }
-.pb-dl:hover .pb-dl-arrow,
-.pb-dl:focus-visible .pb-dl-arrow { transform: translateY(2px); }
+.pb-cta-arrow,
+.pb-cta-label { position: relative; z-index: 1; }
+.pb-cta-arrow { transition: transform 0.4s cubic-bezier(0.2, 0.8, 0.2, 1); }
+.pb-cta:hover .pb-cta-arrow,
+.pb-cta:focus-visible .pb-cta-arrow { transform: translateX(3px); }
+/* THE RIG: the email field and the join button as ONE piece of machined
+   hardware rather than a form on a card.
+   The card that used to be here was a translucent rounded rectangle with a
+   hairline white border, which is the single most templated component on the
+   web and belonged to no part of this page. This page has exactly one material
+   in it: the dark brushed ground of the button above, edged in the icon's
+   brass. So the waitlist is built out of THAT, with a slot cut in it for the
+   address. The rig owns the material and the enclosure; the button inside it
+   keeps only its meter and its label. */
+.pb-rig {
+  position: relative;
+  isolation: isolate;
+  display: flex;
+  align-items: stretch;
+  width: min(28rem, 100%);
+  margin-top: 0.65rem;
+  border-radius: 0.9rem;
+  overflow: hidden;
+  background: linear-gradient(180deg, #1e1e22, #131315);
+  border: 1px solid rgba(${BRASS}, 0.22);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.07),
+    0 12px 30px rgba(0, 0, 0, 0.5);
+  transition: border-color 0.4s ease, box-shadow 0.4s ease;
+}
+/* One lit state for the whole instrument, driven by the field inside it:
+   focusing the input is the same event as arming the button, so lighting only
+   the half under the cursor would say the two are separate things. */
+.pb-rig:hover,
+.pb-rig:focus-within {
+  border-color: rgba(${BRASS}, 0.62);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.14),
+    0 0 34px -6px rgba(${BRASS}, 0.45),
+    0 16px 38px rgba(0, 0, 0, 0.55);
+}
+/* The same machined top edge the standalone button wears. */
+.pb-rig::before {
+  content: "";
+  position: absolute;
+  inset: 0 0 auto;
+  height: 1px;
+  z-index: 2;
+  opacity: 0.45;
+  background: linear-gradient(90deg, transparent, rgba(${BRASS}, 0.8), transparent);
+  transition: opacity 0.4s ease;
+}
+.pb-rig:hover::before,
+.pb-rig:focus-within::before { opacity: 1; }
+/* The slot. No border and no ground of its own: it is an opening in the rig,
+   not a control sitting on one. Its padding matches the button's exactly, so
+   the address and the label sit on the same optical line. */
+.pb-rig-field {
+  position: relative;
+  z-index: 1;
+  flex: 1 1 auto;
+  min-width: 0;
+  padding: 0.9rem 1.1rem 1.3rem;
+  border: 0;
+  outline: none;
+  background: none;
+  color: #f5f5f7;
+  font-family: inherit;
+  font-size: 0.95rem;
+  line-height: 1.2;
+}
+.pb-rig-field::placeholder { color: #6b6b70; }
+.pb-rig-field:disabled { color: #a9a49a; }
+/* The button, once the rig owns the material: no ground, no shell, no lift.
+   What is left of it is the half that lights up, divided off by one hairline.
+   The lift is dropped deliberately, because a button that rises out of the bar
+   it is set into reads as a part coming loose. */
+.pb-cta-in-rig {
+  flex: none;
+  margin-top: 0;
+  border: 0;
+  border-left: 1px solid rgba(${BRASS}, 0.18);
+  border-radius: 0;
+  background: none;
+  box-shadow: none;
+}
+.pb-cta-in-rig::before { display: none; }
+.pb-cta-in-rig:hover,
+.pb-cta-in-rig:focus-visible {
+  transform: none;
+  box-shadow: none;
+  border-color: rgba(${BRASS}, 0.35);
+}
+/* Drawn inside, because the rig clips anything outside it. */
+.pb-cta-in-rig:focus-visible { outline-offset: -3px; }
+/* In flight. The meter keeps running (the request is the thing being waited
+   on) but the hardware stops answering the pointer. */
+.pb-cta[disabled] { cursor: progress; color: #a9a49a; }
+.pb-cta[disabled]:hover,
+.pb-cta[disabled]:hover .pb-cta-arrow { transform: none; }
+.pb-cta[disabled]:hover { border-color: rgba(${BRASS}, 0.22); box-shadow:
+  inset 0 1px 0 rgba(255, 255, 255, 0.07), 0 12px 30px rgba(0, 0, 0, 0.5); }
+.pb-cta-in-rig[disabled]:hover { box-shadow: none; border-color: rgba(${BRASS}, 0.18); }
 @media (prefers-reduced-motion: reduce) {
-  .pb-dl,
-  .pb-dl-arrow { transition-duration: 0.01ms; }
-  .pb-dl:hover,
-  .pb-dl:focus-visible,
-  .pb-dl:hover .pb-dl-arrow,
-  .pb-dl:focus-visible .pb-dl-arrow { transform: none; }
+  .pb-cta,
+  .pb-cta-arrow { transition-duration: 0.01ms; }
+  .pb-cta:hover,
+  .pb-cta:focus-visible,
+  .pb-cta:hover .pb-cta-arrow,
+  .pb-cta:focus-visible .pb-cta-arrow { transform: none; }
 }
 `;
 
-// The one piece of hardware on the page. At rest the meter shows a noise floor
-// (the same slop scrolling behind the frost); on hover the filter closes and
-// only the passband survives, lit in the icon's brass. The animation is the
-// product's own metaphor, which is the price of putting motion here at all.
-function DownloadButton() {
+// The one piece of hardware in the product, and now it appears twice: on the
+// homepage as the call to action and on the waitlist form as its submit. At
+// rest the meter shows a noise floor (the same slop scrolling behind the
+// frost); on hover the filter closes and only the passband survives, lit in the
+// icon's brass. The animation is the product's own metaphor, which is the price
+// of putting motion here at all.
+//
+// A HOOK RATHER THAN A COMPONENT because the pointer handlers have to sit on
+// the button, not on the canvas inside it: the meter is ground beneath a label,
+// and the geometry it reads is the button's own box. So the hook hands back
+// both halves, the caller spreads the handlers onto whatever element it is
+// building, and the two pages share one meter rather than growing two that
+// drift apart.
+function useMeter() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   // Hover lives in a ref, not state: the rAF loop reads it every frame and CSS
   // already owns the chrome, so a re-render would buy nothing.
@@ -496,74 +589,130 @@ function DownloadButton() {
     };
   }, []);
 
+  return {
+    // Everything that goes INSIDE the button: the stylesheet, and the canvas
+    // the loop above draws on.
+    chrome: (
+      <>
+        {/* href + precedence is React 19's hoist path: the rules land in <head>
+            and dedupe by href instead of sitting loose in the body, which is
+            also what lets both buttons render this without shipping it twice. */}
+        <style href="pb-cta" precedence="default">
+          {CTA_CSS}
+        </style>
+        <canvas ref={canvasRef} className="pb-cta-meter" aria-hidden="true" />
+      </>
+    ),
+    // Everything that goes ON it.
+    handlers: {
+      onPointerEnter: () => {
+        hovered.current = true;
+      },
+      onPointerMove: (event: PointerEvent<HTMLElement>) => {
+        const box = event.currentTarget.getBoundingClientRect();
+        const x = (event.clientX - box.left) / (box.width || 1);
+        // Screen y grows downward and the hump grows upward, so invert: the
+        // top of the button is the filter wide open.
+        const lift = 1 - (event.clientY - box.top) / (box.height || 1);
+        // Never fully shut: at zero the hump has no height and no width, so
+        // the bars all die and the button looks broken rather than tuned. The
+        // top of the travel goes past 1, which is the meter's nominal full
+        // height, so the peak reaches up behind the label instead of stopping
+        // politely beneath it.
+        const aperture = 0.38 + 0.8 * Math.min(1, Math.max(0, lift));
+        // Clamped by the skirts' real width, not a fixed margin: a wide hump
+        // needs more room to keep both shoulders on the button than a narrow
+        // one, so the travel opens up exactly as the filter closes down. The
+        // quartic is down to a percent of peak by 1.5 half-widths, so 0.72 is
+        // where the shoulder has visually landed.
+        const edge = 0.72 * FULL_W * aperture;
+        tuned.current = {
+          x: Math.min(1 - edge, Math.max(edge, x)),
+          lift: aperture,
+        };
+      },
+      onPointerLeave: () => {
+        hovered.current = false;
+        // Home, so the next hover starts centred and open rather than
+        // wherever the last one happened to end.
+        tuned.current = { x: 0.5, lift: 1 };
+      },
+      // Keyboard focus has no cursor to follow, so it gets the centred band.
+      onFocus: () => {
+        hovered.current = true;
+      },
+      onBlur: () => {
+        hovered.current = false;
+      },
+    },
+  };
+}
+
+// The arrow both buttons wear. It points the way the press goes, which is
+// onward now rather than down: the homepage leads to the waitlist, and the
+// waitlist form sends. Label first, arrow second, so the two read left to right
+// in the order they happen.
+function Arrow() {
   return (
-    <>
-      {/* href + precedence is React 19's hoist path: the rules land in <head>
-          and dedupe by href instead of sitting loose in the body. */}
-      <style href="pb-download" precedence="default">
-        {DOWNLOAD_CSS}
-      </style>
-      <a
-        className="pb-dl"
-        href="/download/latest"
-        onPointerEnter={() => (hovered.current = true)}
-        onPointerMove={(event) => {
-          const box = event.currentTarget.getBoundingClientRect();
-          const x = (event.clientX - box.left) / (box.width || 1);
-          // Screen y grows downward and the hump grows upward, so invert: the
-          // top of the button is the filter wide open.
-          const lift = 1 - (event.clientY - box.top) / (box.height || 1);
-          // Never fully shut: at zero the hump has no height and no width, so
-          // the bars all die and the button looks broken rather than tuned. The
-          // top of the travel goes past 1, which is the meter's nominal full
-          // height, so the peak reaches up behind the label instead of stopping
-          // politely beneath it.
-          const aperture = 0.38 + 0.8 * Math.min(1, Math.max(0, lift));
-          // Clamped by the skirts' real width, not a fixed margin: a wide hump
-          // needs more room to keep both shoulders on the button than a narrow
-          // one, so the travel opens up exactly as the filter closes down. The
-          // quartic is down to a percent of peak by 1.5 half-widths, so 0.72 is
-          // where the shoulder has visually landed.
-          const edge = 0.72 * FULL_W * aperture;
-          tuned.current = {
-            x: Math.min(1 - edge, Math.max(edge, x)),
-            lift: aperture,
-          };
-        }}
-        onPointerLeave={() => {
-          hovered.current = false;
-          // Home, so the next hover starts centred and open rather than
-          // wherever the last one happened to end.
-          tuned.current = { x: 0.5, lift: 1 };
-        }}
-        // Keyboard focus has no cursor to follow, so it gets the centred band.
-        onFocus={() => (hovered.current = true)}
-        onBlur={() => (hovered.current = false)}
-      >
-        <canvas ref={canvasRef} className="pb-dl-meter" aria-hidden="true" />
-        <svg
-          className="pb-dl-arrow"
-          width="14"
-          height="15"
-          viewBox="0 0 14 15"
-          fill="none"
-          stroke="currentColor"
-          strokeWidth="1.6"
-          strokeLinecap="round"
-          strokeLinejoin="round"
-          aria-hidden="true"
-        >
-          <path d="M7 1.5v8.2m0 0 3.3-3.3M7 9.7 3.7 6.4" />
-          <path d="M1.4 13.2h11.2" />
-        </svg>
-        <span className="pb-dl-label">download the client</span>
-      </a>
-    </>
+    <svg
+      className="pb-cta-arrow"
+      width="15"
+      height="14"
+      viewBox="0 0 15 14"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="1.6"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+    >
+      <path d="M1.4 7h11.2m0 0L9.3 3.7M12.6 7 9.3 10.3" />
+    </svg>
   );
 }
 
-// Same corner links on every React page, so /waitlist reads as a sibling of
-// the homepage rather than a detour off the site.
+// THE HOMEPAGE'S ONE ACTION. It used to be the download, and the client is not
+// a thing worth holding before there is a mailbox behind it: the door here is
+// the list, and the download waits at the end of the invite flow, where it is
+// the next thing somebody actually needs.
+//
+// STILL AN ANCHOR with a real `href`, even though the click is handled: it is a
+// link to a URL that exists, so cmd-click, middle-click, and "copy link" all
+// have to keep meaning what they mean.
+function JoinButton({
+  onClick,
+}: {
+  onClick: (event: MouseEvent<HTMLAnchorElement>) => void;
+}) {
+  const { chrome, handlers } = useMeter();
+  return (
+    <a className="pb-cta" href={WAITLIST_PATH} onClick={onClick} {...handlers}>
+      {chrome}
+      <span className="pb-cta-label">join the waitlist</span>
+      <Arrow />
+    </a>
+  );
+}
+
+// The rig's submit half. NO METER OF ITS OWN: the rig carries one meter across
+// its whole width, so this is the label and the divider and nothing else.
+// Squeezed into a button this narrow the meter read as a squiggle rather than
+// an instrument, and it had nothing to say about the half of the bar where the
+// typing happens.
+//
+// `busy` is the request in flight. The rig's meter keeps running, because that
+// is the part that is honestly still happening; the button stops answering.
+function SubmitButton({ busy }: { busy: boolean }) {
+  return (
+    <button className="pb-cta pb-cta-in-rig" type="submit" disabled={busy}>
+      <span className="pb-cta-label">{busy ? "sending" : "join"}</span>
+      {!busy && <Arrow />}
+    </button>
+  );
+}
+
+// Same corner links in both of the page's states, so joining the list never
+// reads as having left the site.
 function CornerLinks() {
   return (
     <>
@@ -584,34 +733,22 @@ function CornerLinks() {
   );
 }
 
-export function App() {
-  return (
-    <main style={styles.page}>
-      <FakeInbox />
-      <div style={styles.frost} />
-      <div style={styles.content}>
-        {/* The mark on its own, no tile: the page is already a dark field, so
-            the icon's ground would just be a lighter rectangle sitting on it. */}
-        <img
-          src="/mark.svg"
-          alt="Passband"
-          width={180}
-          height={98}
-        />
-        <h1 style={styles.title}>Passband</h1>
-        <p style={styles.tagline}>fuck email. lets make it bearable</p>
-        <DownloadButton />
-      </div>
-      <CornerLinks />
-    </main>
-  );
-}
-
 // The control plane answers 200 for a fresh address and for one already on the
 // list, so this page can never become a membership oracle.
 const WAITLIST_URL = "https://signup.passband.app/waitlist";
 
-export function WaitlistPage() {
+// The path the waitlist state answers to. A real URL, deep-linkable and
+// shareable, even though reaching it from the homepage never loads a document.
+const WAITLIST_PATH = "/waitlist";
+
+// The waitlist, as a state of the homepage rather than a page of its own.
+//
+// It renders into the slot THE BUTTON occupies, and nothing above it moves: the
+// mark, the wordmark and the tagline are the page's constants in every state,
+// so joining the list swaps exactly one element and the rest of the page holds
+// perfectly still.
+function Waitlist() {
+  const { chrome, handlers } = useMeter();
   const [email, setEmail] = useState("");
   const [state, setState] = useState<"idle" | "busy" | "done" | "error">("idle");
 
@@ -633,66 +770,113 @@ export function WaitlistPage() {
     }
   };
 
+  // WHAT ARRIVES AND WHAT IS AT THE END OF IT, which is the only thing still
+  // unanswered once somebody is on the list, and where the client lives now.
+  if (state === "done") {
+    return (
+      <>
+        <p style={styles.confirm}>you're on the list.</p>
+        <p style={styles.status}>
+          you will receive an email when a spot opens. it walks you through
+          setup, and the app is waiting at the end of it.
+        </p>
+      </>
+    );
+  }
+
+  return (
+    <>
+      <form className="pb-rig" onSubmit={submit} {...handlers}>
+        {chrome}
+        <input
+          className="pb-rig-field"
+          type="email"
+          name="email"
+          required
+          autoComplete="email"
+          placeholder="you@example.com"
+          aria-label="email address"
+          // The button that opened this is gone from under the cursor, so the
+          // field takes the focus it left behind: press join, start typing.
+          autoFocus
+          value={email}
+          disabled={state === "busy"}
+          onChange={(event) => setEmail(event.target.value)}
+        />
+        <SubmitButton busy={state === "busy"} />
+      </form>
+      {state === "error" && (
+        <p style={{ ...styles.status, color: "#d8a39a" }}>
+          that didn't go through. give it a second and try again.
+        </p>
+      )}
+    </>
+  );
+}
+
+export function App() {
+  // THE WAITLIST IS A STATE OF THIS PAGE, not a document of its own. It was a
+  // second page at /waitlist, and clicking through re-parsed the bundle and
+  // re-rolled the random inbox behind the frost, so the one thing on screen
+  // that should never move flickered on every click. The URL still changes, so
+  // the link stays real and the back button still goes back; nothing remounts.
+  const [joining, setJoining] = useState(
+    () => location.pathname === WAITLIST_PATH,
+  );
+
+  // The browser's own history is the source of truth, so back and forward land
+  // where they should rather than leaving the page arguing with its address.
+  useEffect(() => {
+    const sync = () => setJoining(location.pathname === WAITLIST_PATH);
+    addEventListener("popstate", sync);
+    return () => removeEventListener("popstate", sync);
+  }, []);
+
+  const go =
+    (path: string, next: boolean) => (event: MouseEvent<HTMLAnchorElement>) => {
+      // Anything but a plain left click is asking for a new document: a new
+      // tab, a new window, a saved link. Let the browser have those.
+      if (
+        event.metaKey ||
+        event.ctrlKey ||
+        event.shiftKey ||
+        event.altKey ||
+        event.button !== 0
+      ) {
+        return;
+      }
+      event.preventDefault();
+      history.pushState(null, "", path);
+      setJoining(next);
+    };
+
+  // The mark on its own, no tile: the page is already a dark field, so the
+  // icon's ground would just be a lighter rectangle sitting on it.
+  const masthead = (
+    <>
+      <img src="/mark.svg" alt="Passband" width={180} height={98} />
+      <h1 style={styles.title}>Passband</h1>
+    </>
+  );
+
   return (
     <main style={styles.page}>
       <FakeInbox />
       <div style={styles.frost} />
       <div style={styles.content}>
-        <a
-          href="/"
-          style={{
-            display: "flex",
-            flexDirection: "column",
-            alignItems: "center",
-            gap: "1rem",
-            textDecoration: "none",
-          }}
-        >
-          <img
-            src="/mark.svg"
-            alt="Passband"
-            width={180}
-            height={98}
-          />
-          <h1 style={styles.title}>Passband</h1>
-        </a>
-        <section style={{ ...styles.card, marginTop: "0.5rem" }}>
-          <span style={styles.cardLabel}>hosted beta</span>
-          <p style={styles.cardCopy}>
-            we run the daemon for you. join the list and your invite lands by
-            email.
-          </p>
-          {state === "done" ? (
-            <p style={styles.status}>you're on the list. watch your inbox.</p>
-          ) : (
-            <form style={styles.waitlistForm} onSubmit={submit}>
-              <input
-                style={styles.waitlistInput}
-                type="email"
-                name="email"
-                required
-                autoComplete="email"
-                placeholder="you@example.com"
-                aria-label="email address"
-                value={email}
-                disabled={state === "busy"}
-                onChange={(event) => setEmail(event.target.value)}
-              />
-              <button
-                style={styles.pill}
-                type="submit"
-                disabled={state === "busy"}
-              >
-                {state === "busy" ? "sending" : "join"}
-              </button>
-            </form>
-          )}
-          {state === "error" && (
-            <p style={{ ...styles.status, color: "#d8a39a" }}>
-              that didn't go through. give it a second and try again.
-            </p>
-          )}
-        </section>
+        {joining ? (
+          <a href="/" onClick={go("/", false)} style={styles.homeLink}>
+            {masthead}
+          </a>
+        ) : (
+          masthead
+        )}
+        <p style={styles.tagline}>fuck email. lets make it bearable</p>
+        {joining ? (
+          <Waitlist />
+        ) : (
+          <JoinButton onClick={go(WAITLIST_PATH, true)} />
+        )}
       </div>
       <CornerLinks />
     </main>

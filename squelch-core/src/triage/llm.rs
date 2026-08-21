@@ -556,14 +556,28 @@ where
     }
 }
 
-/// True when a permanent-failure kind is an AUTH failure (`http_401` /
-/// `http_403`): the credential is wrong for the endpoint, which is a CONFIG
-/// problem shared by every queued row, not a fact about the message being
-/// classified. Callers should leave the row queued and stop the pass — the
-/// remaining rows would fail identically, and a row marked processed on an
-/// auth failure is foreclosed from triage even after the credential is fixed.
-pub fn is_auth_failure(kind: &str) -> bool {
-    kind.starts_with("http_401") || kind.starts_with("http_403")
+/// True when a permanent-failure kind is a CONFIG-LEVEL failure: the request
+/// was rejected for a reason shared by every queued row, never a fact about the
+/// message being classified. A wrong credential (`http_401`/`http_403`), an
+/// exhausted gateway budget (`http_402`), a bad endpoint (`http_404`) — and
+/// `http_400`, because this daemon builds every request from the same schema,
+/// capped body, and configured model, so a 400 means the CONFIGURATION is
+/// rejected (the canonical case: a gateway virtual key whose allowed-models
+/// list does not contain the configured model answers 400 in 0ms, before any
+/// upstream call). Callers must leave the row queued and stop the pass: the
+/// remaining rows would fail identically, and a row marked processed here is
+/// foreclosed from triage even after the config is fixed. The 2026-08-19
+/// fleet outage foreclosed two days of hosted mail exactly that way — every
+/// verdict silently fell back to the ingest heuristic.
+///
+/// Row-level permanent kinds (`json_parse`, `max_tokens_truncation`,
+/// `response_decode`, `importance_out_of_range`) stay outside this predicate:
+/// those ARE facts about the row's response and must mark processed so the row
+/// cannot loop.
+pub fn is_config_failure(kind: &str) -> bool {
+    ["http_400", "http_401", "http_402", "http_403", "http_404"]
+        .iter()
+        .any(|prefix| kind.starts_with(prefix))
 }
 
 /// Parse a `retry-after` header (seconds) if present.
@@ -588,18 +602,24 @@ async fn sleep_backoff(attempt: u32, retry_after: Option<Duration>) {
 mod tests {
     use super::*;
 
-    /// The auth split is what keeps a bad credential from eating the queue:
-    /// 401/403 leave rows queued for after the fix, everything else in the
-    /// permanent class marks the row processed so it cannot loop.
+    /// The config split is what keeps a bad credential, budget, or model list
+    /// from eating the queue: config-shaped 4xx leaves rows queued for after
+    /// the fix, while row-level kinds (a malformed response IS a fact about
+    /// this row) mark processed so the row cannot loop.
     #[test]
-    fn auth_failures_split_from_the_permanent_class_by_kind() {
-        assert!(is_auth_failure("http_401:authentication_error"));
-        assert!(is_auth_failure("http_403:permission_error"));
-        assert!(!is_auth_failure("http_400:invalid_request_error"));
-        assert!(!is_auth_failure("http_404:not_found_error"));
-        assert!(!is_auth_failure("max_tokens_truncation"));
-        assert!(!is_auth_failure("json_parse"));
-        assert!(!is_auth_failure("response_decode"));
+    fn config_failures_split_from_the_row_level_permanent_class_by_kind() {
+        assert!(is_config_failure("http_401:authentication_error"));
+        assert!(is_config_failure("http_403:permission_error"));
+        // The 2026-08-19 outage class: a gateway virtual key rejecting the
+        // configured model answers 400 for every row alike.
+        assert!(is_config_failure("http_400:invalid_request_error"));
+        // Gateway budget exhausted: month-scoped config, not a row fact.
+        assert!(is_config_failure("http_402:payment_required"));
+        assert!(is_config_failure("http_404:not_found_error"));
+        assert!(!is_config_failure("max_tokens_truncation"));
+        assert!(!is_config_failure("json_parse"));
+        assert!(!is_config_failure("response_decode"));
+        assert!(!is_config_failure("importance_out_of_range"));
     }
 
     #[test]

@@ -1906,7 +1906,7 @@ fn a_done_row_is_never_re_evaluated() {
 /// The staleness sweep has a COOLDOWN, and the pending-revisit check is not it: a
 /// swept row schedules at `now` and fires in the same pass, so within one sync
 /// tick it is pending no longer. Without the fired-since half of the window every
-/// stale standing row re-sweeps every 45 seconds, spending a frontier-model call
+/// stale standing row re-sweeps every poll tick, spending a frontier-model call
 /// each time until the daily cap runs out.
 #[test]
 fn the_staleness_sweep_waits_a_full_window_before_asking_again() {
@@ -1945,7 +1945,7 @@ fn the_staleness_sweep_waits_a_full_window_before_asking_again() {
             .revisit_stale_standing(acct, older_than, 6, 10)
             .unwrap()
             .is_empty(),
-        "the next tick, 45 seconds later, must not sweep the same row again"
+        "the next tick, seconds later, must not sweep the same row again"
     );
 
     // A full window later it is fair game once more: the row is still sitting

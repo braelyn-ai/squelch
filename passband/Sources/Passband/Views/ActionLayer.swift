@@ -44,6 +44,9 @@ struct ActionLayer: View {
             if let target = store.triageFix {
                 TriageFixPalette(target: target) { store.closeTriageFix() }
             }
+            if let target = store.remindTarget {
+                RemindPalette(target: target) { store.closeRemind() }
+            }
             if store.askBarOpen { AskBar { store.askBarOpen = false } }
             if store.shortcutsOpen { ShortcutsOverlay { store.shortcutsOpen = false } }
         }
@@ -238,6 +241,7 @@ struct ShortcutsOverlay: View {
                 (["c"], "new message"),
                 (["e", "d"], "mark done"),
                 (["v"], "fix a wrong triage verdict"),
+                (["h"], "remind me about this later"),
                 (["t"], "tune sender rule"),
                 (["f"], "search this sender"),
                 (["p"], "process mode"),
@@ -252,6 +256,7 @@ struct ShortcutsOverlay: View {
                 (["Enter"], "reply all"),
                 (["c"], "new message"),
                 (["e", "d"], "done + next"),
+                (["h"], "remind + next"),
                 (["u"], "unsubscribe from this sender"),
                 (["t"], "new rule for this sender"),
                 // `f` is FORWARD in the reader and search-this-sender

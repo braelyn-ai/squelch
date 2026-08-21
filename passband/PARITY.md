@@ -1,10 +1,16 @@
-# Passband — the native macOS client
+# Passband — the native client
 
 Passband is a native macOS/SwiftUI app targeting macOS 26, so it can use
 **real Liquid Glass** rather than CSS that imitates it. It began as a rewrite
-of a Tauri + React desktop client (`squelch-desktop`, since retired and removed
-from the tree); this file records the design, the security posture, and the
-decisions that deliberately diverge from that predecessor.
+of a Tauri + React desktop client (`squelch-desktop`, since retired); this file
+records the design, the security posture, and the decisions that deliberately
+diverge from that predecessor.
+
+**Scope.** Everything below is the Mac app. An iOS target (`PassbandiOS`) now
+shares this source tree and this model layer, differing only where the shell has
+to: a tab bar instead of a window, its own web and markdown views, and its own
+attachment preview. Where a file has a `…iOS` twin, that twin is the phone's
+half of the same feature.
 
 Every view, surface, keybinding and behavior below is implemented natively.
 The single remaining webview is the sanitized-HTML email body, which is the one

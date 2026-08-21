@@ -46,14 +46,13 @@ RUN apt-get update \
 
 COPY --from=builder /build/target/release/squelch-control /usr/local/bin/squelch-control
 
-# The control store (tenants + invite hashes) lives on the one mount. There is
-# no token and no ciphertext in it: a stolen volume yields a list of labels and
-# a set of SHA-256 hashes. Owned here for the no-volume case; a mounted volume
-# arrives root-owned and overlays this, which the entrypoint fixes before
-# dropping privileges.
+# TRANSITION: the control store is Postgres now, reached via
+# SQUELCH_CONTROL_DATABASE_URL set on the service (never baked here — the URL
+# embeds a password). The /data mount survives only until the one-time
+# `import-sqlite` cutover is done and the volume is retired; the mkdir, the
+# entrypoint chown and this paragraph go with it. The old SQLite file holds
+# no token and no ciphertext: labels and SHA-256 hashes, nothing else.
 RUN mkdir -p /data && chown control:control /data
-
-ENV SQUELCH_CONTROL_DB_PATH=/data/control.sqlite3
 
 COPY squelch-control/docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 RUN chmod +x /usr/local/bin/docker-entrypoint.sh

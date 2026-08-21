@@ -1289,6 +1289,11 @@ pub trait Store: Send + Sync {
     /// The returned `surfaced_at` is the PRE-stamp value — this method never
     /// mutates the ledger; the caller stamps with [`Store::mark_surfaced`] AFTER
     /// the serialization set is computed.
+    ///
+    /// `pending_reminders` narrows to rows with a reminder still owed and orders
+    /// them soonest-first, which is a SCHEDULE rather than a band: every such row
+    /// is `done` by construction (see [`Store::set_reminder`]), so a caller
+    /// asking for it must not also be filtering done away.
     fn attention_updates(
         &self,
         account_id: AccountId,
@@ -1296,6 +1301,7 @@ pub trait Store: Send + Sync {
         min_importance: Option<u8>,
         status: Option<AttentionStatus>,
         band: Option<SitrepBand>,
+        pending_reminders: bool,
     ) -> Result<Vec<AttentionUpdate>>;
 
     /// SEEN-LEDGER stamp, in ONE transaction: for each non-sealed message id set
@@ -1313,6 +1319,32 @@ pub trait Store: Send + Sync {
         message_id: i64,
         status: AttentionStatus,
     ) -> Result<bool>;
+
+    /// "Remind me about this at `remind_at`." Stamps the reminder on this
+    /// message and marks the whole THREAD done, in one transaction — deferring
+    /// mail is resolving it until the date arrives, and a thread that stayed
+    /// half-open would keep showing the user what they just put off. Any
+    /// previously fired reminder on the row is cleared. Sealed rows are excluded
+    /// in SQL, so missing and sealed both return `false`.
+    fn set_reminder(
+        &self,
+        account_id: AccountId,
+        message_id: i64,
+        remind_at: DateTime<Utc>,
+    ) -> Result<bool>;
+
+    /// Drop a pending reminder. Status, `resolved_at` and any already-fired
+    /// `reminded_at` are left alone — this un-schedules, it does not undo. A row
+    /// with no reminder is a successful no-op (idempotent), so `false` means only
+    /// missing or sealed.
+    fn clear_reminder(&self, account_id: AccountId, message_id: i64) -> Result<bool>;
+
+    /// Fire every reminder due at `now`: status back to `open`, `resolved_at`
+    /// cleared, and the stamp MOVED from `remind_at` to `reminded_at`. Returns
+    /// the message ids moved. Idempotent by construction — a fired row no longer
+    /// matches — and sealed rows are excluded in SQL. Called from the sync poll
+    /// loop; nothing else should fire reminders.
+    fn fire_due_reminders(&self, account_id: AccountId, now: DateTime<Utc>) -> Result<Vec<i64>>;
 
     /// Resolve EVERY still-open triage row from one sender address, returning how
     /// many moved. Case-insensitive on `from_addr`; sealed rows excluded in SQL,

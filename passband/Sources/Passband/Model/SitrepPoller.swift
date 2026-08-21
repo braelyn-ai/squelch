@@ -202,7 +202,7 @@ final class SitrepPoller {
     }
 
     /// Manual refresh: poke the daemon to poll Gmail now, then re-pull so fresh
-    /// mail shows without waiting out the ~45s server or 10s client poll. The
+    /// mail shows without waiting out the ~5s server or 10s client poll. The
     /// poke is fire-and-forget, hence two pulls — one when rows have likely
     /// landed, one a beat later for a slower Gmail round trip.
     func triggerMailRefresh() async {

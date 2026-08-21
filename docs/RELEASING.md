@@ -356,6 +356,15 @@ roll the carrier promptly.
   table-rebuild migration (the `stage2_usage` precedent) or a `NOT NULL`
   column an old writer cannot populate is a ONE-WAY DOOR: call it out in the
   release notes, because downgrade after it means restore-from-backup.
+- **Sanitized html is API too, and it is written before it is read.**
+  `body_html` is cleaned once at ingest (`sync/html.rs`) and never rewritten, so
+  a change there reaches readers running last month's app and keeps reaching
+  them for every message synced in between. The `cid:` admission is the
+  precedent: the scheme survives sanitization only because the client pairs the
+  reference with an attachment row and rewrites it, and any build older than the
+  one carrying `Lib/CidImages.swift` paints a broken box over every inline photo
+  instead. Ship the app release first, or the daemon tag alone is a visible
+  regression on every reader that has not updated.
 - **Env vars are API.** Renames need the legacy-alias treatment
   (`SQUELCH_ACCOUNT`/`SQUELCH_DB` precedent: honored + deprecation line).
   Defaults baked into `squelchd/Dockerfile` (`SQUELCH_BIND=0.0.0.0:8848`,
@@ -388,9 +397,11 @@ roll the carrier promptly.
   one in TestFlight.
 - **Railway:** each service's dashboard can redeploy the previous deployment;
   for repo-connected services, revert the commit on `main`.
-- **Control DB** (`/data/control.sqlite3` on Railway) has no backups today.
-  A migration that corrupts it has no restore path. Treat control-plane
-  schema changes with the same one-way-door respect as tenant schemas.
+- **Control DB** is the project's Railway Postgres service. Railway keeps its
+  own backups of managed Postgres, which is more restore path than the old
+  volume file ever had — but a migration that corrupts data still deserves
+  the same one-way-door respect as tenant schemas: verify against a copy
+  before shipping schema changes.
 
 ## Known gaps (fix or at least know)
 

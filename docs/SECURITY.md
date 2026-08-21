@@ -2,8 +2,8 @@
 
 One section per surface: the **invariant**, the **enforcement point** (`file:symbol`
 — the line that actually holds it), and **what a maintainer must not break**.
-Verified against the tree on 2026-07-30; stale source comments are flagged, not
-trusted.
+Verified against the tree on 2026-07-30; §6 was written against it on 2026-08-18.
+Stale source comments are flagged, not trusted.
 
 ## 1. HTML sanitization at ingest
 
@@ -14,7 +14,7 @@ no `<meta>`/`<link>`/`<base>`.
 **Enforcement.** `squelch-core/src/sync/html.rs:sanitize_email_html` — a closed
 `ammonia::Builder` allow-list, run once at ingest before storage; pure, no I/O,
 fixture-tested in the same file. Four deliberate deviations from ammonia's
-defaults: `url_schemes` narrowed to `{http, https, mailto}`; `<style>` kept with
+defaults: `url_schemes` narrowed to `{http, https, mailto, cid}`; `<style>` kept with
 CSS verbatim (`rm_clean_content_tags` then `add_tags` — that order, or ammonia
 panics); `style`/`class`/`id` added to the generic attribute set; `link_rel`
 pinned to `noopener noreferrer`.
@@ -22,6 +22,13 @@ pinned to `noopener noreferrer`.
 **Do not break.**
 - Never widen `url_schemes`; `data:` coming back re-admits inline
   `data:text/html` payloads and is the only reason `data:` image URIs drop today.
+  `cid:` is the one addition ever made, and only because it is a pointer with
+  nothing behind it: it names a part of the same message (RFC 2392), reaches no
+  host, and no renderer we ship resolves it. It is kept so the client can pair the
+  reference with the attachment row carrying that Content-ID; dropping the `src`
+  instead leaves an anonymous `<img>` nothing can resolve. The client rewrites the
+  resolvable ones to `passband-cid:` and deletes the rest before any web view sees
+  the body (§3), and `img-src` never names `cid:`.
 - Never add a tag that creates a browsing context, submits, or loads a document
   (`iframe`, `object`, `embed`, `form`, `link`, `meta`, `base`).
 - `<style>` is the ONLY raw-text tag allowed. Ammonia escapes `<` in text *and* in
@@ -44,10 +51,13 @@ numbered as the source comments number them:
 2. `allowsContentJavaScript = false`: page script cannot run at all. Our own injected
    `WKUserScript` is governed separately and still runs.
 3. CSP injected as the FIRST child of `<head>` by
-   `Coordinator.document(html:allowRemote:)`: `default-src 'none'; style-src
-   'unsafe-inline'; img-src passband-img: data:` (or `img-src data:` alone when
-   remote images are off), plus `<meta name="referrer" content="no-referrer">`. No
-   `script-src`, and no `http:`/`https:` anywhere in the policy.
+   `Coordinator.document(html:allowRemote:)`, built by `Lib/MailCSP.swift`:
+   `default-src 'none'; style-src 'unsafe-inline'; img-src passband-img:
+   passband-cid: data:` (`img-src passband-cid: data:` when remote images are
+   off), plus `<meta name="referrer" content="no-referrer">`. No `script-src`, and
+   no `http:`/`https:`/`cid:` anywhere in the policy. `passband-cid:` is
+   unconditional because those bytes are a part of the same message fetched from
+   the user's own daemon, so the remote-image opt-in has nothing to gate (§3).
 4. Navigation refused. `Coordinator.decideNavigation` allows exactly the loads we
    started (`pendingOwnLoads` is a counter, not a flag: `loadHTMLString` is async,
    so two loads would otherwise race one permission) and cancels everything else; a
@@ -163,13 +173,31 @@ refuses it before the handler is reached).
   referrer, `image/*` only, redirects re-guarded per hop, files named `sha256(url)`
   and a manifest holding **no URLs** — a directory listing the reader's mail URLs
   would be a readable index of their correspondence.
+- **`cid:` references are the local mirror of all this.** `Lib/CidImages.swift`
+  matches each `<img src="cid:…">` against this message's own attachment rows by
+  normalized Content-ID (§1 keeps the scheme so there is something to match) and
+  rewrites the ones that resolve to `passband-cid://local/<hmac>?a=<id>&n=<name>`.
+  A reference that matches nothing, or whose part fails the same inline gate the
+  attachment strip renders under (`AttachmentKinds.isInline` — stored bytes, a
+  non-svg image mime, within `inlineMaxBytes`), has its **whole `<img>` tag
+  dropped**: pre-migration mail resolves nothing at all, and a body with a gap
+  reads as a message while one full of broken glyphs reads as a bug. The HMAC is
+  over both values the parser returns and is what scopes a reference to its own
+  message — without it a body could hand-write `?a=91` and read another message's
+  attachment. Bytes come from the authenticated human door
+  (`GET /client/attachments/{id}`), served by the same `ImageSchemeHandler` under
+  the same live-set discipline, refused again over `inlineMaxBytes`.
 
 **Do not break.**
 - The order in `EmailWebView.Prepared.make`: `Trackers.strip` → `ImageRepeats`
-  dedupe → the `hasNetworkImages`/`extractLinks` reads → `ImageProxy.rewrite`
-  **last**. Trackers first so a pixel can never be the "first occurrence" that
-  suppresses a real image; rewrite last because after it nothing recognises a
-  reference as remote.
+  dedupe → the `hasNetworkImages`/`extractLinks` reads → `CidImages.rewrite` →
+  `ImageProxy.rewrite` **last**. Trackers first so a pixel can never be the "first
+  occurrence" that suppresses a real image; rewrite last because after it nothing
+  recognises a reference as remote.
+- `Prepared.cacheKey` folds in every attachment field the cid rewrite reads (id,
+  content-id, downloadable, mime, size). Drop them and two bodies that share html
+  but not parts collide in `PreparedBodies` — which is one message's photo pasted
+  into another's.
 - Never put `http:`/`https:` in `img-src`. A missed rewrite must fail closed
   instead of becoming an un-proxied request.
 - Keep the signature check: without it a hand-written `url(passband-img://…)` in a
@@ -516,3 +544,49 @@ pre-echo status quo. The read-back is also capped at **5s**
 already made two serial Gmail calls, so bookkeeping may not spend the rest of that
 budget. Keep the echo's failures audited and swallowed; keep it out of core's write
 surface (the fetch lives in `squelch-api/src/gmail_write.rs`, core takes bytes).
+
+## 6. The embedded assistant
+
+**Invariant.** The agent inside Passband reads only what the human door serves, so
+sealed mail is absent from it for the same reason it is absent from the door; and it
+cannot touch the mailbox without a human tap that has already happened by the time
+the call goes out.
+
+**Enforcement.**
+- **Reads inherit §4.** Every tool call in
+  `passband/Sources/Passband/Assistant/AgentTools.swift` goes through `APIClient`,
+  i.e. `/client/*`. The assistant cannot read a 2FA code because the door it knocks
+  on has none — nothing is filtered here, and nothing needs to be. It holds no
+  sealed tool: `/client/sealed` and the reveal route are not in its inventory.
+- **Three tiers, and only one of them stops.** Fourteen tools: reads are never
+  gated; safe writes touch this database only (status, sender rules, drafts) and are
+  reversible in the app; the four that touch Gmail (archive, label, send,
+  unsubscribe) route through `AgentTools.confirmed(_:_:)`, where only `.approved`
+  reaches `perform`. That single funnel is the entire reason the `confirm: true`
+  those calls carry is a true statement rather than a default.
+- **The daemon does not take the client's word for it.** Every mutating `/client/*`
+  route demands the flag itself and audits the attempt, and a send still meets the
+  outbound secret guard (§5). A client that lied would be recorded doing it.
+- **A half-arrived instruction is not an instruction.**
+  `passband/Sources/Passband/Assistant/Assistant.swift` executes a `tool_use` only
+  after its message has closed, so a partially streamed tool input never runs.
+- **The key.** Self-host is BYOK and the key is read only inside
+  `LLMProxy` (`passband/Sources/Passband/Model/Keychain.swift`) at call time —
+  never a parameter, a return value, or an error string — over sessions that refuse
+  every redirect, because URLSession carries `x-api-key` verbatim across a hop.
+  Hosted holds no key in the app at all: `POST /client/assistant/messages`
+  (`squelch-api/src/assistant.rs`) relays with a daemon-held credential and streams
+  the bytes back, human door only, and 404s when no gateway is configured. The
+  conversation body is treated like mail content and logged in neither direction.
+
+**What a maintainer must not break.**
+- **Prompt injection is the standing threat, and the gate is the answer to it.**
+  Mail bodies reach this model as data, so assume the text is adversarial and
+  assume it will eventually ask for an action. Everything that touches the mailbox
+  must keep going through `confirmed`; a new ungated write is how this section stops
+  being true.
+- Do not hand the assistant a sealed route, and do not "helpfully" widen a tool's
+  read to a store call that bypasses the door.
+- Do not log the relay body, in either direction, at any level.
+- A decline is a legitimate answer with `is_error` false. Do not turn it into a
+  failure the model feels invited to retry.

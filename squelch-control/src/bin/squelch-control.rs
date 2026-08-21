@@ -23,12 +23,14 @@
 //! Env table: `README.md`. Wire contract and deployment: `docs/HOSTED.md`.
 
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
 use clap::{Parser, Subcommand};
 use squelch_control::bifrost::BifrostClient;
 use squelch_control::config::{self, BifrostConfig, OUTBOUND_TIMEOUT};
+use squelch_control::import;
 use squelch_control::warden::{DriftReport, HttpWarden, Warden as _};
 use squelch_control::{Config, ControlState, ControlStore, invites, labels, router};
 use tracing_subscriber::EnvFilter;
@@ -75,6 +77,14 @@ enum Command {
         /// The tenant to converge. One at a time, on purpose: verify it before
         /// you walk the next one.
         label: String,
+    },
+    /// Copy a legacy SQLite control store into the Postgres this binary now
+    /// uses. ONE TIME, during the cutover, and it refuses a target that already
+    /// holds rows. The file is opened read-only, so the old image can be
+    /// redeployed onto it unchanged if anything goes wrong.
+    ImportSqlite {
+        /// The `control.sqlite3` on the old volume.
+        path: PathBuf,
     },
 }
 
@@ -123,11 +133,22 @@ const MAX_ISSUE_COUNT: usize = 100;
 /// campaign it was minted for and the person who was sent it.
 const MAX_TTL_DAYS: i64 = 365;
 
+/// The default filter, and the one directive in it that is not "info".
+///
+/// tokio-postgres logs every server NOTICE at INFO, and the schema this store
+/// creates on EVERY connect produces eleven of them ("relation ... already
+/// exists, skipping", one per `IF NOT EXISTS`). At INFO that is eleven lines in
+/// front of every `invite list` an operator runs and eleven more on every boot,
+/// which is how the one line that matters gets scrolled away. Warnings and
+/// errors from that target still print, and `SQUELCH_CONTROL_LOG` overrides the
+/// whole thing when somebody is debugging the connection itself.
+const DEFAULT_LOG: &str = "info,tokio_postgres::connection=warn";
+
 fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_env("SQUELCH_CONTROL_LOG")
-                .unwrap_or_else(|_| EnvFilter::new("info")),
+                .unwrap_or_else(|_| EnvFilter::new(DEFAULT_LOG)),
         )
         .init();
 
@@ -138,19 +159,36 @@ fn main() -> anyhow::Result<()> {
         Command::Llm { command } => llm(command),
         Command::Drift { label } => drift(label),
         Command::Reconcile { label } => reconcile(label),
+        Command::ImportSqlite { path } => import_sqlite(path),
     }
 }
 
-fn open_store() -> anyhow::Result<ControlStore> {
-    let path = config::db_path_from_env();
-    if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
-        std::fs::create_dir_all(dir)?;
-    }
-    Ok(ControlStore::open(&path)?)
+/// One current-thread runtime, for the operator commands that are a handful of
+/// awaits at a shell. `serve` builds a multi-thread one of its own; nothing
+/// here needs more than one.
+fn runtime() -> anyhow::Result<tokio::runtime::Runtime> {
+    Ok(tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?)
 }
 
+/// Open the control store from the environment. No directory to create and no
+/// file to own any more: the URL names a database that already exists, and
+/// [`ControlStore::connect`] creates the schema in it.
+async fn open_store() -> anyhow::Result<ControlStore> {
+    let url =
+        config::database_url_from_env().map_err(|e| anyhow::anyhow!("squelch-control: {e}"))?;
+    Ok(ControlStore::connect(&url).await?)
+}
+
+/// The invite commands, on their own runtime: the store is async now, and these
+/// run at a shell with no runtime around them.
 fn invite(command: InviteCommand) -> anyhow::Result<()> {
-    let store = open_store()?;
+    runtime()?.block_on(invite_async(command))
+}
+
+async fn invite_async(command: InviteCommand) -> anyhow::Result<()> {
+    let store = open_store().await?;
     match command {
         InviteCommand::Issue { count, ttl } => {
             if count == 0 || count > MAX_ISSUE_COUNT {
@@ -162,7 +200,7 @@ fn invite(command: InviteCommand) -> anyhow::Result<()> {
             let expires_at = chrono::Utc::now() + chrono::Duration::days(ttl);
             for _ in 0..count {
                 let minted = invites::mint()?;
-                let id = store.insert_invite(&minted.code_hash, expires_at)?;
+                let id = store.insert_invite(&minted.code_hash, expires_at).await?;
                 // THE PLAINTEXT, ALONE ON STDOUT.
                 println!("{}", minted.code);
                 eprintln!("squelch-control: issued invite {id}");
@@ -176,7 +214,7 @@ fn invite(command: InviteCommand) -> anyhow::Result<()> {
             Ok(())
         }
         InviteCommand::List => {
-            let rows = store.list_invites()?;
+            let rows = store.list_invites().await?;
             if rows.is_empty() {
                 eprintln!("squelch-control: no invite codes have been issued.");
                 return Ok(());
@@ -198,7 +236,7 @@ fn invite(command: InviteCommand) -> anyhow::Result<()> {
             Ok(())
         }
         InviteCommand::Revoke { id } => {
-            if store.revoke_invite(id)? {
+            if store.revoke_invite(id).await? {
                 eprintln!("squelch-control: invite {id} revoked.");
             } else {
                 // Two cases, one message, and here that is honesty rather than
@@ -214,7 +252,10 @@ fn invite(command: InviteCommand) -> anyhow::Result<()> {
 }
 
 fn tenants() -> anyhow::Result<()> {
-    let rows = open_store()?.list_tenants()?;
+    let rows = runtime()?.block_on(async {
+        let store = open_store().await?;
+        Ok::<_, anyhow::Error>(store.list_tenants().await?)
+    })?;
     if rows.is_empty() {
         eprintln!("squelch-control: no tenants have been provisioned.");
         return Ok(());
@@ -255,7 +296,6 @@ fn llm(command: LlmCommand) -> anyhow::Result<()> {
     let (warden_url, warden_token) =
         config::warden_from_env().map_err(|e| anyhow::anyhow!("squelch-control: {e}"))?;
 
-    let store = open_store()?;
     let warden = HttpWarden::new(warden_url, warden_token, OUTBOUND_TIMEOUT)?;
     let bifrost = BifrostClient::new(
         llm.url.clone(),
@@ -264,10 +304,10 @@ fn llm(command: LlmCommand) -> anyhow::Result<()> {
         OUTBOUND_TIMEOUT,
     )?;
 
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()?;
-    runtime.block_on(async {
+    runtime()?.block_on(async {
+        // Opened inside the runtime with everything else it takes: the store is
+        // async, so there is nowhere outside this block to open it.
+        let store = open_store().await?;
         match command {
             LlmCommand::Mint { label } => llm_mint(&store, &bifrost, &warden, &llm, &label).await,
             LlmCommand::Revoke { label } => llm_revoke(&store, &bifrost, &label).await,
@@ -286,18 +326,38 @@ async fn llm_mint(
     llm: &BifrostConfig,
     label: &str,
 ) -> anyhow::Result<()> {
-    if !store.label_exists(label)? {
+    if !store.label_exists(label).await? {
         anyhow::bail!("no tenant `{label}` in the control store");
     }
-    let old = store.tenant_vk(label)?;
-    let old_assistant = store.tenant_assistant_vk(label)?;
+    let old = store.tenant_vk(label).await?;
+    let old_assistant = store.tenant_assistant_vk(label).await?;
+
+    // REVOKE BEFORE MINT, not after: the live gateway enforces unique key
+    // names and answers 409 while `tenant-<label>` exists, so the documented
+    // "new keys first, revoke the old ones at leisure" order cannot happen.
+    // The window this opens — old key revoked, new mint fails, tenant keyless
+    // until the rerun — is the window this command is already run in: an
+    // operator rotates keys because the installed ones are wrong. A revoke
+    // failure still fails loud before anything is minted. 404 maps to Ok in
+    // the client, so a key already gone from the gateway does not block.
+    for (kind, id) in [("triage", &old), ("assistant", &old_assistant)] {
+        if let Some(id) = id {
+            bifrost.revoke_virtual_key(id).await.map_err(|e| {
+                anyhow::anyhow!(
+                    "could not revoke the previous {kind} virtual key {id} ({e}); nothing was \
+                     minted — the installed keys are untouched"
+                )
+            })?;
+            eprintln!("squelch-control: revoked previous {kind} virtual key {id}.");
+        }
+    }
 
     // Each id is recorded BEFORE the next step is attempted: from the moment a
     // key exists in Bifrost, whatever happens next, the store must name it so
     // a later `llm revoke` or `llm mint` can find it. A failed install or a
     // failed second mint does not un-mint the first.
     let vk = bifrost.mint_virtual_key(label, llm.budget_usd).await?;
-    if !store.set_tenant_vk(label, &vk.id)? {
+    if !store.set_tenant_vk(label, &vk.id).await? {
         anyhow::bail!(
             "tenant `{label}` vanished from the store mid-mint; revoke virtual key {} in Bifrost by hand",
             vk.id
@@ -309,24 +369,15 @@ async fn llm_mint(
     {
         Ok(a) => a,
         Err(e) => {
-            if let Some(old) = &old {
-                // The store was repointed at the new triage id above, but the
-                // cluster still runs on the OLD key. The id must not scroll
-                // away, or the operator has nothing to revoke by.
-                eprintln!(
-                    "squelch-control: the previous triage virtual key {old} is still installed \
-                     and live in Bifrost; the store now tracks only the new one."
-                );
-            }
             anyhow::bail!(
-                "minted triage virtual key {} but the assistant mint failed: {e}. The triage id \
-                 is recorded and its key is NOT yet installed; run `llm mint {label}` again to \
-                 finish the rotation, or `llm revoke {label}` to back out",
+                "minted triage virtual key {} but the assistant mint failed: {e}. The previous \
+                 keys are already revoked, so this tenant's installed keys are DEAD until the \
+                 rotation finishes; run `llm mint {label}` again now",
                 vk.id
             );
         }
     };
-    if !store.set_tenant_assistant_vk(label, &assistant.id)? {
+    if !store.set_tenant_assistant_vk(label, &assistant.id).await? {
         anyhow::bail!(
             "tenant `{label}` vanished from the store mid-mint; revoke virtual keys {} and {} in Bifrost by hand",
             vk.id,
@@ -337,21 +388,10 @@ async fn llm_mint(
         .put_llm_key(label, Some(&vk.value), Some(&assistant.value))
         .await
     {
-        for (kind, old) in [("triage", &old), ("assistant", &old_assistant)] {
-            if let Some(old) = old {
-                // The rotation half-failed: the cluster still runs on the OLD
-                // keys, which this store no longer tracks. The ids must not
-                // scroll away.
-                eprintln!(
-                    "squelch-control: the previous {kind} virtual key {old} is still installed \
-                     and live in Bifrost; the store now tracks only the new one."
-                );
-            }
-        }
         anyhow::bail!(
-            "minted virtual keys {} and {} but the warden did not take them: {e}. The ids are \
-             recorded; run `llm mint {label}` again to replace them, or `llm revoke {label}` to \
-             back out",
+            "minted virtual keys {} and {} but the warden did not take them: {e}. The previous \
+             keys are already revoked, so the tenant's installed keys are DEAD until the \
+             install lands; run `llm mint {label}` again now",
             vk.id,
             assistant.id
         );
@@ -361,17 +401,6 @@ async fn llm_mint(
         "squelch-control: virtual keys {} (triage) and {} (assistant) minted and installed for {label}.",
         vk.id, assistant.id
     );
-    for (kind, old, new) in [
-        ("triage", old, &vk.id),
-        ("assistant", old_assistant, &assistant.id),
-    ] {
-        if let Some(old) = old.filter(|old| old != new) {
-            eprintln!(
-                "squelch-control: the PREVIOUS {kind} virtual key {old} is still live in Bifrost; \
-                 revoke it there. This store now tracks only the new key."
-            );
-        }
-    }
     Ok(())
 }
 
@@ -384,11 +413,11 @@ async fn llm_revoke(
     bifrost: &BifrostClient,
     label: &str,
 ) -> anyhow::Result<()> {
-    if !store.label_exists(label)? {
+    if !store.label_exists(label).await? {
         anyhow::bail!("no tenant `{label}` in the control store");
     }
-    let triage = store.tenant_vk(label)?;
-    let assistant = store.tenant_assistant_vk(label)?;
+    let triage = store.tenant_vk(label).await?;
+    let assistant = store.tenant_assistant_vk(label).await?;
     if triage.is_none() && assistant.is_none() {
         eprintln!("squelch-control: no virtual keys are recorded for {label}; nothing to revoke.");
         return Ok(());
@@ -400,7 +429,7 @@ async fn llm_revoke(
             Ok(()) => {
                 // Cleared only AFTER Bifrost confirms: a revoke that failed
                 // must leave the pointer in place for the retry.
-                store.clear_tenant_vk(label)?;
+                store.clear_tenant_vk(label).await?;
                 eprintln!(
                     "squelch-control: triage virtual key {id} revoked and forgotten for {label}."
                 );
@@ -411,7 +440,7 @@ async fn llm_revoke(
     if let Some(id) = assistant {
         match bifrost.revoke_virtual_key(&id).await {
             Ok(()) => {
-                store.clear_tenant_assistant_vk(label)?;
+                store.clear_tenant_assistant_vk(label).await?;
                 eprintln!(
                     "squelch-control: assistant virtual key {id} revoked and forgotten for {label}."
                 );
@@ -463,23 +492,24 @@ fn operator_label(label: String) -> anyhow::Result<String> {
 /// halfway through.
 fn drift(label: Option<String>) -> anyhow::Result<()> {
     let warden = warden_client()?;
-    let labels: Vec<String> = match label {
-        Some(one) => vec![operator_label(one)?],
-        None => open_store()?
-            .list_tenants()?
-            .into_iter()
-            .map(|t| t.label)
-            .collect(),
-    };
-    if labels.is_empty() {
-        eprintln!("squelch-control: no tenants have been provisioned.");
-        return Ok(());
-    }
-
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()?;
-    let (drifted, failed) = runtime.block_on(async {
+    // THE FLEET IS READ INSIDE THE RUNTIME, with the walk that uses it: the
+    // store is async, so "who is the fleet" and "what does the warden say about
+    // them" are now the same block of awaits rather than a lookup before one.
+    // `None` is the empty fleet, reported below where it always was.
+    let walked = runtime()?.block_on(async {
+        let labels: Vec<String> = match label {
+            Some(one) => vec![operator_label(one)?],
+            None => open_store()
+                .await?
+                .list_tenants()
+                .await?
+                .into_iter()
+                .map(|t| t.label)
+                .collect(),
+        };
+        if labels.is_empty() {
+            return Ok(None);
+        }
         let mut drifted = 0usize;
         let mut failed = 0usize;
         for label in &labels {
@@ -498,10 +528,13 @@ fn drift(label: Option<String>) -> anyhow::Result<()> {
                 }
             }
         }
-        (drifted, failed)
-    });
+        Ok::<_, anyhow::Error>(Some((labels.len(), drifted, failed)))
+    })?;
 
-    let total = labels.len();
+    let Some((total, drifted, failed)) = walked else {
+        eprintln!("squelch-control: no tenants have been provisioned.");
+        return Ok(());
+    };
     let word = tenant_word(total);
     if drifted > 0 {
         eprintln!(
@@ -592,10 +625,7 @@ fn json(v: &serde_json::Value) -> String {
 fn reconcile(label: String) -> anyhow::Result<()> {
     let label = operator_label(label)?;
     let warden = warden_client()?;
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()?;
-    let outcome = runtime.block_on(warden.reconcile(&label))?;
+    let outcome = runtime()?.block_on(warden.reconcile(&label))?;
 
     eprintln!(
         "squelch-control: {label}: deployment {}, tenant {}.",
@@ -608,6 +638,27 @@ fn reconcile(label: String) -> anyhow::Result<()> {
         );
     }
     Ok(())
+}
+
+/// Move a legacy SQLite control store into Postgres.
+///
+/// COUNTS ONLY on the way out. Every row this touches is somebody's address —
+/// a tenant's mailbox, a waitlist entry — and the operator needs to know that
+/// the numbers match the old store, not who is in it.
+fn import_sqlite(path: PathBuf) -> anyhow::Result<()> {
+    runtime()?.block_on(async {
+        let store = open_store().await?;
+        let report = import::import_sqlite(&store, &path).await?;
+        eprintln!(
+            "squelch-control: imported {} tenants, {} invite codes, {} waitlist rows.",
+            report.tenants, report.invite_codes, report.waitlist
+        );
+        eprintln!(
+            "squelch-control: check them with `tenants` and `invite list`, then keep the SQLite \
+             file until the new store has soaked. Nothing wrote to it."
+        );
+        Ok(())
+    })
 }
 
 fn serve() -> anyhow::Result<()> {
@@ -624,7 +675,7 @@ async fn serve_async(config: Config) -> anyhow::Result<()> {
     let base_domain = config.base_domain.clone();
     let insecure = config.is_insecure();
 
-    let store = open_store()?;
+    let store = open_store().await?;
     let warden = Arc::new(HttpWarden::new(
         config.warden_url.clone(),
         config.warden_token.clone(),

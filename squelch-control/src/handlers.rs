@@ -311,6 +311,7 @@ pub async fn signup(State(state): State<ControlState>, body: Bytes) -> Response 
     match state
         .store()
         .find_available_invite(&code_hash, chrono::Utc::now())
+        .await
     {
         Ok(Some(_)) => {}
         Ok(None) => return reject(INVITE_REFUSED, &label),
@@ -326,7 +327,7 @@ pub async fn signup(State(state): State<ControlState>, body: Bytes) -> Response 
     // Two authorities on whether a label is free, and both are asked: this
     // control plane's own record, and the warden, which is the one that knows
     // what actually exists in the cluster.
-    match state.store().label_exists(&label) {
+    match state.store().label_exists(&label).await {
         Ok(true) => return reject(LABEL_TAKEN, ""),
         Ok(false) => {}
         Err(e) => {
@@ -388,6 +389,7 @@ pub async fn signup(State(state): State<ControlState>, body: Bytes) -> Response 
     let invite_id = match state
         .store()
         .reserve_invite(&code_hash, &holder, now, reserved_until)
+        .await
     {
         Ok(Some(id)) => id,
         // Lost the race with another tab, or the code went away between the
@@ -420,7 +422,7 @@ pub async fn signup(State(state): State<ControlState>, body: Bytes) -> Response 
         );
         // The session that would have held this code does not exist, so the
         // hold is handed back rather than left to lapse on its own.
-        release_invite(&state, invite_id, &holder);
+        release_invite(&state, invite_id, &holder).await;
         return reject(
             "Too many signups are in flight right now. Please try again in a few minutes.",
             &label,
@@ -482,7 +484,7 @@ pub async fn waitlist(State(state): State<ControlState>, body: Bytes) -> Respons
         return waitlist_answer(origin, StatusCode::BAD_REQUEST, INVALID_EMAIL);
     }
 
-    match state.store().add_to_waitlist(&email) {
+    match state.store().add_to_waitlist(&email).await {
         // PRIVACY: whether this submission created a row, and nothing else.
         // Never the address, on either branch.
         Ok(created) => {
@@ -803,15 +805,19 @@ pub async fn oauth_callback(
     // and the exits below do not have to know which flow they are on.
     let holder = sessions::fingerprint(&claim.sid);
     let held_invite = session.kind.invite_id();
-    let release = || {
+    // AN ASYNC CLOSURE, because the store is async and a dozen exits below
+    // would otherwise each spell the same `if let` out. Every call site AWAITS
+    // it: a `release()` whose future is dropped hands nothing back, and the
+    // code sits held until the session window lapses.
+    let release = async || {
         if let Some(id) = held_invite {
-            release_invite(&state, id, &holder);
+            release_invite(&state, id, &holder).await;
         }
     };
 
     if !squelch_httpauth::ct_eq(returned_state.as_bytes(), session.state.as_bytes()) {
         tracing::warn!("callback state mismatch");
-        release();
+        release().await;
         return done(refused_session_for(&state, voice));
     }
     // The cookie and the server-side session must agree, on the label AND on
@@ -821,11 +827,11 @@ pub async fn oauth_callback(
     // both sides, so this holds it to being empty rather than exempting it.
     if claim.label != session.label || claim.invite != held_invite || claimed_voice != voice {
         tracing::warn!("callback cookie does not match its session");
-        release();
+        release().await;
         return done(refused_session_for(&state, voice));
     }
     let Some(code) = code.filter(|c| is_code(c)) else {
-        release();
+        release().await;
         return done(refused_session_for(&state, voice));
     };
 
@@ -861,14 +867,14 @@ pub async fn oauth_callback(
         // Nothing has been provisioned at this point, so the retry is clean.
         Err(oauth::OAuthError::Scope) => {
             tracing::info!(label = %label, "consent granted only part of the scope set");
-            release();
+            release().await;
             return done(partial_consent_problem());
         }
         Err(e) => {
             // The error type only. Its `Display` is written to carry no code,
             // no secret, and no provider body.
             tracing::warn!(error = %e, label = %label, "token exchange failed");
-            release();
+            release().await;
             return done(pages::problem(
                 StatusCode::BAD_GATEWAY,
                 "Google did not complete the sign in",
@@ -879,10 +885,14 @@ pub async fn oauth_callback(
 
     // One mailbox, one daemon. Checked before anything is provisioned, and
     // enforced again by a unique index when the tenant row is written.
-    match state.store().active_tenant_for_email(&grant.account_email) {
+    match state
+        .store()
+        .active_tenant_for_email(&grant.account_email)
+        .await
+    {
         Ok(Some(existing)) => {
             tracing::info!(label = %existing, "signup refused: mailbox already has a tenant");
-            release();
+            release().await;
             return done(pages::problem(
                 StatusCode::CONFLICT,
                 "That Google account already has a mailbox",
@@ -892,7 +902,7 @@ pub async fn oauth_callback(
         Ok(None) => {}
         Err(e) => {
             tracing::error!(error = %e, "tenant lookup failed");
-            release();
+            release().await;
             return done(internal_problem());
         }
     }
@@ -908,7 +918,7 @@ pub async fn oauth_callback(
     {
         Ok(c) => c,
         Err(WardenError::LabelTaken) => {
-            release();
+            release().await;
             return done(pages::problem(
                 StatusCode::CONFLICT,
                 "That address was just taken",
@@ -919,7 +929,7 @@ pub async fn oauth_callback(
             // PRIVACY: the error type and the label. Never the recipient, the
             // bearer, or anything the warden said verbatim.
             tracing::error!(error = %e, label = %label, "creating the tenant failed");
-            release();
+            release().await;
             return done(pages::problem(
                 StatusCode::BAD_GATEWAY,
                 "Your mailbox could not be set up",
@@ -939,7 +949,7 @@ pub async fn oauth_callback(
         Ok(c) => c,
         Err(e) => {
             tracing::error!(error = %e, label = %label, "sealing the credential failed");
-            release();
+            release().await;
             // NOT `internal_problem`: call 1 has reserved the address, so
             // "nothing was set up" would be false. It is not the retriable page
             // either, because a warden that answered with an unusable key will
@@ -1028,7 +1038,7 @@ pub async fn oauth_callback(
     let pairing = match state.warden().put_credentials(&label, &ciphertext).await {
         Ok(p) => p,
         Err(WardenError::AlreadyProvisioned) => {
-            release();
+            release().await;
             log_orphaned_vks(&label, vk_id.as_deref(), assistant_vk_id.as_deref());
             return done(pages::problem(
                 StatusCode::CONFLICT,
@@ -1040,7 +1050,7 @@ pub async fn oauth_callback(
             tracing::warn!(error = %e, label = %label, "tenant created but the credential was not installed; the signup is retriable");
             // The page tells this user to start again with the SAME code, so the
             // hold has to go back now rather than in ten minutes.
-            release();
+            release().await;
             log_orphaned_vks(&label, vk_id.as_deref(), assistant_vk_id.as_deref());
             return done(incomplete_problem());
         }
@@ -1050,7 +1060,11 @@ pub async fn oauth_callback(
     // RELEASE on this path: the mailbox is running in the cluster, so the code
     // must not go back on the shelf for somebody to spend on a second one. It
     // stays held, unspent, until an operator sorts the row out.
-    if let Err(e) = state.store().insert_tenant(&label, &grant.account_email) {
+    if let Err(e) = state
+        .store()
+        .insert_tenant(&label, &grant.account_email)
+        .await
+    {
         // The daemon is running in the cluster but this control plane could not
         // record it, so it will not be visible to `tenants list` and the label
         // will look free here. Loud, with the label, because a human has to go
@@ -1080,7 +1094,7 @@ pub async fn oauth_callback(
     // Fail-soft like the rest of the LLM block: a record that did not land
     // costs `llm revoke` its pointer, not the user their mailbox.
     if let Some(id) = &vk_id {
-        match state.store().set_tenant_vk(&label, id) {
+        match state.store().set_tenant_vk(&label, id).await {
             Ok(true) => {}
             Ok(false) => {
                 tracing::error!(label = %label, vk_id = %id, "VK NOT RECORDED: the tenant row vanished under it")
@@ -1091,7 +1105,7 @@ pub async fn oauth_callback(
         }
     }
     if let Some(id) = &assistant_vk_id {
-        match state.store().set_tenant_assistant_vk(&label, id) {
+        match state.store().set_tenant_assistant_vk(&label, id).await {
             Ok(true) => {}
             Ok(false) => {
                 tracing::error!(label = %label, assistant_vk_id = %id, "ASSISTANT VK NOT RECORDED: the tenant row vanished under it")
@@ -1108,7 +1122,11 @@ pub async fn oauth_callback(
     // by another session could refuse it. A failure is therefore a broken
     // invariant, logged at error and never shown: the tenant exists, and telling
     // the user their mailbox did not get made would be a lie.
-    if let Err(e) = state.store().consume_invite(invite_id, &label, &holder) {
+    if let Err(e) = state
+        .store()
+        .consume_invite(invite_id, &label, &holder)
+        .await
+    {
         tracing::error!(error = %e, label = %label, "tenant provisioned but the invite was not consumed");
     }
 
@@ -1153,7 +1171,7 @@ async fn console_login(
         }
     };
 
-    let owner = match state.store().active_tenant_email(label) {
+    let owner = match state.store().active_tenant_email(label).await {
         Ok(Some(email)) => email,
         // Provisioned and then torn down while the user was at Google, or a
         // label that never existed and only reached here because nothing before
@@ -1258,7 +1276,7 @@ async fn app_login(state: &ControlState, code: String, pkce_verifier: String) ->
 
     // Normalized the way the store normalizes on insert, so a capitalized Google
     // answer finds the same row rather than none.
-    let label = match state.store().active_tenant_for_email(&account_email) {
+    let label = match state.store().active_tenant_for_email(&account_email).await {
         Ok(Some(label)) => label,
         // A real Google account with no mailbox here. Said plainly: see
         // [`APP_NO_TENANT`] for why that is not an oracle.
@@ -1389,8 +1407,8 @@ fn reservation_window() -> chrono::Duration {
 /// Best effort, always on a path that is already reporting something else: a
 /// hold that will not release lapses on its own within the session window, and
 /// the cost of that is one person waiting, not a lost code.
-fn release_invite(state: &ControlState, invite_id: i64, holder: &str) {
-    match state.store().release_invite(invite_id, holder) {
+async fn release_invite(state: &ControlState, invite_id: i64, holder: &str) {
+    match state.store().release_invite(invite_id, holder).await {
         Ok(true) => {}
         // The hold lapsed and somebody else took the code, or an operator
         // revoked it mid-signup. Nothing to undo, but worth a line.

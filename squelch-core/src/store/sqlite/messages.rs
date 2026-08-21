@@ -162,8 +162,8 @@ fn insert_attachments_conn(
     )?;
     for a in attachments {
         conn.execute(
-            "INSERT OR IGNORE INTO attachments(account_id, message_id, filename, mime, size_bytes, data)
-             VALUES(?1,?2,?3,?4,?5,?6)",
+            "INSERT OR IGNORE INTO attachments(account_id, message_id, filename, mime, size_bytes, data, content_id)
+             VALUES(?1,?2,?3,?4,?5,?6,?7)",
             params![
                 account_id,
                 message_id,
@@ -171,6 +171,7 @@ fn insert_attachments_conn(
                 a.mime,
                 a.size_bytes,
                 a.data.as_deref(),
+                a.content_id,
             ],
         )?;
     }
@@ -251,7 +252,7 @@ fn load_client_attachments_conn(
     message_id: i64,
 ) -> Result<Vec<ClientAttachment>> {
     let mut stmt = conn.prepare(
-        "SELECT id, filename, mime, size_bytes, data IS NOT NULL
+        "SELECT id, filename, mime, size_bytes, data IS NOT NULL, content_id
          FROM attachments
          WHERE account_id=?1 AND message_id=?2
          ORDER BY id ASC",
@@ -264,6 +265,7 @@ fn load_client_attachments_conn(
                 mime: r.get(2)?,
                 size: r.get(3)?,
                 downloadable: r.get(4)?,
+                content_id: r.get(5)?,
             })
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -352,7 +354,8 @@ impl SqliteStore {
         // one message, not from the conversation.
         let mut stmt = conn.prepare(
             "SELECT m.id, m.from_addr, m.from_name, m.received_at, m.body, m.body_html,
-                    t.tier, t.deadline, t.status, t.one_line, m.auth_pass, m.subject
+                    t.tier, t.deadline, t.status, t.one_line, m.auth_pass, m.subject,
+                    m.is_sent
              FROM messages m
              LEFT JOIN triage t ON t.message_id = m.id
              WHERE m.account_id=?1 AND m.thread_id=?2
@@ -379,6 +382,10 @@ impl SqliteStore {
                     attention_open: r.get::<_, Option<String>>(8)?.map(|s| s != "done"),
                     one_line: r.get::<_, Option<String>>(9)?.filter(|s| !s.is_empty()),
                     auth_pass: r.get::<_, Option<bool>>(10)?,
+                    // The thread carries the user's own replies (that is what
+                    // makes it a conversation); the reader is where "which of
+                    // these is mine" gets answered.
+                    is_sent: r.get::<_, i64>(12)? != 0,
                 })
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;

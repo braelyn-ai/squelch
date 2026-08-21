@@ -12,7 +12,7 @@ fn mark_surfaced_is_stamp_once_and_promotes_new_to_open() {
 
     // Pre-stamp: status new, surfaced_at NULL.
     let before = store
-        .attention_updates(acct, since, None, None, None)
+        .attention_updates(acct, since, None, None, None, false)
         .unwrap();
     assert_eq!(before.len(), 1);
     assert_eq!(before[0].status, AttentionStatus::New);
@@ -22,7 +22,7 @@ fn mark_surfaced_is_stamp_once_and_promotes_new_to_open() {
     let n = store.mark_surfaced(acct, &[id]).unwrap();
     assert_eq!(n, 1, "first surface counts as a transition");
     let after = store
-        .attention_updates(acct, since, None, None, None)
+        .attention_updates(acct, since, None, None, None, false)
         .unwrap();
     assert_eq!(after[0].status, AttentionStatus::Open);
     let stamp = after[0].surfaced_at.expect("surfaced_at set");
@@ -31,7 +31,7 @@ fn mark_surfaced_is_stamp_once_and_promotes_new_to_open() {
     let n2 = store.mark_surfaced(acct, &[id]).unwrap();
     assert_eq!(n2, 0, "second surface transitions nothing");
     let after2 = store
-        .attention_updates(acct, since, None, None, None)
+        .attention_updates(acct, since, None, None, None, false)
         .unwrap();
     assert_eq!(after2[0].surfaced_at, Some(stamp));
     assert_eq!(after2[0].status, AttentionStatus::Open);
@@ -57,14 +57,14 @@ fn band_queries_bucket_correctly() {
 
     // STANDING: only the bill (tier past_due/deadline, not done).
     let standing = store
-        .attention_updates(acct, since, None, None, Some(SitrepBand::Standing))
+        .attention_updates(acct, since, None, None, Some(SitrepBand::Standing), false)
         .unwrap();
     assert_eq!(standing.len(), 1);
     assert_eq!(standing[0].update.id, bill);
 
     // NEW: everything (nothing surfaced yet).
     let new = store
-        .attention_updates(acct, since, None, None, Some(SitrepBand::New))
+        .attention_updates(acct, since, None, None, Some(SitrepBand::New), false)
         .unwrap();
     assert_eq!(new.len(), 3);
 
@@ -73,14 +73,14 @@ fn band_queries_bucket_correctly() {
 
     // NEW now only the bill.
     let new2 = store
-        .attention_updates(acct, since, None, None, Some(SitrepBand::New))
+        .attention_updates(acct, since, None, None, Some(SitrepBand::New), false)
         .unwrap();
     assert_eq!(new2.len(), 1);
     assert_eq!(new2[0].update.id, bill);
 
     // OPEN band sorted by age*importance: aged (14d*60) before fresh (0d*70).
     let open = store
-        .attention_updates(acct, since, None, None, Some(SitrepBand::Open))
+        .attention_updates(acct, since, None, None, Some(SitrepBand::Open), false)
         .unwrap();
     assert_eq!(open.len(), 2);
     assert_eq!(open[0].update.id, aged, "older*importance floats to top");
@@ -99,7 +99,7 @@ fn set_attention_status_resolves_and_reopens() {
             .unwrap()
     );
     let done = store
-        .attention_updates(acct, since, None, Some(AttentionStatus::Done), None)
+        .attention_updates(acct, since, None, Some(AttentionStatus::Done), None, false)
         .unwrap();
     assert_eq!(done.len(), 1);
     assert!(done[0].resolved_at.is_some(), "done stamps resolved_at");
@@ -111,7 +111,7 @@ fn set_attention_status_resolves_and_reopens() {
             .unwrap()
     );
     let open = store
-        .attention_updates(acct, since, None, Some(AttentionStatus::Open), None)
+        .attention_updates(acct, since, None, Some(AttentionStatus::Open), None, false)
         .unwrap();
     assert_eq!(open.len(), 1);
     assert!(open[0].resolved_at.is_none(), "reopen clears resolved_at");
@@ -154,7 +154,7 @@ fn resolve_sender_clears_every_open_thread_from_that_address() {
 
     let since = now - chrono::Duration::days(1);
     let open = store
-        .attention_updates(acct, since, None, Some(AttentionStatus::Open), None)
+        .attention_updates(acct, since, None, Some(AttentionStatus::Open), None, false)
         .unwrap();
     assert!(
         !open.iter().any(|u| u.update.id == a || u.update.id == b),
@@ -162,7 +162,7 @@ fn resolve_sender_clears_every_open_thread_from_that_address() {
     );
 
     let done = store
-        .attention_updates(acct, since, None, Some(AttentionStatus::Done), None)
+        .attention_updates(acct, since, None, Some(AttentionStatus::Done), None, false)
         .unwrap();
     assert!(
         done.iter().all(|u| u.update.id != other),
@@ -213,7 +213,7 @@ fn thread_shows_one_row_and_done_resolves_the_whole_thread() {
     // One row for the duplicated thread, and it is the band-sort-first message
     // (higher importance wins the representative slot).
     let standing = store
-        .attention_updates(acct, since, None, None, Some(SitrepBand::Standing))
+        .attention_updates(acct, since, None, None, Some(SitrepBand::Standing), false)
         .unwrap();
     assert_eq!(standing.len(), 2, "two threads, two rows: {standing:#?}");
     assert_eq!(
@@ -243,7 +243,7 @@ fn thread_shows_one_row_and_done_resolves_the_whole_thread() {
             .unwrap()
     );
     let standing2 = store
-        .attention_updates(acct, since, None, None, Some(SitrepBand::Standing))
+        .attention_updates(acct, since, None, None, Some(SitrepBand::Standing), false)
         .unwrap();
     assert_eq!(
         standing2.len(),
@@ -254,7 +254,7 @@ fn thread_shows_one_row_and_done_resolves_the_whole_thread() {
 
     // The unrelated thread was untouched.
     let done = store
-        .attention_updates(acct, since, None, Some(AttentionStatus::Done), None)
+        .attention_updates(acct, since, None, Some(AttentionStatus::Done), None, false)
         .unwrap();
     assert!(done.iter().all(|u| u.update.id != other));
 }
@@ -273,13 +273,13 @@ fn sealed_rows_never_surface_through_the_ledger() {
     // Never appears in attention_updates (any band).
     assert!(
         store
-            .attention_updates(acct, since, None, None, None)
+            .attention_updates(acct, since, None, None, None, false)
             .unwrap()
             .is_empty()
     );
     assert!(
         store
-            .attention_updates(acct, since, None, None, Some(SitrepBand::New))
+            .attention_updates(acct, since, None, None, Some(SitrepBand::New), false)
             .unwrap()
             .is_empty()
     );
@@ -337,7 +337,7 @@ fn dateless(store: &SqliteStore, acct: AccountId, gmail: &str, thread: &str, fro
 
 fn standing_ids(store: &SqliteStore, acct: AccountId, since: DateTime<Utc>) -> Vec<i64> {
     store
-        .attention_updates(acct, since, None, None, Some(SitrepBand::Standing))
+        .attention_updates(acct, since, None, None, Some(SitrepBand::Standing), false)
         .unwrap()
         .into_iter()
         .map(|u| u.update.id)
@@ -418,7 +418,7 @@ fn standing_admits_a_thread_the_user_has_written_in() {
 
     // SECURITY/UX: the evidence row is never itself listed, in any band.
     let all = store
-        .attention_updates(acct, since, None, None, None)
+        .attention_updates(acct, since, None, None, None, false)
         .unwrap();
     assert!(
         all.iter().all(|u| u.update.id != reply),
@@ -640,4 +640,506 @@ fn stats_bands_and_last_surfaced_at() {
     assert_eq!(s1.bands.open, 2);
     assert_eq!(s1.bands.standing, 1, "surfacing doesn't change standing");
     assert!(s1.last_surfaced_at.is_some());
+}
+
+// ---- reminders: "remind me about this later" -----------------------------
+
+/// The pending-reminder schedule, in listing order.
+fn pending_ids(store: &SqliteStore, acct: AccountId, since: DateTime<Utc>) -> Vec<i64> {
+    store
+        .attention_updates(acct, since, None, None, None, true)
+        .unwrap()
+        .into_iter()
+        .map(|u| u.update.id)
+        .collect()
+}
+
+/// Every row for this account, reminder fields included — the listing a client
+/// actually reads, so the assertions run through the same columns it does.
+fn all_updates(store: &SqliteStore, acct: AccountId, since: DateTime<Utc>) -> Vec<AttentionUpdate> {
+    store
+        .attention_updates(acct, since, None, None, None, false)
+        .unwrap()
+}
+
+/// `(status, remind_at)` straight off the row. The listing collapses a thread to
+/// one representative, so a hidden sibling can only be inspected here.
+fn raw_triage(store: &SqliteStore, message_id: i64) -> (String, Option<String>) {
+    store
+        .lock()
+        .unwrap()
+        .query_row(
+            "SELECT status, remind_at FROM triage WHERE message_id = ?1",
+            params![message_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap()
+}
+
+#[test]
+fn set_reminder_stamps_the_message_and_resolves_the_whole_thread() {
+    // DEFERRING IS RESOLVING: the mail must leave every band immediately, and
+    // the thread's other messages with it — a sibling left open puts the mail
+    // the user just snoozed straight back in front of them.
+    let (store, acct) = store();
+    let since = Utc::now() - chrono::Duration::days(30);
+    let first = ingest_normal(&store, acct, "g1", "thr", Tier::Signal, 80, Utc::now());
+    let sibling = ingest_normal(&store, acct, "g2", "thr", Tier::Signal, 70, Utc::now());
+    let elsewhere = ingest_normal(&store, acct, "g3", "other", Tier::Signal, 60, Utc::now());
+
+    let due = Utc::now() + chrono::Duration::days(3);
+    assert!(store.set_reminder(acct, first, due).unwrap());
+
+    let rows = all_updates(&store, acct, since);
+    let by_id = |id: i64| rows.iter().find(|u| u.update.id == id).unwrap();
+    assert_eq!(
+        by_id(first).status,
+        AttentionStatus::Done,
+        "the reminded message is done"
+    );
+    assert!(by_id(first).resolved_at.is_some());
+    assert_eq!(
+        by_id(first).remind_at.unwrap().timestamp(),
+        due.timestamp(),
+        "the pending stamp roundtrips"
+    );
+    assert!(by_id(first).reminded_at.is_none(), "nothing has fired yet");
+    assert_eq!(
+        by_id(elsewhere).status,
+        AttentionStatus::New,
+        "another thread is untouched"
+    );
+    // The sibling is read from the row, not the listing: the thread collapses to
+    // one representative, which is exactly why the done sweep has to be
+    // thread-wide in the first place.
+    assert_eq!(
+        raw_triage(&store, sibling),
+        ("done".to_string(), None),
+        "done is thread-wide, and only the named message carries the reminder"
+    );
+
+    // And it is out of the bands until it comes due.
+    assert!(standing_ids(&store, acct, since).is_empty());
+    assert_eq!(store.stats(acct, since).unwrap().bands.standing, 0);
+}
+
+#[test]
+fn set_reminder_replaces_a_reminder_that_already_fired() {
+    // The two stamps are the pending and fired halves of ONE reminder, never a
+    // history: re-arming must clear the old fired mark or the row would sit in
+    // the standing band while ALSO being scheduled to come back.
+    let (store, acct) = store();
+    let since = Utc::now() - chrono::Duration::days(30);
+    let id = ingest_normal(&store, acct, "g1", "t1", Tier::Noise, 10, Utc::now());
+
+    store
+        .set_reminder(acct, id, Utc::now() - chrono::Duration::hours(1))
+        .unwrap();
+    assert_eq!(
+        store.fire_due_reminders(acct, Utc::now()).unwrap(),
+        vec![id]
+    );
+    assert!(all_updates(&store, acct, since)[0].reminded_at.is_some());
+
+    store
+        .set_reminder(acct, id, Utc::now() + chrono::Duration::days(2))
+        .unwrap();
+    let row = all_updates(&store, acct, since).remove(0);
+    assert!(row.remind_at.is_some(), "re-armed");
+    assert!(row.reminded_at.is_none(), "the fired stamp is cleared");
+    assert!(
+        standing_ids(&store, acct, since).is_empty(),
+        "and it leaves the band it had re-entered"
+    );
+}
+
+#[test]
+fn fire_due_reminders_moves_only_the_due_and_only_the_named_columns() {
+    let (store, acct) = store();
+    let since = Utc::now() - chrono::Duration::days(30);
+    let due = ingest_normal(&store, acct, "g1", "t1", Tier::Signal, 80, Utc::now());
+    let later = ingest_normal(&store, acct, "g2", "t2", Tier::Signal, 80, Utc::now());
+    let never = ingest_normal(&store, acct, "g3", "t3", Tier::Signal, 80, Utc::now());
+
+    let due_at = Utc::now() - chrono::Duration::minutes(5);
+    store.set_reminder(acct, due, due_at).unwrap();
+    store
+        .set_reminder(acct, later, Utc::now() + chrono::Duration::days(1))
+        .unwrap();
+
+    let fired = store.fire_due_reminders(acct, Utc::now()).unwrap();
+    assert_eq!(fired, vec![due], "only the one whose moment has passed");
+
+    let rows = all_updates(&store, acct, since);
+    let by_id = |id: i64| rows.iter().find(|u| u.update.id == id).unwrap();
+    let hit = by_id(due);
+    assert_eq!(hit.status, AttentionStatus::Open, "back in play");
+    assert!(hit.resolved_at.is_none(), "and no longer resolved");
+    assert!(hit.remind_at.is_none(), "the pending stamp MOVED");
+    assert_eq!(hit.reminded_at.unwrap().timestamp(), due_at.timestamp());
+    assert_eq!(by_id(later).status, AttentionStatus::Done, "still deferred");
+    assert!(by_id(later).remind_at.is_some());
+    assert_eq!(
+        by_id(never).status,
+        AttentionStatus::New,
+        "a row with no reminder is not touched"
+    );
+
+    // IDEMPOTENT WITHOUT A COOLDOWN: the fired row no longer matches, so a
+    // second tick (or a second daemon) cannot fire it twice.
+    assert!(
+        store
+            .fire_due_reminders(acct, Utc::now())
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn a_fired_reminder_re_enters_standing_at_any_tier() {
+    // THE POINT OF THE ARM: the user personally declared this mail owed
+    // attention, so the triage model's "noise" verdict stops mattering. Asserted
+    // on BOTH sides of the shared const — the list and the header count.
+    let (store, acct) = store();
+    let since = Utc::now() - chrono::Duration::days(30);
+    let noise = ingest_normal(&store, acct, "g1", "t1", Tier::Noise, 0, Utc::now());
+    ingest_normal(&store, acct, "g2", "t2", Tier::Noise, 0, Utc::now());
+
+    assert!(
+        standing_ids(&store, acct, since).is_empty(),
+        "noise is not standing on its own"
+    );
+
+    store
+        .set_reminder(acct, noise, Utc::now() - chrono::Duration::minutes(1))
+        .unwrap();
+    store.fire_due_reminders(acct, Utc::now()).unwrap();
+
+    assert_eq!(
+        standing_ids(&store, acct, since),
+        vec![noise],
+        "a fired reminder outranks tier"
+    );
+    assert_eq!(
+        store.stats(acct, since).unwrap().bands.standing as usize,
+        1,
+        "header count equals the listed band"
+    );
+}
+
+#[test]
+fn pending_reminders_lists_deferred_mail_soonest_first() {
+    // A SCHEDULE, NOT A BAND: every row in it is done, so this listing is the
+    // one place `done` must not mean `gone`.
+    let (store, acct) = store();
+    let since = Utc::now() - chrono::Duration::days(30);
+    let soon = ingest_normal(&store, acct, "g1", "t1", Tier::Noise, 0, Utc::now());
+    let later = ingest_normal(&store, acct, "g2", "t2", Tier::PastDue, 99, Utc::now());
+    let unscheduled = ingest_normal(&store, acct, "g3", "t3", Tier::Signal, 50, Utc::now());
+
+    // The LOW-importance row is due first: due date beats the ranking sort, or
+    // the schedule is not a schedule.
+    store
+        .set_reminder(acct, later, Utc::now() + chrono::Duration::days(9))
+        .unwrap();
+    store
+        .set_reminder(acct, soon, Utc::now() + chrono::Duration::hours(2))
+        .unwrap();
+
+    assert_eq!(pending_ids(&store, acct, since), vec![soon, later]);
+    assert!(
+        !pending_ids(&store, acct, since).contains(&unscheduled),
+        "a row with no reminder is not on the schedule"
+    );
+    assert!(
+        pending_ids(&store, acct, since)
+            .iter()
+            .all(|id| all_updates(&store, acct, since)
+                .iter()
+                .any(|u| u.update.id == *id && u.status == AttentionStatus::Done)),
+        "pending-reminder rows are done by construction"
+    );
+
+    // Firing the soonest one takes it off the schedule.
+    store
+        .fire_due_reminders(acct, Utc::now() + chrono::Duration::hours(3))
+        .unwrap();
+    assert_eq!(pending_ids(&store, acct, since), vec![later]);
+}
+
+#[test]
+fn clear_reminder_unschedules_without_undoing_the_deferral() {
+    let (store, acct) = store();
+    let since = Utc::now() - chrono::Duration::days(30);
+    let id = ingest_normal(&store, acct, "g1", "t1", Tier::Signal, 80, Utc::now());
+
+    store
+        .set_reminder(acct, id, Utc::now() + chrono::Duration::days(1))
+        .unwrap();
+    assert!(store.clear_reminder(acct, id).unwrap());
+
+    let row = all_updates(&store, acct, since).remove(0);
+    assert!(row.remind_at.is_none(), "un-scheduled");
+    assert_eq!(
+        row.status,
+        AttentionStatus::Done,
+        "clearing a reminder is not an undo"
+    );
+    assert!(pending_ids(&store, acct, since).is_empty());
+    // Idempotent: a row with no reminder is a successful no-op.
+    assert!(store.clear_reminder(acct, id).unwrap());
+    // Missing id is the only false.
+    assert!(!store.clear_reminder(acct, 999).unwrap());
+    assert!(
+        store
+            .fire_due_reminders(acct, Utc::now())
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn reminders_never_touch_a_sealed_row() {
+    // SECURITY: every reminder query excludes sealed rows in SQL, so a sealed
+    // message is indistinguishable from a missing one — and the sweep re-guards
+    // even though nothing should have been able to schedule one.
+    let (store, acct) = store();
+    let sealed = triaged(acct, "g-sealed", "t-sealed")
+        .sealed(SealedKind::Otp)
+        .seed(&store);
+
+    let due = Utc::now() + chrono::Duration::days(1);
+    assert!(
+        !store.set_reminder(acct, sealed, due).unwrap(),
+        "sealed reads as missing"
+    );
+    assert!(!store.clear_reminder(acct, sealed).unwrap());
+    assert!(!store.set_reminder(acct, 999, due).unwrap(), "missing id");
+
+    // Force a reminder onto the sealed row behind the store's back: the sweep's
+    // own guard is what is under test, not `set_reminder`'s.
+    store
+        .lock()
+        .unwrap()
+        .execute(
+            "UPDATE triage SET remind_at = ?1 WHERE message_id = ?2",
+            params![
+                (Utc::now() - chrono::Duration::days(1)).to_rfc3339(),
+                sealed
+            ],
+        )
+        .unwrap();
+    assert!(
+        store
+            .fire_due_reminders(acct, Utc::now())
+            .unwrap()
+            .is_empty(),
+        "the sweep will not surface a sealed row"
+    );
+}
+
+#[test]
+fn reminders_do_not_cross_accounts() {
+    // SECURITY: every reminder statement is account-scoped, sweep included.
+    let (store, mine) = store();
+    let theirs = store.ensure_account("other@example.com").unwrap();
+    let my_row = ingest_normal(&store, mine, "g1", "t1", Tier::Signal, 80, Utc::now());
+
+    let past = Utc::now() - chrono::Duration::hours(1);
+    assert!(
+        !store.set_reminder(theirs, my_row, past).unwrap(),
+        "another account cannot schedule my mail"
+    );
+    store.set_reminder(mine, my_row, past).unwrap();
+    assert!(
+        store
+            .fire_due_reminders(theirs, Utc::now())
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        store.fire_due_reminders(mine, Utc::now()).unwrap(),
+        vec![my_row]
+    );
+}
+
+#[test]
+fn a_reminder_outlives_the_recency_window() {
+    // THE FEATURE'S CORE PROMISE, against the window that would have killed it
+    // on day 30: `since` here is the handler's own default (now - 30d), and the
+    // mail is two months old — exactly the "remind me next month" case. Without
+    // the exemption the schedule stops listing it, and the fired reminder
+    // reopens a row no band, no count and no page can show.
+    let (store, acct) = store();
+    let since = Utc::now() - chrono::Duration::days(30);
+    let old = ingest_normal(
+        &store,
+        acct,
+        "g-old",
+        "t-old",
+        Tier::Noise,
+        0,
+        Utc::now() - chrono::Duration::days(60),
+    );
+    assert!(
+        all_updates(&store, acct, since).is_empty(),
+        "the window still holds for mail nobody scheduled"
+    );
+
+    // (a) the pending lens lists it, 60-day-old receipt date and all.
+    store
+        .set_reminder(acct, old, Utc::now() + chrono::Duration::days(2))
+        .unwrap();
+    assert_eq!(pending_ids(&store, acct, since), vec![old]);
+
+    // (b) once it fires: in the standing LIST and in the header COUNT, which is
+    // the pair that has to agree row for row.
+    store
+        .fire_due_reminders(acct, Utc::now() + chrono::Duration::days(3))
+        .unwrap();
+    assert_eq!(standing_ids(&store, acct, since), vec![old]);
+    assert_eq!(store.stats(acct, since).unwrap().bands.standing, 1);
+
+    // (c) and the flat listing (no band) carries it too — the page the user
+    // lands on after the reminder brings it back.
+    assert_eq!(
+        all_updates(&store, acct, since)
+            .iter()
+            .map(|u| u.update.id)
+            .collect::<Vec<_>>(),
+        vec![old]
+    );
+}
+
+#[test]
+fn a_reminder_cannot_be_set_on_the_users_own_sent_mail() {
+    // Sent mail carries a triage row (neutral, tier=noise) and every listing
+    // filters `m.is_sent = 0`, so a reminder on one would be unreachable
+    // forever. Same indistinguishability rule as sealed: no row, no `true`.
+    let (store, acct) = store();
+    let since = Utc::now() - chrono::Duration::days(30);
+    let sent = triaged(acct, "g-sent", "t1").is_sent(true).seed(&store);
+    let inbound = triaged(acct, "g-in", "t1").importance(80).seed(&store);
+
+    let due = Utc::now() + chrono::Duration::days(1);
+    assert!(
+        !store.set_reminder(acct, sent, due).unwrap(),
+        "the user's own message reads as missing"
+    );
+    // NOTHING happened: not the stamp, not the thread-wide done sweep that
+    // would have resolved the real, inbound half of the conversation.
+    assert_eq!(raw_triage(&store, sent), ("new".to_string(), None));
+    assert_eq!(raw_triage(&store, inbound), ("new".to_string(), None));
+    assert!(pending_ids(&store, acct, since).is_empty());
+    assert!(
+        store
+            .fire_due_reminders(acct, Utc::now() + chrono::Duration::days(2))
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn the_schedule_lists_every_reminder_even_two_in_one_thread() {
+    // A SCHEDULE LISTS ONE ROW PER REMINDER, not one per conversation: the
+    // band's thread collapse would hide the second one where it can neither be
+    // seen nor cancelled, while it still comes due.
+    let (store, acct) = store();
+    let since = Utc::now() - chrono::Duration::days(30);
+    let first = ingest_normal(&store, acct, "g1", "thr", Tier::Signal, 80, Utc::now());
+    let second = ingest_normal(&store, acct, "g2", "thr", Tier::Signal, 70, Utc::now());
+
+    store
+        .set_reminder(acct, first, Utc::now() + chrono::Duration::days(1))
+        .unwrap();
+    store
+        .set_reminder(acct, second, Utc::now() + chrono::Duration::days(4))
+        .unwrap();
+    assert_eq!(
+        pending_ids(&store, acct, since),
+        vec![first, second],
+        "both siblings are on the schedule, soonest first"
+    );
+
+    // And cancelling one leaves the other exactly where it was.
+    assert!(store.clear_reminder(acct, first).unwrap());
+    assert_eq!(pending_ids(&store, acct, since), vec![second]);
+
+    // The bands still collapse the thread to one row — this is a schedule
+    // exemption, not a change to the bands.
+    store
+        .fire_due_reminders(acct, Utc::now() + chrono::Duration::days(5))
+        .unwrap();
+    assert_eq!(standing_ids(&store, acct, since).len(), 1);
+}
+
+#[test]
+fn resolving_a_fired_reminder_spends_it_for_good() {
+    // The fired stamp holds a row in standing at ANY tier, so it must not
+    // survive the user answering it: fire -> done -> reopen would otherwise put
+    // a noise-tier newsletter back in the standing band forever, every single
+    // time the row is ever reopened.
+    let (store, acct) = store();
+    let since = Utc::now() - chrono::Duration::days(30);
+    let noise = ingest_normal(&store, acct, "g1", "t1", Tier::Noise, 0, Utc::now());
+
+    store
+        .set_reminder(acct, noise, Utc::now() - chrono::Duration::minutes(1))
+        .unwrap();
+    store.fire_due_reminders(acct, Utc::now()).unwrap();
+    assert_eq!(standing_ids(&store, acct, since), vec![noise], "it fired");
+
+    store
+        .set_attention_status(acct, noise, AttentionStatus::Done)
+        .unwrap();
+    assert!(all_updates(&store, acct, since)[0].reminded_at.is_none());
+
+    // The undo path: the row comes back, the spent reminder does not.
+    store
+        .set_attention_status(acct, noise, AttentionStatus::Open)
+        .unwrap();
+    assert!(
+        standing_ids(&store, acct, since).is_empty(),
+        "a reopened row is judged on its tier again, not on a spent reminder"
+    );
+    assert_eq!(store.stats(acct, since).unwrap().bands.standing, 0);
+}
+
+#[test]
+fn re_arming_clears_the_fired_stamp_on_the_whole_thread() {
+    // The done sweep is thread-wide, and so is the clearing: a sibling left
+    // wearing an old fired stamp sits in the standing band while the thread is
+    // supposedly parked until the new date.
+    let (store, acct) = store();
+    let since = Utc::now() - chrono::Duration::days(30);
+    let first = ingest_normal(&store, acct, "g1", "thr", Tier::Noise, 0, Utc::now());
+    let sibling = ingest_normal(&store, acct, "g2", "thr", Tier::Noise, 0, Utc::now());
+
+    // The sibling's reminder fires, then the user re-parks the thread off the
+    // other message.
+    store
+        .set_reminder(acct, sibling, Utc::now() - chrono::Duration::minutes(1))
+        .unwrap();
+    store.fire_due_reminders(acct, Utc::now()).unwrap();
+    store
+        .set_reminder(acct, first, Utc::now() + chrono::Duration::days(3))
+        .unwrap();
+
+    assert!(
+        standing_ids(&store, acct, since).is_empty(),
+        "the whole thread is parked, siblings included"
+    );
+
+    // And the sibling's spent stamp is really gone, not merely hidden behind
+    // its `done`: reopening it (undo, or the next reminder firing on the thread)
+    // must not drag a noise-tier row back into standing on a reminder that was
+    // already answered.
+    store
+        .set_attention_status(acct, sibling, AttentionStatus::Open)
+        .unwrap();
+    assert!(
+        standing_ids(&store, acct, since).is_empty(),
+        "a re-armed thread carries no leftover fired stamp"
+    );
+    assert_eq!(store.stats(acct, since).unwrap().bands.standing, 0);
 }

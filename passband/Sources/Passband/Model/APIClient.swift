@@ -236,6 +236,7 @@ actor APIClient {
                 "limit": params.limit.map(String.init),
                 "cursor": params.cursor,
                 "peek": peek ? "true" : nil,
+                "reminders": params.remindersPending ? "pending" : nil,
             ])
     }
 
@@ -430,6 +431,49 @@ actor APIClient {
     func setStatus(_ messageId: Int, _ status: AttentionStatus) async throws -> StatusResult {
         try await post(
             "/client/updates/\(messageId)/status", body: StatusBody(status: status.rawValue))
+    }
+
+    // MARK: - reminders
+
+    struct ReminderBody: Codable, Sendable { var remind_at: String }
+    struct ReminderResult: Codable, Sendable {
+        var message_id: Int
+        var remind_at: String?
+    }
+
+    /// RFC3339 in UTC, which is the only shape the daemon parses. Reminders are
+    /// CHOSEN in local time ("tomorrow morning" is a wall clock, not an
+    /// offset), so this conversion is the one place the two meet.
+    nonisolated(unsafe) private static let wireStamp: ISO8601DateFormatter = {
+        let f = ISO8601DateFormatter()
+        f.formatOptions = [.withInternetDateTime]
+        f.timeZone = TimeZone(secondsFromGMT: 0)
+        return f
+    }()
+    private static let wireStampLock = NSLock()
+
+    /// The same rendering, for a caller that has to name the instant it just
+    /// asked for (an optimistic row) rather than send it.
+    nonisolated static func rfc3339(_ date: Date) -> String {
+        wireStampLock.lock()
+        defer { wireStampLock.unlock() }
+        return wireStamp.string(from: date)
+    }
+
+    /// Park this thread until `date`. The daemon marks the thread done now and
+    /// re-opens the message when the stamp comes due — so this is a resolve and
+    /// a schedule in one call, and the caller's optimistic removal is correct.
+    @discardableResult
+    func setReminder(_ messageId: Int, at date: Date) async throws -> ReminderResult {
+        try await post(
+            "/client/updates/\(messageId)/reminder",
+            body: ReminderBody(remind_at: Self.rfc3339(date)))
+    }
+
+    /// Drop a pending reminder. Idempotent server-side: a row with none already
+    /// answers 200, which is what lets an undo fire without checking first.
+    func clearReminder(_ messageId: Int) async throws {
+        try await deleteNoContent("/client/updates/\(messageId)/reminder")
     }
 
     @discardableResult

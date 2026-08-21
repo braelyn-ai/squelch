@@ -3,6 +3,13 @@
 Design session record (2026-07-08). Direction D ("Sitrep") is the chosen chassis; A–C are
 documented for future development — each survives as a mode or a rejected-for-a-reason.
 
+**Status.** D shipped: the three bands, the seen-ledger they need, and the
+undo-first action feel are all in Passband, on both the Mac and the phone. This
+file stays the record of *why* those choices beat the alternatives — it is not a
+description of the app as it stands, and where the two disagree the app is right.
+"OpenClaw" throughout is the agent-of-the-day; read it as "whatever agent holds
+the MCP connection".
+
 ## Chosen: D — "Sitrep"
 
 **Thesis:** the agent (OpenClaw) watches the inbox continuously; the human drops in

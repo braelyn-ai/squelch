@@ -328,21 +328,31 @@ private struct CarrierBadge: View {
 /// Statements & transaction alerts, latest first: institution + kind tag +
 /// masked account hint, amount right-aligned (a statement's amount is the TOTAL
 /// balance the extractor pulled).
+///
+/// WINDOWED, not capped: the card shows the last 24 hours, or everything since
+/// this zone was last SEEN, whichever reaches further back (SitrepWindow). The
+/// old fixed "latest 8" held week-old rows forever — issue #82.
 struct BankingZone: View {
     @Environment(AppStore.self) private var store
     private var records: [BankingRecord] { store.zones.banking }
 
-    /// How many the rail shows. Statements are ~monthly, so a short recency
-    /// list beats a today-only filter that would sit empty.
-    private static let shown = 8
+    /// How many rows stand unfolded. The window decides what BELONGS; this only
+    /// keeps a busy week from swallowing the rail — the rest sits behind the
+    /// fold row.
+    private static let collapsed = 8
+
+    @State private var expanded = false
 
     var body: some View {
-        let rows = Array(records.prefix(Self.shown))
+        let window = SitrepWindow.shared
+        let inWindow = records.filter { window.admits(Fmt.date($0.received_at)) }
+        let rows = expanded ? inWindow : Array(inWindow.prefix(Self.collapsed))
         ZoneCard(
-            symbol: "building.columns", title: "Banking", count: rows.count, tint: Palette.accentInk
+            symbol: "building.columns", title: "Banking", count: inWindow.count,
+            tint: Palette.accentInk
         ) {
-            if rows.isEmpty {
-                EmptyNote("No statements or alerts.")
+            if inWindow.isEmpty {
+                EmptyNote("No new statements or alerts.")
             } else {
                 VStack(spacing: 1) {
                     ForEach(rows) { r in
@@ -368,10 +378,34 @@ struct BankingZone: View {
                         }
                         .buttonStyle(RecordRowStyle())
                     }
+                    if inWindow.count > Self.collapsed {
+                        Button {
+                            expanded.toggle()
+                        } label: {
+                            Text(
+                                expanded
+                                    ? "Show fewer"
+                                    : "Show \(inWindow.count - Self.collapsed) more"
+                            )
+                            .font(Typo.rowSub)
+                            .foregroundStyle(Palette.inkFaintest)
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 5)
+                            .contentShape(Rectangle())
+                        }
+                        .buttonStyle(RecordRowStyle())
+                    }
                 }
             }
         }
         .task { await store.refreshZones() }
+        // THE SEEN-SIGNAL. The stamp belongs to this zone, not to the app: the
+        // Mac mounts it on the sitrep page, the phone on the Quick Look tab, and
+        // a session spent entirely in Mail must not clear a card nobody looked
+        // at. Appearance and disappearance are both reported — the window's
+        // clearing rides on them.
+        .onAppear { SitrepWindow.shared.surfaceAppeared() }
+        .onDisappear { SitrepWindow.shared.surfaceDisappeared() }
     }
 
     private func institutionLabel(_ r: BankingRecord) -> String {

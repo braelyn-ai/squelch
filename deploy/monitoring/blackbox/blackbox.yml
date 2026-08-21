@@ -1,8 +1,12 @@
-# Blackbox exporter modules. http_2xx is all we use today: follow redirects,
-# require a 2xx, record TLS expiry (probe_ssl_earliest_cert_expiry comes free
-# with any https probe). No public domain is ever minted for this service —
+# Blackbox exporter modules. No public domain is ever minted for this service —
 # Prometheus reaches it over Railway private networking only.
+#
+# THIS FILE IS A TEMPLATE: entrypoint.sh renders __BIFROST_CANARY_KEY__ from
+# the BLACKBOX_BIFROST_CANARY_KEY Railway service variable at boot (same
+# pattern as prometheus's web.yml). Never put the key itself here.
 modules:
+  # follow redirects, require a 2xx, record TLS expiry
+  # (probe_ssl_earliest_cert_expiry comes free with any https probe).
   http_2xx:
     prober: http
     timeout: 10s
@@ -10,3 +14,34 @@ modules:
       preferred_ip_protocol: ip4
       follow_redirects: true
       fail_if_not_ssl: true
+
+  # THE LLM CANARY: a real, minimal model call through the exact public path
+  # every tenant daemon uses (gateway auth -> virtual-key model allowlist ->
+  # upstream call), with the SAME model triage runs. The 2026-08-19 outage —
+  # every fleet LLM call 400ing at the gateway for two days — was invisible to
+  # http_2xx probes because the gateway itself was up; only a real call fails
+  # the way triage fails. probe_success{job="blackbox-bifrost-llm"} is the
+  # fleet-level "are LLM calls going through" signal.
+  #
+  # The key is a DEDICATED canary virtual key (mint it in the Bifrost UI:
+  # name `canary`, the triage model list, a few dollars of monthly budget) so
+  # a probe never spends tenant budget and a tenant rotation never breaks the
+  # canary. Cost at the 5m scrape interval is on the order of $5/month.
+  # If BLACKBOX_BIFROST_CANARY_KEY is unset the module renders with a dead
+  # key and the probe fails visibly — configure it, don't delete the module.
+  bifrost_llm:
+    prober: http
+    timeout: 30s
+    http:
+      preferred_ip_protocol: ip4
+      fail_if_not_ssl: true
+      method: POST
+      headers:
+        Content-Type: application/json
+        anthropic-version: "2023-06-01"
+        x-api-key: __BIFROST_CANARY_KEY__
+      body: '{"model":"claude-opus-5","max_tokens":16,"messages":[{"role":"user","content":"Reply with ok."}]}'
+      # A 2xx that is not a Messages response (an HTML error page, a proxy
+      # interstitial) must still fail the probe.
+      fail_if_body_not_matches_regexp:
+        - '"type"\s*:\s*"message"'
