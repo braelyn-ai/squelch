@@ -100,8 +100,14 @@ enum Palette {
         (Color(light: 0xDDE0F0, dark: 0x282C45), Color(light: 0x3B4490, dark: 0xAAB2EE)),
     ]
 
+    /// THROUGH THE CACHE, not `SenderID.slot` directly: the slot is a parse of
+    /// the address plus a hash of it, and this is asked once per message on
+    /// every render of a surface that lists them — the reader's minimap asks for
+    /// the whole thread. `SenderCache` already holds the answer for the avatar
+    /// beside the same name.
+    @MainActor
     static func avatarColors(for sender: String) -> (bg: Color, fg: Color) {
-        avatarPalette[SenderID.slot(sender) % avatarPalette.count]
+        avatarPalette[SenderCache.resolved(sender).slot % avatarPalette.count]
     }
 }
 

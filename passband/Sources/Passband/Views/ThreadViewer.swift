@@ -62,6 +62,10 @@ struct ThreadViewer: View {
     /// the reader is wherever the initial anchor dropped it, which is not a
     /// position anybody chose.
     @State private var landed = false
+    /// True while a hand is on the scroll — see `onScrollPhaseChange`. It is
+    /// what keeps a late measurement from correcting a position the reader is
+    /// in the middle of choosing.
+    @State private var handScrolling = false
 
     enum ConfirmMode: Equatable { case ask, noLink }
 
@@ -440,11 +444,22 @@ struct ThreadViewer: View {
                         LazyVStack(alignment: .leading, spacing: 0) {
                             ForEach(Array(messages.enumerated()), id: \.element.id) { i, m in
                                 MessageCard(
-                                    message: m, selected: i == index, ruled: i > 0,
+                                    message: m, position: i, selected: i == index, ruled: i > 0,
                                     opens: opens[m.id] ?? []
                                 ) {
                                     index = i
                                 }
+                                // THE CARD DIFFS ON ITS DATA, NOT ON ITS
+                                // CALLBACK. Every card carries a fresh
+                                // `onSelect` closure, and a closure minted in
+                                // this body never compares equal to the last
+                                // one — so without this, ANY invalidation of
+                                // the reader (a row crossing the visibility
+                                // threshold, receipts landing, the unsubscribe
+                                // lookup returning) rebuilt every message card
+                                // and re-ran every web frame's update, none of
+                                // which had changed. See MessageCard's `==`.
+                                .equatable()
                                 .id(i)
                                 .onScrollVisibilityChange(threshold: 0.1) { visible in
                                     if visible {
@@ -498,6 +513,13 @@ struct ThreadViewer: View {
                     .onGeometryChange(for: CGFloat.self) { $0.size.height } action: {
                         viewportHeight = $0
                     }
+                    // WHOSE SCROLL IS IT. Anything but idle means the reader has
+                    // a hand on it — a wheel, a trackpad, the tail of a flick —
+                    // and while that is true the landing below must keep its
+                    // hands off. It fires twice a gesture, not per tick.
+                    .onScrollPhaseChange { _, phase in
+                        handScrolling = phase != .idle
+                    }
                 }
                 // A STEP animates, A JUMP DOES NOT. j/k moves to the neighbouring
                 // card, which is already laid out and reads as the mail sliding
@@ -538,7 +560,16 @@ struct ThreadViewer: View {
                     // parked on the newest — a resize, or the card growing as its
                     // images arrive. Somebody who has scrolled back into the
                     // history is not holding a position this may correct.
-                    guard !landed || parkedOnNewest || was.last != now.last else { return }
+                    //
+                    // NOR IS SOMEBODY WHO IS SCROLLING RIGHT NOW. "Parked" allows
+                    // a couple of dozen points of slack, which is about one turn
+                    // of a wheel — so the first nudge off the newest message used
+                    // to be answered by a height landing somewhere in the thread
+                    // and yanking the reader back to where they started. A
+                    // gesture in progress owns the scroll; the window resizing
+                    // (the third arm) is not a gesture and still lands.
+                    guard !landed || (parkedOnNewest && !handScrolling) || was.last != now.last
+                    else { return }
                     proxy.scrollTo(newestIndex, anchor: .top)
                     landed = true
                 }
@@ -1302,16 +1333,35 @@ struct ReaderBackdrop: View {
 /// information around a frame that already clips itself round, paid on every
 /// message in a surface whose whole job is reading. Messages are divided by a
 /// hairline and marked by a rule, and the mail is the only thing with edges.
-private struct MessageCard: View {
-    let message: ClientMessage
-    let selected: Bool
+private struct MessageCard: View, Equatable {
+    // NONISOLATED, all five: a View is main-actor isolated, and Equatable's
+    // requirement is not, so the comparison below can only reach fields that
+    // have stepped outside the actor. Every one of them is a value type the
+    // wire already declares Sendable, so stepping out costs nothing. The
+    // callback stays isolated, which is exactly why `==` cannot see it.
+    nonisolated let message: ClientMessage
+    /// Display index. Carried only so `==` can see it: the callback below
+    /// captures it, so two cards that agree about everything else and disagree
+    /// about this one would select the wrong message if the older callback were
+    /// kept.
+    nonisolated let position: Int
+    nonisolated let selected: Bool
     /// The first message needs no divider above it: that is the top of the
     /// document, not a seam between two messages.
-    let ruled: Bool
+    nonisolated let ruled: Bool
     /// Recorded opens of this message, when it is one of the user's own tracked
     /// sends. Empty for everything else, which renders no mark.
-    let opens: [MessageOpen]
+    nonisolated let opens: [MessageOpen]
     let onSelect: () -> Void
+
+    /// EVERYTHING BUT THE CALLBACK, which is what makes the card diffable at
+    /// all — see the `.equatable()` at the call site. Rebuilding a card means
+    /// rebuilding its sandboxed web frame's view value and running that frame's
+    /// update, so a card that has not changed must be able to say so.
+    nonisolated static func == (a: MessageCard, b: MessageCard) -> Bool {
+        a.message == b.message && a.position == b.position && a.selected == b.selected
+            && a.ruled == b.ruled && a.opens == b.opens
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 9) {
@@ -1343,7 +1393,8 @@ private struct MessageCard: View {
                 EmailWebView(
                     html: html, cacheKey: String(message.id),
                     allowTrackers: message.allowsTrackers,
-                    attachments: message.attachmentList)
+                    attachments: message.attachmentList,
+                    textHeight: guessedTextHeight)
             } else {
                 PlainBody(content: message.content)
             }
@@ -1383,6 +1434,27 @@ private struct MessageCard: View {
         }
         .contentShape(Rectangle())
         .onTapGesture(perform: onSelect)
+    }
+
+    /// HOW TALL THIS BODY WILL BE, before anything has rendered it — the size
+    /// the web frame is given while it is still loading, so the message that
+    /// finishes measuring itself mid-scroll corrects its own height by a little
+    /// instead of shoving the rest of the thread down the window.
+    ///
+    /// Off the FLATTENED TEXT with the quoted chain taken off it, because that
+    /// is what the frame will actually draw: the injected script collapses
+    /// trailing quoted history before its first measurement, so a one-line
+    /// reply that quotes a hundred-message thread renders as one line. Guessing
+    /// from the whole body would be as wrong as the flat placeholder was, just
+    /// in the other direction.
+    ///
+    /// Memoized by message id: this is read from a view body, and the split is
+    /// a regex walk of every line of the message.
+    private var guessedTextHeight: CGFloat {
+        FrameHeights.shared.guess(String(message.id)) {
+            MinimapGeometry.textHeight(
+                text: Quotes.splitText(message.content).visible, html: message.html)
+        }
     }
 
     /// The parts the BODY already shows, because a `cid:` reference in the html

@@ -205,18 +205,43 @@ final class PreparedBodies: @unchecked Sendable {
 /// Remembered rendered heights, keyed by message id: a frame with one renders
 /// at its final size instantly, with no resize on reopen (the reader perceives
 /// that resize as flicker).
+///
+/// It also keeps the GUESSED height of a body nothing has measured yet — the
+/// size a message is given while it is scrolling into view for the first time.
+/// The two are deliberately separate maps: a measurement is what the document
+/// turned out to be, a guess is what its text says it will be, and a guess must
+/// never be remembered as though a frame had reported it.
 @MainActor
 final class FrameHeights {
     static let shared = FrameHeights()
     private var heights: [String: CGFloat] = [:]
+    private var guesses: [String: CGFloat] = [:]
     private init() {}
 
     func get(_ key: String) -> CGFloat? { heights[key] }
     func set(_ key: String, _ height: CGFloat) { heights[key] = height }
-    func clear(_ key: String) { heights.removeValue(forKey: key) }
+    func clear(_ key: String) {
+        heights.removeValue(forKey: key)
+        guesses.removeValue(forKey: key)
+    }
+
+    /// The guessed height for this message, computed once and kept. Memoized
+    /// because the caller is a view body — it is asked on every render of a
+    /// message card, and the answer is a walk of the body's text (the quoted
+    /// chain has to be split off it first, or a one-line reply quoting a long
+    /// thread is guessed at the length of the whole thread).
+    func guess(_ key: String, _ make: () -> CGFloat) -> CGFloat {
+        if let known = guesses[key] { return known }
+        let made = make()
+        guesses[key] = made
+        return made
+    }
 
     /// Forget every height. An account switch: the keys are message ids, one
     /// daemon's, so a surviving entry paints the new account's mail at the old
     /// account's size and then snaps — which reads as a rendering glitch.
-    func wipeAll() { heights.removeAll() }
+    func wipeAll() {
+        heights.removeAll()
+        guesses.removeAll()
+    }
 }

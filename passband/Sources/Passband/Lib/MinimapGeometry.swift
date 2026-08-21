@@ -51,9 +51,7 @@ enum MinimapGeometry {
     private static let markupRatio: CGFloat = 6
 
     /// WHAT A MESSAGE IS WORTH ON THE RAIL, from the only thing knowable without
-    /// laying it out: how much text is in it. Counted in UTF-8 bytes rather than
-    /// characters because this runs for every message on every render and byte
-    /// count is free where grapheme count is a walk.
+    /// laying it out: how much text is in it.
     ///
     /// IT COUNTS LINES AND NOTHING ELSE — images, tables, and signature cards are
     /// all worth zero. Deliberately: guessing a picture's size from its markup is
@@ -61,6 +59,24 @@ enum MinimapGeometry {
     /// which is a conversation, which is text. A newsletter is one message in a
     /// thread of its own and has no rail to be wrong about.
     static func estimate(text: String, html: String? = nil, attachments: Int = 0) -> CGFloat {
+        let body =
+            cardChrome + textHeight(text: text, html: html)
+            + (attachments > 0 ? attachmentStrip : 0)
+        return min(max(body, minimumCard), longestGuess)
+    }
+
+    /// HOW TALL THIS BODY'S TEXT DRAWS, with no card around it. Split out of
+    /// `estimate` because the READER needs the same number for a different
+    /// reason: a web frame that has not measured itself yet has to be given a
+    /// height, and until this existed that height was a flat 120 points. A
+    /// message that scrolled into view at 120 and then measured at 900 shoved
+    /// everything below it down by the difference, which is the mail lurching
+    /// under somebody who is reading it. The guess does not have to be right —
+    /// it has to be close enough that the correction is not a jump.
+    ///
+    /// Counted in UTF-8 bytes rather than characters because a long thread runs
+    /// this per message and byte count is free where grapheme count is a walk.
+    static func textHeight(text: String, html: String? = nil) -> CGFloat {
         var lines: CGFloat = 0
         var run: CGFloat = 0
         var ink = false
@@ -84,8 +100,7 @@ enum MinimapGeometry {
             lines = max(1, (visible / charsPerLine).rounded(.up))
         }
 
-        let body = cardChrome + lines * lineHeight + (attachments > 0 ? attachmentStrip : 0)
-        return min(max(body, minimumCard), longestGuess)
+        return lines * lineHeight
     }
 
     /// `estimates` carries one entry per message and IS the map. Nothing measured

@@ -28,6 +28,16 @@ struct EmailWebView: View {
     /// real answer, not a missing one: a body with nothing to resolve against
     /// drops every cid reference it carries, which is what sealed mail wants.
     let attachments: [Attachment]
+    /// WHAT THIS BODY'S TEXT IS GUESSED TO DRAW AS (MinimapGeometry.textHeight),
+    /// or 0 from a caller with no guess to offer.
+    ///
+    /// It is the height the frame is given until the document measures itself,
+    /// and that is a scrolling concern, not a cosmetic one: a message that
+    /// mounts at a flat placeholder and then snaps to its real height moves
+    /// every message after it by the difference, under somebody who is in the
+    /// middle of reading. A guess that is roughly right turns that shove into a
+    /// nudge.
+    let textHeight: CGFloat
 
     @Environment(Prefs.self) private var prefs
     @Environment(AppStore.self) private var store
@@ -48,12 +58,13 @@ struct EmailWebView: View {
     /// from `body`, and every later hook is a frame too late.
     init(
         html: String, cacheKey: String? = nil, allowTrackers: Bool = false,
-        attachments: [Attachment] = []
+        attachments: [Attachment] = [], textHeight: CGFloat = 0
     ) {
         self.html = html
         self.cacheKey = cacheKey
         self.allowTrackers = allowTrackers
         self.attachments = attachments
+        self.textHeight = textHeight
         _prepared = State(
             initialValue: PreparedBodies.shared.get(
                 Prepared.cacheKey(html, allowTrackers, attachments)) ?? .empty)
@@ -164,8 +175,13 @@ struct EmailWebView: View {
 
     @MainActor private static var warmFrame: WKWebView?
 
-    /// Frame height shown before the first successful measurement.
+    /// Frame height shown before the first successful measurement, for a body
+    /// whose caller offered no guess at all. A LAST RESORT: a frame that opens
+    /// at this and measures at ten times it is the thread lurching.
     private static let placeholderHeight: CGFloat = 120
+    /// The document's own top and bottom padding (the 14px in `document`),
+    /// which a caller counting lines of text knows nothing about.
+    private static let documentPadding: CGFloat = 28
     /// Height used when measurement never arrives at all — generous on purpose:
     /// too tall leaves whitespace, too short silently hides mail.
     private static let unmeasuredFallbackHeight: CGFloat = 900
@@ -256,8 +272,18 @@ struct EmailWebView: View {
 
     private var preparedKey: Int { Prepared.cacheKey(html, allowTrackers, attachments) }
     private var rememberedHeight: CGFloat? { cacheKey.flatMap { FrameHeights.shared.get($0) } }
+    /// What the caller's line count says this document will come to, or nil
+    /// when it offered none. Never remembered as a height: it is a guess, and
+    /// `FrameHeights` holds measurements.
+    private var guessedHeight: CGFloat? {
+        textHeight > 0 ? textHeight + Self.documentPadding : nil
+    }
+    /// MEASURED, then REMEMBERED, then GUESSED. The order is the confidence
+    /// order, and everything above the last resort exists so that the frame
+    /// which lands its measurement mid-scroll corrects by a little instead of
+    /// shoving the rest of the thread down the window.
     private var displayHeight: CGFloat {
-        height > 0 ? height : (rememberedHeight ?? Self.placeholderHeight)
+        height > 0 ? height : (rememberedHeight ?? guessedHeight ?? Self.placeholderHeight)
     }
 
     @ViewBuilder
@@ -541,6 +567,17 @@ final class EmailFrameCoordinator: NSObject {
     /// cancelled — a permanently blank frame that still reports a height.
     private var pendingOwnLoads = 0
 
+    /// The quoted-history state the HOST wants, and the one the DOCUMENT is
+    /// actually in. They are kept apart because `updateNSView` runs for reasons
+    /// that have nothing to do with quoted history — a new height, a re-render
+    /// of the reader, a fresh set of callback closures — and firing the toggle
+    /// each time is a script round trip into every open message's content
+    /// process, each one forcing that document to lay itself out again to
+    /// answer with a height it already reported. `nil` = the document's state
+    /// is unknown, which is what a load in flight leaves behind.
+    private var wantedCollapse = true
+    private var appliedCollapse: Bool?
+
     init(
         onHeight: @escaping (CGFloat) -> Void, onQuotedFound: @escaping (Bool) -> Void,
         onLink: @escaping (String) -> Void
@@ -569,6 +606,11 @@ final class EmailFrameCoordinator: NSObject {
         loadedPoolKey = poolKey.map {
             WebFramePool.Key(message: $0, allowRemote: allowRemote, document: document)
         }
+        // The document about to be replaced is the one whose quote state we
+        // knew. Until the new one lands there is nothing to toggle — the
+        // function the toggle calls does not exist yet — and `documentDidLoad`
+        // is what applies the host's wish once it does.
+        appliedCollapse = nil
         relay?.noteLoadStarted()
         pendingOwnLoads += 1
         webView.loadHTMLString(
@@ -595,6 +637,10 @@ final class EmailFrameCoordinator: NSObject {
         // permission outstanding to grant.
         loadedSignature = Self.signature(allowRemote: key.allowRemote, document: key.document)
         loadedPoolKey = key
+        // A frame is parked COLLAPSED (WebFramePool.checkIn settles it there),
+        // which is also a fresh host's default — so the update that follows
+        // this has nothing to toggle and does not say so twice.
+        appliedCollapse = true
 
         // A document that was not reloaded never re-runs the measuring script,
         // so a reused frame would sit at zero height behind the paint-hold
@@ -633,8 +679,25 @@ final class EmailFrameCoordinator: NSObject {
     }
 
     func setQuotesCollapsed(_ webView: WKWebView, collapsed: Bool) {
+        wantedCollapse = collapsed
+        applyCollapse(webView)
+    }
+
+    /// The document just finished loading, so it IS collapsed: the injected
+    /// script does that before its first measurement. That is what makes the
+    /// state knowable again — and what re-applies an expanded history the
+    /// reader had open when something (the remote-image opt-in) reloaded the
+    /// frame out from under them.
+    func documentDidLoad(_ webView: WKWebView) {
+        appliedCollapse = true
+        applyCollapse(webView)
+    }
+
+    private func applyCollapse(_ webView: WKWebView) {
+        guard appliedCollapse != wantedCollapse else { return }
+        appliedCollapse = wantedCollapse
         webView.evaluateJavaScript(
-            "window.__passbandSetQuotes && window.__passbandSetQuotes(\(collapsed))")
+            "window.__passbandSetQuotes && window.__passbandSetQuotes(\(wantedCollapse))")
     }
 
     /// LAYER 4: allow exactly the in-memory loads WE started, refuse everything
@@ -772,6 +835,9 @@ final class FrameRelay: NSObject, WKScriptMessageHandler, WKNavigationDelegate,
 
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
         loaded = true
+        // The new document is collapsed and toggleable again; only the owner
+        // knows which state its host is asking for.
+        owner?.documentDidLoad(webView)
     }
 
     func webView(
