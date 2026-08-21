@@ -197,7 +197,7 @@ pub async fn page(State(state): State<ControlState>, headers: HeaderMap) -> Resp
         // asked for `/admin` learns only that the form exists.
         return pages::admin_login(None);
     }
-    dashboard(&state, None)
+    dashboard(&state, None).await
 }
 
 /// `POST /admin/logout` — end this session deliberately.
@@ -286,18 +286,18 @@ pub async fn invite(
     // different, deliverable one.
     let email = field_capped(&body, "email", crate::handlers::MAX_EMAIL + 1);
     if !crate::handlers::is_email(&email) {
-        return dashboard(&state, Some(INVALID_ADDRESS));
+        return dashboard(&state, Some(INVALID_ADDRESS)).await;
     }
 
-    let id = match state.store().invite_directly(&email, Utc::now()) {
+    let id = match state.store().invite_directly(&email, Utc::now()).await {
         Ok(Some(id)) => id,
         // Already on the approved half. Not an error worth a red banner, but
         // not silence either: the row is on the page with its own button, and
         // saying so is what stops the operator from typing it again.
-        Ok(None) => return dashboard(&state, Some(ALREADY_INVITED)),
+        Ok(None) => return dashboard(&state, Some(ALREADY_INVITED)).await,
         Err(e) => {
             tracing::error!(error = %e, "recording a direct invite failed");
-            return dashboard(&state, Some(STORE_TROUBLE));
+            return dashboard(&state, Some(STORE_TROUBLE)).await;
         }
     };
 
@@ -307,7 +307,7 @@ pub async fn invite(
     // A row that was just created or just promoted names no invite yet, which
     // is the NULL this mint expects to replace.
     match mint_and_send(&state, id, None).await {
-        Some(problem) => dashboard(&state, Some(problem)),
+        Some(problem) => dashboard(&state, Some(problem)).await,
         None => back_to_dashboard(),
     }
 }
@@ -331,22 +331,22 @@ pub async fn approve(
         return cross_origin(&state, &headers);
     }
     let Some(id) = row_id(&body) else {
-        return dashboard(&state, Some(NO_SUCH_ROW));
+        return dashboard(&state, Some(NO_SUCH_ROW)).await;
     };
 
-    match state.store().approve_waitlist(id, Utc::now()) {
+    match state.store().approve_waitlist(id, Utc::now()).await {
         Ok(true) => {}
-        Ok(false) => return dashboard(&state, Some(ALREADY_APPROVED)),
+        Ok(false) => return dashboard(&state, Some(ALREADY_APPROVED)).await,
         Err(e) => {
             tracing::error!(id, error = %e, "approving a waitlist row failed");
-            return dashboard(&state, Some(STORE_TROUBLE));
+            return dashboard(&state, Some(STORE_TROUBLE)).await;
         }
     }
 
     // A row that just left `pending` names no invite yet, so that NULL is what
     // this call expects to replace.
     match mint_and_send(&state, id, None).await {
-        Some(problem) => dashboard(&state, Some(problem)),
+        Some(problem) => dashboard(&state, Some(problem)).await,
         None => back_to_dashboard(),
     }
 }
@@ -364,19 +364,19 @@ pub async fn send(State(state): State<ControlState>, headers: HeaderMap, body: B
         return cross_origin(&state, &headers);
     }
     let Some(id) = row_id(&body) else {
-        return dashboard(&state, Some(NO_SUCH_ROW));
+        return dashboard(&state, Some(NO_SUCH_ROW)).await;
     };
 
-    let row = match state.store().waitlist_entry(id) {
+    let row = match state.store().waitlist_entry(id).await {
         Ok(Some(row)) => row,
-        Ok(None) => return dashboard(&state, Some(NO_SUCH_ROW)),
+        Ok(None) => return dashboard(&state, Some(NO_SUCH_ROW)).await,
         Err(e) => {
             tracing::error!(id, error = %e, "reading a waitlist row failed");
-            return dashboard(&state, Some(STORE_TROUBLE));
+            return dashboard(&state, Some(STORE_TROUBLE)).await;
         }
     };
     if row.status != WAITLIST_APPROVED {
-        return dashboard(&state, Some(NOT_APPROVED));
+        return dashboard(&state, Some(NOT_APPROVED)).await;
     }
 
     if let Some(old) = row.invite_id {
@@ -385,7 +385,7 @@ pub async fn send(State(state): State<ControlState>, headers: HeaderMap, body: B
         // enough for a signup to take the hold the check just said was absent:
         // the code would then be deleted out from under somebody who has
         // already granted Google consent they cannot grant twice.
-        match state.store().revoke_unheld_invite(old, Utc::now()) {
+        match state.store().revoke_unheld_invite(old, Utc::now()).await {
             Ok(true) => {}
             // Why it declined, asked only now that nothing destructive is left
             // to do: a race here changes the sentence, not the outcome.
@@ -396,14 +396,15 @@ pub async fn send(State(state): State<ControlState>, headers: HeaderMap, body: B
                 if state
                     .store()
                     .invite_is_held(old, Utc::now())
+                    .await
                     .unwrap_or(true)
                 {
-                    return dashboard(&state, Some(INVITE_HELD));
+                    return dashboard(&state, Some(INVITE_HELD)).await;
                 }
                 // SPENT is a refusal: somebody set a mailbox up with that code,
                 // and minting a second is a tenant nobody approved.
-                if invite_is_spent(&state, old) {
-                    return dashboard(&state, Some(INVITE_SPENT));
+                if invite_is_spent(&state, old).await {
+                    return dashboard(&state, Some(INVITE_SPENT)).await;
                 }
                 // GONE is not. An operator who revoked the code from the CLI
                 // leaves a row pointing at nothing, and refusing that too would
@@ -411,13 +412,13 @@ pub async fn send(State(state): State<ControlState>, headers: HeaderMap, body: B
             }
             Err(e) => {
                 tracing::error!(id, error = %e, "revoking the replaced invite failed");
-                return dashboard(&state, Some(STORE_TROUBLE));
+                return dashboard(&state, Some(STORE_TROUBLE)).await;
             }
         }
     }
 
     match mint_and_send(&state, id, row.invite_id).await {
-        Some(problem) => dashboard(&state, Some(problem)),
+        Some(problem) => dashboard(&state, Some(problem)).await,
         None => back_to_dashboard(),
     }
 }
@@ -446,7 +447,7 @@ async fn mint_and_send(
     expected_prior: Option<i64>,
 ) -> Option<&'static str> {
     let (resend, _) = state.waitlist()?;
-    let row = match state.store().waitlist_entry(id) {
+    let row = match state.store().waitlist_entry(id).await {
         Ok(Some(row)) => row,
         Ok(None) => {
             tracing::warn!(
@@ -469,7 +470,11 @@ async fn mint_and_send(
         }
     };
     let expires_at = Utc::now() + chrono::Duration::days(invites::DEFAULT_TTL_DAYS);
-    let invite_id = match state.store().insert_invite(&minted.code_hash, expires_at) {
+    let invite_id = match state
+        .store()
+        .insert_invite(&minted.code_hash, expires_at)
+        .await
+    {
         Ok(invite_id) => invite_id,
         Err(e) => {
             tracing::error!(id, error = %e, "recording the minted invite failed");
@@ -479,15 +484,16 @@ async fn mint_and_send(
     match state
         .store()
         .set_waitlist_invite(id, invite_id, expected_prior)
+        .await
     {
         Ok(true) => {}
         Ok(false) => {
-            discard(state, id, invite_id);
+            discard(state, id, invite_id).await;
             return Some(ALREADY_HANDLED);
         }
         Err(e) => {
             tracing::error!(id, invite_id, error = %e, "pointing the waitlist row at its invite failed");
-            discard(state, id, invite_id);
+            discard(state, id, invite_id).await;
             return Some(STORE_TROUBLE);
         }
     }
@@ -500,6 +506,7 @@ async fn mint_and_send(
             match state
                 .store()
                 .mark_waitlist_notified(id, invite_id, Utc::now())
+                .await
             {
                 // The row moved to a newer code while this send was in flight,
                 // so the delivery this stamp would claim is not the one the row
@@ -524,8 +531,8 @@ async fn mint_and_send(
 
 /// Take back a code this call minted and then lost the row for. Best effort: a
 /// code nothing points at expires on its own, and there is nobody to tell.
-fn discard(state: &ControlState, id: i64, invite_id: i64) {
-    if let Err(e) = state.store().revoke_invite(invite_id) {
+async fn discard(state: &ControlState, id: i64, invite_id: i64) {
+    if let Err(e) = state.store().revoke_invite(invite_id).await {
         tracing::error!(id, invite_id, error = %e, "revoking an unclaimed invite failed");
     }
 }
@@ -541,8 +548,8 @@ fn discard(state: &ControlState, id: i64, invite_id: i64) {
 /// A store that will not answer counts as spent. That is the closed direction:
 /// the worst case is an operator sending themselves a CLI code, rather than this
 /// page minting an invite it could not rule out.
-fn invite_is_spent(state: &ControlState, invite_id: i64) -> bool {
-    match state.store().list_invites() {
+async fn invite_is_spent(state: &ControlState, invite_id: i64) -> bool {
+    match state.store().list_invites().await {
         Ok(rows) => rows
             .iter()
             .any(|r| r.id == invite_id && r.used_at.is_some()),
@@ -580,8 +587,8 @@ fn is_admin(state: &ControlState, headers: &HeaderMap) -> bool {
 
 /// The dashboard, listed fresh. `error` is a banner over a correct list, never
 /// a page in place of one.
-fn dashboard(state: &ControlState, error: Option<&str>) -> Response {
-    let rows = match state.store().list_waitlist() {
+async fn dashboard(state: &ControlState, error: Option<&str>) -> Response {
+    let rows = match state.store().list_waitlist().await {
         Ok(rows) => rows,
         Err(e) => {
             // An empty page under a banner that says the store did not answer.

@@ -64,7 +64,7 @@ Security Admission at `restricted`), `cert-manager`. Manifests applied from
 | Service | `control` — `squelch-control`, the signup plane |
 | Build | `railway.control.toml`, set as the service's **Config-as-code file path** |
 | Domain | `signup.passband.app` (CNAME to the Railway target) |
-| Volume | mounted at `/data`; the store is `/data/control.sqlite3` |
+| Store | the project's Railway **Postgres** service, referenced as `SQUELCH_CONTROL_DATABASE_URL = ${{Postgres.DATABASE_URL}}` (private URL). The `/data` volume only survives until the one-time `import-sqlite` cutover, then it is retired |
 | Health check | `GET /healthz` |
 
 **The config file is what selects the image, not `RAILWAY_DOCKERFILE_PATH`.**
@@ -88,6 +88,36 @@ top, all defaulted: `SQUELCH_CONTROL_LLM_BUDGET_USD` ($5) and
 `SQUELCH_CONTROL_ASSISTANT_MODELS` (haiku + opus) for the assistant key
 the Passband app's relay chats spend against.
 Full table: `squelch-control/README.md`.
+
+### The Postgres cutover (one-time, then delete this section)
+
+The store moved from the volume's SQLite file to the project's Postgres
+service. The order matters:
+
+1. Add the Railway Postgres service; on `control` set
+   `SQUELCH_CONTROL_DATABASE_URL = ${{Postgres.DATABASE_URL}}` — the
+   **private** URL (the store speaks no TLS; `DATABASE_PUBLIC_URL` is the
+   TCP proxy plus egress fees). Private DNS is IPv6-only and can lag a fresh
+   boot by a beat; the `on_failure` restart policy absorbs a failed first
+   connect.
+2. Deploy. The service is live on an empty store from here until step 3 —
+   minutes, and a signup that lands in the window makes the importer refuse
+   on a non-empty table, which is the designed failure: reconcile by hand,
+   re-run.
+3. `railway ssh` into `control` (lands as root, env present):
+   `squelch-control import-sqlite /data/control.sqlite3`. It copies all
+   three tables with ids preserved, re-arms the sequences, and prints counts
+   only.
+4. Verify: `squelch-control tenants`, `squelch-control invite list`, and the
+   `/admin` board against known counts.
+5. Copy `control.sqlite3` off the box **before** touching the volume —
+   deleting a Railway volume destroys it. After a soak (one invite issued,
+   one signup completed on Postgres), remove the volume; a cleanup PR then
+   drops the entrypoint chown, `rusqlite`, and `import.rs`.
+
+Rollback until step 5: redeploy the previous image — the importer opened the
+file read-only, so it is exactly as it was, minus rows that landed in
+Postgres after cutover.
 
 ### The LLM gateway
 

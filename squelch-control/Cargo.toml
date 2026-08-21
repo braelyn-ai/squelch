@@ -41,8 +41,29 @@ tower = "0.5"
 # rather than hand-rolling a token POST and a response parse.
 oauth2 = { workspace = true }
 reqwest = { workspace = true }
-# The control store: tenants and invite codes. `bundled` (workspace default)
-# links SQLite itself, so the Railway image needs no system libsqlite.
+# The control store: tenants and invite codes, in a managed Postgres. Crate-local
+# rather than workspace deps, like axum above, because this is the ONLY crate in
+# the workspace that talks to Postgres: the daemons keep a SQLite file each, on
+# purpose, and a workspace dep would read as an invitation to that changing.
+#
+# NoTls, and that is a deployment fact rather than a shortcut: the control plane
+# reaches its database over Railway's private network
+# (`postgres.railway.internal`), which never leaves the project. The day this
+# connects over the public proxy it needs `tokio-postgres-rustls` and a
+# `MakeTlsConnector` in `connect`, and nothing else here changes.
+tokio-postgres = "0.7"
+# A POOL FOR RESILIENCE, NOT THROUGHPUT. One `Client` whose connection task dies
+# — Railway restarts Postgres for maintenance, and a private-network blip does
+# the same — is permanently broken, and every request after it would fail with a
+# closed connection until the process restarted. The pool notices and dials
+# again. `max_size` is 4 because this service's concurrency is a handful of
+# signups, not a fleet.
+deadpool-postgres = "0.14"
+# READ-ONLY, AND ONLY FOR `import-sqlite`. The control store used to be a SQLite
+# file on a Railway volume; this dependency is what the one-time importer opens
+# it with, and it has to be in the SHIPPED IMAGE because the import is run with
+# `railway ssh` against the live volume. It dies with the volume: when that is
+# retired, this line and `src/import.rs` go together.
 rusqlite = { workspace = true }
 url = { workspace = true }
 clap = { workspace = true }

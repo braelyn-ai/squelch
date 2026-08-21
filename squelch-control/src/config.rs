@@ -4,15 +4,15 @@
 //! will ever see, and one that guesses its base domain hands out tenant URLs
 //! that resolve to somebody else.
 //!
-//! SIX FIELDS HERE ARE SECRETS: the OAuth client secret, the cookie key, the
-//! warden bearer, the Bifrost admin token, the admin-page token, and the Resend
-//! API key. So [`Config`] (and [`BifrostConfig`] and [`WaitlistConfig`] inside
-//! it) has a HAND-WRITTEN `Debug` that redacts them. A derived one would put
-//! all six in any `tracing::debug!` that ever formats the config, and that is
-//! exactly the line nobody notices adding.
+//! SEVEN FIELDS HERE ARE SECRETS: the OAuth client secret, the cookie key, the
+//! warden bearer, the Bifrost admin token, the admin-page token, the Resend
+//! API key, and the database URL (which embeds the database password). So
+//! [`Config`] (and [`BifrostConfig`] and [`WaitlistConfig`] inside it) has a
+//! HAND-WRITTEN `Debug` that redacts them. A derived one would put all seven in
+//! any `tracing::debug!` that ever formats the config, and that is exactly the
+//! line nobody notices adding.
 
 use std::net::SocketAddr;
-use std::path::PathBuf;
 use std::time::Duration;
 
 use base64::Engine as _;
@@ -22,10 +22,6 @@ use base64::Engine as _;
 /// container entrypoint widens this to `0.0.0.0:$PORT` for platforms that
 /// inject a port, which is an explicit act rather than a default.
 pub const DEFAULT_BIND: &str = "127.0.0.1:8852";
-
-/// Where the control store lives when nothing says otherwise. Matches the
-/// mount point the image documents.
-pub const DEFAULT_DB_PATH: &str = "/data/control.sqlite3";
 
 /// Google's token endpoint. Pinned as a constant and deliberately NOT readable
 /// from the environment: this request carries the confidential client secret,
@@ -205,7 +201,10 @@ pub struct Config {
     pub warden_url: String,
     /// Bearer presented to the warden on every request. Redacted from `Debug`.
     pub warden_token: String,
-    pub db_path: PathBuf,
+    /// The control store's Postgres connection string. A SECRET: it carries the
+    /// database password, so the hand-written `Debug` redacts it whole rather
+    /// than trying to spell one half of a URL.
+    pub database_url: String,
     /// How many proxies the operator asserts sit in front of this listener. `0`
     /// trusts nothing and meters the TCP peer. See [`crate::ratelimit`].
     pub trusted_proxy_hops: usize,
@@ -337,7 +336,7 @@ impl std::fmt::Debug for Config {
             .field("cookie_key", &format!("<{} bytes>", self.cookie_key.len()))
             .field("warden_url", &self.warden_url)
             .field("warden_token", &"<redacted>")
-            .field("db_path", &self.db_path)
+            .field("database_url", &"<redacted>")
             .field("trusted_proxy_hops", &self.trusted_proxy_hops)
             .field("token_url", &self.token_url)
             .field("auth_url", &self.auth_url)
@@ -364,12 +363,31 @@ fn require(name: &str, what: &str) -> Result<String, ConfigError> {
     var(name).ok_or_else(|| ConfigError::invalid(format!("{name} is required ({what})")))
 }
 
-/// The control store path, for the CLI subcommands that touch only the store
-/// and must not need an OAuth client or a warden to mint an invite.
-pub fn db_path_from_env() -> PathBuf {
-    var("SQUELCH_CONTROL_DB_PATH")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(DEFAULT_DB_PATH))
+/// The control store's Postgres URL, for the CLI subcommands that touch only
+/// the store and must not need an OAuth client or a warden to mint an invite.
+///
+/// NO DEFAULT, unlike the file path this replaced. A default path was harmless
+/// (the worst case was an empty store in the wrong directory); a default URL
+/// would be a guess at which database holds the tenants, and the two failure
+/// modes are "cannot connect" and "connected to the wrong one and wrote there".
+///
+/// TWO NAMES, IN THIS ORDER. `SQUELCH_CONTROL_DATABASE_URL` is ours and wins,
+/// so an operator can point one deployment at a different database without
+/// fighting the platform. `DATABASE_URL` is the fallback because it is what
+/// every platform injects by convention, Railway included, and a deployment
+/// that works because the convention was followed should not need a second
+/// variable spelling the same string.
+pub fn database_url_from_env() -> Result<String, ConfigError> {
+    var("SQUELCH_CONTROL_DATABASE_URL")
+        .or_else(|| var("DATABASE_URL"))
+        .ok_or_else(|| {
+            ConfigError::invalid(
+                "SQUELCH_CONTROL_DATABASE_URL is required (the control store's Postgres \
+                 connection string, e.g. postgres://user:pass@host:5432/railway). On Railway set \
+                 it to the reference ${{Postgres.DATABASE_URL}} — the PRIVATE one, not \
+                 DATABASE_PUBLIC_URL. DATABASE_URL is read as a fallback.",
+            )
+        })
 }
 
 impl Config {
@@ -459,7 +477,7 @@ impl Config {
             cookie_key,
             warden_url,
             warden_token,
-            db_path: db_path_from_env(),
+            database_url: database_url_from_env()?,
             trusted_proxy_hops,
             token_url: GOOGLE_TOKEN_URL.to_string(),
             auth_url: GOOGLE_AUTH_URL.to_string(),
@@ -862,7 +880,7 @@ mod tests {
             cookie_key: vec![7; 32],
             warden_url: "https://warden.passband.email".into(),
             warden_token: "WARDEN-BEARER-VALUE".into(),
-            db_path: PathBuf::from(":memory:"),
+            database_url: "postgres://unused".into(),
             trusted_proxy_hops: 0,
             token_url: GOOGLE_TOKEN_URL.into(),
             auth_url: GOOGLE_AUTH_URL.into(),
@@ -985,6 +1003,10 @@ mod tests {
         assert!(!rendered.contains("BIFROST-ADMIN-VALUE"), "{rendered}");
         assert!(!rendered.contains("ADMIN-PAGE-TOKEN-VALUE"), "{rendered}");
         assert!(!rendered.contains("RESEND-API-KEY-VALUE"), "{rendered}");
+        // The database URL is redacted WHOLE, not partly: it carries the
+        // password, and there is no half of a connection string worth printing
+        // badly enough to risk spelling the other half.
+        assert!(!rendered.contains("postgres://"), "{rendered}");
         assert!(rendered.contains("<redacted>"));
         assert!(rendered.contains("<32 bytes>"));
     }

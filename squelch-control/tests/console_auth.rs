@@ -41,7 +41,7 @@
 //!   carve-out, so alternating the two cannot buy a flooder a second budget.
 //!
 //! Nothing here touches a real Google endpoint, a real cluster, a real port
-//! 8848, or any store outside an in-memory SQLite.
+//! 8848, or any store outside the throwaway Postgres schema `common` makes.
 
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
@@ -62,8 +62,11 @@ use squelch_control::cookie::{self, SessionClaim};
 use squelch_control::invites;
 use squelch_control::ratelimit::CONSOLE_AUTH_REQUESTS_PER_MINUTE;
 use squelch_control::warden::HttpWarden;
-use squelch_control::{ControlState, ControlStore, router};
+use squelch_control::{ControlState, router};
 use tower::ServiceExt as _;
+
+/// The throwaway Postgres schema every harness in this file is built on.
+mod common;
 
 /// The access token the mock Google hands out. Nothing in this flow may ever
 /// render or redirect with it, and the assertions grep for this exact string.
@@ -269,7 +272,7 @@ impl Harness {
             cookie_key: COOKIE_KEY.to_vec(),
             warden_url: warden_url.clone(),
             warden_token: "warden-bearer".into(),
-            db_path: ":memory:".into(),
+            database_url: "postgres://unused".into(),
             trusted_proxy_hops: 0,
             token_url: format!("{google}/token"),
             auth_url: format!("{google}/authorize"),
@@ -281,16 +284,17 @@ impl Harness {
             waitlist: None,
         };
 
-        let store = ControlStore::open_in_memory().unwrap();
+        let (store, _url) = common::fresh_store().await;
         // The tenant that already exists. Capitalized on purpose: the store
         // normalizes, and so must the comparison on the way back.
-        store.insert_tenant(LABEL, "Ada@Example.com").unwrap();
+        store.insert_tenant(LABEL, "Ada@Example.com").await.unwrap();
         let minted = invites::mint().unwrap();
         store
             .insert_invite(
                 &minted.code_hash,
                 chrono::Utc::now() + chrono::Duration::days(30),
             )
+            .await
             .unwrap();
 
         let warden = Arc::new(
@@ -976,7 +980,10 @@ async fn no_console_refusal_offers_the_signup_form() {
         );
         assert!(!visible.contains("Start again"), "{name}: {body}");
         assert!(!visible.contains("invite"), "{name}: {body}");
-        assert!(!visible.contains("/signup"), "{name} routes to signup: {body}");
+        assert!(
+            !visible.contains("/signup"),
+            "{name} routes to signup: {body}"
+        );
     }
 
     // The two that know which console this was link back to it, which is the
