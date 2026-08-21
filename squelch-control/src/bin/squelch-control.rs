@@ -292,6 +292,26 @@ async fn llm_mint(
     let old = store.tenant_vk(label)?;
     let old_assistant = store.tenant_assistant_vk(label)?;
 
+    // REVOKE BEFORE MINT, not after: the live gateway enforces unique key
+    // names and answers 409 while `tenant-<label>` exists, so the documented
+    // "new keys first, revoke the old ones at leisure" order cannot happen.
+    // The window this opens — old key revoked, new mint fails, tenant keyless
+    // until the rerun — is the window this command is already run in: an
+    // operator rotates keys because the installed ones are wrong. A revoke
+    // failure still fails loud before anything is minted. 404 maps to Ok in
+    // the client, so a key already gone from the gateway does not block.
+    for (kind, id) in [("triage", &old), ("assistant", &old_assistant)] {
+        if let Some(id) = id {
+            bifrost.revoke_virtual_key(id).await.map_err(|e| {
+                anyhow::anyhow!(
+                    "could not revoke the previous {kind} virtual key {id} ({e}); nothing was \
+                     minted — the installed keys are untouched"
+                )
+            })?;
+            eprintln!("squelch-control: revoked previous {kind} virtual key {id}.");
+        }
+    }
+
     // Each id is recorded BEFORE the next step is attempted: from the moment a
     // key exists in Bifrost, whatever happens next, the store must name it so
     // a later `llm revoke` or `llm mint` can find it. A failed install or a
@@ -309,19 +329,10 @@ async fn llm_mint(
     {
         Ok(a) => a,
         Err(e) => {
-            if let Some(old) = &old {
-                // The store was repointed at the new triage id above, but the
-                // cluster still runs on the OLD key. The id must not scroll
-                // away, or the operator has nothing to revoke by.
-                eprintln!(
-                    "squelch-control: the previous triage virtual key {old} is still installed \
-                     and live in Bifrost; the store now tracks only the new one."
-                );
-            }
             anyhow::bail!(
-                "minted triage virtual key {} but the assistant mint failed: {e}. The triage id \
-                 is recorded and its key is NOT yet installed; run `llm mint {label}` again to \
-                 finish the rotation, or `llm revoke {label}` to back out",
+                "minted triage virtual key {} but the assistant mint failed: {e}. The previous \
+                 keys are already revoked, so this tenant's installed keys are DEAD until the \
+                 rotation finishes; run `llm mint {label}` again now",
                 vk.id
             );
         }
@@ -337,21 +348,10 @@ async fn llm_mint(
         .put_llm_key(label, Some(&vk.value), Some(&assistant.value))
         .await
     {
-        for (kind, old) in [("triage", &old), ("assistant", &old_assistant)] {
-            if let Some(old) = old {
-                // The rotation half-failed: the cluster still runs on the OLD
-                // keys, which this store no longer tracks. The ids must not
-                // scroll away.
-                eprintln!(
-                    "squelch-control: the previous {kind} virtual key {old} is still installed \
-                     and live in Bifrost; the store now tracks only the new one."
-                );
-            }
-        }
         anyhow::bail!(
-            "minted virtual keys {} and {} but the warden did not take them: {e}. The ids are \
-             recorded; run `llm mint {label}` again to replace them, or `llm revoke {label}` to \
-             back out",
+            "minted virtual keys {} and {} but the warden did not take them: {e}. The previous \
+             keys are already revoked, so the tenant's installed keys are DEAD until the \
+             install lands; run `llm mint {label}` again now",
             vk.id,
             assistant.id
         );
@@ -361,17 +361,6 @@ async fn llm_mint(
         "squelch-control: virtual keys {} (triage) and {} (assistant) minted and installed for {label}.",
         vk.id, assistant.id
     );
-    for (kind, old, new) in [
-        ("triage", old, &vk.id),
-        ("assistant", old_assistant, &assistant.id),
-    ] {
-        if let Some(old) = old.filter(|old| old != new) {
-            eprintln!(
-                "squelch-control: the PREVIOUS {kind} virtual key {old} is still live in Bifrost; \
-                 revoke it there. This store now tracks only the new key."
-            );
-        }
-    }
     Ok(())
 }
 

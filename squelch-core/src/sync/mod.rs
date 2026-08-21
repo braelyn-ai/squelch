@@ -1726,14 +1726,17 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
                     }
                 }
                 Ok(stage1_llm::ClassifyOutcome::Failed(kind))
-                    if crate::triage::llm::is_auth_failure(&kind) =>
+                    if crate::triage::llm::is_config_failure(&kind) =>
                 {
-                    // A bad credential is a config problem shared by every row,
-                    // not a verdict about this one: leave the revisit PENDING
-                    // (no `fire`) so it is retried once the key is fixed.
+                    // A config-level rejection (bad credential, disallowed
+                    // model, spent gateway budget) is shared by every row, not
+                    // a verdict about this one: leave the revisit PENDING
+                    // (no `fire`) so it is retried once the config is fixed.
                     eprintln!(
-                        "squelch: revisit auth failure ({kind}); re-evaluations stay scheduled"
+                        "squelch: revisit config-level failure ({kind}); \
+                         re-evaluations stay scheduled"
                     );
+                    self.metrics.record_llm_config_failure();
                     break;
                 }
                 Ok(stage1_llm::ClassifyOutcome::Refused)
@@ -1912,17 +1915,20 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
                     }
                 }
                 Ok(stage1_llm::ClassifyOutcome::Failed(kind))
-                    if crate::triage::llm::is_auth_failure(&kind) =>
+                    if crate::triage::llm::is_config_failure(&kind) =>
                 {
-                    // AUTH FAILURE (401/403): a config problem shared by every
-                    // row. Heuristic fallback is for verdicts about THIS row; a
-                    // bad credential is not one, so leave the row queued
+                    // CONFIG-LEVEL FAILURE (4xx shared by every row: bad key,
+                    // disallowed model, spent gateway budget). Heuristic
+                    // fallback is for verdicts about THIS row; a rejected
+                    // config is not one, so leave the row queued
                     // (stage1_model_used stays NULL) and stop the pass instead
                     // of burning the cap on calls that fail identically.
                     eprintln!(
-                        "squelch: stage-1 auth failure ({kind}); the resolved LLM key is \
-                         wrong for the endpoint; rows stay queued"
+                        "squelch: stage-1 config-level failure ({kind}) at message {}; the \
+                         resolved key/endpoint/model is wrong for the gateway; rows stay queued",
+                        row.message_id
                     );
+                    self.metrics.record_llm_config_failure();
                     break;
                 }
                 Ok(stage1_llm::ClassifyOutcome::Refused)
@@ -2113,16 +2119,18 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
                             }
                         }
                         Ok(marketing::ExtractOutcome::Failed(kind))
-                            if crate::triage::llm::is_auth_failure(&kind) =>
+                            if crate::triage::llm::is_config_failure(&kind) =>
                         {
-                            // AUTH FAILURE: a fact about the CREDENTIAL, not
-                            // about this row. Marking it processed would
-                            // foreclose the row forever even after the key is
-                            // fixed, so leave it queued and stop the pass.
+                            // CONFIG-LEVEL FAILURE: a fact about the key,
+                            // model, or gateway budget, not about this row.
+                            // Marking it processed would foreclose the row
+                            // forever even after the config is fixed, so leave
+                            // it queued and stop the pass.
                             eprintln!(
-                                "squelch: extract auth failure ({kind}); the resolved LLM key \
-                                 is wrong for the endpoint; rows stay queued"
+                                "squelch: extract config-level failure ({kind}); the resolved \
+                                 key/endpoint/model is wrong for the gateway; rows stay queued"
                             );
+                            self.metrics.record_llm_config_failure();
                             auth_failed = true;
                             break;
                         }
@@ -2177,15 +2185,16 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
                             }
                         }
                         Ok(banking::ExtractOutcome::Failed(kind))
-                            if crate::triage::llm::is_auth_failure(&kind) =>
+                            if crate::triage::llm::is_config_failure(&kind) =>
                         {
-                            // See the marketing arm: a bad credential is not a
-                            // verdict about this row, and marking it processed
-                            // would forfeit it permanently.
+                            // See the marketing arm: a config-level rejection is
+                            // not a verdict about this row, and marking it
+                            // processed would forfeit it permanently.
                             eprintln!(
-                                "squelch: extract auth failure ({kind}); the resolved LLM key \
-                                 is wrong for the endpoint; rows stay queued"
+                                "squelch: extract config-level failure ({kind}); the resolved \
+                                 key/endpoint/model is wrong for the gateway; rows stay queued"
                             );
+                            self.metrics.record_llm_config_failure();
                             auth_failed = true;
                             break;
                         }
@@ -2291,15 +2300,16 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
                     }
                 }
                 Ok(shipments::ExtractOutcome::Failed(kind))
-                    if crate::triage::llm::is_auth_failure(&kind) =>
+                    if crate::triage::llm::is_config_failure(&kind) =>
                 {
-                    // See the marketing arm: the credential is wrong for every
+                    // See the marketing arm: the config is wrong for every
                     // row, so stamping this one would forfeit a shipping email
                     // permanently over a config mistake.
                     eprintln!(
-                        "squelch: ship-extract auth failure ({kind}); the resolved LLM key \
-                         is wrong for the endpoint; rows stay queued"
+                        "squelch: ship-extract config-level failure ({kind}); the resolved \
+                         key/endpoint/model is wrong for the gateway; rows stay queued"
                     );
+                    self.metrics.record_llm_config_failure();
                     break;
                 }
                 Ok(shipments::ExtractOutcome::Refused)
@@ -2559,39 +2569,49 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
                 }
                 Ok(ClassifyOutcome::Refused) => {
                     // Keep Stage-1 values; mark processed so it doesn't loop.
-                    // Redacted: no body/subject logged.
+                    // Redacted: no body/subject logged. The stamp is
+                    // STAGE2_REFUSED, never the model id: a row stamped with
+                    // the model reads as "the model said this", and during the
+                    // 2026-08-19 outage that lie cost the diagnosis its first
+                    // hour. Same lesson as stale-skip vs heuristic-only.
                     eprintln!("squelch: stage-2 refusal (redacted); keeping stage-1 values");
                     self.metrics.record_stage2(Stage2Verdict::Refused);
                     let _ = self.store.stage2_mark_processed(
                         self.account_id,
                         row.message_id,
-                        &cfg.model,
+                        stage2::STAGE2_REFUSED,
                     );
                 }
                 Ok(ClassifyOutcome::Failed(kind)) => {
-                    // AUTH FAILURE (401/403): the key is wrong for the endpoint,
-                    // a config problem shared by every row — not a fact about
-                    // this one. Leave the row queued and STOP the pass: the
-                    // remaining rows would fail identically while burning the
-                    // daily caps, and a row marked processed here would be
-                    // foreclosed from triage even after the credential is fixed
-                    // (the legacy shared-key-plus-gateway pod is exactly this).
-                    if crate::triage::llm::is_auth_failure(&kind) {
+                    // CONFIG-LEVEL FAILURE (4xx shared by every row: bad key,
+                    // disallowed model, spent gateway budget). Leave the row
+                    // queued and STOP the pass: the remaining rows would fail
+                    // identically while burning the daily caps, and a row
+                    // marked processed here would be foreclosed from triage
+                    // even after the config is fixed (the 2026-08-19
+                    // model-allowlist outage foreclosed two days of mail
+                    // exactly this way).
+                    if crate::triage::llm::is_config_failure(&kind) {
                         eprintln!(
-                            "squelch: stage-2 auth failure ({kind}); the resolved LLM key is \
-                             wrong for the endpoint; rows stay queued"
+                            "squelch: stage-2 config-level failure ({kind}) at message {}; the \
+                             resolved key/endpoint/model is wrong for the gateway; rows stay \
+                             queued",
+                            row.message_id
                         );
+                        self.metrics.record_llm_config_failure();
                         self.metrics.record_stage2(Stage2Verdict::Retryable);
                         break;
                     }
-                    // Permanent failure (400/truncation/parse): mark the row
-                    // processed so it cannot loop. `kind` is already redacted.
+                    // Row-level permanent failure (truncation/parse): mark the
+                    // row processed so it cannot loop, stamped with the failure
+                    // kind rather than the model id — the model never answered.
+                    // `kind` is already redacted.
                     eprintln!("squelch: stage-2 permanent failure ({kind}); marking row failed");
                     self.metrics.record_stage2(Stage2Verdict::Failed);
                     let _ = self.store.stage2_mark_processed(
                         self.account_id,
                         row.message_id,
-                        &cfg.model,
+                        &stage2::failed_stamp(&kind),
                     );
                 }
                 Err(e) => {
