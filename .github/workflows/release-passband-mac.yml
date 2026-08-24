@@ -85,9 +85,24 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           VERSION=$(cat passband/VERSION)
+          # The release body is the SAME text the app's What's New card shows,
+          # rendered from Sources/Passband/Lib/ReleaseNotes.swift. A version
+          # with no note there still ships: it gets the install line alone
+          # rather than blocking a tag on prose.
+          NOTES=$(mktemp)
+          if ./passband/make-changelog.sh "$VERSION" > "$NOTES" 2>/dev/null; then
+            printf '\n' >> "$NOTES"
+          else
+            : > "$NOTES"
+            echo "==> no release note for $VERSION in ReleaseNotes.swift" >&2
+          fi
+          printf '%s\n' \
+            'Existing installs get this via auto-update. New installs: unzip and drag' \
+            'to Applications, or `brew install --cask braelyn-ai/tap/passband`.' \
+            >> "$NOTES"
           gh release create "$GITHUB_REF_NAME" "passband/build/Passband-$VERSION.zip" \
             --title "Passband $VERSION" \
-            --notes "Passband $VERSION. Existing installs get this via auto-update; new installs: unzip and drag to Applications, or \`brew install --cask braelyn-ai/tap/passband\`."
+            --notes-file "$NOTES"
 
       # The feed lists exactly the zips in releases/, so hydrate it with every
       # previously shipped archive — the workflow is stateless, the releases

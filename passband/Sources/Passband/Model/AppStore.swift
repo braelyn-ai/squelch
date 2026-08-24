@@ -540,6 +540,11 @@ final class AppStore {
     /// (the first sync of the session) fires from the shell, not from a step.
     let tour = TourController()
 
+    /// The what's-new card. Held here for the same reason the tour is, and
+    /// beside it on purpose: the two are mutually exclusive by construction
+    /// (see WhatsNew), and keeping them adjacent is what keeps that readable.
+    let whatsNew = WhatsNew()
+
     // MARK: undo / toasts
     var undos: [PendingUndo] = []
     var toasts: [Toast] = []
@@ -1314,7 +1319,7 @@ final class AppStore {
     var modalOverlayOpen: Bool {
         askBarOpen || shortcutsOpen || processModeOpen
             || triageFix != nil || remindTarget != nil || ruleEditor != nil
-            || !authQueue.isEmpty || tour.wantsBlur
+            || !authQueue.isEmpty || tour.wantsBlur || whatsNew.active
     }
 
     // MARK: - sitrep zones

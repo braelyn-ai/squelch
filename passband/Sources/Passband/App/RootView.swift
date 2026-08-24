@@ -126,7 +126,14 @@ private struct ShellWatchers: View {
             // dark. A reconnect clears `lastRefresh`, so this fires again; the
             // tour's own once-a-session flag is what stops it starting twice.
             .onChange(of: store.lastRefresh) { old, new in
-                if old == nil, new != nil { store.tour.maybeStart() }
+                if old == nil, new != nil {
+                    store.tour.maybeStart()
+                    // The same trigger, and the ORDER is the whole arrangement:
+                    // a first-run tour claims the moment, and the changelog's
+                    // own gate (tourCompleted) then declines it. Neither has to
+                    // know about the other beyond that.
+                    store.whatsNew.maybeShow()
+                }
             }
     }
 }
