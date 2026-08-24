@@ -14,11 +14,13 @@ on:
   pull_request:
     paths:
       - "passband/**"
+      - "docs/CHANGELOG.md"
       - ".github/workflows/ci-passband.yml"
   push:
     branches: [main]
     paths:
       - "passband/**"
+      - "docs/CHANGELOG.md"
       - ".github/workflows/ci-passband.yml"
 
 concurrency:
@@ -38,3 +40,9 @@ jobs:
 
       - name: test
         run: ./passband/test.sh
+
+      # docs/CHANGELOG.md is generated from the release-note table the app
+      # itself reads. The app can never show a stale note, so nothing else
+      # catches the document drifting behind the table; this does.
+      - name: changelog is current
+        run: ./passband/make-changelog.sh --check

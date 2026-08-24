@@ -49,6 +49,11 @@ struct ActionLayer: View {
             }
             if store.askBarOpen { AskBar { store.askBarOpen = false } }
             if store.shortcutsOpen { ShortcutsOverlay { store.shortcutsOpen = false } }
+            // LAST, so it stacks above every other overlay in this layer. It is
+            // shown at most once per version, at a moment nothing else has been
+            // raised yet, and a modal that can end up UNDER something has to be
+            // dismissed twice to be read once.
+            if store.whatsNew.active { WhatsNewCard() }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomLeading)
         .keyBindings(.list, [
