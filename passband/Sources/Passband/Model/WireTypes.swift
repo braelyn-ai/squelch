@@ -553,6 +553,44 @@ struct StoreStats: Codable, Sendable, Hashable {
     /// (POST /client/assistant/messages). ABSENT on a daemon too old to say —
     /// and nil reads exactly like false: BYOK is the only assistant door.
     var assistant_relay: Bool?
+    /// Whether this daemon can mint and send invites (POST /client/invites).
+    /// ABSENT on a daemon too old to say, and on every self-host, and nil reads
+    /// exactly like false: no button, no nudge, nothing offered.
+    var invite_sharing: Bool?
+}
+
+// MARK: - invites
+
+/// What GET /client/invites answers: whether sharing is possible at all, and
+/// the one number the invite mail would be able to say about this mailbox.
+///
+/// `open_percent` is NIL far more often than not, and that is by design on the
+/// daemon's side (too new a mailbox, too little mail, or a rate not worth
+/// quoting). The sheet must have copy for both, and it must never invent one.
+struct InviteAvailability: Codable, Sendable, Hashable {
+    var can_share: Bool
+    var open_percent: Int?
+    /// The mail as it will go out, rendered by the DAEMON so the preview on
+    /// screen cannot drift from what is sent. Absent when this daemon cannot
+    /// share (there is no mail to preview) and on one too old to render one.
+    var preview: String?
+}
+
+/// One friend's outcome. `error` is copy the daemon wrote for a human; it never
+/// carries a status code or anything about the invite code itself.
+struct InviteResult: Codable, Sendable, Hashable, Identifiable {
+    var email: String
+    var sent: Bool
+    var error: String?
+    var id: String { email }
+}
+
+/// What POST /client/invites answers. `remaining` is nil when nothing was
+/// minted at all, so it is never rendered as "0 left" for a press that failed
+/// before it reached the control plane.
+struct InviteSendResponse: Codable, Sendable, Hashable {
+    var results: [InviteResult]
+    var remaining: Int?
 }
 
 // MARK: - usage

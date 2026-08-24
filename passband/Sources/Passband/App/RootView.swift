@@ -49,6 +49,23 @@ struct RootView: View {
         .sheet(isPresented: $store.addAccountSheetOpen) {
             ConnectView(purpose: .addAccount)
         }
+        // SHARE PASSBAND, hung here for the same reason Add Account is: it is
+        // raised from Settings and from the two-week nudge, and neither knows
+        // which page is on screen.
+        .sheet(isPresented: $store.shareSheetOpen) {
+            SharePanel()
+        }
+        // THE TWO-WEEK ASK. Over the shell rather than inside a page, because
+        // it is about the app and not about whatever surface it lands on. It
+        // draws nothing until it has earned the right to.
+        .overlay { ShareNudgeModal() }
+        // WHEN THE ASK FIRES. Hung on the capability rather than on connect,
+        // because whether this daemon can share arrives with the first stats
+        // and not before; `askIfEarned` is what decides whether a fortnight has
+        // actually been used, and it can only ever say yes once.
+        .onChange(of: store.shareAvailable) { _, canShare in
+            ShareNudge.shared.askIfEarned(canShare: canShare)
+        }
         .task {
             // Pay WebKit's process-launch cost at boot rather than on the first
             // email the reader opens.

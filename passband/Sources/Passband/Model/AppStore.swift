@@ -388,6 +388,11 @@ final class AppStore {
     /// unmount and the account already on screen would go with it.
     var addAccountSheetOpen = false
 
+    /// The Share Passband sheet. Raised by Settings and by the two-week nudge,
+    /// and hung on the shell for the same reason Add Account is: neither raiser
+    /// can be sure which page is on screen.
+    var shareSheetOpen = false
+
     // MARK: sitrep slice
     var sitrep = SitrepData()
     var lastRefresh: Date?
@@ -1973,6 +1978,16 @@ final class AppStore {
     /// this. A self-host daemon never says `assistant_relay`, and nil means
     /// the switch is simply not offered (same posture as `trackingAvailable`).
     var relayAvailable: Bool { sitrep.stats?.assistant_relay == true }
+
+    // MARK: - invite sharing
+
+    /// Whether this daemon can mint and send invites. Read off the same sitrep
+    /// stats the relay switch is, for the same reason: /client/stats is already
+    /// the connect probe. A self-host daemon, a daemon too old to say, and a
+    /// hosted tenant nobody has turned sharing on for all read as false, and
+    /// false means the button is never offered and the two-week nudge never
+    /// fires.
+    var shareAvailable: Bool { sitrep.stats?.invite_sharing == true }
 
     // MARK: - read tracking
 

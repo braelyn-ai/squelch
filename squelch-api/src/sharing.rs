@@ -299,11 +299,45 @@ pub async fn get_invites(State(state): State<ApiState>) -> Result<impl IntoRespo
         store.share_open_rate(account_id, since)
     })
     .await?;
+    let open_percent = share_stat(&rate, chrono::Utc::now());
+    // THE MAIL ITSELF, so the app can show it before anyone presses send.
+    // Rendered by the same function that renders the real one, from a sample
+    // code, because a preview the client wrote in its own words would drift
+    // from what actually goes out - and this mail goes out over the user's own
+    // name, from their own address, which is exactly the case where they are
+    // owed a look at it first.
+    //
+    // NO NOTE: theirs is not typed yet. It is inserted verbatim at the top of
+    // this text (see `invite_mail::text_body`), which is where the sheet shows
+    // it, so the two agree without the note having to make a round trip per
+    // keystroke.
+    let preview = invite_mail::text_body(&InviteCopy {
+        code: PREVIEW_CODE,
+        signup_url: PREVIEW_SIGNUP_URL,
+        expires_in_days: PREVIEW_EXPIRY_DAYS,
+        open_percent,
+        note: None,
+    });
     Ok(Json(json!({
         "can_share": true,
-        "open_percent": share_stat(&rate, chrono::Utc::now()),
+        "open_percent": open_percent,
+        "preview": preview,
     })))
 }
+
+/// What the preview stands in with. Shaped like a real code so the block is the
+/// right size on screen, and obviously not one: `XXXX` is not in the Crockford
+/// alphabet, so this can never be mistaken for something to type in.
+const PREVIEW_CODE: &str = "XXXX-XXXX-XXXX-XXXX";
+
+/// And where it would be spent. The real one comes from the control plane per
+/// mint; this is the deployment everybody who can see this screen is on.
+const PREVIEW_SIGNUP_URL: &str = "https://signup.passband.app";
+
+/// The expiry the copy quotes in a preview. The real one is whatever the
+/// control plane stamps on the code it mints; this matches its default, and a
+/// preview being a day out is not a promise anybody acts on.
+const PREVIEW_EXPIRY_DAYS: i64 = 30;
 
 /// `POST /client/invites` - mint a code per friend and mail each of them from
 /// the user's own mailbox.

@@ -257,6 +257,33 @@ actor APIClient {
 
     func getStats() async throws -> StoreStats { try await get("/client/stats") }
 
+    /// Whether this daemon can share invites, and what the mail could say.
+    /// Asked before anything is shown, so a daemon that cannot share never
+    /// renders a button whose only outcome is a refusal.
+    func inviteAvailability() async throws -> InviteAvailability {
+        try await get("/client/invites")
+    }
+
+    /// Mint a code per friend and mail each of them from the user's own
+    /// mailbox. One request, N sends, and each recipient's outcome comes back
+    /// on its own row.
+    ///
+    /// A LONGER TIMEOUT than the default, because the daemon does the work
+    /// serially: a mint plus a Gmail send per recipient, up to five of them. The
+    /// request finishing is what tells the user which ones went; giving up on it
+    /// early would leave them staring at mail that may or may not have been
+    /// sent under their name.
+    func sendInvites(to recipients: [String], note: String?) async throws -> InviteSendResponse {
+        struct Body: Encodable {
+            let recipients: [String]
+            let note: String?
+        }
+        return try await post(
+            "/client/invites",
+            body: Body(recipients: recipients, note: note),
+            timeout: 90)
+    }
+
     /// Prove a CANDIDATE credential pair against /client/stats without adopting
     /// it. Same test `connect` makes, minus the part that makes it this app's
     /// identity: adding a second account has to check its daemon while the live
