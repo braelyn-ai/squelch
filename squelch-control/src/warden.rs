@@ -446,6 +446,24 @@ pub trait Warden: Send + Sync {
         assistant_api_key: Option<&str>,
     ) -> Result<(), WardenError>;
 
+    /// Install, rotate, or REMOVE a tenant's share token.
+    ///
+    /// `share_token` of `None` removes what is installed, which is how
+    /// `share revoke` reaches the pod: the control plane forgetting the hash
+    /// stops a token working, but only taking it out of the env stops the
+    /// daemon offering the button. Both halves, or the tenant is told it can
+    /// share and then refused every time.
+    ///
+    /// ON THE TRAIT, unlike `drift` and `reconcile` next door, because signup
+    /// calls it: a tenant that had to wait for an operator before it could
+    /// share is a tenant that never shares, and the whole point of the feature
+    /// is the person who just arrived through it.
+    async fn put_share_token(
+        &self,
+        label: &str,
+        share_token: Option<&str>,
+    ) -> Result<(), WardenError>;
+
     /// The tenant's state, or `None` when the warden has never heard of it.
     /// Used before consent to check that a label is free.
     async fn status(&self, label: &str) -> Result<Option<TenantStatus>, WardenError>;
@@ -593,6 +611,53 @@ impl Warden for HttpWarden {
             // with it. It collapses into the generic retriable failure so the
             // page says "not finished yet" instead of blaming their input.
             422 => Err(WardenError::Failed),
+            _ => Err(WardenError::Failed),
+        }
+    }
+
+    /// Install, rotate, or REMOVE a tenant's share token.
+    ///
+    /// `share_token` of `None` removes what is installed, which is how
+    /// `share revoke` reaches the pod: the control plane forgetting the hash
+    /// stops a token working, but only taking it out of the env stops the
+    /// daemon offering the button. Both halves, or the tenant is told it can
+    /// share and then refused every time.
+    ///
+    async fn put_share_token(
+        &self,
+        label: &str,
+        share_token: Option<&str>,
+    ) -> Result<(), WardenError> {
+        // The label goes into a URL path, same as every other route here.
+        crate::labels::validate(label).map_err(|_| WardenError::LabelRefused)?;
+        // The same bar `put_llm_key` holds its keys to, and for the same
+        // reason: this value becomes an environment variable in a container.
+        // Checked before the socket is opened, so a bad token is a local error
+        // rather than a round trip.
+        if let Some(token) = share_token
+            && (token.is_empty() || !token.bytes().all(|b| b.is_ascii_graphic()))
+        {
+            return Err(WardenError::BadApiKey);
+        }
+
+        let resp = self
+            .http
+            .put(self.url(&format!("/v1/tenants/{label}/control-token")))
+            .bearer_auth(&self.token)
+            .json(&ShareTokenRequest { share_token })
+            .send()
+            .await
+            .map_err(|e| transport_error(e, label))?;
+
+        match resp.status().as_u16() {
+            // `{}` by contract: the token came in, nothing goes out.
+            200 => Ok(()),
+            401 | 403 => Err(WardenError::Unauthorized),
+            404 => Err(WardenError::UnknownTenant),
+            // 422 is the warden refusing the token's shape, which the check
+            // above should have caught: the two sides disagreeing about what a
+            // token may contain is the same class of bug as a bad key.
+            422 => Err(WardenError::BadApiKey),
             _ => Err(WardenError::Failed),
         }
     }
@@ -747,55 +812,6 @@ impl Warden for HttpWarden {
 /// cluster to answer a question no request will ask. The commands that do ask
 /// hold a real [`HttpWarden`] and nothing else.
 impl HttpWarden {
-    /// Install, rotate, or REMOVE a tenant's share token.
-    ///
-    /// `share_token` of `None` removes what is installed, which is how
-    /// `share revoke` reaches the pod: the control plane forgetting the hash
-    /// stops a token working, but only taking it out of the env stops the
-    /// daemon offering the button. Both halves, or the tenant is told it can
-    /// share and then refused every time.
-    ///
-    /// INHERENT for the reason this whole block is: no request in the serving
-    /// path mints a share token. An operator at a shell does.
-    pub async fn put_share_token(
-        &self,
-        label: &str,
-        share_token: Option<&str>,
-    ) -> Result<(), WardenError> {
-        // The label goes into a URL path, same as every other route here.
-        crate::labels::validate(label).map_err(|_| WardenError::LabelRefused)?;
-        // The same bar `put_llm_key` holds its keys to, and for the same
-        // reason: this value becomes an environment variable in a container.
-        // Checked before the socket is opened, so a bad token is a local error
-        // rather than a round trip.
-        if let Some(token) = share_token
-            && (token.is_empty() || !token.bytes().all(|b| b.is_ascii_graphic()))
-        {
-            return Err(WardenError::BadApiKey);
-        }
-
-        let resp = self
-            .http
-            .put(self.url(&format!("/v1/tenants/{label}/control-token")))
-            .bearer_auth(&self.token)
-            .json(&ShareTokenRequest { share_token })
-            .send()
-            .await
-            .map_err(|e| transport_error(e, label))?;
-
-        match resp.status().as_u16() {
-            // `{}` by contract: the token came in, nothing goes out.
-            200 => Ok(()),
-            401 | 403 => Err(WardenError::Unauthorized),
-            404 => Err(WardenError::UnknownTenant),
-            // 422 is the warden refusing the token's shape, which the check
-            // above should have caught: the two sides disagreeing about what a
-            // token may contain is the same class of bug as a bad key.
-            422 => Err(WardenError::BadApiKey),
-            _ => Err(WardenError::Failed),
-        }
-    }
-
     /// What is on this tenant's workload that the warden did not put there.
     ///
     /// Read-only on both sides: the warden's own apply for the comparison is a

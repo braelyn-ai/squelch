@@ -943,8 +943,14 @@ unconfigured deployment answers 404 there, not 403.
 
 ### Letting a tenant invite their own friends
 
-Sharing is **off for every tenant until an operator turns it on**, one at a
-time, the same shape `llm mint` has:
+**A tenant provisioned from now on can already share.** Signup mints the token
+and installs it in the same window the LLM keys go in, BEFORE the workload is
+applied, so the pod's first render carries it and nothing rolls twice to pick it
+up. It is fail-soft: every way it can go wrong leaves a mailbox that works and
+cannot share, which is what the command below is for.
+
+**Every tenant provisioned BEFORE it needs the command**, one at a time, the
+same shape `llm mint` has:
 
 ```sh
 railway ssh --service control
@@ -976,10 +982,14 @@ the only thing the control plane records about a share: **not** the recipient,
 who has consented to nothing and whose address never leaves their friend's
 daemon.
 
-A tenant nobody has run `share mint` for boots fine and reports
-`invite_sharing: false` on `/client/stats`, so the app shows no button and the
-two-week nudge never fires. Same for every self-hosted daemon, which has no
-control plane to mint against at all.
+A tenant with no share token boots fine and reports `invite_sharing: false` on
+`/client/stats`, so the app shows no button and the two-week nudge never fires.
+Same for every self-hosted daemon, which has no control plane to mint against at
+all.
+
+Signup's mint is gated on the invite policy being configured, the same condition
+`POST /tenant/invite` itself answers 503 without: a deployment with no invite
+feature installs no credential for a door that cannot open.
 
 ## Backups
 

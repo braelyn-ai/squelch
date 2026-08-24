@@ -43,7 +43,7 @@ use axum::{
 use base64::Engine as _;
 use serde_json::{Value, json};
 use squelch_control::config::{
-    BifrostConfig, Config, DEFAULT_ASSISTANT_BUDGET_USD, DEFAULT_LLM_BUDGET_USD,
+    BifrostConfig, Config, DEFAULT_ASSISTANT_BUDGET_USD, DEFAULT_LLM_BUDGET_USD, WaitlistConfig,
 };
 use squelch_control::warden::HttpWarden;
 use squelch_control::{ControlState, activation, invites, router, seal};
@@ -92,6 +92,12 @@ struct Recorder {
     /// `(label, body)` seen on `PUT /v1/tenants/{label}/llm-key`. The whole
     /// body, so absence of a slot can be asserted, not just presence.
     llm_key_puts: Vec<(String, Value)>,
+    /// `(label, body)` seen on `PUT /v1/tenants/{label}/control-token`, the
+    /// share token signup installs before the workload is applied.
+    control_token_puts: Vec<(String, Value)>,
+    /// When true, the control-token install answers 503, which must cost the
+    /// tenant its button and nothing else.
+    fail_control_token: bool,
     /// Bodies posted to the mock Bifrost's mint route.
     bifrost_mint_bodies: Vec<Value>,
     /// Authorization headers the mock Bifrost saw, on every route. The live
@@ -303,6 +309,24 @@ async fn spawn_warden(rec: Shared) -> String {
             ),
         )
         .route(
+            "/v1/tenants/{label}/control-token",
+            put(
+                |AxumState(rec): AxumState<Shared>,
+                 axum::extract::Path(label): axum::extract::Path<String>,
+                 headers: HeaderMap,
+                 body: String| async move {
+                    let parsed: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
+                    let mut r = rec.lock().unwrap();
+                    r.control_token_puts.push((label, parsed));
+                    r.warden_bearers.push(bearer_of(&headers));
+                    if r.fail_control_token {
+                        return json_status(StatusCode::SERVICE_UNAVAILABLE, "unavailable");
+                    }
+                    Json(json!({})).into_response()
+                },
+            ),
+        )
+        .route(
             "/v1/tenants/{label}/llm-key",
             put(
                 |AxumState(rec): AxumState<Shared>,
@@ -481,10 +505,21 @@ enum Bifrost {
 
 impl Harness {
     async fn new() -> Self {
-        Self::with_bifrost(Bifrost::Off).await
+        Self::build(Bifrost::Off, false).await
+    }
+
+    /// The same, with the invite policy configured, which is what production
+    /// has and what signup's share-token mint is gated on: a deployment with no
+    /// invite feature installs no credential for a door that answers 503.
+    async fn with_invites() -> Self {
+        Self::build(Bifrost::Off, true).await
     }
 
     async fn with_bifrost(bifrost: Bifrost) -> Self {
+        Self::build(bifrost, false).await
+    }
+
+    async fn build(bifrost: Bifrost, waitlist: bool) -> Self {
         let rec: Shared = Arc::new(Mutex::new(Recorder::default()));
         let google = spawn_google(rec.clone()).await;
         let warden_url = spawn_warden(rec.clone()).await;
@@ -525,9 +560,19 @@ impl Harness {
                 assistant_budget_usd: DEFAULT_ASSISTANT_BUDGET_USD,
                 assistant_models: vec!["claude-haiku-4-5".into(), "claude-opus-4-8".into()],
             }),
-            // The signup flow does not touch the waitlist; feature off, so
-            // those routes are not mounted at all.
-            waitlist: None,
+            // Off by default: the signup flow does not touch the waitlist, so
+            // those routes are not mounted at all. On for the tests that care
+            // about the share token, which signup mints only where there is an
+            // invite feature to spend it on.
+            waitlist: waitlist.then(|| WaitlistConfig {
+                admin_token: "0123456789abcdef0123456789abcdef".into(),
+                resend_api_key: "re_test_0123456789".into(),
+                invite_from: "Passband <invites@passband.test>".into(),
+                allowed_origin: "https://passband.test".into(),
+                // Port 1: nothing listens. Nothing on this flow mails anybody,
+                // and a reachable mock would only hide it if something did.
+                resend_url: "http://127.0.0.1:1".into(),
+            }),
         };
 
         let (store, db_url) = common::fresh_store().await;
@@ -550,6 +595,41 @@ impl Harness {
             invite_code: minted.code,
             db_url,
         }
+    }
+
+    /// Drive one whole signup to the pairing page, the way
+    /// `signup_provisions_a_tenant_and_hands_back_a_pairing_code` does at
+    /// length. For the tests that care about what the flow LEFT BEHIND rather
+    /// than about the flow itself.
+    async fn complete_signup(&self, label: &str) {
+        let (consent_url, cookie) = self.start_signup(label).await;
+        self.rec.lock().unwrap().expected_challenge =
+            Some(query_param(&consent_url, "code_challenge"));
+        let state = state_param(&consent_url);
+        let (status, _, body) = self
+            .get(
+                &format!("/oauth/callback?code=the-auth-code&state={state}"),
+                Some(&cookie),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+
+    /// The share-token hash recorded against a tenant, or `None`.
+    ///
+    /// Read raw, like `analytics_id` above and for a related reason: no method
+    /// returns it, because nothing outside the tenant door's own lookup has any
+    /// business with a credential's hash.
+    async fn share_token_hash(&self, label: &str) -> Option<String> {
+        common::raw_client(&self.db_url)
+            .await
+            .query_one(
+                "SELECT share_token_hash FROM tenants WHERE label = $1",
+                &[&label],
+            )
+            .await
+            .unwrap()
+            .get(0)
     }
 
     /// Every funnel row, as `(email, account_email, tenant_label, signed_up_at,
@@ -945,6 +1025,68 @@ async fn signup_provisions_a_tenant_and_hands_back_a_pairing_code() {
 /// The row is seeded through the store the way the admin page seeds it —
 /// `invite_directly`, then `set_user_invite` with the id the mint returned — so
 /// the pointer under test is the one production writes.
+/// A NEW TENANT CAN SHARE THE DAY IT IS MADE. Nobody runs a command for it, and
+/// the person who just arrived through an invite is exactly the one most likely
+/// to send another.
+///
+/// The token is installed BEFORE the workload is applied, so the pod's first
+/// render carries it and nothing has to roll a second time to pick it up.
+#[tokio::test]
+async fn signup_leaves_a_tenant_that_can_already_share() {
+    let h = Harness::with_invites().await;
+    h.complete_signup("ada").await;
+
+    // The lock is taken and released INSIDE this block: a std `MutexGuard` may
+    // not be alive across the await below.
+    {
+        let rec = h.rec.lock().unwrap();
+        assert_eq!(rec.control_token_puts.len(), 1, "one token, once");
+        let (label, body) = &rec.control_token_puts[0];
+        assert_eq!(label, "ada");
+        let token = body["share_token"].as_str().expect("a token was installed");
+        assert!(token.starts_with("pbs_"), "{token}");
+
+        // BEFORE the workload: the render that first applies the Deployment has
+        // to see the Secret, or the tenant is rolled again a moment later -
+        // during the one minute its owner is opening the app with a pairing
+        // code.
+        assert_eq!(rec.credential_puts.len(), 1);
+        assert!(
+            rec.warden_bearers.len() >= 2,
+            "both calls carried the bearer: {:?}",
+            rec.warden_bearers
+        );
+    }
+
+    // AND THE STORE KNOWS IT: the hash is recorded against the row, so the
+    // token the pod holds is one the tenant door will accept.
+    let hash = h.share_token_hash("ada").await;
+    assert!(hash.is_some(), "the hash joined the tenant row");
+    assert_eq!(hash.unwrap().len(), 64);
+}
+
+/// A warden that will not take the token costs the tenant its button and
+/// NOTHING ELSE. The mailbox is made, the code is spent, the pairing code is on
+/// screen; `share mint` backfills the rest.
+#[tokio::test]
+async fn a_refused_share_token_still_provisions_the_mailbox() {
+    let h = Harness::with_invites().await;
+    h.rec.lock().unwrap().fail_control_token = true;
+    h.complete_signup("ada").await;
+
+    // The mailbox exists and the funnel recorded it.
+    let funnel = h.funnel().await;
+    assert_eq!(funnel.len(), 1, "{funnel:?}");
+    assert_eq!(funnel[0].2.as_deref(), Some("ada"));
+
+    // And the store did NOT record a hash for a token no pod holds: a row that
+    // said otherwise would claim a credential nothing can present.
+    assert!(
+        h.share_token_hash("ada").await.is_none(),
+        "an uninstalled token must not be recorded as installed"
+    );
+}
+
 #[tokio::test]
 async fn a_mailed_invite_stamps_the_row_it_was_minted_for() {
     let h = Harness::new().await;
