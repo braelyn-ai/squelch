@@ -7,6 +7,7 @@
 //! PUT    /v1/tenants/{label}/control-token -> 200 {}
 //! GET    /v1/tenants/{label}             -> 200 { status } | 404
 //! GET    /v1/tenants/{label}/drift       -> 200 { status, deployment_present, foreign, changes }
+//! GET    /v1/tenants/{label}/devices     -> 200 { first_paired_at } | 404 | 503
 //! POST   /v1/tenants/{label}/reconcile   -> 200 { deployment, status } | 409
 //! POST   /v1/tenants/{label}/pair        -> 200 { pair_code, pair_url, deep_link }
 //! DELETE /v1/tenants/{label}             -> 204
@@ -35,6 +36,7 @@ use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},
 };
+use chrono::SecondsFormat;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
@@ -95,6 +97,12 @@ fn error_response(e: &WardenError) -> Response {
         // subdomain), and that a subdomain was cancelled is already implied by
         // every other answer this tenant gives.
         WardenError::Cancelled => (StatusCode::CONFLICT, "cancelled", None),
+        // 503, and NOT the 409 its neighbours use, because the caller's next
+        // move is the only thing a status code is for here. A 409 says "this
+        // request was wrong, do something else"; the activation poll was not
+        // wrong, it just arrived while the tenant had no pod, and the right
+        // answer is the retry it was already going to make on its next tick.
+        WardenError::NotRunning => (StatusCode::SERVICE_UNAVAILABLE, "not_running", None),
         // 503, not 422: the request was fine, this deployment is what lacks
         // the LLM gateway. The control plane should not be calling here at all.
         WardenError::LlmNotConfigured => {
@@ -203,6 +211,23 @@ impl From<Pairing> for PairResponse {
 #[derive(Debug, Serialize)]
 struct StatusResponse {
     status: &'static str,
+}
+
+/// The activation signal, and the entire body of `GET .../devices`.
+///
+/// ONE FIELD, and it is a timestamp: RFC3339 at seconds precision in UTC, or
+/// `null` for a mailbox nobody has ever paired a client with. No count, no
+/// names, no ids. The daemon's `token first-paired` refuses to print more than
+/// this and the route refuses to carry more than this, so "device names never
+/// leave the pod" holds at both ends rather than by convention at one.
+///
+/// `null` is a real answer here (the tenant is running and nobody has paired),
+/// which is why every way of NOT knowing is a status code instead: 404 for a
+/// tenant that does not exist, 503 for one with no pod to ask, 500 for a daemon
+/// whose answer could not be read.
+#[derive(Debug, Serialize)]
+struct DevicesResponse {
+    first_paired_at: Option<String>,
 }
 
 /// `POST /v1/tenants` - mint this tenant's key pair and hand back the public
@@ -326,6 +351,31 @@ pub async fn get_tenant(State(state): State<WardenState>, Path(label): Path<Stri
 pub async fn get_drift(State(state): State<WardenState>, Path(label): Path<String>) -> Response {
     match state.warden().drift(&label).await {
         Ok(report) => (StatusCode::OK, Json(report)).into_response(),
+        Err(e) => e.into_response(),
+    }
+}
+
+/// `GET /v1/tenants/{label}/devices` - when a client device first paired with
+/// this tenant's mailbox, for the control plane's activation signal.
+///
+/// A GET that EXECS, which no other read on this service does, so it is its own
+/// route rather than a field on the status body: `GET /v1/tenants/{label}` is a
+/// cheap hot-path call and must stay one.
+///
+/// The timestamp is re-rendered here rather than passed through as the daemon
+/// printed it: what the pod returned has already been parsed into an instant, so
+/// one spelling crosses this wire (UTC, seconds, `Z`) whatever a future daemon
+/// decides to print.
+pub async fn get_devices(State(state): State<WardenState>, Path(label): Path<String>) -> Response {
+    match state.warden().first_paired(&label).await {
+        Ok(first_paired_at) => (
+            StatusCode::OK,
+            Json(DevicesResponse {
+                first_paired_at: first_paired_at
+                    .map(|at| at.to_rfc3339_opts(SecondsFormat::Secs, true)),
+            }),
+        )
+            .into_response(),
         Err(e) => e.into_response(),
     }
 }
@@ -812,6 +862,66 @@ mod tests {
         assert_eq!(body["error"], "invalid_label");
     }
 
+    /// The activation route on the wire, through every answer it has: a
+    /// timestamp, a null, the 503 for a tenant with no pod, and the 500 for a
+    /// daemon whose output could not be read.
+    #[tokio::test]
+    async fn the_devices_route_carries_one_timestamp_and_nothing_else() {
+        let h = Harness::new();
+        call(&h, authed("POST", "/v1/tenants", &create_body("alice"))).await;
+
+        // Pending: there is no pod to ask, so the answer is "later", not
+        // "wrong". 503 rather than 409 because the caller's next move IS the
+        // retry it was already going to make.
+        let (status, body) = call(&h, authed("GET", "/v1/tenants/alice/devices", "")).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body, serde_json::json!({ "error": "not_running" }));
+
+        call(
+            &h,
+            authed(
+                "PUT",
+                "/v1/tenants/alice/credentials",
+                &credential_body("alice"),
+            ),
+        )
+        .await;
+
+        h.cluster
+            .exec_prints(&crate::testing::first_paired_stdout("2026-03-01T09:30:00Z"));
+        let (status, body) = call(&h, authed("GET", "/v1/tenants/alice/devices", "")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["first_paired_at"], "2026-03-01T09:30:00Z");
+        // ONE FIELD. A device name or a count reaching this body would be the
+        // whole privacy claim of the feature, gone.
+        assert_eq!(body.as_object().unwrap().len(), 1);
+        assert!(!body.to_string().contains("example.com"));
+
+        // A running tenant nobody paired with: a 200 carrying an explicit null,
+        // which is a real answer and not an absent field.
+        h.cluster
+            .exec_prints(&crate::testing::first_paired_none_stdout());
+        let (status, body) = call(&h, authed("GET", "/v1/tenants/alice/devices", "")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, serde_json::json!({ "first_paired_at": null }));
+
+        // An old daemon image: non-zero exit, terse 500, no detail.
+        h.cluster.exec_fails();
+        let (status, body) = call(&h, authed("GET", "/v1/tenants/alice/devices", "")).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(body, serde_json::json!({ "error": "first_paired_failed" }));
+
+        // Output nobody can read is a 500 too, never a null: "we could not ask"
+        // and "nobody has ever paired" must not be the same answer.
+        h.cluster.exec_prints("who knows\n");
+        let (status, body) = call(&h, authed("GET", "/v1/tenants/alice/devices", "")).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            body,
+            serde_json::json!({ "error": "first_paired_unparsed" })
+        );
+    }
+
     #[tokio::test]
     async fn unknown_tenants_404_except_on_delete() {
         let h = Harness::new();
@@ -829,6 +939,13 @@ mod tests {
 
         let (status, _) = call(&h, authed("POST", "/v1/tenants/nobody/pair", "")).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
+
+        // A tenant that does not exist is a 404 here and not the 503 a real one
+        // with no pod gets: "no such mailbox" is permanent, "not running" is a
+        // retry, and a poller must be able to tell them apart.
+        let (status, body) = call(&h, authed("GET", "/v1/tenants/nobody/devices", "")).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["error"], "not_found");
 
         let (status, _) = call(
             &h,
@@ -898,6 +1015,7 @@ mod tests {
             ("PUT", "/v1/tenants/alice/llm-key"),
             ("GET", "/v1/tenants/alice"),
             ("GET", "/v1/tenants/alice/drift"),
+            ("GET", "/v1/tenants/alice/devices"),
             ("POST", "/v1/tenants/alice/reconcile"),
             ("DELETE", "/v1/tenants/alice"),
             ("POST", "/v1/tenants/alice/pair"),

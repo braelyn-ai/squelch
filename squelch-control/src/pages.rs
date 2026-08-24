@@ -27,7 +27,7 @@ use axum::{
 };
 use chrono::{DateTime, Utc};
 
-use crate::store::WaitlistRow;
+use crate::store::UserRow;
 
 /// The Content-Security-Policy every page carries. The single allowance is the
 /// inline `<style>`; `frame-ancestors 'none'` (with the older `X-Frame-Options`
@@ -76,12 +76,28 @@ pub fn percent_encode(s: &str) -> String {
 /// Built HERE from this deployment's own tenant URL and the validated pairing
 /// code, never echoed from the warden's answer: an `href` assembled from a
 /// remote service's response is an open redirect with our domain in front of it.
-pub fn deep_link(tenant_url: &str, pair_code: &str) -> String {
-    format!(
-        "passband://pair?url={}&code={}",
-        percent_encode(tenant_url),
-        percent_encode(pair_code)
-    )
+pub fn deep_link(tenant_url: &str, pair_code: &str, analytics_id: Option<&str>) -> String {
+    // `aid` is the person's opaque analytics id, riding along so the app can
+    // adopt it as its PostHog distinct_id after a SUCCESSFUL pairing — the
+    // join between the funnel and app behavior that never names an address.
+    // Optional because a person can exist without the stamp having landed
+    // (the fail-soft record_signup window), and the pairing must never wait
+    // on analytics. Shipped app builds ignore unknown params, so the link
+    // stays backward compatible. The encoder is the rule, not the content: a
+    // UUID encodes to itself, and that is not a reason to skip it.
+    match analytics_id {
+        Some(aid) => format!(
+            "passband://pair?url={}&code={}&aid={}",
+            percent_encode(tenant_url),
+            percent_encode(pair_code),
+            percent_encode(aid)
+        ),
+        None => format!(
+            "passband://pair?url={}&code={}",
+            percent_encode(tenant_url),
+            percent_encode(pair_code)
+        ),
+    }
 }
 
 /// Where the client is downloaded from.
@@ -525,8 +541,13 @@ sync while you are away. Self-host if you would rather we did not.</p>"#,
 /// The code and the URL are `user-select: all` text rather than a copy button,
 /// because a copy button is JavaScript and this page has none. The deep link is
 /// the fast path; typing the code into the app is the path that always works.
-pub fn success(tenant_url: &str, pair_code: &str, minutes: i64) -> Response {
-    let link = deep_link(tenant_url, pair_code);
+pub fn success(
+    tenant_url: &str,
+    pair_code: &str,
+    minutes: i64,
+    analytics_id: Option<&str>,
+) -> Response {
+    let link = deep_link(tenant_url, pair_code, analytics_id);
     page(
         StatusCode::OK,
         "Your mailbox is ready",
@@ -578,8 +599,9 @@ pub fn app_signed_in(
     tenant_url: &str,
     pair_code: &str,
     minutes: i64,
+    analytics_id: Option<&str>,
 ) -> Response {
-    let link = deep_link(tenant_url, pair_code);
+    let link = deep_link(tenant_url, pair_code, analytics_id);
     page(
         StatusCode::OK,
         "Signed in",
@@ -750,18 +772,14 @@ proxy, or the page running inside a sandboxed frame. Opening
 ///
 /// THE CODE IS NOT HERE, and cannot be. Only its hash was kept, so the one
 /// remedy for a lost invite is a fresh one, which is what the send buttons are.
-pub fn admin_page(
-    pending: &[WaitlistRow],
-    approved: &[WaitlistRow],
-    error: Option<&str>,
-) -> Response {
+pub fn admin_page(pending: &[UserRow], approved: &[UserRow], error: Option<&str>) -> Response {
     let waiting: String = pending
         .iter()
         .map(|r| {
             format!(
-                r#"<tr><td class="who">{email}</td><td class="when">{joined}</td><td class="act">{action}</td></tr>
+                r#"<tr><td class="who">{who}</td><td class="when">{joined}</td><td class="act">{action}</td></tr>
 "#,
-                email = escape_html(&r.email),
+                who = who_cell(r),
                 joined = day(r.created_at),
                 // "Approve", not "Approve and email invite". The long label was
                 // the only disclosure that pressing it sends mail, and it paid
@@ -783,7 +801,7 @@ pub fn admin_page(
             // THREE STATES, AND THE LAST ONE IS THE POINT OF THE COLUMN.
             //
             // Redemption was always in the store (`invite_codes.used_at`, joined
-            // on in `list_waitlist`) and the re-send handler already refused a
+            // on in `list_users`) and the re-send handler already refused a
             // spent code with INVITE_SPENT. What was missing was SAYING so: the
             // only way to learn somebody had signed up was to press a button and
             // read the refusal. Now the board says it, and offers NO button on
@@ -793,12 +811,22 @@ pub fn admin_page(
             // code means a mailbox exists, and minting a second for the same
             // person is a tenant nobody approved, which is what the handler's
             // refusal is there to stop.
-            let outcome = if let Some(at) = r.accepted_at {
-                let label = r
-                    .accepted_label
-                    .as_deref()
-                    .map(|l| format!(" <code>{}</code>", escape_html(l)))
-                    .unwrap_or_default();
+            //
+            // THE TOP RUNG IS ACTIVATION, and it sits ABOVE "signed up" because
+            // the ladder is read as PRECEDENCE and not as history: somebody
+            // active signed up too, the row has space for one answer, and the
+            // answer worth having is the furthest they got. Same `.done` family
+            // as the rung below and the same no-button rule, for the same
+            // reason: there is nothing left to mail somebody who is using the
+            // product.
+            let outcome = if let Some(at) = r.first_paired_at {
+                let label = tenant_code(r);
+                format!(
+                    r#"<span class="done">active</span><span class="muted">{}</span>{label}"#,
+                    day(at),
+                )
+            } else if let Some(at) = r.signed_up_at {
+                let label = tenant_code(r);
                 format!(
                     r#"<span class="done">signed up</span><span class="muted">{}</span>{label}"#,
                     day(at),
@@ -823,9 +851,9 @@ pub fn admin_page(
                 .map(|at| format!("<br>approved {}", day(at)))
                 .unwrap_or_default();
             format!(
-                r#"<tr><td class="who">{email}</td><td class="when">joined {joined}{approved_on}</td><td class="act">{outcome}</td></tr>
+                r#"<tr><td class="who">{who}</td><td class="when">joined {joined}{approved_on}</td><td class="act">{outcome}</td></tr>
 "#,
-                email = escape_html(&r.email),
+                who = who_cell(r),
                 joined = day(r.created_at),
             )
         })
@@ -837,7 +865,7 @@ pub fn admin_page(
         &format!(
             r#"<h1>Waitlist</h1>
 <p class="tally">{waiting_count} waiting, {approved_count} approved recently,
-{accepted_count} of those signed up</p>
+{accepted_count} of those signed up, {active_count} of those active</p>
 {error_html}
 <h2>Waiting</h2>
 <p class="hint">Approving mints one invite code and emails it. The code works
@@ -864,7 +892,14 @@ this browser; rotating the admin token ends it everywhere.</p>"#,
             error_html = stop_note(error),
             waiting_count = pending.len(),
             approved_count = approved.len(),
-            accepted_count = approved.iter().filter(|r| r.accepted_at.is_some()).count(),
+            // "OF THOSE" NESTS, so an active person is counted in BOTH numbers:
+            // everybody active signed up. Partitioning them instead would make
+            // "3 signed up, 2 active" read as five people.
+            accepted_count = approved.iter().filter(|r| r.signed_up_at.is_some()).count(),
+            active_count = approved
+                .iter()
+                .filter(|r| r.first_paired_at.is_some())
+                .count(),
             session_days = crate::cookie::ADMIN_COOKIE_TTL_SECS / (24 * 60 * 60),
             waiting_table = table(
                 r#"<th>Email</th><th>Joined</th><th></th>"#,
@@ -879,6 +914,45 @@ this browser; rotating the admin token ends it everywhere.</p>"#,
             ttl = crate::invites::DEFAULT_TTL_DAYS,
         ),
     )
+}
+
+/// The "who" cell: the address this person is known by, and — when the Google
+/// account that actually signed up is a DIFFERENT address — a muted second line
+/// naming it.
+///
+/// AN INVITE IS A BEARER CODE, so the two are not promised to match: a person
+/// can be invited at work and sign up with a personal mailbox, or forward the
+/// mail to somebody else entirely. Before this line the board silently showed
+/// the invited address for a mailbox belonging to another address, which is the
+/// one thing an operator reading this page cannot afford to guess at.
+///
+/// Shown only on a MISMATCH. Repeating the same address twice on every signed-up
+/// row would be noise that trains the eye to skip the line that matters.
+///
+/// Both are escaped, like everything else on this page: `account_email` comes
+/// from Google rather than from a form, and the rule here is that nothing is
+/// interpolated raw regardless of how well-behaved its source is believed to be.
+fn who_cell(r: &UserRow) -> String {
+    let email = escape_html(&r.email);
+    match r.account_email.as_deref() {
+        Some(account) if account != r.email => format!(
+            r#"{email}<br><span class="muted">signed up as {}</span>"#,
+            escape_html(account)
+        ),
+        _ => email,
+    }
+}
+
+/// The mailbox a row became, as a `<code>` label, or nothing at all.
+///
+/// Shared by the two `.done` rungs so the label renders identically on both: an
+/// active row is a signed-up row that got further, and a difference in how they
+/// spell the same tenant would read as a difference in what happened.
+fn tenant_code(r: &UserRow) -> String {
+    r.tenant_label
+        .as_deref()
+        .map(|l| format!(" <code>{}</code>", escape_html(l)))
+        .unwrap_or_default()
 }
 
 /// One row's button, as its own form. No JavaScript on this page, so a button
@@ -987,13 +1061,54 @@ mod tests {
         assert_eq!(percent_encode("a b"), "a%20b");
     }
 
-    /// The link shape the Swift client parses (`passband://pair?url=…&code=…`).
+    /// The link shape the Swift client parses (`passband://pair?url=…&code=…`),
+    /// with and without the analytics ride-along. The no-aid string is pinned
+    /// EXACTLY: self-host and the fail-soft window must keep producing the
+    /// link every shipped build already understands.
     #[test]
     fn builds_the_deep_link_the_app_expects() {
         assert_eq!(
-            deep_link("https://ada.passband.email", "ABCD-EFGH"),
+            deep_link("https://ada.passband.email", "ABCD-EFGH", None),
             "passband://pair?url=https%3A%2F%2Fada.passband.email&code=ABCD-EFGH"
         );
+        assert_eq!(
+            deep_link(
+                "https://ada.passband.email",
+                "ABCD-EFGH",
+                Some("0e51e11e-89ff-4c8f-a566-95a8f9b169b0"),
+            ),
+            "passband://pair?url=https%3A%2F%2Fada.passband.email&code=ABCD-EFGH&aid=0e51e11e-89ff-4c8f-a566-95a8f9b169b0"
+        );
+    }
+
+    /// Both flow-finishing pages carry the aid'd link when a person is known,
+    /// HTML-escaped like every href on them. The `&amp;` is the point of the
+    /// assertion: a raw `&` in an attribute is the kind of thing only a test
+    /// notices.
+    #[tokio::test]
+    async fn the_finishing_pages_carry_the_analytics_ride_along() {
+        let aid = "0e51e11e-89ff-4c8f-a566-95a8f9b169b0";
+        let expected = format!(
+            "passband://pair?url=https%3A%2F%2Fada.passband.email&amp;code=ABCD-EFGH&amp;aid={aid}"
+        );
+        let success_html = body_of(success(
+            "https://ada.passband.email",
+            "ABCD-EFGH",
+            10,
+            Some(aid),
+        ))
+        .await;
+        let app_html = body_of(app_signed_in(
+            "ada@example.com",
+            "https://ada.passband.email",
+            "ABCD-EFGH",
+            10,
+            Some(aid),
+        ))
+        .await;
+        for html in [success_html, app_html] {
+            assert!(html.contains(&expected), "{html}");
+        }
     }
 
     /// The form is the only place the three grants are explained in the
@@ -1092,7 +1207,7 @@ mod tests {
 
     #[tokio::test]
     async fn the_success_page_carries_the_code_the_url_and_the_link() {
-        let html = body_of(success("https://ada.passband.email", "ABCD-EFGH", 10)).await;
+        let html = body_of(success("https://ada.passband.email", "ABCD-EFGH", 10, None)).await;
         assert!(html.contains("ABCD-EFGH"));
         assert!(html.contains("https://ada.passband.email"));
         assert!(
@@ -1118,12 +1233,13 @@ mod tests {
     #[tokio::test]
     async fn the_pages_that_finish_a_flow_hand_over_the_client() {
         for html in [
-            body_of(success("https://ada.passband.email", "ABCD-EFGH", 10)).await,
+            body_of(success("https://ada.passband.email", "ABCD-EFGH", 10, None)).await,
             body_of(app_signed_in(
                 "ada@example.com",
                 "https://ada.passband.email",
                 "ABCD-EFGH",
                 10,
+                None,
             ))
             .await,
         ] {
@@ -1170,30 +1286,43 @@ mod tests {
         assert!(!html.contains("href"), "{html}");
     }
 
-    /// A waitlist row as the store hands one over.
-    fn row(id: i64, email: &str, notified: bool) -> WaitlistRow {
+    /// A user row as the store hands one over.
+    fn row(id: i64, email: &str, notified: bool) -> UserRow {
         // 2026-01-01T00:00:00Z.
         let at = DateTime::from_timestamp(1_767_225_600, 0).unwrap();
-        WaitlistRow {
+        UserRow {
             id,
             email: email.to_string(),
             created_at: at,
-            status: crate::store::WAITLIST_APPROVED.to_string(),
+            status: crate::store::USER_APPROVED.to_string(),
             approved_at: Some(at),
             invite_id: Some(7),
             notified_at: notified.then_some(at),
-            accepted_at: None,
-            accepted_label: None,
+            signed_up_at: None,
+            tenant_label: None,
+            account_email: None,
+            first_paired_at: None,
         }
     }
 
     /// The same row after they spent the code: a mailbox exists.
-    fn accepted_row(id: i64, email: &str, label: &str) -> WaitlistRow {
+    fn accepted_row(id: i64, email: &str, label: &str) -> UserRow {
         let at = DateTime::from_timestamp(1_767_225_600, 0).unwrap();
-        WaitlistRow {
-            accepted_at: Some(at),
-            accepted_label: Some(label.to_string()),
+        UserRow {
+            signed_up_at: Some(at),
+            tenant_label: Some(label.to_string()),
+            account_email: Some(email.to_string()),
             ..row(id, email, true)
+        }
+    }
+
+    /// ...and after a device that is not the console paired with it: the top of
+    /// the ladder.
+    fn active_row(id: i64, email: &str, label: &str) -> UserRow {
+        let at = DateTime::from_timestamp(1_767_225_600, 0).unwrap();
+        UserRow {
+            first_paired_at: Some(at),
+            ..accepted_row(id, email, label)
         }
     }
 
@@ -1308,6 +1437,83 @@ mod tests {
         );
     }
 
+    /// THE TOP OF THE LADDER (#89): somebody who signed up AND opened the app.
+    /// The whole point of the column was that "did anyone we invited ever run
+    /// it" had no answer anywhere; this is the answer, on the row.
+    ///
+    /// Same `.done` family and same no-button rule as the rung below it, and the
+    /// tally nests: an active person is counted as signed up too.
+    #[tokio::test]
+    async fn an_active_row_says_so_and_offers_no_button() {
+        let html = document_of(admin_page(
+            &[],
+            &[active_row(1, "ada@example.com", "ada")],
+            None,
+        ))
+        .await;
+        assert!(
+            html.contains(r#"<span class="done">active</span>"#),
+            "{html}"
+        );
+        assert!(html.contains("<code>ada</code>"), "{html}");
+        // Precedence, not history: the further rung wins the cell outright.
+        assert!(!html.contains("signed up</span>"), "{html}");
+        assert!(
+            html.contains("1 of those signed up, 1 of those active"),
+            "{html}"
+        );
+        // Nothing left to mail somebody who is using the product.
+        assert!(!html.contains("Re-send"), "{html}");
+        assert!(!html.contains("/admin/send"), "{html}");
+
+        // A signed-up row that never paired is the other half of the count.
+        let not_yet = document_of(admin_page(
+            &[],
+            &[accepted_row(1, "ada@example.com", "ada")],
+            None,
+        ))
+        .await;
+        assert!(
+            not_yet.contains("1 of those signed up, 0 of those active"),
+            "{not_yet}"
+        );
+        assert!(!not_yet.contains(r#">active</span>"#), "{not_yet}");
+    }
+
+    /// AN INVITE IS A BEARER CODE, so the address that was invited and the
+    /// Google account that signed up are two different facts. When they differ
+    /// the board says so, and when they agree it says nothing rather than
+    /// printing one address twice.
+    ///
+    /// The second line is ESCAPED like everything else here: it arrives from
+    /// Google rather than from the public form, and the rule on this page does
+    /// not care where a string came from.
+    #[tokio::test]
+    async fn a_signup_under_another_address_says_which() {
+        let mismatch = UserRow {
+            account_email: Some(r#"<script>alert(1)</script>@evil.test"#.to_string()),
+            ..accepted_row(1, "ada@example.com", "ada")
+        };
+        let html = document_of(admin_page(&[], &[mismatch], None)).await;
+        assert!(html.contains("signed up as"), "{html}");
+        assert!(html.contains("ada@example.com"), "{html}");
+        assert!(!html.contains("<script>alert(1)"), "{html}");
+        assert!(html.contains("&lt;script&gt;"), "{html}");
+        assert!(
+            html.contains(r#"<span class="muted">signed up as"#),
+            "{html}"
+        );
+
+        // Same address on both sides: one line, no second address, no noise.
+        let agreed = document_of(admin_page(
+            &[],
+            &[accepted_row(1, "ada@example.com", "ada")],
+            None,
+        ))
+        .await;
+        assert!(!agreed.contains("signed up as"), "{agreed}");
+    }
+
     /// A DELIBERATE SIGN OUT IS NOT A REFUSAL. The session runs for a month
     /// now, so ending one on a borrowed machine had to become a press rather
     /// than a trip to Railway to rotate the token; and the page that press lands
@@ -1370,7 +1576,7 @@ mod tests {
                 Some("no"),
             ))
             .await,
-            body_of(success("https://ada.passband.email", "ABCD-EFGH", 10)).await,
+            body_of(success("https://ada.passband.email", "ABCD-EFGH", 10, None)).await,
             body_of(problem(StatusCode::BAD_REQUEST, "Nope", "Try again.")).await,
             body_of(console_problem(
                 StatusCode::BAD_REQUEST,
@@ -1399,12 +1605,13 @@ mod tests {
     async fn every_page_wears_the_mark_and_fetches_nothing_to_do_it() {
         for html in [
             body_of(signup_form("passband.email", None, "", "", None)).await,
-            body_of(success("https://ada.passband.email", "ABCD-EFGH", 10)).await,
+            body_of(success("https://ada.passband.email", "ABCD-EFGH", 10, None)).await,
             body_of(app_signed_in(
                 "ada@example.com",
                 "https://ada.passband.email",
                 "ABCD-EFGH",
                 10,
+                None,
             ))
             .await,
             body_of(problem(StatusCode::BAD_REQUEST, "Nope", "Try again.")).await,
@@ -1449,7 +1656,7 @@ mod tests {
     async fn every_page_carries_the_security_headers() {
         for r in [
             signup_form("passband.email", None, "", "", None),
-            success("https://ada.passband.email", "ABCD-EFGH", 10),
+            success("https://ada.passband.email", "ABCD-EFGH", 10, None),
             problem(StatusCode::BAD_REQUEST, "Nope", "Try again."),
             console_problem(StatusCode::BAD_REQUEST, "Nope", "Try again."),
             admin_login(None),

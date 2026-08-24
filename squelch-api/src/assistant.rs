@@ -109,19 +109,24 @@ pub(crate) async fn assistant_messages(State(state): State<ApiState>, body: Byte
     // ONLY these headers cross: the daemon's credential and the wire pins. The
     // client's Authorization (its device token) and anything else it sent stop
     // here.
-    let upstream = tokio::time::timeout(
-        HEADERS_TIMEOUT,
-        relay
-            .http
-            .post(&relay.url)
-            .header("x-api-key", relay.api_key.as_str())
-            .header("anthropic-version", ANTHROPIC_VERSION)
-            .header(header::CONTENT_TYPE, "application/json")
-            .header(header::ACCEPT, "text/event-stream")
-            .body(body)
-            .send(),
-    )
-    .await;
+    let mut req = relay
+        .http
+        .post(&relay.url)
+        .header("x-api-key", relay.api_key.as_str())
+        .header("anthropic-version", ANTHROPIC_VERSION)
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::ACCEPT, "text/event-stream");
+    // The gateway reads its virtual key ONLY from `x-bf-vk` and ignores
+    // `x-api-key` outright, so without this every assistant turn is a 401 —
+    // the same bug that silently took hosted TRIAGE down (see
+    // `squelch_core::triage::llm::GATEWAY_VK_HEADER`). This relay is
+    // gateway-only by construction (`resolve_assistant` returns None without a
+    // base URL), but the condition is kept so ONE rule decides who gets a
+    // virtual key, here and on the triage wire.
+    if squelch_core::triage::llm::is_gateway_url(&relay.url) {
+        req = req.header("x-bf-vk", relay.api_key.as_str());
+    }
+    let upstream = tokio::time::timeout(HEADERS_TIMEOUT, req.body(body).send()).await;
 
     let upstream = match upstream {
         Ok(Ok(resp)) => resp,

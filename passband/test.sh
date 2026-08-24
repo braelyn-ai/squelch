@@ -36,6 +36,15 @@ run_suite pairing \
   Sources/Passband/Model/Pairing.swift \
   Tests/PairingTests.swift
 
+# The changelog and the rule that decides which of it a given install is owed.
+# One file, no dependencies: ReleaseNotes.swift is kept free of SwiftUI and
+# Bundle precisely so this suite and make-changelog.sh can both compile it
+# alone, and so the running version arrives as an argument rather than as
+# whatever bundle the binary happens to sit in.
+run_suite release-notes \
+  Sources/Passband/Lib/ReleaseNotes.swift \
+  Tests/ReleaseNotesTests.swift
+
 # One file, no dependencies at all — SubjectText is kept that way on purpose.
 # The marker sanitizer is what lets a stranger's subject line sit inside the
 # assistant's system prompt, so it gets asserted rather than reasoned about.
@@ -81,10 +90,22 @@ run_suite cid-images \
   Tests/CidImagesTests.swift
 
 # The thread minimap's window math. CoreGraphics only — the rail that draws it
-# is SwiftUI, the arithmetic that aims it is not.
+# is SwiftUI, the arithmetic that aims it is not. ThreadStyle comes along
+# because a bubble is a narrower measure than a card, which the guess has to
+# know; the enum is kept free of SwiftUI and of the account for exactly this.
 run_suite minimap-geometry \
   Sources/Passband/Lib/MinimapGeometry.swift \
+  Sources/Passband/Lib/ThreadStyle.swift \
   Tests/MinimapGeometryTests.swift
+
+# The automatic thread style: a guess about somebody's mail, so it is asserted
+# fixture by fixture rather than reasoned about. Quotes comes along because the
+# length test is fed by the quote splitter — a reply under forty lines of chain
+# is a short message — and both files are pure Foundation for this reason.
+run_suite thread-style \
+  Sources/Passband/Lib/ThreadStyle.swift \
+  Sources/Passband/Lib/Quotes.swift \
+  Tests/ThreadStyleTests.swift
 
 # The banking card's recency window (issue #82): 24h or since-last-open,
 # whichever reaches further back. Platform rides along for the notification
@@ -109,3 +130,15 @@ run_suite share-nudge \
 run_suite remind-times \
   Sources/Passband/Lib/RemindTimes.swift \
   Tests/RemindTimesTests.swift
+
+# Which senders leave the device. `eligibleFaviconDomain` is the privacy
+# boundary in SenderIdentity — a human correspondent answers nil and that nil
+# is why the correspondent graph stays local — so the brand/robot heuristics
+# guarding it are asserted rather than reasoned about. Pure string work;
+# WireTypes and Format ride along for the Tier and the capitalizer.
+run_suite sender-identity \
+  Sources/Passband/Model/WireTypes.swift \
+  Sources/Passband/Lib/Format.swift \
+  Sources/Passband/Lib/AsyncMemo.swift \
+  Sources/Passband/Lib/SenderIdentity.swift \
+  Tests/SenderIdentityTests.swift

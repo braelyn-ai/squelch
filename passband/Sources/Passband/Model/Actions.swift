@@ -40,10 +40,10 @@ enum Actions {
         do {
             try await APIClient.shared.setStatus(u.id, .done)
             Analytics.capture("email_done")
-            // The message leaves the working set: drop its remembered height and
+            // The message leaves the working set: drop its remembered heights and
             // unpin its images. The bytes stay on disk — the undo below is five
             // seconds away and re-pins them.
-            FrameHeights.shared.clear(String(u.id))
+            FrameHeights.shared.clear(messageId: u.id)
             await ImageStore.shared.release(messageId: u.id)
             store.pushUndo(kind: .done, messageId: u.id, label: "done \(u.sender)") {
                 try await APIClient.shared.setStatus(u.id, .open)
@@ -99,7 +99,7 @@ enum Actions {
             }
             // Same as `done`: the message leaves the working set. The undo five
             // seconds away re-pins it.
-            FrameHeights.shared.clear(String(messageId))
+            FrameHeights.shared.clear(messageId: messageId)
             await ImageStore.shared.release(messageId: messageId)
             store.pushUndo(kind: .remind, messageId: messageId, label: "reminder set for \(label)")
             {

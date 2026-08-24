@@ -11,8 +11,23 @@
 // in a debug build). Email data — subjects, senders, bodies, labels, questions
 // — could only ever leave as a free-form string, so free-form strings cannot
 // leave at all.
+//
+// There is exactly ONE string that leaves without being in that vocabulary: the
+// hosted `analytics_id`, adopted as the install's distinct_id by `adopt` below.
+// It is not an exception to the rule, it is the rule enforced a second way — a
+// UUID shape check admits hex and dashes and nothing else, which carries as
+// much mail as a closed set does. Read `adopt`'s comment before adding a second
+// one; the honest count of bypasses in this file is one, and it should stay one.
 
 import Foundation
+
+// Only for the device idiom in the event context below, and fenced the way
+// Pairing.swift fences its own UIKit import: the Mac target must not so much as
+// name a framework it does not have, and the fence sits directly over the one
+// expression that needs it so the two can never drift apart.
+#if os(iOS)
+    import UIKit
+#endif
 
 enum Analytics {
     /// PostHog PROJECT API key (phc_…, public by design — it can only ingest).
@@ -76,7 +91,7 @@ enum Analytics {
         "process_completed", "notification_opened", "sealed_revealed",
         "connect_succeeded", "connection_lost", "connection_restored",
         "account_added",
-        "tour_completed", "tour_skipped",
+        "tour_completed", "tour_skipped", "whats_new_shown",
         "invite_sent", "invite_nudge_accepted", "invite_nudge_dismissed",
     ]
 
@@ -109,7 +124,7 @@ enum Analytics {
     private static let allowedStrings: Set<String> =
         Set(MainView.allCases.map(\.rawValue)).union([
             // compose_send / compose_opened
-            "new", "reply", "sent", "guard_blocked", "forbidden", "failure",
+            "new", "reply", "forward", "sent", "guard_blocked", "forbidden", "failure",
             // undo_fired kinds
             "archive", "done", "label", "ruleDelete", "remind",
             // triage_corrected axes and wire values — the daemon's closed
@@ -179,6 +194,62 @@ enum Analytics {
         UserDefaults.standard.set(now, forKey: key)
         capture(event, properties)
     }
+
+    /// Marks that a hosted `aid` has already been adopted. First aid wins,
+    /// forever.
+    private static let adoptedKey = "app.passband.analytics.aidAdopted"
+
+    /// Adopt the analytics id a hosted pairing link carried, as this install's
+    /// PostHog `distinct_id`.
+    ///
+    /// WHY THIS EXISTS: PostHog otherwise sees a random per-install UUID, and
+    /// the control plane sees an email address, and nothing joins them — so
+    /// "did anyone we invited ever open the app" is unanswerable. The `aid` is
+    /// the join key, minted control-plane side and opaque on both ends. PostHog
+    /// still never sees an email; it sees an id that only the control plane can
+    /// resolve to a person, which is the whole design.
+    ///
+    /// THIS BYPASSES THE EVENT VOCABULARY ON PURPOSE. Every other string that
+    /// leaves this file must appear in `allowedStrings`, because mail content
+    /// could only ever escape as a free-form string. A UUID is not free-form:
+    /// the shape check below reduces it to hex and dashes at fixed offsets,
+    /// which carries exactly as much mail as a closed set does — none. That
+    /// check IS the guarantee here, so it is not optional, and the id must NOT
+    /// be added to `allowedStrings`/`allowedEvents` instead: those sets are
+    /// closed and enumerable and a per-person id would end both properties.
+    ///
+    /// THREAT MODEL: any web page can open a `passband://` URL, so a hostile
+    /// page can name an `aid` of its choosing. It buys nothing. Adoption
+    /// happens only after a claim AND a successful connect against the daemon
+    /// the SAME link named, so the attacker needs a live, unspent pairing code
+    /// for a daemon the victim then completes pairing with — at which point
+    /// they had the mailbox, not merely the analytics. There is no read-back
+    /// channel either: the id is written outward and never surfaced. Residual
+    /// risk is analytics pollution (one install's events filed under an id of
+    /// the attacker's choosing), and nothing about mail, credentials, or the
+    /// account.
+    static func adopt(analyticsId: String) {
+        guard UUID(uuidString: analyticsId) != nil else {
+            assertionFailure("analytics: adopted id is not a uuid")
+            return
+        }
+        // FIRST AID WINS. A `distinct_id` is per-install and an install is one
+        // human; the multi-account case is that one human running two mailboxes,
+        // not two people sharing a Mac. The funnel this exists for is "the
+        // person we invited started using the app", so the FIRST hosted account
+        // is the one that answers it — a second account's aid is simply not
+        // adopted, and the person keeps the identity their history is under.
+        let defaults = UserDefaults.standard
+        guard !defaults.bool(forKey: adoptedKey) else { return }
+        defaults.set(true, forKey: adoptedKey)
+
+        // With telemetry off the id still flips, but no alias event is sent.
+        // The flip costs nothing and is not a transmission: it means that if
+        // the user later turns telemetry back on, what they send arrives as
+        // THEM rather than opening a third identity. The alias is a real event,
+        // so it waits — while the user has said nothing leaves, nothing leaves.
+        client?.adoptDistinctId(analyticsId.lowercased(), mergeHistory: level != .none)
+    }
 }
 
 /// Buffered batch uploader. All state is confined to `queue`; the public
@@ -201,12 +272,30 @@ final class PostHogClient: @unchecked Sendable {
     private var lastActivity = Date.distantPast
 
     /// Anonymous install id. Analytics for a single-user app needs stability,
-    /// not identity, so a random UUID minted once is the whole story.
-    private let distinctId: String
+    /// not identity, so a random UUID minted once is the whole story — until a
+    /// hosted pairing hands over an `aid`, at which point `adoptDistinctId`
+    /// swaps this for the control plane's opaque per-person id so the two
+    /// halves of the funnel are the same row. Still a UUID, still carrying no
+    /// address: the control plane holds the email, PostHog holds the id, and
+    /// nothing on this machine can join them.
+    ///
+    /// A `var`, but a queue-confined one: every read and write below happens
+    /// inside `queue`. Initialized directly in `init` rather than on the queue,
+    /// which is safe because nothing can enqueue against a client that has not
+    /// finished being constructed, and the lazy `static let` that builds it is
+    /// the memory barrier that publishes the initial value to every later
+    /// queue block.
+    private var distinctId: String
 
     private static let bufferCap = 500
     private static let flushAt = 20
     private static let flushEvery: TimeInterval = 15
+
+    /// Where the install id lives across launches. An adopted `aid` is written
+    /// straight back to this same key rather than to one beside it: after
+    /// adoption the aid simply IS this install's id, so a relaunch reads it
+    /// like any other and needs no re-adoption logic at all.
+    private static let distinctIdKey = "app.passband.analytics.distinctId"
 
     private let iso: ISO8601DateFormatter = {
         let f = ISO8601DateFormatter()
@@ -214,32 +303,50 @@ final class PostHogClient: @unchecked Sendable {
         return f
     }()
 
+    /// The per-event envelope PostHog reads to place a session on a platform.
+    ///
+    /// The platform half is COMPILED, not detected: this file ships in both the
+    /// Mac and the iOS target, and a hardcoded "macOS" here reported every
+    /// iPhone as a desktop — which does not merely mislabel iOS, it poisons
+    /// every whole-app number by folding two platforms into one. `$os_version`
+    /// was always honest (ProcessInfo answers per-process); only the two
+    /// constants beside it were not.
     private let context: [String: Any] = {
         let info = Bundle.main.infoDictionary ?? [:]
         let os = ProcessInfo.processInfo.operatingSystemVersion
         let version = info["CFBundleShortVersionString"] as? String ?? "0"
-        return [
+        var ctx: [String: Any] = [
             "$app_name": "Passband",
             "$app_version": version,
             "$app_build": info["CFBundleVersion"] as? String ?? "0",
-            "$os_name": "macOS",
             "$os_version": "\(os.majorVersion).\(os.minorVersion).\(os.patchVersion)",
-            "$device_type": "Desktop",
             "$lib": "passband-native",
             "$lib_version": version,
         ]
+        #if os(iOS)
+            ctx["$os_name"] = "iOS"
+            // PostHog's own device buckets: an iPad is a Tablet, everything
+            // else the target runs on is a Mobile. Read off the main thread on
+            // purpose and safely — `userInterfaceIdiom` is a compile-time-ish
+            // constant for the process, not view state.
+            ctx["$device_type"] =
+                UIDevice.current.userInterfaceIdiom == .pad ? "Tablet" : "Mobile"
+        #else
+            ctx["$os_name"] = "macOS"
+            ctx["$device_type"] = "Desktop"
+        #endif
+        return ctx
     }()
 
     init(apiKey: String, endpoint: URL) {
         self.apiKey = apiKey
         self.endpoint = endpoint
 
-        let key = "app.passband.analytics.distinctId"
-        if let saved = UserDefaults.standard.string(forKey: key) {
+        if let saved = UserDefaults.standard.string(forKey: Self.distinctIdKey) {
             distinctId = saved
         } else {
             distinctId = UUID().uuidString.lowercased()
-            UserDefaults.standard.set(distinctId, forKey: key)
+            UserDefaults.standard.set(distinctId, forKey: Self.distinctIdKey)
         }
 
         let timer = DispatchSource.makeTimerSource(queue: queue)
@@ -282,6 +389,59 @@ final class PostHogClient: @unchecked Sendable {
         let sem = DispatchSemaphore(value: 0)
         queue.async { self.flushLocked { sem.signal() } }
         _ = sem.wait(timeout: .now() + timeout)
+    }
+
+    /// Switch this install's `distinct_id` to an id the control plane minted,
+    /// optionally telling PostHog that the two ids are one person.
+    ///
+    /// `$create_alias` is the merge, and its direction is the part that is easy
+    /// to get backwards: the ENVELOPE carries the OLD id and the `alias`
+    /// property carries the NEW one, matching what posthog-js and posthog-python
+    /// send. PostHog folds the aliased id into the one already on the event, so
+    /// naming the new id in the envelope would merge the wrong direction and
+    /// strand this install's history.
+    ///
+    /// Everything is done inside `queue` because `distinctId` and `buffer` live
+    /// there, and doing it in one block is also what makes the ordering true:
+    /// events already buffered keep the id they were captured under, because
+    /// they happened to the old identity. Only what is captured after this
+    /// block runs belongs to the new one.
+    ///
+    /// `mergeHistory: false` still flips the id — see `Analytics.adopt`.
+    func adoptDistinctId(_ newId: String, mergeHistory: Bool) {
+        queue.async {
+            let old = self.distinctId
+            // Idempotent: the same aid arrives again on every re-pair and every
+            // hosted sign-in, and a second alias to an id we already answer to
+            // would be a wasted event at best.
+            guard newId != old else { return }
+
+            if mergeHistory {
+                let now = Date()
+                var props = self.context
+                props["$session_id"] = self.currentSessionId(now)
+                props["distinct_id"] = old
+                props["alias"] = newId
+                self.buffer.append([
+                    "event": "$create_alias",
+                    "distinct_id": old,
+                    "timestamp": self.iso.string(from: now),
+                    "properties": props,
+                ])
+                // The cap trims from the FRONT, so the alias — appended last —
+                // is the one event a full buffer cannot cost us.
+                if self.buffer.count > Self.bufferCap {
+                    self.buffer.removeFirst(self.buffer.count - Self.bufferCap)
+                }
+            }
+
+            self.distinctId = newId
+            UserDefaults.standard.set(newId, forKey: Self.distinctIdKey)
+            // Sent now rather than on the next 15s tick: the alias is what makes
+            // the funnel joinable, and the moment right after pairing is exactly
+            // when a first-run install is most likely to be quit.
+            self.flushLocked()
+        }
     }
 
     // MARK: - queue-confined

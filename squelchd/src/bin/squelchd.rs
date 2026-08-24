@@ -4,10 +4,11 @@
 //! - `run`: sync-only loop, no HTTP.
 //! - `serve`: sync loop plus one axum server hosting the agent door (`/mcp`) and
 //!   the human door (`/client/*`).
-//! - `token`: issue / list / revoke the human door's per-device tokens.
+//! - `token`: issue / list / revoke the human door's per-device tokens, plus
+//!   `first-paired`, the one machine-readable line the hosted warden reads.
 //! - `pair`: mint a short code a new device trades for one of those tokens.
 
-use chrono::Duration;
+use chrono::{Duration, SecondsFormat};
 use clap::{Args, CommandFactory, FromArgMatches, Parser, Subcommand};
 use squelch_core::auth::{
     AuthFlowOptions, AuthScopes, ConsentBind, CredentialTransfer, DEFAULT_HEADLESS_PORT,
@@ -116,6 +117,21 @@ enum TokenCommand {
         /// The id from `token list`.
         id: i64,
     },
+    /// Print when a client device FIRST paired with this mailbox: one RFC3339
+    /// timestamp, or the word `none`.
+    ///
+    /// MACHINE-READABLE, not a report. The hosted warden execs exactly this in a
+    /// tenant pod to answer "did anybody ever actually run the app" (the
+    /// activation signal), so the contract is one line on stdout and nothing
+    /// else, forever.
+    ///
+    /// Its own subcommand rather than a flag on `token list`, and that is the
+    /// point: a listing carries device NAMES, and a caller that only needs a
+    /// timestamp must not be able to over-share by accident. One line out means
+    /// there is nothing else in it to leak. The console-session exclusion and
+    /// the "a revoked device still paired" rule both live in the store, in one
+    /// place, rather than being re-derived by whoever reads the output.
+    FirstPaired,
 }
 
 #[derive(Args)]
@@ -1165,6 +1181,31 @@ fn cmd_token(config: &Config, args: &TokenArgs) -> Result<(), squelch_core::Core
             }
             Ok(())
         }
+        TokenCommand::FirstPaired => {
+            // EXACTLY ONE LINE ON STDOUT, and nothing else on it, ever — the
+            // `token issue` discipline for the same reason: something machine
+            // is reading this. Here that reader is `squelch-warden`, which
+            // execs the command in a tenant pod and parses the first non-empty
+            // line; a second line, a header, or a friendly note would be a
+            // parse failure on a route the tenant cannot see or fix.
+            //
+            // Seconds precision and a `Z` offset, not the store's raw column:
+            // one spelling crosses the wire, so the control plane never has to
+            // decide whether two renderings of the same instant are the same
+            // stamp. Nanoseconds would say when a device was minted to a
+            // resolution nobody asked for.
+            //
+            // `none` rather than an empty line, because an empty line is what a
+            // broken exec also produces.
+            let first = store.first_client_pairing_at(account_id)?;
+            println!(
+                "{}",
+                first
+                    .map(|at| at.to_rfc3339_opts(SecondsFormat::Secs, true))
+                    .unwrap_or_else(|| "none".to_string())
+            );
+            Ok(())
+        }
     }
 }
 
@@ -1580,12 +1621,16 @@ async fn gather_store_metrics(
             store.list_usage_by_category(account_id, squelch_core::metrics::LEDGER_ALL_DAYS)?,
         );
         let (db_bytes, wal_bytes) = squelch_core::metrics::db_file_sizes(&config.db_path);
+        // A COUNT, never a listing: the exported gauge is unlabelled, so no
+        // device name can reach an unauthenticated scrape even in principle.
+        let devices_paired = store.count_client_devices(account_id)?;
         Ok::<_, squelch_core::CoreError>(squelch_core::metrics::StoreSnapshot {
             llm_cost_usd: squelch_core::metrics::estimate_cost_usd(&llm, &config),
             stats,
             llm,
             db_bytes,
             wal_bytes,
+            devices_paired,
         })
     })
     .await;
@@ -2881,6 +2926,14 @@ mod tests {
             Cli::parse_from(["squelchd", "token", "list"]).command,
             Command::Token(TokenArgs {
                 command: TokenCommand::List
+            })
+        ));
+        // The warden execs this exact spelling in a tenant pod; a rename here
+        // is a rename of a wire contract.
+        assert!(matches!(
+            Cli::parse_from(["squelchd", "token", "first-paired"]).command,
+            Command::Token(TokenArgs {
+                command: TokenCommand::FirstPaired
             })
         ));
         // A name is not optional: an unlabeled token is one nobody can pick out

@@ -239,6 +239,17 @@ pub struct ClientMessage {
     pub from_addr: String,
     pub from_name: Option<String>,
     pub received_at: DateTime<Utc>,
+    /// THIS message's own `Subject`, not the thread's.
+    ///
+    /// [`ClientThreadView::subject`] is the OLDEST message's subject, which is
+    /// the right title for the conversation and the WRONG title for one message
+    /// inside it: a renamed thread ("Lunch?" -> "Re: Lunch? -> Thursday
+    /// instead") makes the two diverge. The client forwards ONE message, and it
+    /// titles and labels that forward from the message it actually forwards, so
+    /// the per-message value has to be on the wire.
+    ///
+    /// An old client simply ignores the extra key.
+    pub subject: String,
     pub content: String,
     /// Sanitized HTML body; served ONLY here (GET /client/thread/{id}).
     pub html: Option<String>,
@@ -247,6 +258,29 @@ pub struct ClientMessage {
     /// GET /client/attachments/{id}. HUMAN-DOOR ONLY, like `html`.
     #[serde(default)]
     pub attachments: Vec<ClientAttachment>,
+    /// AUTHORED BY THIS ACCOUNT: `true` when the account itself wrote this
+    /// message — the stored outbound copy, OR a received copy whose `from_addr`
+    /// is the account's own address — and `false` for mail from anyone else.
+    /// The reader aligns every chat bubble on it, and an action aimed at "the
+    /// message" — remind me about this, reply to this — must land on inbound
+    /// mail, and a thread ends on the user's own reply often enough that aiming
+    /// at the last message would aim at themselves. So it is ALWAYS on the wire
+    /// as a plain bool — never skipped, defaulting to false for a row an older
+    /// daemon serialized — and a client that never learns about it simply
+    /// ignores the key.
+    ///
+    /// NOT the stored `messages.is_sent` column alone. That column is a
+    /// VISIBILITY flag, sticky to 0 on upsert and deliberately lost to the INBOX
+    /// copy for self-addressed mail (self-Cc, mail to oneself, a group echo), so
+    /// a message the user demonstrably wrote can sit there at 0 forever. The
+    /// human-door thread query therefore ORs it with a case-insensitive
+    /// `from_addr` == account-email match; that OR is the whole difference
+    /// between the column and this field.
+    ///
+    /// This is the ONLY type that carries it: the agent door's
+    /// [`SanitizedMessage`] is untouched.
+    #[serde(default)]
+    pub is_sent: bool,
     /// This message's OWN triage verdict, for in-thread attention highlighting:
     /// the band shows one row per thread, so the reader is where "which message
     /// is the reason" gets answered. All optional — absent on a pre-highlight
@@ -263,14 +297,6 @@ pub struct ClientMessage {
     /// The stage-1 one-line summary — the highlight's tooltip.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub one_line: Option<String>,
-    /// The user's own copy in the thread. ALWAYS on the wire (a plain bool,
-    /// defaulting to false for a row an older daemon serialized) because the
-    /// reader needs it on every message, not just the interesting ones: an
-    /// action aimed at "the message" — remind me about this, reply to this —
-    /// must land on inbound mail, and a thread ends on the user's own reply
-    /// often enough that aiming at the last message would aim at themselves.
-    #[serde(default)]
-    pub is_sent: bool,
     /// The stored `messages.auth_pass` (see [`NewMessage::auth_pass`]). NOT on
     /// the wire: it exists so `get_thread` can gate the read-time `sender_known`
     /// bit on it, and the client already receives that derived answer.
@@ -788,6 +814,9 @@ mod tests {
                     from_addr: "a@b.com".into(),
                     from_name: None,
                     received_at: Utc::now(),
+                    // Renamed mid-thread: the message's own subject is NOT the
+                    // thread's, and the forward composer titles from this one.
+                    subject: "Re: s -> Thursday instead".into(),
                     content: "text".into(),
                     html: Some("<p>hi</p>".into()),
                     attachments: vec![
@@ -820,6 +849,7 @@ mod tests {
                     from_addr: "a@b.com".into(),
                     from_name: None,
                     received_at: Utc::now(),
+                    subject: "s".into(),
                     content: "plain".into(),
                     html: None,
                     attachments: vec![],
@@ -859,6 +889,15 @@ mod tests {
             "None content_id must not serialize"
         );
         assert_eq!(v["messages"][1]["attachments"], serde_json::json!([]));
+        // PER-MESSAGE subject, which a renamed thread makes differ from the
+        // thread's own: the forward composer titles from the message it
+        // forwards, so both values have to be on the wire, at their own levels.
+        assert_eq!(v["subject"], serde_json::json!("s"));
+        assert_eq!(
+            v["messages"][0]["subject"],
+            serde_json::json!("Re: s -> Thursday instead")
+        );
+        assert_eq!(v["messages"][1]["subject"], serde_json::json!("s"));
         // Triage highlight fields: present when set, structurally ABSENT when
         // None (not null) — an old client's strict decoder never sees the keys.
         assert_eq!(v["messages"][0]["tier"], serde_json::json!("past_due"));
@@ -868,6 +907,10 @@ mod tests {
             "None tier must not serialize"
         );
         assert!(v["messages"][1].get("attention_open").is_none());
+        // is_sent is NEVER skipped: the reader aligns every bubble on it, so
+        // both polarities are on the wire as plain bools.
+        assert_eq!(v["messages"][0]["is_sent"], serde_json::json!(false));
+        assert_eq!(v["messages"][1]["is_sent"], serde_json::json!(true));
         // auth_pass is an internal gate for the human door's `sender_known`
         // bit, never a wire field, even when it holds a verdict.
         assert!(v["messages"][0].get("auth_pass").is_none());

@@ -119,6 +119,27 @@ data:
   # _STAGE2_MODEL, _STAGE1_DAILY_CAP, _STAGE2_DAILY_CAP) are refused at boot
   # unless this one is set.
   SQUELCH_WARDEN_LLM_BASE_URL: "https://bifrost.passband.app/anthropic"
+  # PROVIDER-QUALIFIED MODEL IDS, and the reason is the gateway, not the model.
+  # The daemon's own default is the bare `claude-opus-5`, which is correct for
+  # self-host talking straight to api.anthropic.com — and which this gateway
+  # answers 400 "could not auto resolve a provider for the request, please
+  # specify a provider explicitly", BEFORE it ever checks the virtual key. That
+  # is what took the whole fleet's triage down from 2026-08-19 to 2026-08-24:
+  # every LLM call rejected in 0ms, every row falling back to its ingest
+  # heuristic. The `anthropic/` prefix is the escape hatch the error text
+  # itself names, and it belongs HERE rather than in the daemon's defaults
+  # because it is invalid against Anthropic direct — hosted-only, exactly what
+  # these knobs are for (they are refused at boot unless the LLM base URL above
+  # is set, which is the right coupling: prefix only when a gateway is routing).
+  #
+  # KEEP IN LOCKSTEP WITH the canary's BLACKBOX_CANARY_MODEL on the blackbox
+  # Railway service. If these two disagree, the canary is probing a request the
+  # fleet does not send, and a green light stops meaning the fleet works.
+  #
+  # Revisit if the gateway is ever upgraded to a build that resolves bare ids:
+  # dropping the prefix is then a one-knob revert (plus the canary's var).
+  SQUELCH_WARDEN_LLM_STAGE1_MODEL: "anthropic/claude-opus-5"
+  SQUELCH_WARDEN_LLM_STAGE2_MODEL: "anthropic/claude-opus-5"
   # 3. EDIT ME. The control plane's origin, handed to every tenant daemon as
   # SQUELCH_CONSOLE_SSO_URL. It is what puts "Continue with Google" on a tenant's
   # own /console login page: Google forbids wildcard redirect URIs, so a

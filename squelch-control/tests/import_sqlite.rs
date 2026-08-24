@@ -3,7 +3,7 @@
 //!
 //! This runs ONCE, in production, against the file on the Railway volume, and
 //! there is no second chance at it: the ids in that file are pointed at by
-//! every soft pointer the store has (`waitlist.invite_id` names an invite,
+//! every soft pointer the store has (a funnel row's `invite_id` names an invite,
 //! `invite_codes.used_by_label` names a tenant), and by the pairing codes and
 //! links already in people's inboxes. So the properties asserted here are the
 //! ones a dry run cannot rehearse:
@@ -21,8 +21,14 @@
 //!   is what this refusal is for.
 //!
 //! The fixture's ids are DELIBERATELY NON-CONTIGUOUS (tenant 7, invites 3 and
-//! 9, waitlist 5): a file whose ids happened to be 1..n would pass an importer
-//! that renumbered as it went.
+//! 9, the waiting row 5): a file whose ids happened to be 1..n would pass an
+//! importer that renumbered as it went.
+//!
+//! THE FILE SAYS `waitlist` AND THE TARGET SAYS `users`. That table absorbed the
+//! waitlist after this file's last writer was retired, so the importer reads one
+//! name and writes the other, minting the `analytics_id` the new shape requires
+//! and the old one never had. Everything else about the row is carried across
+//! unchanged, ids included, which is what these assertions are checking.
 
 use std::path::{Path, PathBuf};
 
@@ -251,6 +257,22 @@ fn legacy_file(name: &str) -> Fixture {
     Fixture(path)
 }
 
+/// Whether a string is shaped like the UUIDv4 `mint_analytics_id` writes:
+/// 8-4-4-4-12 lowercase hex, version nibble 4, variant in `89ab`. The app holds
+/// an adopted id to this shape before it will adopt it, so it is a contract
+/// rather than a convention.
+fn is_uuid_shaped(s: &str) -> bool {
+    let parts: Vec<&str> = s.split('-').collect();
+    parts.len() == 5
+        && [8, 4, 4, 4, 12] == parts.iter().map(|p| p.len()).collect::<Vec<_>>()[..]
+        && parts.iter().all(|p| {
+            p.bytes()
+                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+        })
+        && parts[2].starts_with('4')
+        && matches!(parts[3].as_bytes()[0], b'8' | b'9' | b'a' | b'b')
+}
+
 /// Every row of all three tables, whole, as text, in id order.
 ///
 /// `to_jsonb(t)` rather than a column list, deliberately: a column this test
@@ -258,7 +280,7 @@ fn legacy_file(name: &str) -> Fixture {
 /// nothing" stays true of a table that grows a column later.
 async fn snapshot(client: &tokio_postgres::Client) -> Vec<String> {
     let mut out = Vec::new();
-    for table in ["tenants", "invite_codes", "waitlist"] {
+    for table in ["tenants", "invite_codes", "users"] {
         let rows = client
             .query(
                 &format!("SELECT to_jsonb(t)::text FROM {table} t ORDER BY id"),
@@ -283,7 +305,7 @@ async fn a_legacy_file_lands_row_for_row() {
         .expect("the import");
     assert_eq!(report.tenants, TENANTS.len());
     assert_eq!(report.invite_codes, INVITES.len());
-    assert_eq!(report.waitlist, WAITING.len());
+    assert_eq!(report.users, WAITING.len());
 
     let client = common::raw_client(&url).await;
 
@@ -352,7 +374,7 @@ async fn a_legacy_file_lands_row_for_row() {
     }
 
     let rows = client
-        .query("SELECT * FROM waitlist ORDER BY id", &[])
+        .query("SELECT * FROM users ORDER BY id", &[])
         .await
         .unwrap();
     assert_eq!(rows.len(), WAITING.len());
@@ -371,10 +393,20 @@ async fn a_legacy_file_lands_row_for_row() {
             w.notified_at,
             "a NULL stays NULL"
         );
+        // The one column the file had nothing to say about: minted on the way
+        // in, so a migrated person is knowable to analytics exactly like
+        // somebody who arrived after the funnel table existed.
+        let aid: String = row.get("analytics_id");
+        assert!(is_uuid_shaped(&aid), "{aid}");
+        // ...and the funnel columns start empty, because the file recorded
+        // nothing about them. The first init after this import is what fills
+        // them in from the invite trail.
+        assert_eq!(row.get::<_, Option<String>>("signed_up_at"), None);
+        assert_eq!(row.get::<_, Option<String>>("first_paired_at"), None);
     }
 
-    // THE SOFT POINTER, asked the way the admin page asks it: the id the
-    // waitlist row carries names a row that is actually here.
+    // THE SOFT POINTER, asked the way the admin page asks it: the id the funnel
+    // row carries names a row that is actually here.
     let pointed_at: i64 = WAITING[0].invite_id.expect("the fixture points at one");
     let hit = client
         .query_one(
@@ -382,7 +414,7 @@ async fn a_legacy_file_lands_row_for_row() {
             &[&pointed_at],
         )
         .await
-        .expect("the invite the waitlist row names survived the import");
+        .expect("the invite the funnel row names survived the import");
     assert_eq!(hit.get::<_, String>(0), INVITES[1].code_hash);
 }
 
@@ -422,7 +454,7 @@ async fn every_sequence_continues_where_the_file_left_off() {
         .insert_tenant("grace", "grace@example.com")
         .await
         .unwrap();
-    assert!(store.add_to_waitlist("hopper@example.com").await.unwrap());
+    assert!(store.add_user_waiting("hopper@example.com").await.unwrap());
 
     let client = common::raw_client(&url).await;
     let tenant_id: i64 = client
@@ -431,15 +463,15 @@ async fn every_sequence_continues_where_the_file_left_off() {
         .unwrap()
         .get(0);
     assert_eq!(tenant_id, TENANTS[0].id + 1);
-    let waitlist_id: i64 = client
+    let user_id: i64 = client
         .query_one(
-            "SELECT id FROM waitlist WHERE email = 'hopper@example.com'",
+            "SELECT id FROM users WHERE email = 'hopper@example.com'",
             &[],
         )
         .await
         .unwrap()
         .get(0);
-    assert_eq!(waitlist_id, WAITING[0].id + 1);
+    assert_eq!(user_id, WAITING[0].id + 1);
 }
 
 /// The designed failure: a target that already holds rows is refused by NAME

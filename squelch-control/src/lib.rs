@@ -31,6 +31,7 @@
 //! has consented to nothing but being told when there is room, so the waitlist
 //! and admin paths log the ROW ID and never the address they hold.
 
+pub mod activation;
 pub mod admin;
 pub mod bifrost;
 pub mod config;

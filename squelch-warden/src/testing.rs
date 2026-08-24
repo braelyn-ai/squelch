@@ -125,6 +125,20 @@ pub fn pair_stdout(code: &str, url: &str) -> String {
     )
 }
 
+/// Exactly what `squelchd token first-paired` prints for a mailbox a client has
+/// paired with: ONE line, the timestamp, nothing else. Captured from
+/// `squelchd/src/bin/squelchd.rs::cmd_token`, and the parser is held to it.
+pub fn first_paired_stdout(ts: &str) -> String {
+    format!("{ts}\n")
+}
+
+/// The same command's other answer: the daemon is fine, and nobody has ever
+/// paired a client with this mailbox. Its own fixture because it is an ANSWER
+/// and not an error, and the two must never be spelled the same way.
+pub fn first_paired_none_stdout() -> String {
+    "none\n".to_string()
+}
+
 #[derive(Default)]
 struct MockInner {
     /// Everything that currently exists, keyed the way the API server keys it.

@@ -263,6 +263,16 @@ pub struct TenantStatus {
     pub status: String,
 }
 
+/// `GET /v1/tenants/{label}/devices` 200 body.
+#[derive(Debug, Deserialize)]
+struct DevicesAnswer {
+    /// RFC3339, or null while nobody has paired a client. A STRING on the
+    /// wire and parsed here, because the warden's answers are untrusted input:
+    /// what the store receives is a re-serialized [`chrono::DateTime`], never
+    /// the warden's bytes.
+    first_paired_at: Option<String>,
+}
+
 impl TenantStatus {
     /// Whether this tenant is a half-finished signup that the SAME mailbox may
     /// come back and complete. Anything else (active, failed, stopped, or a
@@ -449,6 +459,19 @@ pub trait Warden: Send + Sync {
     /// ordinary device token. A browser is just another paired device, so
     /// revocation, audit, and expiry are the ones already shipped.
     async fn pair(&self, label: &str) -> Result<Pairing, WardenError>;
+
+    /// When the first CLIENT device paired to this tenant's daemon, from
+    /// `GET /v1/tenants/{label}/devices`. Three layers, three questions:
+    /// `Ok(None)` — the warden has never heard of the label; `Ok(Some(None))`
+    /// — the tenant is up and nobody has paired a client yet, a real answer
+    /// worth polling again; `Ok(Some(Some(ts)))` — the activation fact, at
+    /// the daemon's own timestamp. Every error (the warden's 503
+    /// `not_running` included) means ask later: the poller's cadence is the
+    /// retry, so nothing here distinguishes them.
+    async fn first_paired(
+        &self,
+        label: &str,
+    ) -> Result<Option<Option<chrono::DateTime<chrono::Utc>>>, WardenError>;
 }
 
 /// The real client: one reqwest client, one bearer, one base URL.
@@ -673,6 +696,44 @@ impl Warden for HttpWarden {
             }
             404 => Ok(None),
             401 | 403 => Err(WardenError::Unauthorized),
+            _ => Err(WardenError::Failed),
+        }
+    }
+
+    async fn first_paired(
+        &self,
+        label: &str,
+    ) -> Result<Option<Option<chrono::DateTime<chrono::Utc>>>, WardenError> {
+        crate::labels::validate(label).map_err(|_| WardenError::LabelRefused)?;
+        let resp = self
+            .http
+            .get(self.url(&format!("/v1/tenants/{label}/devices")))
+            .bearer_auth(&self.token)
+            .send()
+            .await
+            .map_err(|e| transport_error(e, label))?;
+
+        match resp.status().as_u16() {
+            200 => {
+                let body = read_capped(resp, label).await?;
+                let answer: DevicesAnswer =
+                    serde_json::from_slice(&body).map_err(|_| WardenError::Unreachable)?;
+                match answer.first_paired_at {
+                    None => Ok(Some(None)),
+                    Some(raw) => {
+                        // A timestamp that does not parse is a warden that is
+                        // not speaking the contract, and half an answer is not
+                        // an answer — refused, like every malformed body.
+                        let ts = chrono::DateTime::parse_from_rfc3339(&raw)
+                            .map_err(|_| WardenError::Unreachable)?;
+                        Ok(Some(Some(ts.with_timezone(&chrono::Utc))))
+                    }
+                }
+            }
+            404 => Ok(None),
+            401 | 403 => Err(WardenError::Unauthorized),
+            // The warden's 503 not_running lands here on purpose: "not
+            // running" and "broken" call for the same next move, later.
             _ => Err(WardenError::Failed),
         }
     }
@@ -1678,5 +1739,60 @@ mod tests {
         // The ESC is what a terminal obeys; the rest of the sequence is
         // ordinary text and stays, so the operator sees the shape of it.
         assert_eq!(declaw("a\u{1b}[2Jb"), format!("a{REPLACEMENT}[2Jb"));
+    }
+
+    /// The devices route on the wire: every answer the poller can meet. The
+    /// null body and the 404 are DIFFERENT answers (keep polling vs the
+    /// candidate join will drop it), and a timestamp that does not parse is
+    /// refused whole — half an answer is not an answer.
+    #[tokio::test]
+    async fn first_paired_reads_every_shape_the_warden_answers() {
+        use axum::{
+            Json, Router, extract::Path, http::StatusCode, response::IntoResponse, routing::get,
+        };
+        use serde_json::json;
+
+        let app = Router::new().route(
+            "/v1/tenants/{label}/devices",
+            get(|Path(label): Path<String>| async move {
+                match label.as_str() {
+                    "paired" => (
+                        StatusCode::OK,
+                        Json(json!({"first_paired_at": "2026-08-20T12:00:00Z"})),
+                    )
+                        .into_response(),
+                    "quiet" => {
+                        (StatusCode::OK, Json(json!({"first_paired_at": null}))).into_response()
+                    }
+                    "rolling" => (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        Json(json!({"error": "not_running"})),
+                    )
+                        .into_response(),
+                    "garbled" => (
+                        StatusCode::OK,
+                        Json(json!({"first_paired_at": "yesterday-ish"})),
+                    )
+                        .into_response(),
+                    _ => {
+                        (StatusCode::NOT_FOUND, Json(json!({"error": "not_found"}))).into_response()
+                    }
+                }
+            }),
+        );
+        let w = mock_warden(app).await;
+
+        let ts = w.first_paired("paired").await.unwrap().unwrap().unwrap();
+        assert_eq!(ts.to_rfc3339(), "2026-08-20T12:00:00+00:00");
+        assert_eq!(w.first_paired("quiet").await.unwrap(), Some(None));
+        assert_eq!(w.first_paired("gone").await.unwrap(), None);
+        assert!(matches!(
+            w.first_paired("rolling").await,
+            Err(WardenError::Failed)
+        ));
+        assert!(matches!(
+            w.first_paired("garbled").await,
+            Err(WardenError::Unreachable)
+        ));
     }
 }

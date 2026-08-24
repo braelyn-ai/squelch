@@ -18,21 +18,27 @@
 //! is to stop and let a human reconcile the handful of rows by hand. A designed
 //! failure, not a limitation.
 //!
-//! PRIVACY: this module reads addresses (every tenant's mailbox, every waitlist
-//! entry) and logs none of them. What it returns is COUNTS, and the CLI prints
-//! counts.
+//! PRIVACY: this module reads addresses (every tenant's mailbox, every person on
+//! the funnel) and logs none of them. What it returns is COUNTS, and the CLI
+//! prints counts.
 
 use std::path::Path;
 
 use rusqlite::{Connection, OpenFlags};
 
-use crate::store::{ControlStore, StoreError};
+use crate::store::{ControlStore, StoreError, mint_analytics_id};
 
 /// The three tables, in the order they are imported and re-armed. Order does
 /// not matter to the database (there are no foreign keys, on purpose: the
 /// pointers between these tables are soft), but it decides the order of the
 /// counts an operator reads.
-const TABLES: [&str; 3] = ["tenants", "invite_codes", "waitlist"];
+///
+/// THE THIRD ONE IS `users`, WHICH THE FILE CALLS `waitlist`. The SQLite store
+/// this reads was written before the funnel table absorbed the waitlist, so the
+/// rows are read out of `waitlist` and written into `users`: same columns, same
+/// ids, plus an `analytics_id` minted per row on the way in, because the shape
+/// they are landing in has one and the shape they came from did not.
+const TABLES: [&str; 3] = ["tenants", "invite_codes", "users"];
 
 /// Why an import stopped.
 #[derive(Debug, thiserror::Error)]
@@ -65,7 +71,7 @@ type Result<T> = std::result::Result<T, ImportError>;
 pub struct ImportReport {
     pub tenants: usize,
     pub invite_codes: usize,
-    pub waitlist: usize,
+    pub users: usize,
 }
 
 /// One tenant row, in the SQLite column order.
@@ -93,7 +99,7 @@ struct Invite {
     reserved_until: Option<String>,
 }
 
-/// One waitlist row, in the SQLite column order.
+/// One legacy `waitlist` row, in the SQLite column order. It lands in `users`.
 struct Waiting {
     id: i64,
     email: String,
@@ -116,9 +122,9 @@ struct Waiting {
 /// happening with a Postgres transaction held open.
 ///
 /// IDS ARE PRESERVED, AND THAT IS THE POINT OF THE WHOLE EXERCISE. Every
-/// pointer between these tables is soft — `waitlist.invite_id` names an invite
-/// row, `invite_codes.used_by_label` names a tenant — so renumbering on the way
-/// in would silently repoint half the waitlist at the wrong codes.
+/// pointer between these tables is soft — a funnel row's `invite_id` names an
+/// invite row, `invite_codes.used_by_label` names a tenant — so renumbering on
+/// the way in would silently repoint half the funnel at the wrong codes.
 pub async fn import_sqlite(store: &ControlStore, path: &Path) -> Result<ImportReport> {
     let (tenants, invites, waiting) = read_sqlite(path)?;
 
@@ -184,11 +190,14 @@ pub async fn import_sqlite(store: &ControlStore, path: &Path) -> Result<ImportRe
         .await?;
     }
     for w in &waiting {
+        // The one column that is not in the file: minted here, per row, exactly
+        // as `add_user_waiting` would have minted it had this person arrived
+        // after the funnel table existed.
         tx.execute(
-            "INSERT INTO waitlist(id, email, created_at, status, approved_at,
-                                  invite_id, notified_at)
+            "INSERT INTO users(id, email, created_at, status, approved_at,
+                               invite_id, notified_at, analytics_id)
              OVERRIDING SYSTEM VALUE
-             VALUES($1, $2, $3, $4, $5, $6, $7)",
+             VALUES($1, $2, $3, $4, $5, $6, $7, $8)",
             &[
                 &w.id,
                 &w.email,
@@ -197,6 +206,7 @@ pub async fn import_sqlite(store: &ControlStore, path: &Path) -> Result<ImportRe
                 &w.approved_at,
                 &w.invite_id,
                 &w.notified_at,
+                &mint_analytics_id()?,
             ],
         )
         .await?;
@@ -224,7 +234,7 @@ pub async fn import_sqlite(store: &ControlStore, path: &Path) -> Result<ImportRe
     Ok(ImportReport {
         tenants: tenants.len(),
         invite_codes: invites.len(),
-        waitlist: waiting.len(),
+        users: waiting.len(),
     })
 }
 

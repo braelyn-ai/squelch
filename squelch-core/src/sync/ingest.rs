@@ -2511,6 +2511,10 @@ mod tests {
         let view = store.thread_view_with_html(acct, "thread-77").unwrap();
         assert_eq!(view.messages.len(), 1);
         assert!(view.messages[0].content.contains("noon works"));
+        assert!(
+            view.messages[0].is_sent,
+            "the outbound copy is flagged for the reader's right-aligned bubble"
+        );
         let updates = store
             .attention_updates(
                 acct,

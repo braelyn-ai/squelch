@@ -39,6 +39,12 @@ use tracing_subscriber::EnvFilter;
 /// removes expired entries, so this only bounds what an idle process holds.
 const SWEEP_EVERY: Duration = Duration::from_secs(60);
 
+/// How often the activation poller runs. NOT the session sweep's 60s: each
+/// candidate costs a `pods/exec` in the cluster, and the stamp it lands is
+/// analytics — minutes of latency are free, so the slower cadence buys a 5x
+/// cut in exec traffic for nothing.
+const ACTIVATION_POLL_EVERY: Duration = Duration::from_secs(300);
+
 #[derive(Parser)]
 #[command(
     name = "squelch-control",
@@ -135,6 +141,12 @@ enum ShareCommand {
 #[derive(Subcommand)]
 enum InviteCommand {
     /// Mint new codes. Each is printed once and stored only as a hash.
+    ///
+    /// A CLI CODE NAMES NOBODY, which is what makes it different from the
+    /// admin page's invite: there is no address to record, so no `users` row
+    /// exists yet. One appears at CONSUMPTION, keyed on the Google account that
+    /// redeems the code, and that account is the only identity this door ever
+    /// learns.
     Issue {
         /// How many to mint.
         #[arg(long, default_value_t = 1)]
@@ -732,15 +744,15 @@ fn reconcile(label: String) -> anyhow::Result<()> {
 /// Move a legacy SQLite control store into Postgres.
 ///
 /// COUNTS ONLY on the way out. Every row this touches is somebody's address —
-/// a tenant's mailbox, a waitlist entry — and the operator needs to know that
-/// the numbers match the old store, not who is in it.
+/// a tenant's mailbox, a person on the funnel — and the operator needs to know
+/// that the numbers match the old store, not who is in it.
 fn import_sqlite(path: PathBuf) -> anyhow::Result<()> {
     runtime()?.block_on(async {
         let store = open_store().await?;
         let report = import::import_sqlite(&store, &path).await?;
         eprintln!(
-            "squelch-control: imported {} tenants, {} invite codes, {} waitlist rows.",
-            report.tenants, report.invite_codes, report.waitlist
+            "squelch-control: imported {} tenants, {} invite codes, {} user rows.",
+            report.tenants, report.invite_codes, report.users
         );
         eprintln!(
             "squelch-control: check them with `tenants` and `invite list`, then keep the SQLite \
@@ -786,6 +798,19 @@ async fn serve_async(config: Config) -> anyhow::Result<()> {
                 // PRIVACY: a count. Never which sessions went.
                 tracing::debug!(swept, "expired signup sessions swept");
             }
+        }
+    });
+
+    // The activation poller (issue #89): its own ticker on its own cadence —
+    // see ACTIVATION_POLL_EVERY — because an exec-per-tenant probe does not
+    // belong on the session sweep's tight loop. All logging lives inside the
+    // pass; a quiet pass is the normal one.
+    let poller = state.clone();
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(ACTIVATION_POLL_EVERY);
+        loop {
+            ticker.tick().await;
+            squelch_control::activation::poll_first_paired(&poller).await;
         }
     });
 

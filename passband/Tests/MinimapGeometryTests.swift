@@ -23,6 +23,8 @@ struct MinimapGeometryTests {
         theMapIsTheEstimates()
         measurementNeverMovesTheMap()
         estimateGrowsWithTheText()
+        textHeightIsTheCardWithoutItsChrome()
+        theStyleIsTheMeasure()
         windowFromACard()
         windowIsAFractionNotADistance()
         windowUsesTheCardItIsInsideNotTheNearest()
@@ -108,6 +110,65 @@ struct MinimapGeometryTests {
                 == MinimapGeometry.estimate(text: "", html: markup), true,
             "whitespace is not text")
 
+    }
+
+    /// THE READER LEANS ON THIS ONE TOO, which is why it is asserted apart from
+    /// the rail's own guess: `textHeight` is the size an unmeasured web frame is
+    /// given while it loads, and a frame that opens at the wrong size shoves the
+    /// rest of the thread when its real height lands. The two callers must stay
+    /// the same guess — the card is this plus its chrome, and nothing else.
+    static func textHeightIsTheCardWithoutItsChrome() {
+        let text = String(repeating: "word ", count: 400)
+        let chrome = MinimapGeometry.estimate(text: "") - MinimapGeometry.textHeight(text: "")
+        equal(
+            MinimapGeometry.estimate(text: text),
+            MinimapGeometry.textHeight(text: text) + chrome,
+            "a card is its text plus a constant")
+        equal(
+            MinimapGeometry.textHeight(text: text) > MinimapGeometry.textHeight(text: "thanks!"),
+            true, "more text is more height")
+        // No floor of its own: the card's minimum is the CARD's, and a frame
+        // that is genuinely one line must be allowed to be one line.
+        equal(
+            MinimapGeometry.textHeight(text: "hi") < MinimapGeometry.minimumCard, true,
+            "a one-line body is not given a card's floor")
+        // Same html stand-in as the rail: a body that is markup with no text
+        // still has to guess tall, or every html-only message opens at a line.
+        let markup = String(repeating: "<td style='padding:0'>hello there</td>", count: 200)
+        equal(
+            MinimapGeometry.textHeight(text: "", html: markup)
+                > MinimapGeometry.textHeight(text: ""), true,
+            "html stands in when the plain text is missing")
+    }
+
+    /// THE SAME MAIL THROUGH TWO MEASURES. A chat bubble is narrower than the
+    /// column, so a paragraph is more lines there and the rail has to say so —
+    /// while the caption over a bubble costs less than a card's header row, so a
+    /// short message is worth LESS. Both directions matter: a map drawn for the
+    /// wrong style points at the wrong part of the conversation.
+    static func theStyleIsTheMeasure() {
+        let paragraph = String(repeating: "word ", count: 400)
+        equal(
+            MinimapGeometry.estimate(text: paragraph, style: .bubbles)
+                > MinimapGeometry.estimate(text: paragraph, style: .classic), true,
+            "a narrower measure is more lines")
+        equal(
+            MinimapGeometry.estimate(text: "thanks!", style: .bubbles)
+                <= MinimapGeometry.estimate(text: "thanks!", style: .classic), true,
+            "and a caption costs less than a header row")
+        // The default is the style every existing caller means, so nothing
+        // outside the reader changes shape by not asking.
+        equal(
+            MinimapGeometry.estimate(text: paragraph),
+            MinimapGeometry.estimate(text: paragraph, style: .classic),
+            "not asking means the email card")
+        // The bounds are the rail's, not a style's: neither end moves.
+        equal(
+            MinimapGeometry.estimate(text: "", style: .bubbles) >= MinimapGeometry.minimumCard,
+            true, "a bubble still has a floor")
+        equal(
+            MinimapGeometry.estimate(text: String(repeating: "x", count: 400_000), style: .bubbles)
+                <= MinimapGeometry.longestGuess, true, "and the same ceiling")
     }
 
     /// The window's own position, read off a card: message 1 is drawn from 200 to

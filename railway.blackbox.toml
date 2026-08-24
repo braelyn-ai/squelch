@@ -2,6 +2,19 @@
 # Selected in the service's settings under "Config-as-code file path"
 # (deploy/DEPLOY.md §8). Private networking only: never mint a public domain
 # for this service.
+#
+# DEPLOY QUIRK (same as railway.bifrost.toml): `railway up` from the repo root
+# is accepted and then silently SKIPPED — the deployment lands in the list as
+# SKIPPED, no build runs, and the previous image keeps serving, so a config
+# change looks deployed and is not. Deploy from a staging dir holding only this
+# file, its Dockerfile, and the configs the Dockerfile COPYs:
+#   SC=$(mktemp -d); mkdir -p $SC/deploy/monitoring/blackbox
+#   cp Dockerfile.blackbox railway.blackbox.toml $SC/
+#   cp deploy/monitoring/blackbox/* $SC/deploy/monitoring/blackbox/
+#   (cd $SC && railway link --project <id> --environment production \
+#        --service blackbox && railway up -s blackbox --detach)
+# Verify what actually shipped rather than trusting the status:
+#   railway ssh --service blackbox -- cat /tmp/config.yml
 [build]
 builder = "dockerfile"
 dockerfilePath = "Dockerfile.blackbox"
