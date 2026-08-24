@@ -48,6 +48,10 @@ struct EmailWebView: View {
     @State private var quotedHidden = true
     @State private var measured = false
     @State private var sizing: SizingPhase = .opening
+    /// Whether the current sizing round was started by the READER doing
+    /// something — see `apply`, which defers to the measuring pass except when
+    /// this is set.
+    @State private var sizingIsUserDriven = false
 
     /// HOW MANY OF THIS DOCUMENT'S REPORTED HEIGHTS ARE ALLOWED TO BECOME THE
     /// FRAME'S HEIGHT, and when. Exactly two, and both at a moment that means
@@ -259,14 +263,14 @@ struct EmailWebView: View {
         // remote images in are the two things that legitimately change what
         // this message is; everything else that reaches the frame is the frame
         // talking to itself.
-        .onChange(of: quotedHidden) { _, _ in sizing = .opening }
-        .onChange(of: allowRemote) { _, _ in sizing = .opening }
+        .onChange(of: quotedHidden) { _, _ in restartSizing(userDriven: true) }
+        .onChange(of: allowRemote) { _, _ in restartSizing(userDriven: true) }
         // And a different BODY in the same frame, which is not a user action
         // but is still a new document to size: the cold path finishing its
         // preparation, or this view being reused for another message as the
         // stack recycles. Without it the new document's first measurement
         // arrives into a machine that has already stopped listening.
-        .onChange(of: prepared.sourceHash) { _, _ in sizing = .opening }
+        .onChange(of: prepared.sourceHash) { _, _ in restartSizing(userDriven: false) }
         // COLD PATH ONLY — `init` already seeded `prepared` from the warmer; this
         // runs for a body opened before its thread warmed (or since evicted). Off
         // the main actor: the scans are a full regex walk of the body.
@@ -310,11 +314,39 @@ struct EmailWebView: View {
         }
     }
 
+    /// A new document to size, and whether the reader asked for it.
+    private func restartSizing(userDriven: Bool) {
+        sizing = .opening
+        sizingIsUserDriven = userDriven
+    }
+
     /// Take a reported height, or decline it. THE ONE PLACE a measurement ever
     /// becomes the frame's size.
     private func apply(_ h: CGFloat) {
         guard h > 0, h <= Self.sanityCeiling else {
             trace("refused \(Int(h))")
+            return
+        }
+        // A MEASUREMENT TAKEN AT A FIXED VIEWPORT BEATS ANYTHING THIS FRAME CAN
+        // WORK OUT, and for one kind of body it is the only real answer there
+        // is. A document written in `vh` units has no intrinsic height — it is
+        // one viewport tall, whatever viewport you ask at, so `h = h + padding`
+        // has no solution — and a frame deriving it from its own box just
+        // returns wherever it started plus a couple of round trips. Measured:
+        // opened at the placeholder, a full-height email settled at 176 points
+        // against 828 for the same document asked at a real window.
+        //
+        // Not for a user action, though: unfolding the quoted history or
+        // letting the images in makes this a different document from the one
+        // the pass measured, and then the frame in front of somebody is the
+        // only thing that knows.
+        if !sizingIsUserDriven, let key = cacheKey,
+            let measuredHeight = FrameHeights.shared.authoritative(key)
+        {
+            height = measuredHeight
+            measured = true
+            sizing = .done
+            trace("deferred to measured \(Int(measuredHeight)), offered \(Int(h))")
             return
         }
         switch sizing {
@@ -330,7 +362,10 @@ struct EmailWebView: View {
         trace("applied \(Int(height)) -> \(Int(h)) (\(sizing))")
         height = h
         measured = true
-        // The memory stores the DEFAULT (collapsed) state only.
+        // The memory stores the DEFAULT (collapsed) state only — and stores
+        // this as PROVISIONAL, because it was taken inside a box this frame had
+        // sized itself. It holds the message at a sane size until the pass
+        // reaches it, and never displaces what the pass finds.
         if let cacheKey, quotedHidden { FrameHeights.shared.set(cacheKey, h) }
     }
 
@@ -796,6 +831,26 @@ final class EmailFrameCoordinator: NSObject {
     func documentDidLoad(_ webView: WKWebView) {
         appliedCollapse = true
         applyCollapse(webView)
+        settle(webView)
+    }
+
+    /// A navigation that failed will never report anything, and a host still
+    /// waiting for it would refuse every later height this frame ever offers —
+    /// including the ones a retry or a resize produces. Releasing the wait
+    /// costs nothing when there is genuinely nothing more to come.
+    func documentDidFail() {
+        onLoaded()
+    }
+
+    /// TELL THE HOST TO TAKE ONE LAST MEASUREMENT, and hand it the number.
+    ///
+    /// Asking is the point: a pushed height says nothing about which state of
+    /// the document produced it, while an answer belongs to the question. Used
+    /// wherever a document has finished becoming whatever it is about to be —
+    /// the navigation landing, and the quoted history folding or unfolding,
+    /// which changes the content just as much but starts no navigation at all,
+    /// so nothing else would ever tell the host it had stopped moving.
+    private func settle(_ webView: WKWebView) {
         onLoaded()
         webView.evaluateJavaScript("window.__passbandHeight ? window.__passbandHeight() : 0") {
             [weak self] value, _ in
@@ -808,7 +863,13 @@ final class EmailFrameCoordinator: NSObject {
         guard appliedCollapse != wantedCollapse else { return }
         appliedCollapse = wantedCollapse
         webView.evaluateJavaScript(
-            "window.__passbandSetQuotes && window.__passbandSetQuotes(\(wantedCollapse))")
+            "window.__passbandSetQuotes && window.__passbandSetQuotes(\(wantedCollapse))"
+        ) { [weak self] _, _ in
+            // Folding the history is a content change with no navigation
+            // behind it, so this is the only thing that ever tells the host
+            // the document has finished moving.
+            self?.settle(webView)
+        }
     }
 
     /// LAYER 4: allow exactly the in-memory loads WE started, refuse everything
@@ -989,6 +1050,7 @@ final class FrameRelay: NSObject, WKScriptMessageHandler, WKNavigationDelegate,
         _ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error
     ) {
         loaded = false
+        owner?.documentDidFail()
     }
 
     func webView(
@@ -996,6 +1058,7 @@ final class FrameRelay: NSObject, WKScriptMessageHandler, WKNavigationDelegate,
         withError error: Error
     ) {
         loaded = false
+        owner?.documentDidFail()
     }
 
     /// No popups, ever.

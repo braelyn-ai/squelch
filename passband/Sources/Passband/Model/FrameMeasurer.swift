@@ -97,7 +97,10 @@ final class FrameMeasurer {
         // above it, so the next size anybody needs is the one just behind them.
         let jobs = messages.reversed().filter { message in
             guard let html = message.html, !html.isEmpty else { return false }
-            return FrameHeights.shared.get(String(message.id)) == nil
+            // AUTHORITATIVE, not merely present: a height a live frame put
+            // there is a stopgap taken inside a box it had sized itself, and
+            // replacing exactly those is what this pass is for.
+            return FrameHeights.shared.authoritative(String(message.id)) == nil
         }
         guard !jobs.isEmpty else {
             onFinished()
@@ -116,7 +119,7 @@ final class FrameMeasurer {
                 let height = await self.measure(message, allowRemote: allowRemote)
                 if Task.isCancelled { return }
                 if height > 0 {
-                    FrameHeights.shared.set(String(message.id), height)
+                    FrameHeights.shared.set(String(message.id), height, authoritative: true)
                     misses = 0
                 } else {
                     misses += 1

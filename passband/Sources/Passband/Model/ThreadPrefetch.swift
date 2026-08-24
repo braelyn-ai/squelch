@@ -214,7 +214,20 @@ final class PreparedBodies: @unchecked Sendable {
 @MainActor
 final class FrameHeights {
     static let shared = FrameHeights()
-    private var heights: [String: CGFloat] = [:]
+    /// A height and WHERE IT CAME FROM. The two sources are not equally good
+    /// and the difference decides things: the offscreen pass measures at a
+    /// fixed viewport, so nothing it reports can have been influenced by what
+    /// it reported last, while a live frame measures inside a box sized from
+    /// its own previous answer. For most mail they agree. For a body written in
+    /// `vh` units there is no viewport-independent answer at all — the height
+    /// is whatever viewport you ask at — and then only the fixed-viewport
+    /// number means anything.
+    private struct Known {
+        var height: CGFloat
+        var authoritative: Bool
+    }
+
+    private var heights: [String: Known] = [:]
     private var guesses: [String: CGFloat] = [:]
     private init() {}
 
@@ -236,8 +249,23 @@ final class FrameHeights {
         heights.removeAll()
     }
 
-    func get(_ key: String) -> CGFloat? { heights[key] }
-    func set(_ key: String, _ height: CGFloat) { heights[key] = height }
+    /// The best height on file, whoever took it — what a frame is drawn at.
+    func get(_ key: String) -> CGFloat? { heights[key]?.height }
+
+    /// Only a height taken at a FIXED viewport. This is the one a live frame
+    /// must defer to rather than re-deriving, and the one that says a message
+    /// no longer needs measuring.
+    func authoritative(_ key: String) -> CGFloat? {
+        heights[key].flatMap { $0.authoritative ? $0.height : nil }
+    }
+
+    /// A provisional height never displaces a measured one: a live frame's
+    /// answer is a stopgap until the pass reaches that message, and letting it
+    /// overwrite would make the stopgap permanent.
+    func set(_ key: String, _ height: CGFloat, authoritative: Bool = false) {
+        if let known = heights[key], known.authoritative, !authoritative { return }
+        heights[key] = Known(height: height, authoritative: authoritative)
+    }
     func clear(_ key: String) {
         heights.removeValue(forKey: key)
         guesses.removeValue(forKey: key)
