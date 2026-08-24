@@ -119,6 +119,7 @@ use crate::oauth::{self, Flow, GoogleEndpoints};
 use crate::pages;
 use crate::seal;
 use crate::sessions::{self, InsertError, SessionKind};
+use crate::share;
 use crate::state::ControlState;
 use crate::store::StoreError;
 use crate::warden::WardenError;
@@ -1031,6 +1032,50 @@ pub async fn oauth_callback(
         }
     }
 
+    // THE SHARE TOKEN, in the same window and for the same reason the LLM keys
+    // are here: installed BEFORE call 2, so the workload's first render carries
+    // its hash and the tenant is never rolled a second time to pick it up. A
+    // tenant that had to wait for an operator before it could share is a tenant
+    // that never shares, and the person who just arrived through an invite is
+    // exactly the one most likely to send another.
+    //
+    // FAIL-SOFT, like the block above: every way this can go wrong leaves a
+    // mailbox that works and cannot share, which is precisely the state every
+    // tenant provisioned before this line was written is in, and
+    // `squelch-control share mint` is the answer to all of them.
+    //
+    // Gated on the invite feature being configured at all, because that is what
+    // `POST /tenant/invite` itself is gated on: a deployment with no invite
+    // policy would be installing a credential for a door that answers 503.
+    let mut share_token_hash: Option<String> = None;
+    if state.config().waitlist.is_some() {
+        match share::mint() {
+            Ok(minted) => {
+                match state
+                    .warden()
+                    .put_share_token(&label, Some(&minted.token))
+                    .await
+                {
+                    // THE HASH IS KEPT ONLY IF THE POD TOOK THE TOKEN. Recorded
+                    // without that, the store would believe in a credential no
+                    // daemon holds; the tenant would still not share, and the
+                    // row would say it could.
+                    Ok(()) => share_token_hash = Some(minted.token_hash),
+                    Err(e) => tracing::error!(
+                        error = %e,
+                        label = %label,
+                        "SHARE TOKEN NOT INSTALLED: this tenant cannot invite anybody until `squelch-control share mint` backfills it"
+                    ),
+                }
+            }
+            // Never the token, and never a prefix of it.
+            Err(_) => tracing::error!(
+                label = %label,
+                "SHARE TOKEN NOT MINTED: the system random source failed; `squelch-control share mint` backfills it"
+            ),
+        }
+    }
+
     // CALL 2. The credential is installed and the workload applied. A failure
     // here leaves the pending tenant standing, which is the retriable state the
     // page below describes: no credential was written, no invite was spent, and
@@ -1112,6 +1157,21 @@ pub async fn oauth_callback(
             }
             Err(e) => {
                 tracing::error!(error = %e, label = %label, assistant_vk_id = %id, "ASSISTANT VK NOT RECORDED: revoke or re-mint by this id by hand")
+            }
+        }
+    }
+
+    // And the share token's hash joins the row, on the same terms: a record that
+    // did not land costs this tenant the button until an operator backfills it,
+    // never the user their mailbox.
+    if let Some(hash) = &share_token_hash {
+        match state.store().set_tenant_share_token(&label, hash).await {
+            Ok(true) => {}
+            Ok(false) => {
+                tracing::error!(label = %label, "SHARE TOKEN NOT RECORDED: the tenant row vanished under it")
+            }
+            Err(e) => {
+                tracing::error!(error = %e, label = %label, "SHARE TOKEN NOT RECORDED: run `squelch-control share mint` to replace it")
             }
         }
     }
