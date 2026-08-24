@@ -1,9 +1,9 @@
 # Blackbox exporter modules. No public domain is ever minted for this service —
 # Prometheus reaches it over Railway private networking only.
 #
-# THIS FILE IS A TEMPLATE: entrypoint.sh renders __BIFROST_CANARY_KEY__ from
-# the BLACKBOX_BIFROST_CANARY_KEY Railway service variable at boot (same
-# pattern as prometheus's web.yml). Never put the key itself here.
+# THIS FILE IS A TEMPLATE: entrypoint.sh renders __BIFROST_CANARY_KEY__ and
+# __CANARY_MODEL__ from Railway service variables at boot (same pattern as
+# prometheus's web.yml). Never put the key itself here.
 modules:
   # follow redirects, require a 2xx, record TLS expiry
   # (probe_ssl_earliest_cert_expiry comes free with any https probe).
@@ -15,23 +15,56 @@ modules:
       follow_redirects: true
       fail_if_not_ssl: true
 
-  # THE LLM CANARY: a real, minimal model call through the exact public path
-  # every tenant daemon uses (gateway auth -> virtual-key model allowlist ->
-  # upstream call), with the SAME model triage runs. The 2026-08-19 outage —
-  # every fleet LLM call 400ing at the gateway for two days — was invisible to
-  # http_2xx probes because the gateway itself was up; only a real call fails
-  # the way triage fails. probe_success{job="blackbox-bifrost-llm"} is the
-  # fleet-level "are LLM calls going through" signal.
+  # THE LLM CANARY: a real model call through the exact public path every
+  # tenant daemon uses (gateway auth -> virtual-key model allowlist -> upstream
+  # call). The 2026-08-19 outage — every fleet LLM call 400ing at the gateway
+  # for two days — was invisible to http_2xx probes because the gateway itself
+  # was up; only a real call fails the way triage fails.
+  # probe_success{job="blackbox-bifrost-llm"} is the fleet-level "are LLM calls
+  # going through" signal.
   #
-  # The key is a DEDICATED canary virtual key (mint it in the Bifrost UI:
-  # name `canary`, the triage model list, a few dollars of monthly budget) so
-  # a probe never spends tenant budget and a tenant rotation never breaks the
-  # canary. Cost at the 5m scrape interval is on the order of $5/month.
-  # If BLACKBOX_BIFROST_CANARY_KEY is unset the module renders with a dead
-  # key and the probe fails visibly — configure it, don't delete the module.
+  # THE BODY MUST MIRROR `classify_anthropic` IN squelch-core/src/triage/llm.rs.
+  # The first cut of this module sent only model+max_tokens+messages, which
+  # proved routing, auth, the allowlist, and budget — and nothing about the
+  # request shape triage actually uses. That gap is dangerous rather than
+  # merely incomplete: if the gateway ever drops `output_config.format`, the
+  # model answers prose, the daemon fails `json_parse` (deliberately a
+  # ROW-level failure, so the row is marked processed on its heuristic seed),
+  # and a thin canary stays GREEN through a silent re-run of the original
+  # outage. So this body carries every element the daemon sends:
+  #   - a `system` block with `cache_control: ephemeral`  (prompt caching)
+  #   - `output_config.format` as a json_schema            (structured output)
+  #   - `output_config.effort`                             (new in daemon-0.0.2)
+  # and the assertions below prove the schema was actually honored, not just
+  # that some 2xx came back.
+  #
+  # HONEST LIMIT: a silently DROPPED `effort` cannot be detected from the
+  # response — nothing echoes it. This proves effort does not BREAK the call;
+  # the daemon's usage ledger is where a dropped effort would show up as cost.
+  #
+  # MAX_TOKENS IS NOT 16. Thinking tokens bill against this ceiling and run
+  # before the first output byte, so a budget sized for the JSON alone
+  # truncates every call before the verdict exists — the exact bug
+  # daemon-0.0.2 fixed by moving MAX_TOKENS 400 -> 8000. 2000 is well clear of
+  # a one-field verdict at low effort while keeping the probe cheap; the
+  # truncation assertion below catches it loudly if that ever stops being true.
+  #
+  # The key is a DEDICATED canary virtual key (Bifrost UI: name `canary`, the
+  # triage model list, a few dollars of monthly budget) so a probe never spends
+  # tenant budget and a tenant rotation never breaks the canary. If
+  # BLACKBOX_BIFROST_CANARY_KEY is unset the module renders with a dead key and
+  # the probe fails visibly — configure it, don't delete the module.
+  #
+  # BLACKBOX_CANARY_MODEL MUST MATCH WHAT THE WARDEN HANDS TENANTS
+  # (SQUELCH_WARDEN_LLM_STAGE1_MODEL / _STAGE2_MODEL, deploy/hosted/
+  # 15-warden-config.yaml). If the canary probes a model string the fleet does
+  # not send, green stops meaning "the fleet works" — which is the one way this
+  # probe can lie. Default is the provider-qualified id, because this gateway
+  # cannot auto-resolve a bare `claude-opus-5` (400 "could not auto resolve a
+  # provider"); moving the fleet back to a bare id means moving this too.
   bifrost_llm:
     prober: http
-    timeout: 30s
+    timeout: 60s
     http:
       preferred_ip_protocol: ip4
       fail_if_not_ssl: true
@@ -40,8 +73,15 @@ modules:
         Content-Type: application/json
         anthropic-version: "2023-06-01"
         x-api-key: __BIFROST_CANARY_KEY__
-      body: '{"model":"claude-opus-5","max_tokens":16,"messages":[{"role":"user","content":"Reply with ok."}]}'
-      # A 2xx that is not a Messages response (an HTML error page, a proxy
-      # interstitial) must still fail the probe.
+      body: '{"model":"__CANARY_MODEL__","max_tokens":2000,"system":[{"type":"text","text":"You are a production canary. Answer only with the JSON object the schema requires.","cache_control":{"type":"ephemeral"}}],"messages":[{"role":"user","content":"Set ok to true."}],"output_config":{"format":{"type":"json_schema","schema":{"type":"object","additionalProperties":false,"required":["ok"],"properties":{"ok":{"type":"boolean"}}}},"effort":"low"}}'
       fail_if_body_not_matches_regexp:
+        # A real Messages response, not an HTML error page or proxy interstitial.
         - '"type"\s*:\s*"message"'
+        # The structured-output schema survived the gateway and was honored:
+        # the verdict text carries the escaped `"ok"` field the schema requires.
+        # This is the assertion the thin first cut was missing.
+        - '\\"ok\\"'
+      fail_if_body_matches_regexp:
+        # Truncated before the verdict: the max_tokens lesson above, regressed.
+        # Distinct from a schema miss so the dashboard failure is readable.
+        - '"stop_reason"\s*:\s*"max_tokens"'
