@@ -313,6 +313,141 @@ impl SqliteStore {
         Ok(first_surfaced)
     }
 
+    /// Stamp `opened_at` on rows the user has opened.
+    ///
+    /// Deliberately NOT folded into [`Self::mark_surfaced`], which every list
+    /// door calls: the two answer different questions, and merging them would
+    /// make "opened" mean "appeared in a list" (see the column comment in
+    /// `schema.sql`).
+    ///
+    /// FIRST OPEN ONLY, like `surfaced_at`: re-reading a thread next week says
+    /// nothing new about whether it needed opening, and a moving stamp would
+    /// make the rate drift with re-reads. Sealed rows are excluded, which is
+    /// belt and braces - the human door never serves one through this path -
+    /// and it keeps the denominator and numerator counting the same universe.
+    pub(super) fn mark_opened(&self, account_id: AccountId, message_ids: &[i64]) -> Result<usize> {
+        if message_ids.is_empty() {
+            return Ok(0);
+        }
+        let mut conn = self.lock()?;
+        let now = Utc::now().to_rfc3339();
+        let tx = conn.transaction()?;
+        let mut first_opened = 0usize;
+        {
+            let mut stmt = tx.prepare(
+                "UPDATE triage
+                 SET opened_at = ?1
+                 WHERE account_id = ?2 AND message_id = ?3
+                   AND sensitivity != 'sealed'
+                   AND opened_at IS NULL",
+            )?;
+            for &id in message_ids {
+                first_opened += stmt.execute(params![now, account_id, id])?;
+            }
+        }
+        tx.commit()?;
+        Ok(first_opened)
+    }
+
+    /// Stamp every message in one thread opened, by thread id.
+    ///
+    /// THE THREAD, NOT A LIST OF IDS, because the client should not have to
+    /// tell the daemon which messages a thread holds - it would be sending back
+    /// a list the daemon gave it, and the two could disagree after a sync. The
+    /// reader shows the whole thread oldest-first anyway, so opening it is
+    /// opening all of it.
+    ///
+    /// Returns the first-open count.
+    pub(super) fn mark_thread_opened(
+        &self,
+        account_id: AccountId,
+        thread_id: &str,
+    ) -> Result<usize> {
+        let conn = self.lock()?;
+        // The sealed guard and the once-only guard are the same ones
+        // `mark_opened` keeps, in one statement because the ids are a subquery
+        // rather than a caller's list.
+        let n = conn.execute(
+            "UPDATE triage
+                SET opened_at = ?1
+              WHERE account_id = ?2
+                AND sensitivity != 'sealed'
+                AND opened_at IS NULL
+                AND message_id IN (
+                    SELECT id FROM messages WHERE account_id = ?2 AND thread_id = ?3
+                )",
+            params![Utc::now().to_rfc3339(), account_id, thread_id],
+        )?;
+        Ok(n)
+    }
+
+    /// How much of this mailbox's incoming mail the user has had to open, over
+    /// the rows received since `since`.
+    ///
+    /// WHAT IT COUNTS, and every exclusion is a decision:
+    ///
+    /// - RECEIVED MAIL ONLY (`is_sent = 0`). Nobody opens their own outbox, and
+    ///   counting it would dilute the rate with a number that has no opinion.
+    /// - SEALED MAIL IS IN THE DENOMINATOR. A login code is mail that arrived
+    ///   and did not need opening, which is the most honest example there is of
+    ///   the thing being measured. It can never be in the numerator, because
+    ///   [`Self::mark_opened`] refuses to stamp it.
+    /// - Rows with no triage row at all are absent from both, by the join: a
+    ///   message the daemon never triaged is one it cannot speak for.
+    ///
+    /// AND IT NEVER LOOKS BACK FURTHER THAN THE LEDGER ITSELF. `opened_at` was
+    /// added to an existing product, so on the day it ships every mailbox has
+    /// years of mail and no opens at all; a window that reached past the
+    /// column's own arrival would divide a full denominator by an empty
+    /// numerator and report that this person opens almost nothing. The caller's
+    /// sample floors cannot catch that - they measure how old the MAIL is,
+    /// which is ample, not how old the LEDGER is, which is seconds. See
+    /// `migrate::stamp_open_ledger_start`.
+    ///
+    /// WHAT IT CANNOT SEE is mail read somewhere else. `opened_at` is stamped
+    /// by this user's own Passband client and nowhere else, so somebody who
+    /// reads half their mail in Gmail on a phone will find this FLATTERINGLY
+    /// LOW.
+    /// Every consumer has to carry that caveat with it, and the one consumer
+    /// (the invite mail) does.
+    pub(super) fn share_open_rate(
+        &self,
+        account_id: AccountId,
+        since: DateTime<Utc>,
+    ) -> Result<OpenRate> {
+        let conn = self.lock()?;
+        // The window, clamped to the ledger. Whichever floor is LATER wins: a
+        // caller asking for ninety days of a thirty-day-old ledger gets thirty.
+        let ledger_since = open_ledger_since(&conn, account_id)?;
+        let floor = since.max(ledger_since);
+        let floor_text = floor.to_rfc3339();
+        let (received, opened): (i64, i64) = conn.query_row(
+            "SELECT COUNT(*), COUNT(t.opened_at)
+               FROM messages m JOIN triage t ON t.message_id = m.id
+              WHERE m.account_id = ?1 AND m.is_sent = 0 AND m.received_at >= ?2",
+            params![account_id, floor_text],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        // The oldest received row in the window, which is what says how much
+        // history the answer actually rests on. A mailbox synced three days ago
+        // has a rate; it does not have a rate worth mailing to a stranger.
+        let oldest: Option<String> = conn.query_row(
+            "SELECT MIN(received_at) FROM messages
+              WHERE account_id = ?1 AND is_sent = 0 AND received_at >= ?2",
+            params![account_id, floor_text],
+            |r| r.get(0),
+        )?;
+        Ok(OpenRate {
+            received: received.max(0) as u64,
+            opened: opened.max(0) as u64,
+            oldest_received_at: oldest.and_then(|s| {
+                DateTime::parse_from_rfc3339(&s)
+                    .ok()
+                    .map(|d| d.with_timezone(&Utc))
+            }),
+        })
+    }
+
     pub(super) fn set_attention_status(
         &self,
         account_id: AccountId,
@@ -603,4 +738,40 @@ impl SqliteStore {
             last_surfaced_at,
         })
     }
+}
+
+/// The moment an account's open ledger started running.
+///
+/// The migration's stamp when there is one (see
+/// `migrate::stamp_open_ledger_start`), and the ACCOUNT'S OWN `created_at` when
+/// there is not: an account made after the column existed has been recording
+/// since it existed, which is exactly what that says.
+///
+/// EVERY FAILURE FALLS TOWARD "NO EVIDENCE YET". A stamp that will not parse,
+/// or an account row that is not there, resolves to NOW rather than to the
+/// epoch — because the epoch reads as "the ledger has always been running",
+/// which is the one answer that produces the flattering number this whole
+/// mechanism exists to prevent.
+fn open_ledger_since(conn: &Connection, account_id: AccountId) -> Result<DateTime<Utc>> {
+    let stored: Option<String> = conn
+        .query_row(
+            "SELECT value FROM app_settings WHERE account_id = ?1 AND key = ?2",
+            params![account_id, OPEN_LEDGER_SINCE_KEY],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let stored = match stored {
+        Some(s) => Some(s),
+        None => conn
+            .query_row(
+                "SELECT created_at FROM accounts WHERE id = ?1",
+                params![account_id],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()?,
+    };
+    Ok(stored
+        .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
+        .map(|d| d.with_timezone(&Utc))
+        .unwrap_or_else(Utc::now))
 }

@@ -513,6 +513,39 @@ pub async fn get_thread(
     .await
 }
 
+// --- POST /client/thread/{thread_id}/opened ---------------------------------
+
+/// Record that the user OPENED this thread. See `triage.opened_at`.
+///
+/// A ROUTE OF ITS OWN, and not a side effect of `GET /client/thread/{id}`,
+/// which is where this started and which was wrong in both directions:
+///
+/// - The client PREFETCHES threads (the sitrep warms every standing item, the
+///   inbox warms on hover), so the GET fires for mail nobody has looked at. The
+///   updates list solved the same problem with `peek`, and a flag would have
+///   fixed this half.
+/// - The other half a flag cannot fix: a warmed thread OPENS FROM CACHE and
+///   never reaches this daemon at all, so the real opens would be the ones that
+///   went unrecorded. That biases the rate DOWN, which is the direction that
+///   makes `share_stat` flatter the product, and flattering it with a number is
+///   exactly what that whole path exists to avoid.
+///
+/// So the client says so, once, when a person actually opens something. It is
+/// the only party that knows.
+///
+/// IDEMPOTENT AND CHEAP: first-open-only in SQL, so a reopen writes nothing and
+/// the client can fire it without bookkeeping.
+pub async fn mark_thread_opened(
+    State(state): State<ApiState>,
+    Path(thread_id): Path<String>,
+) -> Result<impl IntoResponse, ApiError> {
+    let opened = store_call(&state, move |store, account_id| {
+        store.mark_thread_opened(account_id, &thread_id)
+    })
+    .await?;
+    Ok(Json(json!({ "opened": opened })))
+}
+
 // --- GET /client/attachments/{id} -------------------------------------------
 
 /// Render-safety whitelist for the served `Content-Type`: the stored mime is
@@ -1647,6 +1680,11 @@ pub async fn get_stats(State(state): State<ApiState>) -> Result<impl IntoRespons
     // relay (hosted, gateway configured) or 404 (self-host, BYOK in the app).
     // Always present so a client reads an answer, not absence.
     body["assistant_relay"] = json!(state.assistant().is_some());
+    // The same, for invite sharing: whether `/client/invites` will mint (hosted,
+    // a share token installed) or report `can_share: false` (self-host, or a
+    // tenant nobody has turned it on for). Always present, so a client reads an
+    // answer rather than absence, and an OLD daemon's silence reads as "no".
+    body["invite_sharing"] = json!(state.sharing().is_some());
     // Capability flag for the app: whether this daemon understands
     // `forward_of_message_id` on POST /client/actions/send.
     //
@@ -2089,7 +2127,7 @@ async fn resolve_sender_done(state: &ApiState, sender: &str) {
 }
 
 /// Resolve the WRITE-bound gmail client, or 403 with a hint if none configured.
-fn write_client(state: &ApiState) -> Result<GmailWriteClient, ApiError> {
+pub(crate) fn write_client(state: &ApiState) -> Result<GmailWriteClient, ApiError> {
     match state.write_creds() {
         Some(creds) => Ok(match state.write_api_base() {
             Some(base) => {

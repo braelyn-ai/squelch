@@ -567,6 +567,30 @@ pub struct StoreStats {
     pub last_surfaced_at: Option<DateTime<Utc>>,
 }
 
+/// How much of a window's incoming mail the user had to open, as two raw
+/// counts and the reach of the evidence behind them.
+///
+/// RAW COUNTS, NOT A PERCENTAGE, on purpose: whether the sample is big enough
+/// to quote and how coarsely to round it are the CALLER's policy, and a store
+/// that handed back a single tidy number would have made both decisions
+/// silently. The one caller (the invite mail) has a floor and a rounding rule,
+/// and both are written down where a person reviewing the copy can see them.
+///
+/// `opened` is what THIS DAEMON served the body of. See
+/// `Store::share_open_rate` for what that misses.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OpenRate {
+    /// Received, triaged messages in the window. Sealed mail is included.
+    pub received: u64,
+    /// How many of them the human door has ever served the body of.
+    pub opened: u64,
+    /// The oldest received row in the window, or `None` when there are none.
+    /// How much history the pair rests on, which is not the same as how long
+    /// the window is: a mailbox synced yesterday has one day of evidence
+    /// whatever window it is asked about.
+    pub oldest_received_at: Option<DateTime<Utc>>,
+}
+
 /// Per-band counts for the sitrep header. See [`StoreStats::bands`].
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct BandCounts {

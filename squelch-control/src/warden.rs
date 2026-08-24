@@ -232,6 +232,17 @@ struct LlmKeyRequest<'a> {
     assistant_api_key: Option<&'a str>,
 }
 
+/// `PUT /v1/tenants/{label}/control-token` request body. NO Debug derive, for
+/// the reason [`LlmKeyRequest`] has none: the field is a live bearer.
+///
+/// ALWAYS SERIALIZED, even as null, which is the opposite of its sibling: an
+/// absent field here MEANS removal, so skipping it would make "revoke" and
+/// "malformed" the same request.
+#[derive(Serialize)]
+struct ShareTokenRequest<'a> {
+    share_token: Option<&'a str>,
+}
+
 /// `PUT /v1/tenants/{label}/credentials` 200 body, and the same shape
 /// `POST /v1/tenants/{label}/pair` answers with.
 #[derive(Debug, Deserialize)]
@@ -736,6 +747,55 @@ impl Warden for HttpWarden {
 /// cluster to answer a question no request will ask. The commands that do ask
 /// hold a real [`HttpWarden`] and nothing else.
 impl HttpWarden {
+    /// Install, rotate, or REMOVE a tenant's share token.
+    ///
+    /// `share_token` of `None` removes what is installed, which is how
+    /// `share revoke` reaches the pod: the control plane forgetting the hash
+    /// stops a token working, but only taking it out of the env stops the
+    /// daemon offering the button. Both halves, or the tenant is told it can
+    /// share and then refused every time.
+    ///
+    /// INHERENT for the reason this whole block is: no request in the serving
+    /// path mints a share token. An operator at a shell does.
+    pub async fn put_share_token(
+        &self,
+        label: &str,
+        share_token: Option<&str>,
+    ) -> Result<(), WardenError> {
+        // The label goes into a URL path, same as every other route here.
+        crate::labels::validate(label).map_err(|_| WardenError::LabelRefused)?;
+        // The same bar `put_llm_key` holds its keys to, and for the same
+        // reason: this value becomes an environment variable in a container.
+        // Checked before the socket is opened, so a bad token is a local error
+        // rather than a round trip.
+        if let Some(token) = share_token
+            && (token.is_empty() || !token.bytes().all(|b| b.is_ascii_graphic()))
+        {
+            return Err(WardenError::BadApiKey);
+        }
+
+        let resp = self
+            .http
+            .put(self.url(&format!("/v1/tenants/{label}/control-token")))
+            .bearer_auth(&self.token)
+            .json(&ShareTokenRequest { share_token })
+            .send()
+            .await
+            .map_err(|e| transport_error(e, label))?;
+
+        match resp.status().as_u16() {
+            // `{}` by contract: the token came in, nothing goes out.
+            200 => Ok(()),
+            401 | 403 => Err(WardenError::Unauthorized),
+            404 => Err(WardenError::UnknownTenant),
+            // 422 is the warden refusing the token's shape, which the check
+            // above should have caught: the two sides disagreeing about what a
+            // token may contain is the same class of bug as a bad key.
+            422 => Err(WardenError::BadApiKey),
+            _ => Err(WardenError::Failed),
+        }
+    }
+
     /// What is on this tenant's workload that the warden did not put there.
     ///
     /// Read-only on both sides: the warden's own apply for the comparison is a
@@ -1302,73 +1362,74 @@ mod tests {
         use serde_json::json;
 
         let seen: Bearers = Bearers::default();
-        let app = Router::new()
-            .route(
-                "/v1/tenants/{label}/drift",
-                get(
-                    |State(seen): State<Bearers>,
-                     Path(label): Path<String>,
-                     headers: HeaderMap| async move {
-                        record_bearer(&seen, &headers);
-                        match label.as_str() {
-                            "drifted" => (
-                                StatusCode::OK,
-                                Json(json!({
-                                    "status": "active",
-                                    "deployment_present": true,
-                                    "foreign": [{
-                                        "manager": "kubectl-set",
-                                        "operation": "Update",
-                                        "paths": [
-                                            "spec.template.spec.initContainers[seed].env",
-                                        ],
-                                    }],
-                                    "changes": [{
-                                        "path": "spec.template.spec.containers[squelchd].image",
-                                        "live": "squelchd:daemon-0.0.1",
-                                        "rendered": "squelchd:daemon-0.0.2",
-                                    }, {
-                                        "path": "spec.template.spec.replicas",
-                                        "live": 2,
-                                        "rendered": null,
-                                    }],
-                                })),
-                            )
-                                .into_response(),
-                            "settled" => (
-                                StatusCode::OK,
-                                Json(json!({
-                                    "status": "active",
-                                    "deployment_present": true,
-                                    "foreign": [],
-                                    "changes": [],
-                                })),
-                            )
-                                .into_response(),
-                            // Arrays omitted, not empty: a tenant with no
-                            // workload has nothing to say about one.
-                            "halfway" => (
-                                StatusCode::OK,
-                                Json(json!({"status": "pending", "deployment_present": false})),
-                            )
-                                .into_response(),
-                            "refused" => (
-                                StatusCode::UNPROCESSABLE_ENTITY,
-                                Json(json!({"error": "invalid_label"})),
-                            )
-                                .into_response(),
-                            "broken" => (
-                                StatusCode::INTERNAL_SERVER_ERROR,
-                                Json(json!({"error": "cluster_unavailable"})),
-                            )
-                                .into_response(),
-                            _ => (StatusCode::NOT_FOUND, Json(json!({"error": "not_found"})))
-                                .into_response(),
-                        }
-                    },
-                ),
-            )
-            .with_state(seen.clone());
+        let app =
+            Router::new()
+                .route(
+                    "/v1/tenants/{label}/drift",
+                    get(
+                        |State(seen): State<Bearers>,
+                         Path(label): Path<String>,
+                         headers: HeaderMap| async move {
+                            record_bearer(&seen, &headers);
+                            match label.as_str() {
+                                "drifted" => (
+                                    StatusCode::OK,
+                                    Json(json!({
+                                        "status": "active",
+                                        "deployment_present": true,
+                                        "foreign": [{
+                                            "manager": "kubectl-set",
+                                            "operation": "Update",
+                                            "paths": [
+                                                "spec.template.spec.initContainers[seed].env",
+                                            ],
+                                        }],
+                                        "changes": [{
+                                            "path": "spec.template.spec.containers[squelchd].image",
+                                            "live": "squelchd:daemon-0.0.1",
+                                            "rendered": "squelchd:daemon-0.0.2",
+                                        }, {
+                                            "path": "spec.template.spec.replicas",
+                                            "live": 2,
+                                            "rendered": null,
+                                        }],
+                                    })),
+                                )
+                                    .into_response(),
+                                "settled" => (
+                                    StatusCode::OK,
+                                    Json(json!({
+                                        "status": "active",
+                                        "deployment_present": true,
+                                        "foreign": [],
+                                        "changes": [],
+                                    })),
+                                )
+                                    .into_response(),
+                                // Arrays omitted, not empty: a tenant with no
+                                // workload has nothing to say about one.
+                                "halfway" => (
+                                    StatusCode::OK,
+                                    Json(json!({"status": "pending", "deployment_present": false})),
+                                )
+                                    .into_response(),
+                                "refused" => (
+                                    StatusCode::UNPROCESSABLE_ENTITY,
+                                    Json(json!({"error": "invalid_label"})),
+                                )
+                                    .into_response(),
+                                "broken" => (
+                                    StatusCode::INTERNAL_SERVER_ERROR,
+                                    Json(json!({"error": "cluster_unavailable"})),
+                                )
+                                    .into_response(),
+                                _ => (StatusCode::NOT_FOUND, Json(json!({"error": "not_found"})))
+                                    .into_response(),
+                            }
+                        },
+                    ),
+                )
+                .with_state(seen.clone());
         let w = mock_warden(app).await;
 
         let report = w.drift("drifted").await.unwrap();
@@ -1431,47 +1492,48 @@ mod tests {
         use serde_json::json;
 
         let seen: Bearers = Bearers::default();
-        let app = Router::new()
-            .route(
-                "/v1/tenants/{label}/reconcile",
-                post(
-                    |State(seen): State<Bearers>,
-                     Path(label): Path<String>,
-                     headers: HeaderMap| async move {
-                        record_bearer(&seen, &headers);
-                        match label.as_str() {
-                            "settled" => (
-                                StatusCode::OK,
-                                Json(json!({"deployment": "converged", "status": "active"})),
-                            )
-                                .into_response(),
-                            "drifted" => (
-                                StatusCode::OK,
-                                Json(json!({"deployment": "recreated", "status": "active"})),
-                            )
-                                .into_response(),
-                            "halfway" => (
-                                StatusCode::CONFLICT,
-                                Json(json!({"error": "not_reconcilable"})),
-                            )
-                                .into_response(),
-                            "unauthed" => (
-                                StatusCode::UNAUTHORIZED,
-                                Json(json!({"error": "unauthorized"})),
-                            )
-                                .into_response(),
-                            "stalled" => (
-                                StatusCode::INTERNAL_SERVER_ERROR,
-                                Json(json!({"error": "not_ready"})),
-                            )
-                                .into_response(),
-                            _ => (StatusCode::NOT_FOUND, Json(json!({"error": "not_found"})))
-                                .into_response(),
-                        }
-                    },
-                ),
-            )
-            .with_state(seen.clone());
+        let app =
+            Router::new()
+                .route(
+                    "/v1/tenants/{label}/reconcile",
+                    post(
+                        |State(seen): State<Bearers>,
+                         Path(label): Path<String>,
+                         headers: HeaderMap| async move {
+                            record_bearer(&seen, &headers);
+                            match label.as_str() {
+                                "settled" => (
+                                    StatusCode::OK,
+                                    Json(json!({"deployment": "converged", "status": "active"})),
+                                )
+                                    .into_response(),
+                                "drifted" => (
+                                    StatusCode::OK,
+                                    Json(json!({"deployment": "recreated", "status": "active"})),
+                                )
+                                    .into_response(),
+                                "halfway" => (
+                                    StatusCode::CONFLICT,
+                                    Json(json!({"error": "not_reconcilable"})),
+                                )
+                                    .into_response(),
+                                "unauthed" => (
+                                    StatusCode::UNAUTHORIZED,
+                                    Json(json!({"error": "unauthorized"})),
+                                )
+                                    .into_response(),
+                                "stalled" => (
+                                    StatusCode::INTERNAL_SERVER_ERROR,
+                                    Json(json!({"error": "not_ready"})),
+                                )
+                                    .into_response(),
+                                _ => (StatusCode::NOT_FOUND, Json(json!({"error": "not_found"})))
+                                    .into_response(),
+                            }
+                        },
+                    ),
+                )
+                .with_state(seen.clone());
         let w = mock_warden(app).await;
 
         let converged = w.reconcile("settled").await.unwrap();
@@ -1686,11 +1748,7 @@ mod tests {
     #[tokio::test]
     async fn first_paired_reads_every_shape_the_warden_answers() {
         use axum::{
-            Json, Router,
-            extract::Path,
-            http::StatusCode,
-            response::IntoResponse,
-            routing::get,
+            Json, Router, extract::Path, http::StatusCode, response::IntoResponse, routing::get,
         };
         use serde_json::json;
 
@@ -1698,18 +1756,27 @@ mod tests {
             "/v1/tenants/{label}/devices",
             get(|Path(label): Path<String>| async move {
                 match label.as_str() {
-                    "paired" => {
-                        (StatusCode::OK, Json(json!({"first_paired_at": "2026-08-20T12:00:00Z"})))
-                            .into_response()
-                    }
+                    "paired" => (
+                        StatusCode::OK,
+                        Json(json!({"first_paired_at": "2026-08-20T12:00:00Z"})),
+                    )
+                        .into_response(),
                     "quiet" => {
                         (StatusCode::OK, Json(json!({"first_paired_at": null}))).into_response()
                     }
-                    "rolling" => (StatusCode::SERVICE_UNAVAILABLE, Json(json!({"error": "not_running"})))
+                    "rolling" => (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        Json(json!({"error": "not_running"})),
+                    )
                         .into_response(),
-                    "garbled" => (StatusCode::OK, Json(json!({"first_paired_at": "yesterday-ish"})))
+                    "garbled" => (
+                        StatusCode::OK,
+                        Json(json!({"first_paired_at": "yesterday-ish"})),
+                    )
                         .into_response(),
-                    _ => (StatusCode::NOT_FOUND, Json(json!({"error": "not_found"}))).into_response(),
+                    _ => {
+                        (StatusCode::NOT_FOUND, Json(json!({"error": "not_found"}))).into_response()
+                    }
                 }
             }),
         );

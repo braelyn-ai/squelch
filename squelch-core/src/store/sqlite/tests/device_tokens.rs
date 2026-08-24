@@ -300,14 +300,8 @@ fn a_console_session_is_not_a_paired_device() {
 #[test]
 fn the_earliest_pairing_wins_regardless_of_insert_order() {
     let (store, acct) = store();
-    let march = Utc
-        .with_ymd_and_hms(2026, 3, 1, 9, 30, 0)
-        .single()
-        .unwrap();
-    let april = Utc
-        .with_ymd_and_hms(2026, 4, 1, 9, 30, 0)
-        .single()
-        .unwrap();
+    let march = Utc.with_ymd_and_hms(2026, 3, 1, 9, 30, 0).single().unwrap();
+    let april = Utc.with_ymd_and_hms(2026, 4, 1, 9, 30, 0).single().unwrap();
 
     // Inserted newest-first, so an implementation that trusted id order would
     // answer April.
@@ -338,10 +332,7 @@ fn the_earliest_pairing_wins_regardless_of_insert_order() {
 #[test]
 fn a_revoked_first_device_still_counts_as_the_activation() {
     let (store, acct) = store();
-    let march = Utc
-        .with_ymd_and_hms(2026, 3, 1, 9, 30, 0)
-        .single()
-        .unwrap();
+    let march = Utc.with_ymd_and_hms(2026, 3, 1, 9, 30, 0).single().unwrap();
     let phone = store.issue_device_token(acct, "iPhone").unwrap();
     backdate_created(&store, phone.id, march);
     assert!(store.revoke_device_token(acct, phone.id).unwrap());

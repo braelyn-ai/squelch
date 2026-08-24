@@ -14,8 +14,10 @@ mod events;
 pub mod gmail_write;
 pub mod guard;
 mod handlers;
+mod invite_mail;
 mod markdown;
 mod pair;
+mod sharing;
 mod state;
 pub mod tracking;
 pub mod unsubscribe;
@@ -26,6 +28,9 @@ pub use error::ApiError;
 /// The auth-mail retention pass. Exported for the daemon's timer: it uses the
 /// WRITE credential, which the readonly-bound sync loop must never touch.
 pub use handlers::run_shred_pass;
+/// The invite minter. Exported for the daemon binaries that build state by
+/// hand and for the integration suite, which points it at a mock control plane.
+pub use sharing::Sharing;
 pub use state::{ApiState, StateError, attach_event_channel};
 
 use axum::{
@@ -88,6 +93,15 @@ fn client_router(state: ApiState) -> Router {
         )
         .route("/client/refresh", post(handlers::refresh_now))
         .route("/client/thread/{thread_id}", get(handlers::get_thread))
+        // "I opened this." Its own route rather than a side effect of the GET
+        // above, because the client warms threads it has not shown and opens
+        // warmed ones without asking: see `handlers::mark_thread_opened`.
+        // HUMAN DOOR ONLY, and not merely by being on this tree — it is a
+        // statement about what a PERSON looked at, which an agent cannot make.
+        .route(
+            "/client/thread/{thread_id}/opened",
+            post(handlers::mark_thread_opened),
+        )
         .route("/client/attachments/{id}", get(handlers::get_attachment))
         .route("/client/shipments", get(handlers::get_shipments))
         // Force a carrier pass. HUMAN DOOR ONLY: the agent door reads the
@@ -162,6 +176,14 @@ fn client_router(state: ApiState) -> Router {
         .route("/client/marketing", get(handlers::get_marketing))
         .route("/client/audit", get(handlers::get_audit))
         .route("/client/stats", get(handlers::get_stats))
+        // SHARING. The GET is a read (may this daemon share, and what could the
+        // mail say); the POST spends a quota and sends mail as the user, so it
+        // sits with the write routes below rather than here... except it does
+        // not, and that is deliberate: the action routes are gated on the WRITE
+        // credential being configured at all, and this route's own refusal says
+        // something more useful than a blanket 403. See `sharing::post_invites`.
+        .route("/client/invites", get(sharing::get_invites))
+        .route("/client/invites", post(sharing::post_invites))
         .route("/client/usage", get(handlers::get_usage))
         .route(
             "/client/triage-config",

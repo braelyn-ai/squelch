@@ -450,10 +450,7 @@ async fn mint_and_send(
     let row = match state.store().user_entry(id).await {
         Ok(Some(row)) => row,
         Ok(None) => {
-            tracing::warn!(
-                id,
-                "the user row went away before its invite was minted"
-            );
+            tracing::warn!(id, "the user row went away before its invite was minted");
             return Some(NO_SUCH_ROW);
         }
         Err(e) => {
@@ -472,7 +469,7 @@ async fn mint_and_send(
     let expires_at = Utc::now() + chrono::Duration::days(invites::DEFAULT_TTL_DAYS);
     let invite_id = match state
         .store()
-        .insert_invite(&minted.code_hash, expires_at)
+        .insert_invite(&minted.code_hash, expires_at, None)
         .await
     {
         Ok(invite_id) => invite_id,

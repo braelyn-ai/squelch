@@ -115,6 +115,14 @@ run_suite sitrep-window \
   Sources/Passband/Lib/SitrepWindow.swift \
   Tests/SitrepWindowTests.swift
 
+# When the two-week ask fires, and every way it must not. Same shape as the
+# window rule above: the decision is a pure static, so it tests without a
+# daemon, a clock, or a UserDefaults this suite would have to clean up after.
+run_suite share-nudge \
+  Sources/Passband/Lib/Platform.swift \
+  Sources/Passband/Lib/ShareNudge.swift \
+  Tests/ShareNudgeTests.swift
+
 # What "remind me…" resolves to. Foundation only, and every date computed
 # through an injected now/calendar — which is the whole reason it is testable:
 # a reminder is only ever wrong LATER, so the arithmetic has to be pinned here

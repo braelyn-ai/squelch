@@ -883,14 +883,11 @@ async fn two_racing_sends_mail_one_code() {
     let store = h.state.store();
     let expires = chrono::Utc::now() + chrono::Duration::days(30);
     let loser = store
-        .insert_invite(&invites::hash("LOSE-RRRR-RRRR-RRRR"), expires)
+        .insert_invite(&invites::hash("LOSE-RRRR-RRRR-RRRR"), expires, None)
         .await
         .unwrap();
     assert!(
-        !store
-            .set_user_invite(id, loser, Some(first))
-            .await
-            .unwrap(),
+        !store.set_user_invite(id, loser, Some(first)).await.unwrap(),
         "the pointer moved, so this write is refused"
     );
     assert_eq!(

@@ -46,8 +46,10 @@ pub mod ratelimit;
 pub mod resend;
 pub mod seal;
 pub mod sessions;
+pub mod share;
 pub mod state;
 pub mod store;
+pub mod tenant;
 pub mod warden;
 
 pub use config::{Config, ConfigError};
@@ -86,6 +88,12 @@ use axum::{
 ///   once, and everything above the budget is rows of junk for an operator to
 ///   read past; a real submitter who is refused loses one retry, because the
 ///   answer is the same 200 whether the address was new or not.
+/// - `POST /tenant/invite` is LOOSE, and it is the only budget here set by who
+///   the caller is rather than by what the route costs: every hosted daemon
+///   reaches this listener from one cluster's handful of egress addresses, so a
+///   tight per-client bucket would meter the whole fleet as one client. Its
+///   real limit is the per-tenant quota in the store, which counts the right
+///   thing. See [`tenant`].
 /// - `POST /admin/login` is tight and in its OWN bucket, for the reason
 ///   `/console/auth` has one: it is the second route where a stranger guesses at
 ///   a secret, and it must not be able to spend the budget the dashboard needs.
@@ -137,12 +145,27 @@ pub fn router(state: ControlState) -> Router {
         ))
         .with_state(state.clone());
 
+    // MOUNTED UNCONDITIONALLY, unlike the waitlist block below, and the route
+    // itself answers 503 when the deployment has no invite policy. A daemon
+    // that gets a 404 here cannot tell "this control plane is too old to share"
+    // from "the URL is wrong", and the daemon's own copy has to tell a user
+    // which it is.
+    let tenant = Router::new()
+        .route("/tenant/invite", post(tenant::invite))
+        .layer(DefaultBodyLimit::max(handlers::MAX_BODY))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            ratelimit::limit_tenant,
+        ))
+        .with_state(state.clone());
+
     let app = Router::new()
         .route("/healthz", get(handlers::healthz))
         .merge(form)
         .merge(signup)
         .merge(console)
-        .merge(callback);
+        .merge(callback)
+        .merge(tenant);
 
     if state.config().waitlist.is_none() {
         return app;

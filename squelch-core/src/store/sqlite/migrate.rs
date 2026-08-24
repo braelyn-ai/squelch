@@ -112,6 +112,16 @@ pub(super) fn migrate(conn: &Connection) -> Result<()> {
     // the standing band (that column is one of its arms).
     add_column_if_missing(conn, "triage", "remind_at", "TEXT")?;
     add_column_if_missing(conn, "triage", "reminded_at", "TEXT")?;
+    // WHEN THE USER OPENED THIS MAIL. NULL on every
+    // pre-existing row and NOT backfilled, and the absence is honest rather
+    // than convenient: nothing recorded opens before this column existed, and
+    // inventing them would put a number in front of a user that their own
+    // mailbox does not support. `share_open_rate` refuses to answer until the
+    // column has been there long enough to mean something.
+    if add_column_if_missing(conn, "triage", "opened_at", "TEXT")? {
+        stamp_open_ledger_start(conn)?;
+    }
+
     // AND THE SWEEP'S INDEX, HERE rather than in schema.sql, for the reason
     // spelled out at that file's `idx_triage_remind_at` note: it runs before this
     // function, so an index over a just-migrated column takes the open down. The
@@ -409,6 +419,40 @@ pub(super) fn migrate(conn: &Connection) -> Result<()> {
 /// Rows whose creator is unknown or has no derivable domain are LEFT NULL: they
 /// then match no order mail at all, which loses a name donation but can never
 /// bind one merchant's product to another's package.
+/// Record, per existing account, the moment the open ledger started running.
+///
+/// WITHOUT THIS THE FIRST NUMBER IS A LIE, and it is a flattering one. An
+/// established mailbox has years of mail and, the instant `opened_at` is added,
+/// ZERO opens - so a rate computed over "the last 90 days of mail" divides a
+/// real denominator by an empty numerator and reports that its owner opens
+/// almost nothing. The sample floors in `sharing::share_stat` do not catch it:
+/// they measure the age of the MAIL, which is ample, not the age of the LEDGER,
+/// which is seconds.
+///
+/// So the ledger dates itself, and `Store::share_open_rate` refuses to look
+/// back further than this. An account created AFTER this migration gets no row
+/// and needs none: it has been recording since it existed, which is what its
+/// own `created_at` says.
+///
+/// `INSERT OR IGNORE`, so a re-run cannot move a stamp that is already the
+/// truth - which would restart the clock and hide the number for another month.
+fn stamp_open_ledger_start(conn: &Connection) -> Result<()> {
+    // BOTH TABLES OR NEITHER. In production this is never false: `schema.sql`
+    // creates both and runs in full before this function does. It is false only
+    // in the migration suite, which builds deliberately partial old schemas to
+    // migrate FROM, and a stamp into a table that does not exist there would
+    // fail a test about something else entirely.
+    if !tables_exist(conn, &["app_settings", "accounts"])? {
+        return Ok(());
+    }
+    conn.execute(
+        "INSERT OR IGNORE INTO app_settings(account_id, key, value)
+         SELECT id, ?1, ?2 FROM accounts",
+        rusqlite::params![OPEN_LEDGER_SINCE_KEY, Utc::now().to_rfc3339()],
+    )?;
+    Ok(())
+}
+
 fn backfill_order_merchant(conn: &Connection) -> Result<()> {
     if !has_columns(
         conn,

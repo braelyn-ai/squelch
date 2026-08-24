@@ -13,6 +13,19 @@ import SwiftUI
 
 /// Which primary surface the rail is showing. `sitrep` is the abstracted
 /// dashboard (the default on launch); `emails` is the classic band list.
+/// Where the share sheet was raised from. The raw values are ANALYTICS STRINGS
+/// and must appear in `Analytics.allowedStrings`, which is a closed set: a value
+/// missing from it is a fatal assertion at the event site in a debug build, not
+/// a silently dropped property.
+enum ShareOrigin: String, Sendable, Hashable {
+    /// The `gift` tile in the sidebar rail.
+    case rail
+    /// The button in Settings > Account.
+    case settings
+    /// The two-week ask.
+    case nudge
+}
+
 enum MainView: String, Sendable, Hashable, CaseIterable {
     case sitrep, emails, auth, rules, audit, usage, settings, process
 
@@ -425,6 +438,22 @@ final class AppStore {
     /// state: adding an account must not move `connStatus`, or the shell would
     /// unmount and the account already on screen would go with it.
     var addAccountSheetOpen = false
+
+    /// The Share Passband sheet. Raised from three places, and hung on the shell
+    /// for the same reason Add Account is: no raiser can be sure which page is
+    /// on screen.
+    ///
+    /// Written through [`openShareSheet(from:)`] rather than directly, so the
+    /// flag and the origin beside it cannot disagree. A drag-down or a Done
+    /// still sets it false on its own; the origin is only ever read while it is
+    /// true, so a stale one is unreachable.
+    var shareSheetOpen = false
+
+    /// WHICH SURFACE raised the sheet, for the one analytics property that
+    /// makes the event worth having: whether shares come from the rail, from
+    /// Settings, or from the two-week ask. Without it `invite_sent` says people
+    /// share and nothing about what makes them.
+    private(set) var shareOrigin: ShareOrigin = .settings
 
     // MARK: sitrep slice
     var sitrep = SitrepData()
@@ -1267,6 +1296,15 @@ final class AppStore {
                 "via_reply": replyTo != nil,
                 "from_noise": activeView == .emails && mailMode == .noise,
             ])
+        // THE OPEN LEDGER (`triage.opened_at`), and this is the only place that
+        // writes it: opening the reader is the one moment a PERSON has looked
+        // at mail, and a warmed thread renders from the prefetch cache without
+        // the daemon hearing about it at all. Fire and forget, and deliberately
+        // not awaited: it is a statistic, and the reader must not wait on one.
+        //
+        // Same-thread reopens fire it too; the daemon stamps first-open-only,
+        // so the second one writes nothing.
+        Task { try? await APIClient.shared.markThreadOpened(threadId) }
         // A DIFFERENT thread drops the summary NOW rather than when the new one
         // lands: in that gap the reader is showing thread B while this still
         // described A, and the ask bar would pin B's id under A's subject and
@@ -2054,6 +2092,22 @@ final class AppStore {
     /// this. A self-host daemon never says `assistant_relay`, and nil means
     /// the switch is simply not offered (same posture as `trackingAvailable`).
     var relayAvailable: Bool { sitrep.stats?.assistant_relay == true }
+
+    // MARK: - invite sharing
+
+    /// Raise the share sheet, remembering what raised it.
+    func openShareSheet(from origin: ShareOrigin) {
+        shareOrigin = origin
+        shareSheetOpen = true
+    }
+
+    /// Whether this daemon can mint and send invites. Read off the same sitrep
+    /// stats the relay switch is, for the same reason: /client/stats is already
+    /// the connect probe. A self-host daemon, a daemon too old to say, and a
+    /// hosted tenant nobody has turned sharing on for all read as false, and
+    /// false means the button is never offered and the two-week nudge never
+    /// fires.
+    var shareAvailable: Bool { sitrep.stats?.invite_sharing == true }
 
     // MARK: - forwarding
 

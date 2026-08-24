@@ -772,11 +772,7 @@ proxy, or the page running inside a sandboxed frame. Opening
 ///
 /// THE CODE IS NOT HERE, and cannot be. Only its hash was kept, so the one
 /// remedy for a lost invite is a fresh one, which is what the send buttons are.
-pub fn admin_page(
-    pending: &[UserRow],
-    approved: &[UserRow],
-    error: Option<&str>,
-) -> Response {
+pub fn admin_page(pending: &[UserRow], approved: &[UserRow], error: Option<&str>) -> Response {
     let waiting: String = pending
         .iter()
         .map(|r| {
@@ -1095,8 +1091,13 @@ mod tests {
         let expected = format!(
             "passband://pair?url=https%3A%2F%2Fada.passband.email&amp;code=ABCD-EFGH&amp;aid={aid}"
         );
-        let success_html =
-            body_of(success("https://ada.passband.email", "ABCD-EFGH", 10, Some(aid))).await;
+        let success_html = body_of(success(
+            "https://ada.passband.email",
+            "ABCD-EFGH",
+            10,
+            Some(aid),
+        ))
+        .await;
         let app_html = body_of(app_signed_in(
             "ada@example.com",
             "https://ada.passband.email",
@@ -1243,7 +1244,9 @@ mod tests {
             .await,
         ] {
             assert!(
-                html.contains(&format!(r#"<a href="{DOWNLOAD_URL}">Download Passband</a>"#)),
+                html.contains(&format!(
+                    r#"<a href="{DOWNLOAD_URL}">Download Passband</a>"#
+                )),
                 "{html}"
             );
         }
@@ -1410,7 +1413,10 @@ mod tests {
             None,
         ))
         .await;
-        assert!(html.contains(r#"<span class="done">signed up</span>"#), "{html}");
+        assert!(
+            html.contains(r#"<span class="done">signed up</span>"#),
+            "{html}"
+        );
         assert!(html.contains("<code>ada</code>"), "{html}");
         assert!(html.contains("1 of those signed up"), "{html}");
         // The whole point: no press, and nothing that could mint a second code.

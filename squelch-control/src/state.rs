@@ -18,7 +18,7 @@ use crate::config::{BifrostConfig, Config, OUTBOUND_TIMEOUT, WaitlistConfig};
 use crate::ratelimit::{
     ADMIN_LOGIN_REQUESTS_PER_MINUTE, ADMIN_REQUESTS_PER_MINUTE, CALLBACK_REQUESTS_PER_MINUTE,
     CONSOLE_AUTH_REQUESTS_PER_MINUTE, PAGE_REQUESTS_PER_MINUTE, RateLimiter,
-    SIGNUP_REQUESTS_PER_MINUTE, WAITLIST_REQUESTS_PER_MINUTE,
+    SIGNUP_REQUESTS_PER_MINUTE, TENANT_REQUESTS_PER_MINUTE, WAITLIST_REQUESTS_PER_MINUTE,
 };
 use crate::resend::{ResendClient, ResendError};
 use crate::sessions::SessionStore;
@@ -66,6 +66,9 @@ struct Inner {
     callback_limiter: Mutex<RateLimiter>,
     waitlist_limiter: Mutex<RateLimiter>,
     admin_limiter: Mutex<RateLimiter>,
+    /// `POST /tenant/invite`'s own bucket. Loose, because its callers share
+    /// egress addresses and its real limit is a per-tenant one in the store.
+    tenant_limiter: Mutex<RateLimiter>,
     /// `POST /admin/login`'s own bucket, for the reason `console_auth_limiter`
     /// has one: it is the route where a stranger guesses at a secret, and it
     /// must not be able to spend the budget the operator's own page needs.
@@ -129,6 +132,7 @@ impl ControlState {
                 callback_limiter: Mutex::new(RateLimiter::per_minute(CALLBACK_REQUESTS_PER_MINUTE)),
                 waitlist_limiter: Mutex::new(RateLimiter::per_minute(WAITLIST_REQUESTS_PER_MINUTE)),
                 admin_limiter: Mutex::new(RateLimiter::per_minute(ADMIN_REQUESTS_PER_MINUTE)),
+                tenant_limiter: Mutex::new(RateLimiter::per_minute(TENANT_REQUESTS_PER_MINUTE)),
                 admin_login_limiter: Mutex::new(RateLimiter::per_minute(
                     ADMIN_LOGIN_REQUESTS_PER_MINUTE,
                 )),
@@ -215,6 +219,10 @@ impl ControlState {
 
     pub(crate) fn check_admin_rate(&self, ip: IpAddr) -> bool {
         self.charge(&self.inner.admin_limiter, ip)
+    }
+
+    pub(crate) fn check_tenant_rate(&self, ip: IpAddr) -> bool {
+        self.charge(&self.inner.tenant_limiter, ip)
     }
 
     pub(crate) fn check_admin_login_rate(&self, ip: IpAddr) -> bool {

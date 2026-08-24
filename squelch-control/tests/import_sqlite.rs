@@ -265,9 +265,10 @@ fn is_uuid_shaped(s: &str) -> bool {
     let parts: Vec<&str> = s.split('-').collect();
     parts.len() == 5
         && [8, 4, 4, 4, 12] == parts.iter().map(|p| p.len()).collect::<Vec<_>>()[..]
-        && parts
-            .iter()
-            .all(|p| p.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()))
+        && parts.iter().all(|p| {
+            p.bytes()
+                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+        })
         && parts[2].starts_with('4')
         && matches!(parts[3].as_bytes()[0], b'8' | b'9' | b'a' | b'b')
 }
@@ -437,6 +438,7 @@ async fn every_sequence_continues_where_the_file_left_off() {
         .insert_invite(
             "000000000000000000000000000000000000000000000000000000000000000a",
             chrono::Utc::now() + chrono::Duration::days(30),
+            None,
         )
         .await
         .unwrap();

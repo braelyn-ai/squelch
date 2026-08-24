@@ -92,6 +92,7 @@ enum Analytics {
         "connect_succeeded", "connection_lost", "connection_restored",
         "account_added",
         "tour_completed", "tour_skipped", "whats_new_shown",
+        "invite_sent", "invite_nudge_accepted", "invite_nudge_dismissed",
     ]
 
     /// The counter events that ride at `minimal`: anonymous counts and
@@ -111,6 +112,10 @@ enum Analytics {
         // first run explains itself is exactly the "does the product work"
         // question this level exists for.
         "tour_completed", "tour_skipped",
+        // Sharing carries counts and nothing else: how many invites went, how
+        // many did not, and whether the one-time ask was taken up. No address
+        // is anywhere near this, at any level.
+        "invite_sent", "invite_nudge_accepted", "invite_nudge_dismissed",
     ]
 
     /// The closed set of STRING property values allowed off the machine.
@@ -134,6 +139,11 @@ enum Analytics {
             "haiku", "opus",
             // assistant_asked transports
             "relay", "byok",
+            // invite_sent sources — where the share sheet was raised from
+            // (`ShareOrigin`). "settings" is also a MainView above; a Set union
+            // makes the duplicate free, and naming it here is what keeps this
+            // list readable as the vocabulary of THIS event.
+            "rail", "settings", "nudge",
         ])
 
     /// Screen views ride at `minimal` alongside lifecycle events.

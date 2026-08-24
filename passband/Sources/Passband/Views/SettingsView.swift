@@ -1322,6 +1322,25 @@ struct AccountSection: View {
                 meta("triage model", usage?.model ?? "—")
                 meta("provider", usage?.provider ?? "—")
             }
+            // SHARING, and it renders only when this daemon can actually do it.
+            // A self-hosted daemon has no control plane to mint a code at, so
+            // the button would be a control whose only outcome is a refusal —
+            // the same reasoning that keeps Add Account off the phone.
+            //
+            // THE PERMANENT DOOR. The two-week nudge asks once and never again;
+            // anybody who changes their mind comes here.
+            if store.shareAvailable {
+                SectionCard(label: "Invites") {
+                    HStack(spacing: 12) {
+                        Button("Share Passband…") { store.openShareSheet(from: .settings) }
+                            .buttonStyle(.glassProminent)
+                            .tint(Palette.accent)
+                        Text("your friends get an invite from your own address")
+                            .font(Typo.micro)
+                            .foregroundStyle(Palette.inkFaintest)
+                    }
+                }
+            }
         }
         // Usage is decorative here; errors are ignored.
         .task { usage = try? await APIClient.shared.getUsage(days: 1) }

@@ -88,6 +88,15 @@ pub const ADMIN_REQUESTS_PER_MINUTE: f64 = 120.0;
 /// working through a wordlist.
 pub const ADMIN_LOGIN_REQUESTS_PER_MINUTE: f64 = 10.0;
 
+/// The same, for `POST /tenant/invite`. GENEROUS, and the reason is the shape
+/// of the caller: every hosted daemon is a pod in one cluster, so they all
+/// reach this listener from a handful of node addresses and a tight per-client
+/// bucket would meter the whole fleet as one client. The real limit on this
+/// route is the per-tenant quota in the database
+/// ([`crate::share::QUOTA_PER_WINDOW`]), which counts the right thing and
+/// cannot be shared by accident. This bucket exists only to bound a loop.
+pub const TENANT_REQUESTS_PER_MINUTE: f64 = 120.0;
+
 /// Buckets idle longer than this are dropped on the next prune. An idle bucket
 /// has refilled to capacity anyway, so forgetting it costs nothing.
 const IDLE_TTL: Duration = Duration::from_secs(120);
@@ -248,6 +257,16 @@ pub async fn limit_admin(
     next: Next,
 ) -> Result<Response, StatusCode> {
     gate(&state, ControlState::check_admin_rate, req, next).await
+}
+
+/// Middleware: the same for `POST /tenant/invite`, against its own bucket. See
+/// [`TENANT_REQUESTS_PER_MINUTE`] for why it is the loose one.
+pub async fn limit_tenant(
+    State(state): State<ControlState>,
+    req: Request<Body>,
+    next: Next,
+) -> Result<Response, StatusCode> {
+    gate(&state, ControlState::check_tenant_rate, req, next).await
 }
 
 /// Middleware: the same for `POST /admin/login`, against its own bucket. NOT

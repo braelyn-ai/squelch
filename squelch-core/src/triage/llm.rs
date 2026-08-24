@@ -644,7 +644,9 @@ mod tests {
     #[test]
     fn only_a_gateway_endpoint_gets_the_virtual_key_header() {
         assert!(!is_gateway_url(API_URL));
-        assert!(is_gateway_url("https://bifrost.passband.app/anthropic/v1/messages"));
+        assert!(is_gateway_url(
+            "https://bifrost.passband.app/anthropic/v1/messages"
+        ));
         // A self-hosted gateway on a LAN box is still a gateway.
         assert!(is_gateway_url("http://10.0.0.4:8080/v1/messages"));
     }

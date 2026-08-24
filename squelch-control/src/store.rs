@@ -133,6 +133,18 @@ CREATE TABLE IF NOT EXISTS tenants (
     vk_minted_at            TEXT COLLATE \"C\",
     bifrost_assistant_vk_id TEXT,
     assistant_vk_minted_at  TEXT COLLATE \"C\",
+    -- THE SHARE TOKEN: the bearer this tenant's own daemon presents to mint an
+    -- invite for a friend, as a lowercase hex SHA-256 and nothing else. Same
+    -- three rules as an invite code (see `crate::invites`): the plaintext
+    -- exists once, on its way to the warden; verification is a point lookup;
+    -- and every way it can fail is one answer.
+    --
+    -- NULL is the OFF POSITION, and it is where every tenant starts. Sharing
+    -- lights up when an operator runs `share mint`, exactly as the LLM keys do,
+    -- and goes dark again on `share revoke` without touching anything else the
+    -- tenant owns.
+    share_token_hash        TEXT,
+    share_token_minted_at   TEXT COLLATE \"C\",
     -- NAMED, and the name is `TENANTS_LABEL_KEY`. An anonymous UNIQUE would
     -- still be told apart by whatever name Postgres invented for it, which is
     -- a thing to guess rather than a thing to read.
@@ -156,7 +168,17 @@ CREATE TABLE IF NOT EXISTS invite_codes (
     -- when. A live reservation makes the code unavailable to every other
     -- session; it self-releases when `reserved_until` passes.
     reserved_by    TEXT,
-    reserved_until TEXT COLLATE \"C\"
+    reserved_until TEXT COLLATE \"C\",
+    -- The tenant who shared this code, by id, or NULL for one an operator
+    -- minted. It is the whole referral funnel: joined against `tenants` it
+    -- says which mailbox a signup came from, and counted over a window it is
+    -- the per-tenant quota `share_quota_used` enforces.
+    --
+    -- NO FOREIGN KEY, deliberately. A torn-down tenant must not take the record
+    -- of the people it invited with it, and an invite outliving its inviter is
+    -- a dangling id rather than a broken row: every reader treats it as an
+    -- unknown sharer, which is what it is.
+    invited_by     BIGINT
 );
 
 -- Everybody the hosted tier knows of, wherever they have got to: waiting,
@@ -229,19 +251,23 @@ CREATE TABLE IF NOT EXISTS users (
 /// [`SCHEMA`] gives: a column that gained its collation by being created rather
 /// than by being added would compare differently from its neighbour, and the
 /// difference would only show up as a live code reading as expired.
-const ADDED_COLUMNS: [(&str, &str); 3] = [
+const ADDED_COLUMNS: [(&str, &str); 4] = [
     ("expires_at", "TEXT COLLATE \"C\""),
     ("reserved_by", "TEXT"),
     ("reserved_until", "TEXT COLLATE \"C\""),
+    ("invited_by", "BIGINT"),
 ];
 
 /// The same, for `tenants`: the triage virtual-key columns arrived after the
-/// first hosted deployment, and the assistant pair after them.
-const TENANT_ADDED_COLUMNS: [(&str, &str); 4] = [
+/// first hosted deployment, the assistant pair after them, and the share token
+/// after that.
+const TENANT_ADDED_COLUMNS: [(&str, &str); 6] = [
     ("bifrost_vk_id", "TEXT"),
     ("vk_minted_at", "TEXT COLLATE \"C\""),
     ("bifrost_assistant_vk_id", "TEXT"),
     ("assistant_vk_minted_at", "TEXT COLLATE \"C\""),
+    ("share_token_hash", "TEXT"),
+    ("share_token_minted_at", "TEXT COLLATE \"C\""),
 ];
 
 /// Store errors.
@@ -369,6 +395,19 @@ pub struct TenantRow {
     pub created_at: DateTime<Utc>,
 }
 
+/// The tenant behind a presented share token: who they are, and enough to bill
+/// the quota against and to write into an invite's provenance.
+///
+/// DELIBERATELY NOT `Debug`. It carries a mailbox address, and this crate's rule
+/// is that a tenant's address may reach a log line only where a line puts it
+/// there on purpose. A derived `Debug` is how it gets there by accident.
+pub struct Sharer {
+    /// The `tenants` row id, which is what `invite_codes.invited_by` records.
+    pub id: i64,
+    pub label: String,
+    pub account_email: String,
+}
+
 pub struct ControlStore {
     pool: Pool,
 }
@@ -456,15 +495,26 @@ impl ControlStore {
     // ---- invite codes ----------------------------------------------------
 
     /// Record a freshly minted code by hash, with the moment it stops working.
-    /// The plaintext never comes here.
-    pub async fn insert_invite(&self, code_hash: &str, expires_at: DateTime<Utc>) -> Result<i64> {
+    /// The plaintext never comes here. `invited_by` is the tenant who shared it,
+    /// or `None` for one an operator minted.
+    pub async fn insert_invite(
+        &self,
+        code_hash: &str,
+        expires_at: DateTime<Utc>,
+        invited_by: Option<i64>,
+    ) -> Result<i64> {
         let row = self
             .client()
             .await?
             .query_one(
-                "INSERT INTO invite_codes(code_hash, created_at, expires_at)
-                 VALUES($1, $2, $3) RETURNING id",
-                &[&code_hash, &stamp(Utc::now()), &stamp(expires_at)],
+                "INSERT INTO invite_codes(code_hash, created_at, expires_at, invited_by)
+                 VALUES($1, $2, $3, $4) RETURNING id",
+                &[
+                    &code_hash,
+                    &stamp(Utc::now()),
+                    &stamp(expires_at),
+                    &invited_by,
+                ],
             )
             .await?;
         Ok(row.try_get(0)?)
@@ -869,6 +919,163 @@ impl ControlStore {
         Ok(changed == 1)
     }
 
+    // ---- sharing ---------------------------------------------------------
+
+    /// Install (or rotate) this tenant's share token, by hash, stamping when.
+    /// THE HASH ONLY: the plaintext goes to the warden and never comes here.
+    /// Returns whether an ACTIVE tenant with `label` existed to take it.
+    ///
+    /// The `status` guard is not decoration. A torn-down tenant keeps its row
+    /// so its label stays spoken for, and minting a live credential onto one
+    /// would hand a mailbox nobody runs any more the ability to mint invites.
+    pub async fn set_tenant_share_token(&self, label: &str, token_hash: &str) -> Result<bool> {
+        let changed = self
+            .client()
+            .await?
+            .execute(
+                "UPDATE tenants SET share_token_hash = $2, share_token_minted_at = $3
+                  WHERE label = $1 AND status = $4",
+                &[&label, &token_hash, &stamp(Utc::now()), &STATUS_ACTIVE],
+            )
+            .await?;
+        Ok(changed == 1)
+    }
+
+    /// Take this tenant's share token away. Returns whether there was one.
+    ///
+    /// NO `status` GUARD, the mirror image of the one on the way in: revoking is
+    /// the safe direction, and an operator tearing a tenant down must be able to
+    /// pull its credential whatever state the row is in.
+    pub async fn clear_tenant_share_token(&self, label: &str) -> Result<bool> {
+        let changed = self
+            .client()
+            .await?
+            .execute(
+                "UPDATE tenants SET share_token_hash = NULL, share_token_minted_at = NULL
+                  WHERE label = $1 AND share_token_hash IS NOT NULL",
+                &[&label],
+            )
+            .await?;
+        Ok(changed == 1)
+    }
+
+    /// The active tenant holding this share token, or `None`.
+    ///
+    /// A POINT LOOKUP on a unique index, which is the whole security property:
+    /// the work done is the same whether the presented token was one character
+    /// off or pure noise, so the route above cannot be timed into an oracle.
+    /// `None` covers unknown, revoked, and torn-down alike, and the route maps
+    /// all three onto one refusal.
+    pub async fn tenant_by_share_token(&self, token_hash: &str) -> Result<Option<Sharer>> {
+        let row = self
+            .client()
+            .await?
+            .query_opt(
+                "SELECT id, label, account_email FROM tenants
+                  WHERE share_token_hash = $1 AND status = $2",
+                &[&token_hash, &STATUS_ACTIVE],
+            )
+            .await?;
+        row.map(|r| {
+            Ok(Sharer {
+                id: r.try_get(0)?,
+                label: r.try_get(1)?,
+                account_email: r.try_get(2)?,
+            })
+        })
+        .transpose()
+    }
+
+    /// Mint one code against this tenant's quota, ATOMICALLY.
+    ///
+    /// Returns how many codes are left in the window afterwards, or `None` when
+    /// the quota was already spent and nothing was written.
+    ///
+    /// ONE TRANSACTION, AND IT TAKES A ROW LOCK FIRST, because counting and
+    /// then inserting is not a quota. Two requests presenting the same share
+    /// token can read the same count and both insert, and the overshoot is
+    /// however many of them arrive at once: fine for a person pressing a button
+    /// on two devices, and not fine at all for the case the quota actually
+    /// guards, which is somebody who has taken a share token and can issue a
+    /// hundred requests in parallel. `SELECT ... FOR UPDATE` on the tenant row
+    /// serializes exactly the mints that share a tenant and blocks nothing
+    /// else.
+    ///
+    /// The lock is on `tenants`, not on `invite_codes`: there is no row in the
+    /// latter to lock before the insert, and locking the table would serialize
+    /// every tenant's mints against each other.
+    pub async fn mint_shared_invite(
+        &self,
+        tenant_id: i64,
+        code_hash: &str,
+        expires_at: DateTime<Utc>,
+        window_start: DateTime<Utc>,
+        limit: i64,
+    ) -> Result<Option<i64>> {
+        let mut client = self.client().await?;
+        let tx = client.transaction().await?;
+        // The gate. A tenant that vanished mid-request locks nothing and mints
+        // nothing, which is the same refusal an unknown token gets.
+        if tx
+            .query_opt(
+                "SELECT id FROM tenants WHERE id = $1 FOR UPDATE",
+                &[&tenant_id],
+            )
+            .await?
+            .is_none()
+        {
+            return Ok(None);
+        }
+        let used: i64 = tx
+            .query_one(
+                "SELECT COUNT(*) FROM invite_codes
+                  WHERE invited_by = $1 AND created_at >= $2",
+                &[&tenant_id, &stamp(window_start)],
+            )
+            .await?
+            .try_get(0)?;
+        if used >= limit {
+            return Ok(None);
+        }
+        tx.execute(
+            "INSERT INTO invite_codes(code_hash, created_at, expires_at, invited_by)
+             VALUES($1, $2, $3, $4)",
+            &[
+                &code_hash,
+                &stamp(Utc::now()),
+                &stamp(expires_at),
+                &tenant_id,
+            ],
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(Some(limit - (used + 1)))
+    }
+
+    /// How many codes this tenant has minted since `since`. The quota, counted
+    /// rather than stored.
+    ///
+    /// COUNTED ON PURPOSE. A `remaining` column is a second truth that drifts
+    /// the first time a mint half-fails, and it would have to be migrated every
+    /// time the limit moved. `invite_codes` already records who minted what and
+    /// when, so the count IS the answer and a limit change takes effect at once.
+    ///
+    /// Spent, expired, and revoked codes all still count: the quota bounds how
+    /// fast a tenant can mint, and a code that has already been redeemed is the
+    /// case the limit exists for, not an exemption from it.
+    pub async fn share_quota_used(&self, tenant_id: i64, since: DateTime<Utc>) -> Result<i64> {
+        let row = self
+            .client()
+            .await?
+            .query_one(
+                "SELECT COUNT(*) FROM invite_codes
+                  WHERE invited_by = $1 AND created_at >= $2",
+                &[&tenant_id, &stamp(since)],
+            )
+            .await?;
+        Ok(row.try_get(0)?)
+    }
+
     // ---- users -----------------------------------------------------------
 
     /// Record an address that asked for the hosted tier. `true` means this
@@ -995,9 +1202,7 @@ impl ControlStore {
         rows.extend(
             select_users(
                 &tx,
-                &format!(
-                    "SELECT {USER_COLUMNS} WHERE u.status <> $1 ORDER BY u.id DESC LIMIT $2"
-                ),
+                &format!("SELECT {USER_COLUMNS} WHERE u.status <> $1 ORDER BY u.id DESC LIMIT $2"),
                 &[&USER_PENDING, &USER_APPROVED_LIMIT],
             )
             .await?,
@@ -1376,8 +1581,53 @@ const USER_COLUMNS: &str = "u.id, u.email, u.created_at, u.status, u.approved_at
 async fn migrate(tx: &Transaction<'_>) -> Result<()> {
     add_missing_columns(tx, "invite_codes", &ADDED_COLUMNS).await?;
     add_missing_columns(tx, "tenants", &TENANT_ADDED_COLUMNS).await?;
+    add_share_token_index(tx).await?;
+    add_invited_by_index(tx).await?;
     backfill_expiry(tx).await?;
     backfill_users(tx).await
+}
+
+/// The index behind the share quota's `COUNT`.
+///
+/// HERE RATHER THAN IN [`SCHEMA`] for the same reason the share-token index is:
+/// the column arrives by migration, and an index over it would fail on every
+/// database that predates it.
+///
+/// PARTIAL, so it holds only the shared codes: every invite an operator minted
+/// carries NULL here, and those are the majority today. It earns its place
+/// because the count runs inside the transaction that takes the tenant's row
+/// lock ([`ControlStore::mint_shared_invite`]) — a sequential scan there is
+/// lock held over a growing table rather than merely a slow read.
+async fn add_invited_by_index(tx: &Transaction<'_>) -> Result<()> {
+    tx.execute(
+        "CREATE INDEX IF NOT EXISTS idx_invite_codes_invited_by
+             ON invite_codes(invited_by, created_at) WHERE invited_by IS NOT NULL",
+        &[],
+    )
+    .await?;
+    Ok(())
+}
+
+/// The point-lookup index behind [`ControlStore::tenant_by_share_token`], and
+/// the uniqueness that makes a share token name at most one tenant.
+///
+/// HERE RATHER THAN IN [`SCHEMA`] for the reason `squelch-core`'s migrations
+/// give: that constant runs in full on every open, BEFORE the column
+/// migrations, so an index over `share_token_hash` would fail on every database
+/// that predates the column and leave the store unopenable.
+///
+/// PARTIAL, so the NULL that every unminted tenant carries is not a value two
+/// of them can collide on. Postgres would allow the duplicate NULLs anyway;
+/// saying so in the predicate is what makes the intent readable, and it keeps
+/// the index the size of the tenants who actually share.
+async fn add_share_token_index(tx: &Transaction<'_>) -> Result<()> {
+    tx.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_tenants_share_token
+             ON tenants(share_token_hash) WHERE share_token_hash IS NOT NULL",
+        &[],
+    )
+    .await?;
+    Ok(())
 }
 
 /// `ADD COLUMN IF NOT EXISTS` per column, which is the whole of it on Postgres:
@@ -1692,7 +1942,7 @@ fn parse_ts(s: String) -> DateTime<Utc> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::invites;
+    use crate::{invites, share};
 
     /// What to do about a missing [`TEST_URL_VAR`], as one sentence with the
     /// two commands in it.
@@ -1833,11 +2083,24 @@ SQUELCH_TEST_PG_URL is not set, and these tests run against a real Postgres.
         chrono::Duration::days(n)
     }
 
+    /// A tenant's row id. No method returns it (nothing outside the sharing
+    /// path needs one), so the harness reads the column, which is what
+    /// [`ControlStore::client`] exists for.
+    async fn tenant_id(s: &ControlStore, label: &str) -> i64 {
+        s.client()
+            .await
+            .unwrap()
+            .query_one("SELECT id FROM tenants WHERE label = $1", &[&label])
+            .await
+            .unwrap()
+            .get(0)
+    }
+
     /// Mint, store, and hold a code the way one signup does.
     async fn held(s: &ControlStore, holder: &str) -> (String, i64) {
         let m = invites::mint().unwrap();
         let now = now();
-        s.insert_invite(&m.code_hash, now + days(DEFAULT_TTL_DAYS))
+        s.insert_invite(&m.code_hash, now + days(DEFAULT_TTL_DAYS), None)
             .await
             .unwrap();
         let id = s
@@ -1986,7 +2249,10 @@ SQUELCH_TEST_PG_URL is not set, and these tests run against a real Postgres.
         let s = store().await;
         let m = invites::mint().unwrap();
         let now = now();
-        let id = s.insert_invite(&m.code_hash, now + days(30)).await.unwrap();
+        let id = s
+            .insert_invite(&m.code_hash, now + days(30), None)
+            .await
+            .unwrap();
 
         assert_eq!(
             s.find_available_invite(&m.code_hash, now).await.unwrap(),
@@ -2011,7 +2277,7 @@ SQUELCH_TEST_PG_URL is not set, and these tests run against a real Postgres.
     async fn only_the_hash_is_at_rest() {
         let s = store().await;
         let m = invites::mint().unwrap();
-        s.insert_invite(&m.code_hash, now() + days(30))
+        s.insert_invite(&m.code_hash, now() + days(30), None)
             .await
             .unwrap();
 
@@ -2032,7 +2298,7 @@ SQUELCH_TEST_PG_URL is not set, and these tests run against a real Postgres.
     async fn a_wrong_or_unknown_code_is_simply_absent() {
         let s = store().await;
         let m = invites::mint().unwrap();
-        s.insert_invite(&m.code_hash, now() + days(30))
+        s.insert_invite(&m.code_hash, now() + days(30), None)
             .await
             .unwrap();
         assert_eq!(
@@ -2377,10 +2643,7 @@ SQUELCH_TEST_PG_URL is not set, and these tests run against a real Postgres.
         assert_eq!(row.status, USER_APPROVED);
         assert_eq!(row.approved_at, Some(now), "and keeps the first stamp");
 
-        assert!(
-            !s.approve_user(id + 1, now).await.unwrap(),
-            "no such row"
-        );
+        assert!(!s.approve_user(id + 1, now).await.unwrap(), "no such row");
         assert!(s.user_entry(id + 1).await.unwrap().is_none());
     }
 
@@ -2437,7 +2700,7 @@ SQUELCH_TEST_PG_URL is not set, and these tests run against a real Postgres.
         let s = store().await;
         let now = now();
         let id = s
-            .insert_invite("a".repeat(64).as_str(), now + days(30))
+            .insert_invite("a".repeat(64).as_str(), now + days(30), None)
             .await
             .unwrap();
 
@@ -2485,10 +2748,7 @@ SQUELCH_TEST_PG_URL is not set, and these tests run against a real Postgres.
         // A caller that read the CURRENT pointer replaces it, which is the
         // re-send path.
         assert!(s.set_user_invite(id, 13, Some(11)).await.unwrap());
-        assert_eq!(
-            s.user_entry(id).await.unwrap().unwrap().invite_id,
-            Some(13)
-        );
+        assert_eq!(s.user_entry(id).await.unwrap().unwrap().invite_id, Some(13));
     }
 
     /// What the operator reads top to bottom: everyone still waiting, oldest
@@ -2500,13 +2760,7 @@ SQUELCH_TEST_PG_URL is not set, and these tests run against a real Postgres.
         for who in ["a@example.com", "b@example.com", "c@example.com"] {
             s.add_user_waiting(who).await.unwrap();
         }
-        let ids: Vec<i64> = s
-            .list_users()
-            .await
-            .unwrap()
-            .iter()
-            .map(|r| r.id)
-            .collect();
+        let ids: Vec<i64> = s.list_users().await.unwrap().iter().map(|r| r.id).collect();
         s.approve_user(ids[0], now()).await.unwrap();
         s.approve_user(ids[1], now()).await.unwrap();
 
@@ -2544,6 +2798,251 @@ SQUELCH_TEST_PG_URL is not set, and these tests run against a real Postgres.
         );
     }
 
+    /// The share token round trip: installed against an active tenant, found
+    /// by hash, and gone when it is revoked.
+    #[tokio::test]
+    async fn a_share_token_names_exactly_one_active_tenant() {
+        let s = store().await;
+        s.insert_tenant("ada", "ada@example.com").await.unwrap();
+        let m = share::mint().unwrap();
+
+        // Nothing to find before one is minted.
+        assert!(
+            s.tenant_by_share_token(&m.token_hash)
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        assert!(
+            s.set_tenant_share_token("ada", &m.token_hash)
+                .await
+                .unwrap()
+        );
+        let found = s
+            .tenant_by_share_token(&m.token_hash)
+            .await
+            .unwrap()
+            .expect("the token names its tenant");
+        assert_eq!(found.label, "ada");
+        assert_eq!(found.account_email, "ada@example.com");
+
+        // A token nobody minted is the same answer as no token at all.
+        assert!(
+            s.tenant_by_share_token(&share::hash("pbs_not-a-real-token"))
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        assert!(s.clear_tenant_share_token("ada").await.unwrap());
+        assert!(
+            s.tenant_by_share_token(&m.token_hash)
+                .await
+                .unwrap()
+                .is_none(),
+            "a revoked token stops naming anybody"
+        );
+        // Revoking twice is a thing an operator does when the first answer was
+        // lost, and it is not an error.
+        assert!(!s.clear_tenant_share_token("ada").await.unwrap());
+    }
+
+    /// A tenant that is not active may not be handed a live credential, and a
+    /// label nobody provisioned may not either.
+    #[tokio::test]
+    async fn only_an_active_tenant_takes_a_share_token() {
+        let s = store().await;
+        let m = share::mint().unwrap();
+        assert!(
+            !s.set_tenant_share_token("ghost", &m.token_hash)
+                .await
+                .unwrap()
+        );
+
+        s.insert_tenant("ada", "ada@example.com").await.unwrap();
+        s.client()
+            .await
+            .unwrap()
+            .execute("UPDATE tenants SET status = 'cancelled'", &[])
+            .await
+            .unwrap();
+        assert!(
+            !s.set_tenant_share_token("ada", &m.token_hash)
+                .await
+                .unwrap()
+        );
+        assert!(
+            s.tenant_by_share_token(&m.token_hash)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    /// The quota is enforced in the SAME transaction that mints, so requests
+    /// racing on one share token cannot walk past it together.
+    ///
+    /// The check-then-insert this replaced was fine for a person pressing a
+    /// button twice and useless against the case the quota exists for: somebody
+    /// holding a stolen share token who can issue a hundred requests at once,
+    /// every one of them reading the same count.
+    #[tokio::test]
+    async fn concurrent_mints_cannot_outrun_the_quota() {
+        let s = std::sync::Arc::new(store().await);
+        s.insert_tenant("ada", "ada@example.com").await.unwrap();
+        let ada = tenant_id(&s, "ada").await;
+        let now = now();
+        let window = now - days(share::QUOTA_WINDOW_DAYS);
+        let limit = 5;
+
+        // Twenty at once against a limit of five. Without the row lock this
+        // lands somewhere between six and twenty.
+        let mut set = tokio::task::JoinSet::new();
+        for _ in 0..20 {
+            let s = s.clone();
+            set.spawn(async move {
+                s.mint_shared_invite(
+                    ada,
+                    &invites::mint().unwrap().code_hash,
+                    now + days(30),
+                    window,
+                    limit,
+                )
+                .await
+                .unwrap()
+            });
+        }
+        let mut minted = 0;
+        while let Some(res) = set.join_next().await {
+            if res.unwrap().is_some() {
+                minted += 1;
+            }
+        }
+        assert_eq!(
+            minted, limit,
+            "exactly the limit, however many raced for it"
+        );
+        assert_eq!(s.share_quota_used(ada, window).await.unwrap(), limit);
+    }
+
+    /// The `remaining` it hands back counts down to zero and stops, so the copy
+    /// built on it ("3 invites left") is never a lie.
+    #[tokio::test]
+    async fn a_mint_reports_what_is_left_after_it() {
+        let s = store().await;
+        s.insert_tenant("ada", "ada@example.com").await.unwrap();
+        let ada = tenant_id(&s, "ada").await;
+        let now = now();
+        let window = now - days(share::QUOTA_WINDOW_DAYS);
+
+        for expected in (0..3).rev() {
+            let left = s
+                .mint_shared_invite(
+                    ada,
+                    &invites::mint().unwrap().code_hash,
+                    now + days(30),
+                    window,
+                    3,
+                )
+                .await
+                .unwrap();
+            assert_eq!(left, Some(expected));
+        }
+        assert_eq!(
+            s.mint_shared_invite(
+                ada,
+                &invites::mint().unwrap().code_hash,
+                now + days(30),
+                window,
+                3
+            )
+            .await
+            .unwrap(),
+            None,
+            "the next one is refused and writes nothing"
+        );
+        assert_eq!(s.share_quota_used(ada, window).await.unwrap(), 3);
+    }
+
+    /// A tenant that vanished mid-request mints nothing, which is the same
+    /// refusal an unknown token gets.
+    #[tokio::test]
+    async fn a_mint_for_a_tenant_that_is_not_there_writes_nothing() {
+        let s = store().await;
+        let now = now();
+        assert_eq!(
+            s.mint_shared_invite(
+                9_999,
+                &invites::mint().unwrap().code_hash,
+                now + days(30),
+                now - days(30),
+                10
+            )
+            .await
+            .unwrap(),
+            None
+        );
+        assert!(s.list_invites().await.unwrap().is_empty());
+    }
+
+    /// The quota counts this tenant's codes inside the window and nobody
+    /// else's, and it counts a SPENT code: the limit bounds minting, and a
+    /// redeemed invite is the case it exists for.
+    #[tokio::test]
+    async fn the_share_quota_counts_one_tenants_window() {
+        let s = store().await;
+        s.insert_tenant("ada", "ada@example.com").await.unwrap();
+        s.insert_tenant("grace", "grace@example.com").await.unwrap();
+        let ada = tenant_id(&s, "ada").await;
+        let grace = tenant_id(&s, "grace").await;
+        let now = now();
+        let window = now - days(share::QUOTA_WINDOW_DAYS);
+
+        // An operator's own invite belongs to nobody's quota.
+        s.insert_invite(&invites::mint().unwrap().code_hash, now + days(30), None)
+            .await
+            .unwrap();
+        assert_eq!(s.share_quota_used(ada, window).await.unwrap(), 0);
+
+        let spent_hash = invites::mint().unwrap().code_hash;
+        let spent = s
+            .insert_invite(&spent_hash, now + days(30), Some(ada))
+            .await
+            .unwrap();
+        s.insert_invite(
+            &invites::mint().unwrap().code_hash,
+            now + days(30),
+            Some(grace),
+        )
+        .await
+        .unwrap();
+        // Redeemed the way a signup redeems one: reserved by the session that
+        // is about to spend it, then spent.
+        s.reserve_invite(&spent_hash, "session-a", now, now + days(1))
+            .await
+            .unwrap();
+        s.consume_invite(spent, "friend", "session-a")
+            .await
+            .unwrap();
+
+        assert_eq!(s.share_quota_used(ada, window).await.unwrap(), 1);
+        assert_eq!(s.share_quota_used(grace, window).await.unwrap(), 1);
+
+        // A code minted before the window opened has aged out of it, which is
+        // what makes the limit a rolling one rather than a lifetime cap.
+        s.client()
+            .await
+            .unwrap()
+            .execute(
+                "UPDATE invite_codes SET created_at = $1 WHERE id = $2",
+                &[&stamp(now - days(share::QUOTA_WINDOW_DAYS + 1)), &spent],
+            )
+            .await
+            .unwrap();
+        assert_eq!(s.share_quota_used(ada, window).await.unwrap(), 0);
+    }
+
     /// The raw `analytics_id` cell for a row.
     ///
     /// Read here rather than off a [`UserRow`] because no method returns it, on
@@ -2567,9 +3066,10 @@ SQUELCH_TEST_PG_URL is not set, and these tests run against a real Postgres.
         let parts: Vec<&str> = s.split('-').collect();
         parts.len() == 5
             && parts.iter().map(|p| p.len()).collect::<Vec<_>>() == [8, 4, 4, 4, 12]
-            && parts
-                .iter()
-                .all(|p| p.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()))
+            && parts.iter().all(|p| {
+                p.bytes()
+                    .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+            })
             && parts[2].starts_with('4')
             && matches!(parts[3].as_bytes()[0], b'8' | b'9' | b'a' | b'b')
     }
@@ -2646,7 +3146,11 @@ SQUELCH_TEST_PG_URL is not set, and these tests run against a real Postgres.
         assert_eq!(row.tenant_label.as_deref(), Some("ada"));
         assert_eq!(row.signed_up_at, Some(at));
         assert_eq!(row.status, USER_APPROVED);
-        assert_eq!(s.list_users().await.unwrap().len(), 1, "one person, one row");
+        assert_eq!(
+            s.list_users().await.unwrap().len(),
+            1,
+            "one person, one row"
+        );
     }
 
     /// THE CLI DOOR: `invite issue` mints a code addressed to nobody, so the
@@ -2707,7 +3211,11 @@ SQUELCH_TEST_PG_URL is not set, and these tests run against a real Postgres.
         assert_eq!(row.status, USER_APPROVED, "promoted off the waiting half");
         assert_eq!(row.signed_up_at, Some(at));
         assert_eq!(row.tenant_label.as_deref(), Some("ada"));
-        assert_eq!(s.list_users().await.unwrap().len(), 1, "one person, one row");
+        assert_eq!(
+            s.list_users().await.unwrap().len(),
+            1,
+            "one person, one row"
+        );
     }
 
     /// Activation is stamped ONCE, with the date the daemon reported rather than
@@ -3028,7 +3536,11 @@ CREATE TABLE waitlist (
             assert!(is_uuid_shaped(id), "{email}: {id}");
         }
         let distinct: std::collections::HashSet<&String> = ids.iter().map(|(_, id)| id).collect();
-        assert_eq!(distinct.len(), 4, "one id per person, not one per migration");
+        assert_eq!(
+            distinct.len(),
+            4,
+            "one id per person, not one per migration"
+        );
 
         assert!(
             !table_exists(&seed, "waitlist").await,

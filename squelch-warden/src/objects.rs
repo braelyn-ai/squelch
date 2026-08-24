@@ -139,6 +139,15 @@ pub const LLM_API_KEY_KEY: &str = "api-key";
 /// hash ([`llm_keys_hash`]) lands on the pod spec.
 pub const ASSISTANT_API_KEY_KEY: &str = "assistant-api-key";
 
+/// Data key holding the tenant's share token, in `<label>-control`.
+///
+/// The bearer this tenant's daemon presents to the control plane to mint an
+/// invite for a friend. Same posture as the LLM keys, and for the same reason
+/// (the warden writes it and reads it back to hash it for
+/// [`SHARE_TOKEN_HASH_ANNOTATION`]): never logged, never returned on the wire,
+/// and only the hash lands on the world-readable pod spec.
+pub const SHARE_TOKEN_KEY: &str = "share-token";
+
 /// Data keys in the shared Google OAuth client Secret
 /// ([`crate::config::Config::oauth_secret_name`]).
 ///
@@ -170,6 +179,15 @@ pub const CREDENTIAL_HASH_ANNOTATION: &str = "passband.email/credential-hash";
 /// running daemon would keep the env value it booted with. The HASH, never the
 /// key: an annotation is world-readable to anyone with `get deployment`.
 pub const LLM_KEY_HASH_ANNOTATION: &str = "passband.email/llm-key-hash";
+
+/// Annotation on the pod template recording which share token the pod was
+/// rolled for, as a hash.
+///
+/// The same mechanism [`LLM_KEY_HASH_ANNOTATION`] is: a tenant that has just
+/// been given a share token has a Secret the running pod never read, and
+/// without a changed pod spec the daemon would go on believing it cannot
+/// share until something else happened to roll it.
+pub const SHARE_TOKEN_HASH_ANNOTATION: &str = "passband.email/share-token-hash";
 
 /// Annotation on the identity Secret recording when phase one ran, as Unix
 /// seconds. The pending sweep needs an age, and this is the only place a
@@ -505,6 +523,24 @@ pub fn llm_secret(
         metadata: meta(config, name, name.llm_secret()),
         type_: Some("Opaque".to_string()),
         string_data: Some(string_data),
+        ..Default::default()
+    }
+}
+
+/// The tenant's control Secret: the share token the control plane minted for
+/// this tenant, verbatim.
+///
+/// One data key and no optional slots, unlike [`llm_secret`]: there is one
+/// credential here, so a write is always the whole object and there is nothing
+/// for a partial apply to clear.
+pub fn control_secret(config: &Config, name: &TenantName, share_token: &str) -> Secret {
+    Secret {
+        metadata: meta(config, name, name.control_secret()),
+        type_: Some("Opaque".to_string()),
+        string_data: Some(BTreeMap::from([(
+            SHARE_TOKEN_KEY.to_string(),
+            share_token.to_string(),
+        )])),
         ..Default::default()
     }
 }
@@ -880,11 +916,17 @@ fn readiness_probe(config: &Config) -> Probe {
 /// `llm_key_hash` is the same mechanism for the LLM virtual key, when this
 /// tenant has one: absent for a tenant never keyed, present so a rotated key
 /// is a changed pod spec and a roll. See [`LLM_KEY_HASH_ANNOTATION`].
+///
+/// `share_token_hash` is the same again, for the share token. THREE SEPARATE
+/// ARGUMENTS rather than one bundled hash, because they move independently: a
+/// re-consent, a key rotation, and a share mint each have to roll the pod
+/// without needing to know what the other two currently are.
 pub fn deployment(
     config: &Config,
     name: &TenantName,
     credential_hash: &str,
     llm_key_hash: Option<&str>,
+    share_token_hash: Option<&str>,
 ) -> Deployment {
     let pod_security = PodSecurityContext {
         run_as_non_root: Some(true),
@@ -1087,9 +1129,10 @@ pub fn deployment(
             template: PodTemplateSpec {
                 metadata: Some(ObjectMeta {
                     labels: Some(labels(name)),
-                    // What makes a re-consent (and a key rotation) land: see
-                    // [`CREDENTIAL_HASH_ANNOTATION`] and
-                    // [`LLM_KEY_HASH_ANNOTATION`].
+                    // What makes a re-consent (and a key rotation, and a share
+                    // mint) land: see [`CREDENTIAL_HASH_ANNOTATION`],
+                    // [`LLM_KEY_HASH_ANNOTATION`] and
+                    // [`SHARE_TOKEN_HASH_ANNOTATION`].
                     annotations: Some({
                         let mut annotations = BTreeMap::from([(
                             CREDENTIAL_HASH_ANNOTATION.to_string(),
@@ -1098,6 +1141,10 @@ pub fn deployment(
                         if let Some(hash) = llm_key_hash {
                             annotations
                                 .insert(LLM_KEY_HASH_ANNOTATION.to_string(), hash.to_string());
+                        }
+                        if let Some(hash) = share_token_hash {
+                            annotations
+                                .insert(SHARE_TOKEN_HASH_ANNOTATION.to_string(), hash.to_string());
                         }
                         annotations
                     }),
@@ -1215,8 +1262,25 @@ fn daemon_env(config: &Config, name: &TenantName) -> Vec<EnvVar> {
     // link. ABSENT when the operator did not configure one, rather than empty:
     // the daemon treats a blank value as unset anyway, but an empty env var in a
     // pod spec reads like a setting somebody meant to fill in.
+    //
+    // ONE CONFIGURED VALUE, TWO VARIABLES. The same origin is also where the
+    // daemon posts to mint an invite, and the daemon reads the two through
+    // different settings because they are different errands: one is a link it
+    // renders for a human, the other an API it authenticates to. An operator
+    // configuring the control plane twice is an operator who can get them out
+    // of step.
     if let Some(url) = &config.console_sso_url {
         env.push(plain("SQUELCH_CONSOLE_SSO_URL", url));
+        env.push(plain("SQUELCH_CONTROL_URL", url));
+        // The share token, from the Secret, never inline - and OPTIONAL, for
+        // the reason the LLM keys are: a tenant nobody has run `share mint`
+        // for has no such Secret at all and must still boot. The daemon's
+        // share route answers unavailable until one is installed.
+        env.push(from_optional_secret(
+            "SQUELCH_CONTROL_TOKEN",
+            name.control_secret(),
+            SHARE_TOKEN_KEY,
+        ));
     }
 
     // The LLM gateway block, present only when the operator configured one.
@@ -1317,7 +1381,7 @@ mod tests {
     /// not care which ciphertext it was rolled for. No LLM key, which is also
     /// the shape every unkeyed tenant gets.
     fn tenant_deployment(config: &Config) -> Deployment {
-        deployment(config, &name(), &credential_hash("ct"), None)
+        deployment(config, &name(), &credential_hash("ct"), None, None)
     }
 
     /// A config with the LLM gateway turned on and nothing else changed.
@@ -1684,7 +1748,7 @@ mod tests {
         let c = llm_config();
         let n = name();
         let annotations = |llm_hash: Option<&str>| {
-            deployment(&c, &n, &credential_hash("ct"), llm_hash)
+            deployment(&c, &n, &credential_hash("ct"), llm_hash, None)
                 .spec
                 .unwrap()
                 .template
@@ -1838,6 +1902,137 @@ mod tests {
         assert_eq!(var.value.as_deref(), Some("https://signup.passband.app"));
     }
 
+    /// The sharing pair rides on the SAME switch as the console link, because
+    /// they are the same fact: an origin to talk to. The token is a
+    /// `secretKeyRef` and OPTIONAL, so a tenant nobody has run `share mint`
+    /// for still boots.
+    #[test]
+    fn the_control_plane_pair_reaches_the_daemon_when_the_origin_is_configured() {
+        let mut c = test_config();
+        c.console_sso_url = Some("https://signup.passband.app".to_string());
+        let pod = tenant_deployment(&c).spec.unwrap().template.spec.unwrap();
+        let env = pod.containers[0].env.clone().unwrap();
+
+        let url = env
+            .iter()
+            .find(|e| e.name == "SQUELCH_CONTROL_URL")
+            .expect("SQUELCH_CONTROL_URL is missing from the tenant pod");
+        assert_eq!(url.value.as_deref(), Some("https://signup.passband.app"));
+
+        let token = env
+            .iter()
+            .find(|e| e.name == "SQUELCH_CONTROL_TOKEN")
+            .expect("SQUELCH_CONTROL_TOKEN is missing from the tenant pod");
+        // NEVER a plain value: it is a live bearer, and a pod spec is
+        // world-readable to anyone who can list Deployments.
+        assert!(token.value.is_none());
+        let key_ref = token
+            .value_from
+            .clone()
+            .unwrap()
+            .secret_key_ref
+            .expect("the share token must arrive by reference");
+        assert_eq!(key_ref.name, "alice-control");
+        assert_eq!(key_ref.key, SHARE_TOKEN_KEY);
+        assert_eq!(
+            key_ref.optional,
+            Some(true),
+            "an unminted tenant must still boot"
+        );
+    }
+
+    /// No control plane, no sharing: with the origin unconfigured neither
+    /// variable exists, so a self-hosted daemon is never told to post an
+    /// invite mint at a service that is not there.
+    #[test]
+    fn no_control_origin_means_no_sharing_variables() {
+        let c = test_config();
+        assert!(c.console_sso_url.is_none());
+        let pod = tenant_deployment(&c).spec.unwrap().template.spec.unwrap();
+        let env = pod.containers[0].env.clone().unwrap();
+        assert!(
+            !env.iter()
+                .any(|e| e.name == "SQUELCH_CONTROL_URL" || e.name == "SQUELCH_CONTROL_TOKEN")
+        );
+    }
+
+    /// The share token's own roll: minting one has to reach a pod that is
+    /// already running, and revoking has to take the variable away again.
+    #[test]
+    fn a_share_token_rolls_the_deployment_and_an_unshared_pod_carries_no_hash() {
+        let c = test_config();
+        let n = name();
+        let annotations = |share_hash: Option<&str>| {
+            deployment(&c, &n, &credential_hash("ct"), None, share_hash)
+                .spec
+                .unwrap()
+                .template
+                .metadata
+                .unwrap()
+                .annotations
+                .unwrap()
+        };
+
+        assert!(!annotations(None).contains_key(SHARE_TOKEN_HASH_ANNOTATION));
+        let first = annotations(Some(&credential_hash("token-one")));
+        let a = first[SHARE_TOKEN_HASH_ANNOTATION].clone();
+        assert_eq!(
+            a,
+            annotations(Some(&credential_hash("token-one")))[SHARE_TOKEN_HASH_ANNOTATION],
+            "the same token is the same pod spec"
+        );
+        assert_ne!(
+            a,
+            annotations(Some(&credential_hash("token-two")))[SHARE_TOKEN_HASH_ANNOTATION],
+            "a rotated token must roll the pod"
+        );
+        // A hash, not the token: the annotation is world-readable.
+        assert_eq!(a.len(), 64);
+        assert!(a.bytes().all(|b| b.is_ascii_hexdigit()));
+        assert!(first.contains_key(CREDENTIAL_HASH_ANNOTATION));
+    }
+
+    /// The two rotations are INDEPENDENT: a pod carrying both annotations has
+    /// each move on its own, which is what stops one rotation knocking the
+    /// other's off the template.
+    #[test]
+    fn the_llm_and_share_rolls_do_not_collide() {
+        let c = test_config();
+        let n = name();
+        let both = deployment(
+            &c,
+            &n,
+            &credential_hash("ct"),
+            Some(&credential_hash("key")),
+            Some(&credential_hash("token")),
+        )
+        .spec
+        .unwrap()
+        .template
+        .metadata
+        .unwrap()
+        .annotations
+        .unwrap();
+        assert!(both.contains_key(LLM_KEY_HASH_ANNOTATION));
+        assert!(both.contains_key(SHARE_TOKEN_HASH_ANNOTATION));
+        assert_ne!(
+            both[LLM_KEY_HASH_ANNOTATION], both[SHARE_TOKEN_HASH_ANNOTATION],
+            "two credentials, two hashes"
+        );
+    }
+
+    #[test]
+    fn the_control_secret_is_the_token_verbatim_under_the_one_data_key() {
+        let c = test_config();
+        let secret = control_secret(&c, &name(), "pbs_abc123");
+        assert_eq!(secret.metadata.name.as_deref(), Some("alice-control"));
+        assert_eq!(secret.metadata.namespace.as_deref(), Some("tenants"));
+        assert_eq!(secret.type_.as_deref(), Some("Opaque"));
+        let data = secret.string_data.unwrap();
+        assert_eq!(data[SHARE_TOKEN_KEY], "pbs_abc123");
+        assert_eq!(data.len(), 1);
+    }
+
     /// Unset means ABSENT, not empty. A self-host daemon's console is the
     /// pasted-code form alone, and a hosted deploy that has not configured the
     /// control plane's origin gets the same page rather than a broken link.
@@ -1960,7 +2155,7 @@ mod tests {
         let second = crate::testing::armored("second");
 
         let annotation = |ct: &str| {
-            deployment(&c, &n, &credential_hash(ct), None)
+            deployment(&c, &n, &credential_hash(ct), None, None)
                 .spec
                 .unwrap()
                 .template

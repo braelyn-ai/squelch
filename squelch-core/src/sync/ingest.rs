@@ -2323,7 +2323,11 @@ mod tests {
             t.message.body
         );
         assert!(
-            !t.message.from_name.as_deref().unwrap_or("").contains('\u{fffd}'),
+            !t.message
+                .from_name
+                .as_deref()
+                .unwrap_or("")
+                .contains('\u{fffd}'),
             "a replacement character means the charset decoder is gone"
         );
     }

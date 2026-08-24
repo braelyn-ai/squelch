@@ -46,10 +46,15 @@ use crate::store::{
 use crate::types::{
     AccountId, AttachmentInfo, AttentionStatus, AttentionUpdate, AuditEntry, BandCounts, Banking,
     CalendarUpdate, ClientAttachment, ClientMessage, ClientThreadView, Deadline, Disposition,
-    Event, EventKind, NewMessage, Receipt, SanitizedMessage, SearchHit, SenderRule, Sensitivity,
-    ShredCandidate, StoreStats, ThreadView, Tier, TriageAxis, TriageFeedback, UnsubscribeRecord,
-    Update,
+    Event, EventKind, NewMessage, OpenRate, Receipt, SanitizedMessage, SearchHit, SenderRule,
+    Sensitivity, ShredCandidate, StoreStats, ThreadView, Tier, TriageAxis, TriageFeedback,
+    UnsubscribeRecord, Update,
 };
+
+/// `app_settings` key recording when this account's open ledger started, so the
+/// share stat can refuse to look back further than the column has existed. See
+/// `migrate::stamp_open_ledger_start`.
+pub(crate) const OPEN_LEDGER_SINCE_KEY: &str = "opened_ledger_since";
 
 // schema.sql stays beside `store/mod.rs`; this file is `store/sqlite/mod.rs`.
 const SCHEMA: &str = include_str!("../schema.sql");
@@ -799,6 +804,18 @@ impl Store for SqliteStore {
 
     fn mark_surfaced(&self, account_id: AccountId, message_ids: &[i64]) -> Result<usize> {
         self.mark_surfaced(account_id, message_ids)
+    }
+
+    fn mark_opened(&self, account_id: AccountId, message_ids: &[i64]) -> Result<usize> {
+        self.mark_opened(account_id, message_ids)
+    }
+
+    fn mark_thread_opened(&self, account_id: AccountId, thread_id: &str) -> Result<usize> {
+        self.mark_thread_opened(account_id, thread_id)
+    }
+
+    fn share_open_rate(&self, account_id: AccountId, since: DateTime<Utc>) -> Result<OpenRate> {
+        self.share_open_rate(account_id, since)
     }
 
     fn set_attention_status(

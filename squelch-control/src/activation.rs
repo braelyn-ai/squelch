@@ -37,7 +37,11 @@ pub const ACTIVATION_BATCH: i64 = 25;
 /// daemon predates `token first-paired` (a terse 500) heals on its own — the
 /// former on the next tick, the latter on the next fleet roll.
 pub async fn poll_first_paired(state: &ControlState) -> usize {
-    let labels = match state.store().users_awaiting_first_pair(ACTIVATION_BATCH).await {
+    let labels = match state
+        .store()
+        .users_awaiting_first_pair(ACTIVATION_BATCH)
+        .await
+    {
         Ok(labels) => labels,
         Err(e) => {
             tracing::error!(error = %e, "activation: could not read the candidate set");

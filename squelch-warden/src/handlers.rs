@@ -4,6 +4,7 @@
 //! POST   /v1/tenants                     -> 201 { recipient }
 //! PUT    /v1/tenants/{label}/credentials -> 200 { pair_code, pair_url, deep_link }
 //! PUT    /v1/tenants/{label}/llm-key     -> 200 {}
+//! PUT    /v1/tenants/{label}/control-token -> 200 {}
 //! GET    /v1/tenants/{label}             -> 200 { status } | 404
 //! GET    /v1/tenants/{label}/drift       -> 200 { status, deployment_present, foreign, changes }
 //! GET    /v1/tenants/{label}/devices     -> 200 { first_paired_at } | 404 | 503
@@ -160,6 +161,17 @@ struct SetCredentials {
     cred_read_ciphertext: String,
 }
 
+/// No `Debug`: the field is a live bearer, and a derived formatter is how one
+/// ends up in a log line by accident.
+#[derive(Deserialize)]
+struct SetControlToken {
+    /// The tenant's share token, minted by the control plane. Stored verbatim
+    /// in the tenant's Secret and never read back here. Defaulted, and an
+    /// absent field REMOVES what is installed: see [`set_control_token`].
+    #[serde(default)]
+    share_token: Option<String>,
+}
+
 /// No `Debug`: both fields are live virtual keys, and a derived formatter is
 /// how one ends up in a log line by accident.
 #[derive(Deserialize)]
@@ -285,6 +297,35 @@ pub async fn set_llm_key(
         .await
     {
         // Nothing to hand back: the keys came in, and they never go out.
+        Ok(()) => (StatusCode::OK, Json(json!({}))).into_response(),
+        Err(e) => e.into_response(),
+    }
+}
+
+/// `PUT /v1/tenants/{label}/control-token` - store, rotate, or REMOVE the
+/// tenant's share token. A running tenant is rolled onto the result; a pending
+/// one picks it up when the workload is applied.
+///
+/// An absent `share_token` is a REMOVAL, not a no-op, which is the opposite of
+/// what an absent slot means next door. The reason is that this Secret holds
+/// one credential rather than two: with nothing to leave alone, "no token" can
+/// only mean one thing, and revoking has to be sayable on the same wire that
+/// mints. See [`crate::provision::Warden::set_share_token`].
+pub async fn set_control_token(
+    State(state): State<WardenState>,
+    Path(label): Path<String>,
+    body: Bytes,
+) -> Response {
+    let req: SetControlToken = match parse_json(&body) {
+        Ok(req) => req,
+        Err(detail) => return malformed(detail),
+    };
+    match state
+        .warden()
+        .set_share_token(&label, req.share_token.as_deref())
+        .await
+    {
+        // Nothing to hand back: the token came in, and it never goes out.
         Ok(()) => (StatusCode::OK, Json(json!({}))).into_response(),
         Err(e) => e.into_response(),
     }
@@ -875,7 +916,10 @@ mod tests {
         h.cluster.exec_prints("who knows\n");
         let (status, body) = call(&h, authed("GET", "/v1/tenants/alice/devices", "")).await;
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
-        assert_eq!(body, serde_json::json!({ "error": "first_paired_unparsed" }));
+        assert_eq!(
+            body,
+            serde_json::json!({ "error": "first_paired_unparsed" })
+        );
     }
 
     #[tokio::test]

@@ -570,6 +570,10 @@ struct StoreStats: Codable, Sendable, Hashable {
     /// (POST /client/assistant/messages). ABSENT on a daemon too old to say —
     /// and nil reads exactly like false: BYOK is the only assistant door.
     var assistant_relay: Bool?
+    /// Whether this daemon can mint and send invites (POST /client/invites).
+    /// ABSENT on a daemon too old to say, and on every self-host, and nil reads
+    /// exactly like false: no button, no nudge, nothing offered.
+    var invite_sharing: Bool?
     /// Whether `forward_of_message_id` on /client/actions/send MEANS anything
     /// here. ABSENT on a daemon too old to say, and nil must read as false for a
     /// reason no other capability flag has: serde ignores unknown fields, so an
@@ -578,6 +582,56 @@ struct StoreStats: Codable, Sendable, Hashable {
     /// to catch and no undo for a send, so the only place to stop it is before
     /// the composer opens. See `AppStore.forwardingAvailable`.
     var forwarding: Bool?
+}
+
+// MARK: - invites
+
+/// What GET /client/invites answers: whether sharing is possible at all, and
+/// the one number the invite mail would be able to say about this mailbox.
+///
+/// `open_percent` is NIL far more often than not, and that is by design on the
+/// daemon's side (too new a mailbox, too little mail, or a rate not worth
+/// quoting). The sheet must have copy for both, and it must never invent one.
+struct InviteAvailability: Codable, Sendable, Hashable {
+    var can_share: Bool
+    /// WHY not, when `can_share` is false. `no_control_plane` is a property of
+    /// the deployment and nothing the reader can act on; `no_write_credential`
+    /// names a command that fixes it. Absent when sharing is possible, and on a
+    /// daemon too old to say — which the sheet reads as the first, the more
+    /// conservative of the two, because telling somebody to run a command that
+    /// will not help is worse than telling them nothing.
+    var reason: String?
+    var open_percent: Int?
+    /// The DRAFT the composer opens on: the daemon's first version of the mail,
+    /// which the user then edits. Absent when this daemon cannot share, because
+    /// there is no mail to draft.
+    ///
+    /// Written by the daemon rather than the app because the one thing in it
+    /// that must be TRUE - the open rate - is a fact only that machine can
+    /// compute.
+    var subject: String?
+    var body: String?
+    /// The token in `body` that becomes each friend's own invite. Sent rather
+    /// than hardcoded so the composer can name it in its own hint and refuse a
+    /// draft that has lost it, without the two ever disagreeing.
+    var invite_marker: String?
+}
+
+/// One friend's outcome. `error` is copy the daemon wrote for a human; it never
+/// carries a status code or anything about the invite code itself.
+struct InviteResult: Codable, Sendable, Hashable, Identifiable {
+    var email: String
+    var sent: Bool
+    var error: String?
+    var id: String { email }
+}
+
+/// What POST /client/invites answers. `remaining` is nil when nothing was
+/// minted at all, so it is never rendered as "0 left" for a press that failed
+/// before it reached the control plane.
+struct InviteSendResponse: Codable, Sendable, Hashable {
+    var results: [InviteResult]
+    var remaining: Int?
 }
 
 // MARK: - usage

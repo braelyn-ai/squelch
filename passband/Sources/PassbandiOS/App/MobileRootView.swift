@@ -235,6 +235,22 @@ private struct MobileShell: View {
                 TriageFixPalette(target: target) { store.closeTriageFix() }
             }
         }
+        // SHARE PASSBAND, off the same `store.shareSheetOpen` the Mac's shell
+        // presents, so the button in Settings works on both and the flag is
+        // never set into the void. A full-height sheet for the same reason the
+        // composer is one: it autofocuses a field, and the keyboard takes the
+        // bottom half of a phone.
+        .sheet(isPresented: shareOpen) {
+            SharePanel()
+                .presentationDetents([.large])
+                .presentationDragIndicator(.visible)
+                .presentationBackground(Palette.canvas)
+        }
+        // THE TWO-WEEK ASK, over the shell on both platforms.
+        .overlay { ShareNudgeModal() }
+        .onChange(of: store.shareAvailable) { _, canShare in
+            ShareNudge.shared.askIfEarned(canShare: canShare)
+        }
         // `c` / ⌘N. THE SAME `ComposePane` the Mac opens as a half-window pane,
         // off THE SAME `store.compose` — which is what makes the draft restore,
         // the autosave and the send ceremony one code path rather than two. A
@@ -251,6 +267,16 @@ private struct MobileShell: View {
                 .interactiveDismissDisabled(store.compose?.sending == true)
                 .scrollDismissesKeyboard(.interactively)
         }
+    }
+
+    /// The share sheet's flag, as a Binding, so this file keeps its rule: no
+    /// `@Bindable` shadow, every modal presented off a derived binding. There is
+    /// no close verb to funnel through here because the sheet owns nothing but
+    /// itself; a drag-down is a dismissal and nothing else.
+    private var shareOpen: Binding<Bool> {
+        Binding(
+            get: { store.shareSheetOpen },
+            set: { store.shareSheetOpen = $0 })
     }
 
     /// Presented-ness derived from the store's own `triageFix`, so dismissing the

@@ -43,7 +43,10 @@ use chrono::{DateTime, Utc};
 /// the instant is the same either way, and the control plane must not have to
 /// know which spelling it got.
 pub fn parse_first_paired(stdout: &str) -> Option<Option<DateTime<Utc>>> {
-    let line = stdout.lines().map(str::trim).find(|line| !line.is_empty())?;
+    let line = stdout
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())?;
     if line == "none" {
         return Some(None);
     }
