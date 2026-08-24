@@ -15,6 +15,16 @@ pub const API_URL: &str = "https://api.anthropic.com/v1/messages";
 pub const OPENAI_API_URL: &str = "https://api.openai.com/v1/chat/completions";
 /// Pinned Anthropic API version header value.
 const API_VERSION: &str = "2023-06-01";
+/// The header a Bifrost gateway reads the per-tenant VIRTUAL KEY from.
+///
+/// Anthropic's own API takes the credential in `x-api-key`, and the gateway
+/// does NOT read that header at all: with only `x-api-key` set it answers 401
+/// "virtual key is required. Provide a virtual key via the x-bf-vk header",
+/// i.e. it sees no key whatsoever. Sending the value in BOTH is what lets one
+/// request shape serve a direct Anthropic endpoint and a fronting gateway,
+/// which matters because self-host talks straight to Anthropic while every
+/// hosted tenant goes through the gateway.
+const GATEWAY_VK_HEADER: &str = "x-bf-vk";
 /// Default max_tokens. The verdict itself is a compact JSON object, but on a
 /// reasoning model THINKING TOKENS BILL AGAINST THIS CEILING TOO, and thinking
 /// runs before the first output byte: a budget sized for the JSON alone
@@ -360,11 +370,22 @@ async fn classify_anthropic(
         };
 
         let build = || {
-            http.post(url)
+            let req = http
+                .post(url)
                 .header("x-api-key", api_key)
                 .header("anthropic-version", API_VERSION)
-                .header("content-type", "application/json")
-                .json(&body)
+                .header("content-type", "application/json");
+            // See GATEWAY_VK_HEADER: a fronting gateway ignores `x-api-key`
+            // entirely, so the credential has to ride this header too or every
+            // hosted call 401s. Only when a gateway is actually in front —
+            // Anthropic has no use for it, and a credential should not be
+            // copied into extra headers on a request that does not need it.
+            let req = if is_gateway_url(url) {
+                req.header(GATEWAY_VK_HEADER, api_key)
+            } else {
+                req
+            };
+            req.json(&body)
         };
         let parsed: MessagesResponse = match send_with_retry(build).await? {
             SendOk::Body(b) => b,
@@ -556,6 +577,19 @@ where
     }
 }
 
+/// Is this Anthropic-wire request going somewhere OTHER than Anthropic's own
+/// endpoint — i.e. through an operator-configured gateway?
+///
+/// Pure and URL-only on purpose: the credential decision in
+/// [`classify_anthropic`] must be derivable from the resolved endpoint alone,
+/// so no call site can send a virtual key to Anthropic (where it is useless) or
+/// withhold one from the gateway (where its absence is a 401 on every row).
+/// [`crate::config::Stage2Config::resolve_llm`] is what puts a gateway URL here
+/// in the first place, and it only does so when the operator set a base URL.
+pub fn is_gateway_url(url: &str) -> bool {
+    url != API_URL
+}
+
 /// True when a permanent-failure kind is a CONFIG-LEVEL failure: the request
 /// was rejected for a reason shared by every queued row, never a fact about the
 /// message being classified. A wrong credential (`http_401`/`http_403`), an
@@ -601,6 +635,19 @@ async fn sleep_backoff(attempt: u32, retry_after: Option<Duration>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The gateway takes its virtual key ONLY in `x-bf-vk` — with just
+    /// `x-api-key` set it answers 401 "virtual key is required", meaning it saw
+    /// no credential at all. Anthropic direct is the opposite: `x-api-key` is
+    /// the credential and the gateway header means nothing. So the endpoint,
+    /// and only the endpoint, decides.
+    #[test]
+    fn only_a_gateway_endpoint_gets_the_virtual_key_header() {
+        assert!(!is_gateway_url(API_URL));
+        assert!(is_gateway_url("https://bifrost.passband.app/anthropic/v1/messages"));
+        // A self-hosted gateway on a LAN box is still a gateway.
+        assert!(is_gateway_url("http://10.0.0.4:8080/v1/messages"));
+    }
 
     /// The config split is what keeps a bad credential, budget, or model list
     /// from eating the queue: config-shaped 4xx leaves rows queued for after

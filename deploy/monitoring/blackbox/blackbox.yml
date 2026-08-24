@@ -72,7 +72,14 @@ modules:
       headers:
         Content-Type: application/json
         anthropic-version: "2023-06-01"
+        # BOTH, exactly as the daemon sends them to a gateway. `x-api-key` is
+        # Anthropic's credential header and this gateway does not read it at
+        # all — with only that set it answers 401 "virtual key is required",
+        # meaning it saw no credential whatsoever. `x-bf-vk` is the one it
+        # actually reads. The pair is what the daemon puts on a gateway
+        # request, so it is what the canary must put on one.
         x-api-key: __BIFROST_CANARY_KEY__
+        x-bf-vk: __BIFROST_CANARY_KEY__
       body: '{"model":"__CANARY_MODEL__","max_tokens":2000,"system":[{"type":"text","text":"You are a production canary. Answer only with the JSON object the schema requires.","cache_control":{"type":"ephemeral"}}],"messages":[{"role":"user","content":"Set ok to true."}],"output_config":{"format":{"type":"json_schema","schema":{"type":"object","additionalProperties":false,"required":["ok"],"properties":{"ok":{"type":"boolean"}}}},"effort":"low"}}'
       fail_if_body_not_matches_regexp:
         # A real Messages response, not an HTML error page or proxy interstitial.
