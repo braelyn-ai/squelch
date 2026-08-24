@@ -36,19 +36,22 @@ final class FrameMeasurer {
     static let shared = FrameMeasurer()
     private init() {}
 
-    /// The measuring frame's viewport. The width is the reading column's and is
-    /// load-bearing — mail reflows, and the same body measured at 843 and at
-    /// 500 differs by a third.
+    /// THE MEASURING FRAME'S VIEWPORT, and the whole reason this pass exists in
+    /// a file of its own: it is a CONSTANT. The reader's own frames are sized to
+    /// what they measure, which makes their viewport a function of their last
+    /// answer; measuring here instead breaks that circle, because nothing this
+    /// frame reports ever changes the frame it was reported from.
     ///
-    /// The height very nearly is not: `height:100%`, a table at `height="100%"`,
-    /// a float overflowing the body box and an absolutely positioned child were
-    /// all measured to give the same answer at viewport 100, 800 and 2400,
-    /// because the document is `overflow:hidden` and the body's own box is what
-    /// is measured. `vh` units are the one exception (`min-height:100vh` is
-    /// whatever this number says), and they are rare enough in mail — and
-    /// equally circular in the reader, where the frame's height IS the content
-    /// — that a screenful is as good an answer as exists.
-    private static let viewportHeight: CGFloat = 800
+    /// The width is the reading column's and is load-bearing — mail reflows, and
+    /// the same body measured at 843 and at 500 differs by a third.
+    ///
+    /// The height matters for one thing only, but it matters a lot for that one:
+    /// `height:100%`, `height="100%"`, floats overflowing the body box and
+    /// absolutely positioned children all measure the same at viewport 100, 800
+    /// or 2400. `vh` units do not — they are whatever this says. So it is the
+    /// READER'S OWN WINDOW, which is what makes `100vh` in an email mean one
+    /// screenful, the same thing it means in a browser.
+    private var viewportHeight: CGFloat = 800
     /// How long a document has to hold the same height before it is believed.
     /// Short, because the navigation has already done the waiting: `didFinish`
     /// does not fire until the subresources are in, so an image delayed two
@@ -79,12 +82,15 @@ final class FrameMeasurer {
     /// back immediately with nothing to do, which is what a second open looks
     /// like.
     func measure(
-        _ messages: [ClientMessage], width: CGFloat, allowRemote: Bool, token: String,
-        onFinished: @escaping () -> Void
+        _ messages: [ClientMessage], width: CGFloat, viewport: CGFloat, allowRemote: Bool,
+        token: String, onFinished: @escaping () -> Void
     ) {
         reset()
         guard width > 0 else { return }
         FrameHeights.shared.using(width: width)
+        // A window too short to be a reading surface is a window mid-animation;
+        // a screenful is the better guess than a sliver.
+        self.viewportHeight = max(400, viewport)
         self.token = token
 
         // NEWEST FIRST: the thread opens on the newest message with the history
@@ -164,7 +170,7 @@ final class FrameMeasurer {
         let view = liveFrame()
         guard let relay else { return 0 }
         view.frame = CGRect(
-            x: 0, y: 0, width: FrameHeights.shared.width, height: Self.viewportHeight)
+            x: 0, y: 0, width: FrameHeights.shared.width, height: viewportHeight)
         // Claimed BEFORE the load, because the policy gate can be asked before
         // `loadHTMLString` has returned.
         relay.expectOwnLoad()
@@ -276,7 +282,7 @@ final class FrameMeasurer {
         let view = WKWebView(
             frame: CGRect(
                 x: 0, y: 0, width: max(1, FrameHeights.shared.width),
-                height: Self.viewportHeight),
+                height: viewportHeight),
             configuration: config)
         view.navigationDelegate = relay
         self.frame = view

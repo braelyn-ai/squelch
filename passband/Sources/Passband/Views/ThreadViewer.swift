@@ -189,7 +189,8 @@ struct ThreadViewer: View {
             guard !Task.isCancelled, bodyWidth > 0, !messages.isEmpty else { return }
             let sized = messages
             FrameMeasurer.shared.measure(
-                sized, width: bodyWidth, allowRemote: prefs.loadRemoteImages, token: threadId
+                sized, width: bodyWidth, viewport: viewportHeight,
+                allowRemote: prefs.loadRemoteImages, token: threadId
             ) {
                 // THE RAIL SWAPS ONCE, when every message is a measurement
                 // rather than a guess — see `marks(for:)`.

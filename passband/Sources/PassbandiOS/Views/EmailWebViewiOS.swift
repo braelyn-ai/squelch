@@ -21,11 +21,13 @@ struct EmailWebViewRepresentable: UIViewRepresentable {
     /// Message id, or nil for a body that must never be pooled.
     let poolKey: String?
     let onHeight: (CGFloat) -> Void
+    let onLoaded: () -> Void
     let onQuotedFound: (Bool) -> Void
     let onLink: (String) -> Void
 
     func makeCoordinator() -> EmailFrameCoordinator {
-        EmailFrameCoordinator(onHeight: onHeight, onQuotedFound: onQuotedFound, onLink: onLink)
+        EmailFrameCoordinator(
+            onHeight: onHeight, onLoaded: onLoaded, onQuotedFound: onQuotedFound, onLink: onLink)
     }
 
     func makeUIView(context: Context) -> WKWebView {
@@ -90,6 +92,7 @@ struct EmailWebViewRepresentable: UIViewRepresentable {
 
     func updateUIView(_ webView: WKWebView, context: Context) {
         context.coordinator.onHeight = onHeight
+        context.coordinator.onLoaded = onLoaded
         context.coordinator.onQuotedFound = onQuotedFound
         context.coordinator.onLink = onLink
         // A content/policy change is a genuine reload; a quote toggle is not

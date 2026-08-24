@@ -28,11 +28,13 @@ struct EmailWebViewRepresentable: NSViewRepresentable {
     /// Message id, or nil for a body that must never be pooled.
     let poolKey: String?
     let onHeight: (CGFloat) -> Void
+    let onLoaded: () -> Void
     let onQuotedFound: (Bool) -> Void
     let onLink: (String) -> Void
 
     func makeCoordinator() -> EmailFrameCoordinator {
-        EmailFrameCoordinator(onHeight: onHeight, onQuotedFound: onQuotedFound, onLink: onLink)
+        EmailFrameCoordinator(
+            onHeight: onHeight, onLoaded: onLoaded, onQuotedFound: onQuotedFound, onLink: onLink)
     }
 
     /// Typed as the BASE class, not `PassthroughWebView`: the pool hands back
@@ -105,6 +107,7 @@ struct EmailWebViewRepresentable: NSViewRepresentable {
 
     func updateNSView(_ webView: WKWebView, context: Context) {
         context.coordinator.onHeight = onHeight
+        context.coordinator.onLoaded = onLoaded
         context.coordinator.onQuotedFound = onQuotedFound
         context.coordinator.onLink = onLink
         // A content/policy change is a genuine reload; a quote toggle is not
