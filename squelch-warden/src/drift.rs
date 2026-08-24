@@ -350,7 +350,9 @@ fn name_of(item: &Value) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use k8s_openapi::apimachinery::pkg::apis::meta::v1::{FieldsV1, ManagedFieldsEntry, ObjectMeta};
+    use k8s_openapi::apimachinery::pkg::apis::meta::v1::{
+        FieldsV1, ManagedFieldsEntry, ObjectMeta,
+    };
     use serde_json::json;
 
     /// One managedFields entry, the way the API server writes them.
@@ -441,7 +443,11 @@ mod tests {
                 }
             }
         });
-        let deployment = managed(vec![entry("kubectl-client-side-apply", "Update", tombstone)]);
+        let deployment = managed(vec![entry(
+            "kubectl-client-side-apply",
+            "Update",
+            tombstone,
+        )]);
         let foreign = foreign_managers(&deployment);
         assert_eq!(foreign.len(), 1);
         assert_eq!(
@@ -517,7 +523,11 @@ mod tests {
     #[test]
     fn a_mixed_ledger_reports_only_the_foreign_entries() {
         let deployment = managed(vec![
-            entry(FIELD_MANAGER, "Apply", json!({ "f:spec": { "f:replicas": {} } })),
+            entry(
+                FIELD_MANAGER,
+                "Apply",
+                json!({ "f:spec": { "f:replicas": {} } }),
+            ),
             entry("kubectl-set", "Update", set_env_fields()),
             entry(
                 "kube-controller-manager",
@@ -532,7 +542,10 @@ mod tests {
         ]);
         let foreign = foreign_managers(&deployment);
         assert_eq!(
-            foreign.iter().map(|f| f.manager.as_str()).collect::<Vec<_>>(),
+            foreign
+                .iter()
+                .map(|f| f.manager.as_str())
+                .collect::<Vec<_>>(),
             vec!["kubectl-set", "someone"]
         );
         assert_eq!(foreign[1].paths, vec!["metadata.labels.team"]);

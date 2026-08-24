@@ -1128,7 +1128,9 @@ mod tests {
             .await,
         ] {
             assert!(
-                html.contains(&format!(r#"<a href="{DOWNLOAD_URL}">Download Passband</a>"#)),
+                html.contains(&format!(
+                    r#"<a href="{DOWNLOAD_URL}">Download Passband</a>"#
+                )),
                 "{html}"
             );
         }
@@ -1282,7 +1284,10 @@ mod tests {
             None,
         ))
         .await;
-        assert!(html.contains(r#"<span class="done">signed up</span>"#), "{html}");
+        assert!(
+            html.contains(r#"<span class="done">signed up</span>"#),
+            "{html}"
+        );
         assert!(html.contains("<code>ada</code>"), "{html}");
         assert!(html.contains("1 of those signed up"), "{html}");
         // The whole point: no press, and nothing that could mint a second code.

@@ -164,6 +164,10 @@ pub fn router(state: WardenState) -> Router {
             put(handlers::set_credentials),
         )
         .route("/v1/tenants/{label}/llm-key", put(handlers::set_llm_key))
+        .route(
+            "/v1/tenants/{label}/control-token",
+            put(handlers::set_control_token),
+        )
         .route("/v1/tenants/{label}/drift", get(handlers::get_drift))
         .route(
             "/v1/tenants/{label}/reconcile",

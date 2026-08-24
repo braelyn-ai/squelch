@@ -30,11 +30,12 @@ use k8s_openapi::apimachinery::pkg::apis::meta::v1::{FieldsV1, ManagedFieldsEntr
 
 use crate::cluster::{Cluster, ClusterError, ExecOutput, Kind, Object, rolled_out};
 use crate::config::{
-    Config, DEFAULT_BIND, DEFAULT_CPU_LIMIT, DEFAULT_CPU_REQUEST,
-    DEFAULT_EPHEMERAL_LIMIT, DEFAULT_EPHEMERAL_REQUEST, DEFAULT_INGRESS_CLASS,
-    DEFAULT_INGRESS_NAMESPACE, DEFAULT_MEMORY_LIMIT, DEFAULT_MEMORY_REQUEST, DEFAULT_MIN_READY_SECS,
+    Config, DEFAULT_BIND, DEFAULT_CPU_LIMIT, DEFAULT_CPU_REQUEST, DEFAULT_EPHEMERAL_LIMIT,
+    DEFAULT_EPHEMERAL_REQUEST, DEFAULT_INGRESS_CLASS, DEFAULT_INGRESS_NAMESPACE,
+    DEFAULT_MEMORY_LIMIT, DEFAULT_MEMORY_REQUEST, DEFAULT_MIN_READY_SECS,
     DEFAULT_OAUTH_SECRET_NAME, DEFAULT_PENDING_TTL_SECS, DEFAULT_RUN_AS, DEFAULT_STORAGE_CLASS,
-    DEFAULT_STORAGE_SIZE, DEFAULT_TENANT_NAMESPACE, DEFAULT_TLS_SECRET, DEFAULT_TMP_SIZE, Resources,
+    DEFAULT_STORAGE_SIZE, DEFAULT_TENANT_NAMESPACE, DEFAULT_TLS_SECRET, DEFAULT_TMP_SIZE,
+    Resources,
 };
 use crate::provision::Warden;
 
@@ -602,7 +603,10 @@ impl Cluster for MockCluster {
         else {
             return Ok(());
         };
-        let annotations = secret.metadata.annotations.get_or_insert_with(BTreeMap::new);
+        let annotations = secret
+            .metadata
+            .annotations
+            .get_or_insert_with(BTreeMap::new);
         match value {
             Some(value) => annotations.insert(key.to_string(), value.to_string()),
             None => annotations.remove(key),

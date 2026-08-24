@@ -293,6 +293,7 @@ impl Harness {
             .insert_invite(
                 &minted.code_hash,
                 chrono::Utc::now() + chrono::Duration::days(30),
+                None,
             )
             .await
             .unwrap();

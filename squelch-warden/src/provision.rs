@@ -650,6 +650,10 @@ impl Warden {
         // exist if `llm_base_url` was configured when `set_llm_key` accepted
         // it, so this pickup cannot stamp the annotation with the feature off.
         let llm_hash = self.llm_hash(&name).await?;
+        // The same pickup, for the same reason: "PUT control-token then PUT
+        // credentials" is a legal order too, and a pod born without the
+        // annotation would never differ from the first rotation.
+        let share_hash = self.share_hash(&name).await?;
         // The hash of what was just stored, not of what is running: this is the
         // whole mechanism by which a re-consent reaches the daemon.
         self.apply(
@@ -659,6 +663,7 @@ impl Warden {
                 &name,
                 &objects::credential_hash(&ciphertext),
                 llm_hash.as_deref(),
+                share_hash.as_deref(),
             ))),
             "workload_failed",
         )
@@ -713,7 +718,11 @@ impl Warden {
         // the one direction this marker may never fail in.
         if reopening {
             self.cluster
-                .annotate_secret(&name.identity_secret(), objects::CANCELLED_AT_ANNOTATION, None)
+                .annotate_secret(
+                    &name.identity_secret(),
+                    objects::CANCELLED_AT_ANNOTATION,
+                    None,
+                )
                 .await
                 .map_err(|e| fail(name.as_str(), "cancel_marker_failed", &e))?;
             tracing::info!(tenant = %name, "reopened a cancelled account");
@@ -857,6 +866,10 @@ impl Warden {
                 );
                 return Err(WardenError::cluster(CREDENTIAL_MISSING));
             };
+            // CARRIED FORWARD, not recomputed from this request: a re-render
+            // that dropped the share annotation would roll every sharing
+            // tenant's pod off its own token on the next key rotation.
+            let share_hash = self.share_hash(&name).await?;
             self.apply(
                 &name,
                 Object::Deployment(Box::new(objects::deployment(
@@ -869,6 +882,7 @@ impl Warden {
                         api_key.as_deref(),
                         assistant_api_key.as_deref(),
                     )),
+                    share_hash.as_deref(),
                 ))),
                 "workload_failed",
             )
@@ -876,6 +890,125 @@ impl Warden {
         }
 
         tracing::info!(tenant = %name, "llm key stored");
+        Ok(())
+    }
+
+    /// Store (or rotate, or remove) a tenant's share token and roll its pod
+    /// onto it.
+    ///
+    /// `share_token` of `None` is a REMOVAL, which is the one place this
+    /// departs from [`Self::set_llm_key`]'s shape: that Secret has two slots
+    /// and a missing one means "leave the other alone", so it has no way to
+    /// spell "take it away". This Secret has one slot and one meaning, so
+    /// `share revoke` can be the same call as `share mint` with nothing in it,
+    /// and the pod rolls back to a daemon that answers "sharing is not
+    /// available here". Without that, revoking on the control plane would
+    /// leave a live-looking token in the pod's env, and the tenant would find
+    /// out it was revoked only by having an invite refused.
+    ///
+    /// NO FEATURE GATE, unlike the LLM path. The env this feeds is rendered
+    /// whenever the control plane's origin is configured, which is the same
+    /// condition that makes a control plane exist to mint against.
+    pub async fn set_share_token(
+        &self,
+        raw_label: &str,
+        raw_share_token: Option<&str>,
+    ) -> Result<(), WardenError> {
+        let name = TenantName::parse(raw_label)?;
+        let share_token = raw_share_token
+            .map(validate::validate_share_token)
+            .transpose()?;
+        let Some(identity) = self.identity(&name).await? else {
+            return Err(WardenError::NotFound);
+        };
+        // Intent before shape, the same order everything else here uses. The
+        // reasoning is `set_llm_key`'s exactly: storing a live credential
+        // against a closed account, and re-rendering a Deployment a teardown
+        // left standing, are both things a cancelled mailbox must not get.
+        // A REMOVAL is exempt, because taking a credential away from a
+        // cancelled account is the direction teardown was already going.
+        if share_token.is_some() && is_cancelled(&identity) {
+            tracing::warn!(
+                tenant = %name,
+                "refusing to store a share token for a cancelled account"
+            );
+            return Err(WardenError::Cancelled);
+        }
+
+        match &share_token {
+            Some(token) => {
+                self.apply(
+                    &name,
+                    Object::Secret(Box::new(objects::control_secret(
+                        &self.config,
+                        &name,
+                        token,
+                    ))),
+                    "share_token_write_failed",
+                )
+                .await?
+            }
+            // Tolerant of already-gone, the way every other delete here is:
+            // revoking twice is a thing an operator does when the first answer
+            // was lost, and it must not be an error.
+            None => self
+                .cluster
+                .delete(Kind::Secret, &name.control_secret())
+                .await
+                .map_err(|e| fail(name.as_str(), "share_token_delete_failed", &e))?,
+        }
+
+        let deployment = self
+            .cluster
+            .get_deployment(name.as_str())
+            .await
+            .map_err(|e| fail(name.as_str(), "cluster_unavailable", &e))?;
+        if deployment.is_some() {
+            // The ciphertext the running pod was rolled for, byte-exact from
+            // the Secret. Same read, same refusal, and the same reason as
+            // `set_llm_key`: a workload with no sealed credential behind it is
+            // a state this warden never writes.
+            let ciphertext = self
+                .cluster
+                .get_secret(&name.credential_secret())
+                .await
+                .map_err(|e| fail(name.as_str(), "cluster_unavailable", &e))?
+                .as_ref()
+                .and_then(|secret| secret_value(secret, objects::CREDENTIAL_KEY));
+            let Some(ciphertext) = ciphertext else {
+                tracing::error!(
+                    tenant = %name,
+                    reason = CREDENTIAL_MISSING,
+                    "a workload exists but its credential Secret does not"
+                );
+                return Err(WardenError::cluster(CREDENTIAL_MISSING));
+            };
+            // The LLM pair carried forward, for the reason the share hash is
+            // carried through `set_llm_key`: neither rotation may knock the
+            // other's annotation off the pod template.
+            let llm_hash = self.llm_hash(&name).await?;
+            self.apply(
+                &name,
+                Object::Deployment(Box::new(objects::deployment(
+                    &self.config,
+                    &name,
+                    &objects::credential_hash(&ciphertext),
+                    llm_hash.as_deref(),
+                    // Over what was just written, not what was asked for. On a
+                    // removal that is `None`, which is what takes the
+                    // annotation off and rolls the pod without the variable.
+                    share_token
+                        .as_deref()
+                        .map(objects::credential_hash)
+                        .as_deref(),
+                ))),
+                "workload_failed",
+            )
+            .await?;
+        }
+
+        // PRIVACY: whether one was stored, never the token.
+        tracing::info!(tenant = %name, stored = share_token.is_some(), "share token set");
         Ok(())
     }
 
@@ -1007,12 +1140,14 @@ impl Warden {
             return Err(WardenError::cluster(CREDENTIAL_MISSING));
         };
         let llm_hash = self.llm_hash(name).await?;
+        let share_hash = self.share_hash(name).await?;
 
         let rendered = objects::deployment(
             &self.config,
             name,
             &objects::credential_hash(&ciphertext),
             llm_hash.as_deref(),
+            share_hash.as_deref(),
         );
         let merged = self
             .cluster
@@ -1236,6 +1371,7 @@ impl Warden {
             return Err(WardenError::cluster("credential_missing"));
         };
         let llm_hash = self.llm_hash(&name).await?;
+        let share_hash = self.share_hash(&name).await?;
 
         // The same order phase two applies in, for the same reasons: the volume
         // exists before anything wants it, the NetworkPolicy before the pod it
@@ -1266,6 +1402,7 @@ impl Warden {
             &name,
             &objects::credential_hash(&ciphertext),
             llm_hash.as_deref(),
+            share_hash.as_deref(),
         );
         let live = self
             .cluster
@@ -1473,6 +1610,14 @@ impl Warden {
             .delete(Kind::Secret, &name.llm_secret())
             .await
             .map_err(|e| fail(name.as_str(), "llm_key_delete_failed", &e))?;
+        // And the share token, for exactly the same reason: it is a live
+        // bearer against the control plane, not tenant data. Leaving it would
+        // let a cancelled mailbox's Secret go on naming an active tenant if the
+        // control-plane row outlived the teardown by a step.
+        self.cluster
+            .delete(Kind::Secret, &name.control_secret())
+            .await
+            .map_err(|e| fail(name.as_str(), "share_token_delete_failed", &e))?;
         tracing::info!(tenant = %name, "tenant stopped; volume, identity and credential kept");
         Ok(())
     }
@@ -2153,6 +2298,21 @@ impl Warden {
                 (api_key.is_some() || assistant.is_some())
                     .then(|| objects::llm_keys_hash(api_key.as_deref(), assistant.as_deref()))
             }))
+    }
+
+    /// The hash of this tenant's stored share token, or `None` when it has
+    /// none. The mirror of [`Self::llm_hash`], and simpler: one data key, so
+    /// the hash is over the value itself rather than over a pair.
+    async fn share_hash(&self, name: &TenantName) -> Result<Option<String>, WardenError> {
+        Ok(self
+            .cluster
+            .get_secret(&name.control_secret())
+            .await
+            .map_err(|e| fail(name.as_str(), "cluster_unavailable", &e))?
+            .as_ref()
+            .and_then(|secret| secret_value(secret, objects::SHARE_TOKEN_KEY))
+            .as_deref()
+            .map(objects::credential_hash))
     }
 
     /// Derive the status from what exists. See [`TenantStatus`].
@@ -3109,16 +3269,21 @@ mod tests {
                 (Kind::NetworkPolicy, "alice".to_string()),
                 // The gateway credential goes with the workload; see delete().
                 (Kind::Secret, "alice-llm".to_string()),
+                // And the share token, for the same reason: a live bearer
+                // against the control plane, not tenant data.
+                (Kind::Secret, "alice-control".to_string()),
             ]
         );
-        // The three that hold data or keys are untouched, by name: the only
-        // Secret this path may delete is the LLM key.
+        // The three that hold data or the mailbox's own credential are
+        // untouched, by name: the only Secrets this path may delete are the
+        // two that are credentials to something ELSE - the LLM gateway and the
+        // control plane.
         assert!(h.cluster.secret("alice-identity").is_some());
         assert!(h.cluster.secret("alice-credential").is_some());
         assert!(h.cluster.exists(Kind::Pvc, "alice-data"));
         assert!(h.cluster.deleted().iter().all(|(kind, name)| match kind {
             Kind::Pvc => false,
-            Kind::Secret => name == "alice-llm",
+            Kind::Secret => name == "alice-llm" || name == "alice-control",
             _ => true,
         }));
 
@@ -3339,8 +3504,9 @@ mod tests {
         assert_eq!(h.warden.sweep_pending().await.unwrap(), 1);
 
         // The pending one is gone, and it is the only IDENTITY Secret ever
-        // deleted. (Carol's delete also took her `-llm` Secret, which is the
-        // workload's credential, not a tenant record; see `delete`.)
+        // deleted. (Carol's delete also took her `-llm` and `-control`
+        // Secrets, which are the workload's credentials, not tenant records;
+        // see `delete`.)
         assert!(h.cluster.secret("alice-identity").is_none());
         assert_eq!(
             h.cluster
@@ -3355,7 +3521,9 @@ mod tests {
                 .deleted()
                 .iter()
                 .filter(|(kind, _)| *kind == Kind::Secret)
-                .all(|(_, name)| name.ends_with("-identity") || name.ends_with("-llm"))
+                .all(|(_, name)| name.ends_with("-identity")
+                    || name.ends_with("-llm")
+                    || name.ends_with("-control"))
         );
         assert_eq!(
             h.warden.status("alice").await.unwrap_err(),
@@ -3627,7 +3795,10 @@ mod tests {
             .set_credentials("alice", &armored("alice"))
             .await
             .unwrap();
-        h.warden.set_llm_key("alice", Some("sk-vk-first"), None).await.unwrap();
+        h.warden
+            .set_llm_key("alice", Some("sk-vk-first"), None)
+            .await
+            .unwrap();
 
         let report = h.warden.drift("alice").await.unwrap();
         assert_eq!(report.changes, Vec::new());
@@ -3860,7 +4031,10 @@ mod tests {
             h.warden.reconcile("alice").await.unwrap().deployment,
             "created"
         );
-        assert_eq!(h.warden.status("alice").await.unwrap(), TenantStatus::Active);
+        assert_eq!(
+            h.warden.status("alice").await.unwrap(),
+            TenantStatus::Active
+        );
         let live = match h.cluster.object(Kind::Deployment, "alice").unwrap() {
             Object::Deployment(d) => *d,
             other => panic!("not a Deployment: {:?}", other.kind()),
@@ -3948,7 +4122,10 @@ mod tests {
         serving_tenant(&h, "alice").await;
         h.cluster.fail_delete_of(Kind::Ingress);
         assert!(h.warden.delete("alice").await.is_err());
-        assert_eq!(h.warden.status("alice").await.unwrap(), TenantStatus::Active);
+        assert_eq!(
+            h.warden.status("alice").await.unwrap(),
+            TenantStatus::Active
+        );
         assert!(h.cluster.exists(Kind::Deployment, "alice"));
         assert!(h.cluster.exists(Kind::Service, "alice"));
         assert_eq!(
@@ -3979,7 +4156,10 @@ mod tests {
 
         assert!(h.warden.delete("alice").await.is_err());
         assert!(h.cluster.deleted().is_empty());
-        assert_eq!(h.warden.status("alice").await.unwrap(), TenantStatus::Active);
+        assert_eq!(
+            h.warden.status("alice").await.unwrap(),
+            TenantStatus::Active
+        );
         assert!(!is_cancelled(&h.cluster.secret("alice-identity").unwrap()));
     }
 
@@ -4092,7 +4272,10 @@ mod tests {
             .await
             .unwrap();
         assert!(!is_cancelled(&h.cluster.secret("alice-identity").unwrap()));
-        assert_eq!(h.warden.status("alice").await.unwrap(), TenantStatus::Active);
+        assert_eq!(
+            h.warden.status("alice").await.unwrap(),
+            TenantStatus::Active
+        );
 
         // And it is an ordinary tenant again: reconcilable, and in the roll.
         h.warden.reconcile("alice").await.unwrap();
@@ -4118,7 +4301,10 @@ mod tests {
 
         // Closed, and serving: the two readings this exemption is between.
         assert!(is_cancelled(&h.cluster.secret("alice-identity").unwrap()));
-        assert_eq!(h.warden.status("alice").await.unwrap(), TenantStatus::Active);
+        assert_eq!(
+            h.warden.status("alice").await.unwrap(),
+            TenantStatus::Active
+        );
 
         h.warden
             .set_credentials("alice", &armored("alice-again"))
@@ -4816,7 +5002,10 @@ mod tests {
         assert_eq!(rolled.casualty, None);
         assert_eq!(rolled.halted_on, None);
         assert_eq!(daemon_image(&h, "alice"), h.config.image);
-        assert_eq!(h.warden.status("alice").await.unwrap(), TenantStatus::Active);
+        assert_eq!(
+            h.warden.status("alice").await.unwrap(),
+            TenantStatus::Active
+        );
     }
 
     /// The refusal that makes the foreign rule a property of the code rather
@@ -4867,7 +5056,10 @@ mod tests {
         assert!(h.cluster.deleted().is_empty());
         assert_eq!(daemon_image(&h, "alice"), PREVIOUS_IMAGE);
         assert_eq!(daemon_image(&h, "bob"), PREVIOUS_IMAGE);
-        assert_eq!(h.warden.status("alice").await.unwrap(), TenantStatus::Active);
+        assert_eq!(
+            h.warden.status("alice").await.unwrap(),
+            TenantStatus::Active
+        );
 
         // The next tick: Alice's foreign owner is on her Deployment now, so the
         // READ pass skips her and Bob is first in the queue. One tick lost, no
@@ -4977,7 +5169,10 @@ mod tests {
         );
         assert!(h.cluster.deleted().is_empty());
         assert!(h.cluster.exists(Kind::Deployment, "alice"));
-        assert_eq!(h.warden.status("alice").await.unwrap(), TenantStatus::Active);
+        assert_eq!(
+            h.warden.status("alice").await.unwrap(),
+            TenantStatus::Active
+        );
         let Some(Object::Deployment(alice)) = h.cluster.object(Kind::Deployment, "alice") else {
             panic!("no deployment");
         };

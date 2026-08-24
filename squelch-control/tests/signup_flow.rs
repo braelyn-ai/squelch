@@ -503,7 +503,7 @@ impl Harness {
         let (store, _url) = common::fresh_store().await;
         let minted = invites::mint().unwrap();
         store
-            .insert_invite(&minted.code_hash, default_expiry())
+            .insert_invite(&minted.code_hash, default_expiry(), None)
             .await
             .unwrap();
 
@@ -533,7 +533,7 @@ impl Harness {
         let minted = invites::mint().unwrap();
         self.state
             .store()
-            .insert_invite(&minted.code_hash, expires_at)
+            .insert_invite(&minted.code_hash, expires_at, None)
             .await
             .unwrap();
         minted.code

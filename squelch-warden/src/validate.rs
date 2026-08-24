@@ -181,6 +181,18 @@ impl TenantName {
     pub fn llm_secret(&self) -> String {
         format!("{}-llm", self.0)
     }
+
+    /// `<label>-control`: the Secret holding this tenant's share token, the
+    /// bearer its daemon presents to the control plane to mint one invite.
+    ///
+    /// ITS OWN SECRET, not a third data key in `<label>-llm`. The LLM Secret is
+    /// deleted on teardown and rewritten whole on every key rotation, and both
+    /// of those are reasons a credential with a different lifetime and a
+    /// different issuer should not be living in it. Separate objects also mean
+    /// `share revoke` and `llm revoke` cannot reach each other by accident.
+    pub fn control_secret(&self) -> String {
+        format!("{}-control", self.0)
+    }
 }
 
 impl std::fmt::Display for TenantName {
@@ -337,6 +349,21 @@ pub fn validate_llm_api_key(raw: &str) -> Result<String, ApiKeyError> {
         return Err(ApiKeyError::Charset);
     }
     Ok(key.to_string())
+}
+
+/// Validate a tenant's share token, returning it trimmed.
+///
+/// THE SAME RULE AS [`validate_llm_api_key`], delegated rather than restated,
+/// because it is the same situation: a credential this warden stores verbatim
+/// in a Secret, never presents to anyone, and hands to a container as an
+/// environment variable through a `secretKeyRef`. What that rule is guarding
+/// against (a newline or a shell metacharacter arriving in an env value) does
+/// not care which service issued the credential.
+///
+/// PRIVACY: this is a live credential. No error here echoes it, and nothing on
+/// this path logs it.
+pub fn validate_share_token(raw: &str) -> Result<String, ApiKeyError> {
+    validate_llm_api_key(raw)
 }
 
 /// Whether a string is a pairing code as `squelchd pair` prints it: two groups

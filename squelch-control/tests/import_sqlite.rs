@@ -406,6 +406,7 @@ async fn every_sequence_continues_where_the_file_left_off() {
         .insert_invite(
             "000000000000000000000000000000000000000000000000000000000000000a",
             chrono::Utc::now() + chrono::Duration::days(30),
+            None,
         )
         .await
         .unwrap();

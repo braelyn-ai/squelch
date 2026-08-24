@@ -66,6 +66,11 @@ enum Command {
         #[command(subcommand)]
         command: LlmCommand,
     },
+    /// Turn invite sharing on and off for a tenant.
+    Share {
+        #[command(subcommand)]
+        command: ShareCommand,
+    },
     /// Report what is on tenants' workloads that the warden did not put there.
     /// Exits 1 when anything has drifted, 2 when a tenant could not be checked.
     Drift {
@@ -105,6 +110,25 @@ enum LlmCommand {
     Mint { label: String },
     /// Revoke a tenant's recorded virtual keys — both of them — in Bifrost
     /// and forget them.
+    Revoke { label: String },
+}
+
+/// The share-token operator commands. Like `llm`, these need the warden pair
+/// in the environment as well as the store: recording is a store write and
+/// installing is a warden call. They do NOT need Bifrost, the OAuth client, or
+/// the cookie key.
+///
+/// The token VALUE follows the same rule as every other credential here: it
+/// exists between the mint and the warden PUT and is never printed, stored, or
+/// logged. Unlike `invite issue`, nothing is printed for a human to keep.
+#[derive(Subcommand)]
+enum ShareCommand {
+    /// Let this tenant share invites: mint a share token, record its hash, and
+    /// install it. A tenant that already shares gets a NEW token, and the old
+    /// one stops working the moment the hash is replaced.
+    Mint { label: String },
+    /// Stop this tenant sharing: forget the hash and take the token out of the
+    /// pod. Invites it has already sent are untouched.
     Revoke { label: String },
 }
 
@@ -157,6 +181,7 @@ fn main() -> anyhow::Result<()> {
         Command::Invite { command } => invite(command),
         Command::Tenants => tenants(),
         Command::Llm { command } => llm(command),
+        Command::Share { command } => share(command),
         Command::Drift { label } => drift(label),
         Command::Reconcile { label } => reconcile(label),
         Command::ImportSqlite { path } => import_sqlite(path),
@@ -200,7 +225,9 @@ async fn invite_async(command: InviteCommand) -> anyhow::Result<()> {
             let expires_at = chrono::Utc::now() + chrono::Duration::days(ttl);
             for _ in 0..count {
                 let minted = invites::mint()?;
-                let id = store.insert_invite(&minted.code_hash, expires_at).await?;
+                let id = store
+                    .insert_invite(&minted.code_hash, expires_at, None)
+                    .await?;
                 // THE PLAINTEXT, ALONE ON STDOUT.
                 println!("{}", minted.code);
                 eprintln!("squelch-control: issued invite {id}");
@@ -280,6 +307,68 @@ fn tenants() -> anyhow::Result<()> {
 /// with a log line, short enough to sit in a column.
 fn stamp(t: chrono::DateTime<chrono::Utc>) -> String {
     t.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+}
+
+fn share(command: ShareCommand) -> anyhow::Result<()> {
+    let (warden_url, warden_token) =
+        config::warden_from_env().map_err(|e| anyhow::anyhow!("squelch-control: {e}"))?;
+    let warden = HttpWarden::new(warden_url, warden_token, OUTBOUND_TIMEOUT)?;
+
+    runtime()?.block_on(async {
+        let store = open_store().await?;
+        match command {
+            ShareCommand::Mint { label } => share_mint(&store, &warden, &label).await,
+            ShareCommand::Revoke { label } => share_revoke(&store, &warden, &label).await,
+        }
+    })
+}
+
+/// Record the hash, THEN install the token. The order is the one that fails
+/// safe: a token the pod holds and the store does not know is refused at the
+/// door, which is a tenant who cannot share yet. The reverse order would be a
+/// store that believes in a token no pod has, which is the same outcome, but
+/// the recorded hash would have to be cleaned up by hand before a retry could
+/// record another.
+async fn share_mint(store: &ControlStore, warden: &HttpWarden, label: &str) -> anyhow::Result<()> {
+    let minted = squelch_control::share::mint()?;
+    if !store
+        .set_tenant_share_token(label, &minted.token_hash)
+        .await?
+    {
+        anyhow::bail!("no ACTIVE tenant `{label}` in the control store");
+    }
+    if let Err(e) = warden.put_share_token(label, Some(&minted.token)).await {
+        anyhow::bail!(
+            "recorded a share token for `{label}` but the warden did not take it: {e}. The              tenant cannot share until the install lands; run `share mint {label}` again now"
+        );
+    }
+    eprintln!(
+        "squelch-control: {label} can now share up to {} invites every {} days.",
+        squelch_control::share::QUOTA_PER_WINDOW,
+        squelch_control::share::QUOTA_WINDOW_DAYS
+    );
+    Ok(())
+}
+
+/// Forget the hash, THEN pull the token. The same fail-safe order: the moment
+/// the hash is gone the token is refused at the door, whatever the pod still
+/// holds, so an interrupted revoke has already done the part that matters.
+async fn share_revoke(
+    store: &ControlStore,
+    warden: &HttpWarden,
+    label: &str,
+) -> anyhow::Result<()> {
+    let had = store.clear_tenant_share_token(label).await?;
+    if let Err(e) = warden.put_share_token(label, None).await {
+        anyhow::bail!(
+            "the share token for `{label}` is revoked (nothing it presents will be accepted)              but the warden did not remove it from the pod: {e}. Run `share revoke {label}`              again so the app stops offering the button"
+        );
+    }
+    eprintln!(
+        "squelch-control: {label} can no longer share invites{}.",
+        if had { "" } else { " (it was not sharing)" }
+    );
+    Ok(())
 }
 
 fn llm(command: LlmCommand) -> anyhow::Result<()> {
