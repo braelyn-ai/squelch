@@ -421,21 +421,32 @@ pub async fn post_invites(
 
     let mut results = Vec::with_capacity(recipients.len());
     let mut remaining: Option<i64> = None;
-    for email in recipients {
+    let mut queue = recipients.into_iter();
+    while let Some(email) = queue.next() {
         let minted = match sharing.mint().await {
             Ok(m) => m,
             Err(e) => {
+                let reason = e.to_string();
                 // A quota refusal ends the press: every remaining recipient
                 // would get the same answer, and asking again per address is
                 // work nobody benefits from.
+                //
+                // THEY STILL GET A ROW EACH. Stopping the loop without one
+                // would hand back three results for a press of five, and the
+                // two missing names would read as "sent" to anybody skimming.
                 let fatal = matches!(e, ShareError::QuotaExhausted);
                 audit_action(&state, "invite", None, "failed:mint").await;
                 results.push(ShareResult {
                     email,
                     sent: false,
-                    error: Some(e.to_string()),
+                    error: Some(reason.clone()),
                 });
                 if fatal {
+                    results.extend(queue.map(|email| ShareResult {
+                        email,
+                        sent: false,
+                        error: Some(reason.clone()),
+                    }));
                     break;
                 }
                 continue;

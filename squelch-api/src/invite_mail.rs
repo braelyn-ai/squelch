@@ -52,6 +52,16 @@ const OPENING_WITHOUT_STAT: &str = "I have been using Passband for my email. age
 /// The line above the code.
 const HANDOFF: &str = "I had an invite spare:";
 
+/// The expiry line. A DAY IS NOT DAYS: the copy is a sentence somebody could
+/// have typed, and "one use, 1 days" is a sentence nobody has ever typed.
+fn expiry_line(days: i64) -> String {
+    if days == 1 {
+        "one use, and it expires tomorrow.".to_string()
+    } else {
+        format!("one use, {days} days.")
+    }
+}
+
 /// The footer. The one piece of branding on a mail that is otherwise entirely
 /// personal, and deliberately the quietest thing in it.
 const FOOTER: &str = "sent with Passband";
@@ -133,7 +143,7 @@ or go to {signup} and paste this in:
 
 {code}
 
-one use, {days} days.
+{expiry}
 
 --
 {FOOTER}
@@ -141,7 +151,7 @@ one use, {days} days.
         link = invite_link(copy),
         signup = copy.signup_url,
         code = copy.code,
-        days = copy.expires_in_days,
+        expiry = expiry_line(copy.expires_in_days),
     )
 }
 
@@ -176,11 +186,11 @@ pub fn html_body(copy: &InviteCopy<'_>) -> String {
 <p><a href="{link}" style="display: inline-block; background: #1a1a1a; color: #fbfaf8; text-decoration: none; padding: 12px 22px; border-radius: 8px; font-weight: 500;">Set up your mailbox</a></p>
 <p style="color: #6b6b6b;">or go to <a href="{signup}">{signup}</a> and paste this in:</p>
 <p style="font: 18px/1.4 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; letter-spacing: 0.04em; background: #f3f1ed; border-radius: 8px; padding: 14px 16px; display: inline-block;">{code}</p>
-<p style="color: #6b6b6b;">one use, {days} days.</p>
+<p style="color: #6b6b6b;">{expiry}</p>
 <p style="color: #9a9a9a; font-size: 13px; margin-top: 28px;">{FOOTER}</p>
 </div>
 "#,
-        days = copy.expires_in_days,
+        expiry = escape_html(&expiry_line(copy.expires_in_days)),
     )
 }
 
@@ -258,6 +268,18 @@ mod tests {
         c.expires_in_days = 14;
         assert!(text_body(&c).contains("one use, 14 days"));
         assert!(html_body(&c).contains("one use, 14 days"));
+    }
+
+    /// One day is not "1 days". The copy has to read like a sentence somebody
+    /// typed, in every branch, including the one nobody looks at.
+    #[test]
+    fn the_last_day_reads_like_a_sentence() {
+        let mut c = copy(None, None);
+        c.expires_in_days = 1;
+        for part in [text_body(&c), html_body(&c)] {
+            assert!(!part.contains("1 days"), "{part}");
+            assert!(part.contains("expires tomorrow"), "{part}");
+        }
     }
 
     /// The number appears only when there is one, and the no-number copy makes
