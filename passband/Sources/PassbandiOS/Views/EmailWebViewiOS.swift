@@ -21,11 +21,13 @@ struct EmailWebViewRepresentable: UIViewRepresentable {
     /// Message id, or nil for a body that must never be pooled.
     let poolKey: String?
     let onHeight: (CGFloat) -> Void
+    let onLoaded: () -> Void
     let onQuotedFound: (Bool) -> Void
     let onLink: (String) -> Void
 
     func makeCoordinator() -> EmailFrameCoordinator {
-        EmailFrameCoordinator(onHeight: onHeight, onQuotedFound: onQuotedFound, onLink: onLink)
+        EmailFrameCoordinator(
+            onHeight: onHeight, onLoaded: onLoaded, onQuotedFound: onQuotedFound, onLink: onLink)
     }
 
     func makeUIView(context: Context) -> WKWebView {
@@ -40,12 +42,21 @@ struct EmailWebViewRepresentable: UIViewRepresentable {
             return entry.webView
         }
 
-        let (config, relay) = EmailFrame.makeConfiguration()
+        // A WARM SPARE if there is one: the same frame this would have built,
+        // minus the seventy milliseconds of blank box while its content process
+        // comes up. Taking one is what makes the next one worth building.
+        // The FALLBACK builds a frame WITHOUT warming it: there is no time for
+        // a warming load to help a frame that is being used this instant, and
+        // an empty document racing the real one is only something to get wrong.
+        let entry = WebFramePool.shared.takeSpare() ?? Self.buildFrame()
+        WebFramePool.shared.replenishSpares(Self.buildSpare)
 
-        let webView = WKWebView(frame: .zero, configuration: config)
-        // WKWebView holds its delegates WEAKLY; the relay survives because the
-        // content controller retains its message handlers and the frame retains
-        // the controller. That retention is load-bearing — removing the handler
+        let webView = entry.webView
+        let relay = entry.relay
+        // WIRED HERE, not at build time (see `buildSpare`). WKWebView holds its
+        // delegates WEAKLY; the relay survives because the content controller
+        // retains its message handlers and the frame retains the controller.
+        // That retention is load-bearing — removing the handler
         // (WebFramePool.discard) is what unwires the delegates for good.
         webView.navigationDelegate = relay
         webView.uiDelegate = relay
@@ -81,6 +92,7 @@ struct EmailWebViewRepresentable: UIViewRepresentable {
 
     func updateUIView(_ webView: WKWebView, context: Context) {
         context.coordinator.onHeight = onHeight
+        context.coordinator.onLoaded = onLoaded
         context.coordinator.onQuotedFound = onQuotedFound
         context.coordinator.onLink = onLink
         // A content/policy change is a genuine reload; a quote toggle is not
@@ -93,5 +105,33 @@ struct EmailWebViewRepresentable: UIViewRepresentable {
     /// reopening a read message instant.
     static func dismantleUIView(_ webView: WKWebView, coordinator: EmailFrameCoordinator) {
         coordinator.release(webView)
+    }
+
+    /// A blank frame with its process already awake, and DELIBERATELY UNWIRED:
+    /// layer 4 refuses every navigation whose relay has no owner, so a spare
+    /// that had its navigation delegate attached could not load the empty
+    /// document that warms it. Nothing else can reach the frame in the
+    /// meantime — it is in no view and holds nothing — and the delegates go on
+    /// before any mail does.
+    @MainActor
+    static func buildSpare() -> WebFramePool.Entry {
+        let entry = buildFrame()
+        // THE WARMING IS THE LOAD, not the construction: a frame built and
+        // never loaded still pays the full content-process launch when it is
+        // finally used. The claim is what keeps this load from being refused
+        // by layer 4 once the frame has a delegate.
+        entry.relay.expectWarmingLoad()
+        entry.webView.loadHTMLString("<html><body></body></html>", baseURL: nil)
+        return entry
+    }
+
+    /// A frame with nothing loaded. Everything UIKit-side is set when it is
+    /// taken, since those are plain view properties and setting them twice
+    /// costs nothing.
+    @MainActor
+    static func buildFrame() -> WebFramePool.Entry {
+        let (config, relay) = EmailFrame.makeConfiguration()
+        return WebFramePool.Entry(
+            webView: WKWebView(frame: .zero, configuration: config), relay: relay)
     }
 }

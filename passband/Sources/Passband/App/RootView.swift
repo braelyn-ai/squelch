@@ -99,6 +99,45 @@ private struct LoadingGate: View {
     }
 }
 
+/// THE SHELL'S TWO STORE WATCHERS, in a view of their own size — which is
+/// nothing.
+///
+/// `onChange(of:)` reads the value it watches, so watching from MainShell's own
+/// body made that body a reader of `lastRefresh` — a fresh `Date` written by
+/// every poll, on a ten-second clock. The whole shell was then rebuilt every
+/// ten seconds: the rail, the routed page, the reader's wrapper chain, the
+/// global key bindings. Nothing about it had changed; the app had merely
+/// checked its mail. Down here the same two watchers invalidate a zero-sized
+/// nothing at the same rate, and both actions are unchanged.
+private struct ShellWatchers: View {
+    @Environment(AppStore.self) private var store
+
+    var body: some View {
+        Color.clear
+            .frame(width: 0, height: 0)
+            .allowsHitTesting(false)
+            .onChange(of: store.sitrep.sealed) { _, sealed in
+                AuthArrival.shared.observe(sealed: sealed)
+            }
+            // THE TOUR'S TRIGGER: the first sync of the session landing. Not
+            // `onAppear` — the board is empty until a pull returns, and a tour
+            // that opens over "You're all clear." has nothing to point at. Not
+            // connect either, which can succeed against a daemon that then goes
+            // dark. A reconnect clears `lastRefresh`, so this fires again; the
+            // tour's own once-a-session flag is what stops it starting twice.
+            .onChange(of: store.lastRefresh) { old, new in
+                if old == nil, new != nil {
+                    store.tour.maybeStart()
+                    // The same trigger, and the ORDER is the whole arrangement:
+                    // a first-run tour claims the moment, and the changelog's
+                    // own gate (tourCompleted) then declines it. Neither has to
+                    // know about the other beyond that.
+                    store.whatsNew.maybeShow()
+                }
+            }
+    }
+}
+
 struct MainShell: View {
     @Environment(AppStore.self) private var store
     @Namespace private var shellGlass
@@ -231,25 +270,9 @@ struct MainShell: View {
         // jump. The one motion it has is the done+next flight, and that one is
         // animated at the call site, where the direction is known.
         .keyBindings(.global, globalBindings)
-        .onChange(of: store.sitrep.sealed) { _, sealed in
-            AuthArrival.shared.observe(sealed: sealed)
-        }
-        // THE TOUR'S TRIGGER: the first sync of the session landing. Not
-        // `onAppear` — the board is empty until a pull returns, and a tour that
-        // opens over "You're all clear." has nothing to point at. Not connect
-        // either, which can succeed against a daemon that then goes dark.
-        // A reconnect clears `lastRefresh`, so this fires again; the tour's own
-        // once-a-session flag is what stops it starting twice.
-        .onChange(of: store.lastRefresh) { old, new in
-            if old == nil, new != nil {
-                store.tour.maybeStart()
-                // The same trigger, and the ORDER is the whole arrangement: a
-                // first-run tour claims the moment, and the changelog's own
-                // gate (tourCompleted) then declines it. Neither has to know
-                // about the other beyond that.
-                store.whatsNew.maybeShow()
-            }
-        }
+        // The two store watchers are a LEAF of their own (see ShellWatchers) —
+        // watching from here made this body a reader of the poll clock.
+        .background { ShellWatchers() }
         }
     }
 

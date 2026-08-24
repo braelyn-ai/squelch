@@ -55,11 +55,6 @@ struct ThreadViewer: View {
     /// messageId -> recorded opens of the user's own tracked sends. Only sent,
     /// tracked messages ever have an entry; see `refreshOpens`.
     @State private var opens: [Int: [MessageOpen]] = [:]
-    /// Display indices of the rows on screen right now. The wheel moves what is
-    /// visible without touching the selection, and `refreshInPlace` must not
-    /// treat a wheel reader as "at the newest" just because they never pressed
-    /// `j` — see `anchorId`.
-    @State private var visibleIndices: Set<Int> = []
     /// WHERE THE MESSAGE CARDS ARE IN THE WINDOW, which is what the minimap
     /// draws. Kept in an object rather than in `@State` on purpose: it is
     /// rewritten on every scroll tick, and this view's body must not be
@@ -72,16 +67,45 @@ struct ThreadViewer: View {
     @State private var viewportHeight: CGFloat = 0
     /// The newest message card's laid-out height, the other half of `tailSpace`.
     @State private var newestHeight: CGFloat = 0
+    /// The rail's drawing for the thread that is loaded. Held rather than
+    /// derived per render — see `marks(for:)`.
+    @State private var marks: [ThreadMinimap.Mark] = []
+    /// The width a message CARD lays out at, measured off the column itself.
+    /// Style-independent on purpose — it changes only when the window does —
+    /// which is what lets the height memory hold one width for both styles: the
+    /// key carries the style (ThreadStyle.frameKey) and the measure below
+    /// derives from the two together.
+    @State private var columnWidth: CGFloat = 0
     /// Whether the opening landing has been taken for this thread. Until it has,
     /// the reader is wherever the initial anchor dropped it, which is not a
     /// position anybody chose.
     @State private var landed = false
+    /// True while a hand is on the scroll — see `onScrollPhaseChange`. It is
+    /// what keeps a late measurement from correcting a position the reader is
+    /// in the middle of choosing.
+    @State private var handScrolling = false
     /// The re-aiming loop, held so the next one can end it: two live settles
     /// issue competing `scrollTo`s at two targets, which is a column that
     /// judders rather than lands. See `settle`.
     @State private var settleTask: Task<Void, Never>?
 
     enum ConfirmMode: Equatable { case ask, noLink }
+
+    /// What a measuring pass is FOR. Any of the three changing means the
+    /// heights on file answer a question nobody is asking any more: another
+    /// thread, another message in this one, another column width.
+    private struct MeasurePass: Equatable {
+        let thread: String
+        let count: Int
+        let width: CGFloat
+        /// A bubble measures its document at the bubble's measure, so a flip is
+        /// a whole new set of heights to take — under a whole new set of keys.
+        let style: ThreadStyle
+        /// Until the thread has chosen a style there is no measure to render
+        /// at, and a pass taken at the wrong one files every height under a key
+        /// nothing will read.
+        let ready: Bool
+    }
 
     /// Server order IS display order: chronological, oldest first. The reader
     /// opens parked on the last one.
@@ -177,6 +201,38 @@ struct ThreadViewer: View {
             await refreshOpens()
         }
         .task(id: newestSender) { await refreshUnsub() }
+        // SIZE THE THREAD UP BEFORE IT IS SCROLLED THROUGH. Nothing here waits
+        // on it: the pass runs off screen, fills the height memory message by
+        // message, and the reader simply finds the sizes already there when it
+        // gets to them. Keyed on the width too — a resized column is a
+        // different set of heights and has to be taken again.
+        .task(
+            id: MeasurePass(
+                thread: threadId, count: messages.count, width: bodyWidth, style: style,
+                ready: styleReady)
+        ) {
+            // A window resize walks the width a pixel at a time, and each step
+            // is a different set of heights — so this task is restarted a
+            // hundred times during one drag. Waiting a beat first turns that
+            // into one pass at the width the drag ended on. It also lets the
+            // reader paint before anything starts measuring behind it.
+            try? await Task.sleep(for: .milliseconds(120))
+            guard !Task.isCancelled, styleReady, bodyWidth > 0, !messages.isEmpty else { return }
+            let sized = messages
+            let measuring = style
+            FrameMeasurer.shared.measure(
+                sized, width: bodyWidth, viewport: viewportHeight, style: measuring,
+                allowRemote: prefs.loadRemoteImages, token: threadId
+            ) {
+                // THE RAIL SWAPS ONCE, when every message is a measurement
+                // rather than a guess — see `marks(for:)`.
+                marks = Self.marks(for: sized, style: measuring)
+            }
+        }
+        // The pass outlives nothing: a reader that has left owns no thread to
+        // measure. Scoped by token because a thread SWITCH starts the next
+        // pass before this fires.
+        .onDisappear { FrameMeasurer.shared.cancel(token: threadId) }
         // The default changed in Settings while this thread is open. A thread
         // that has been switched by hand keeps what it was told — that is the
         // whole point of an override — so only the ones following the default
@@ -458,7 +514,7 @@ struct ThreadViewer: View {
                     #if os(macOS)
                         // Read-only: it draws where you are, and j/k move you.
                         ThreadMinimap(
-                            map: map, marks: minimapMarks, selected: index,
+                            map: map, marks: marks, selected: index,
                             viewport: viewportHeight)
                     #endif
 
@@ -468,19 +524,24 @@ struct ThreadViewer: View {
                         LazyVStack(alignment: .leading, spacing: 0) {
                             ForEach(Array(messages.enumerated()), id: \.element.id) { i, m in
                                 MessageCard(
-                                    message: m, style: style, selected: i == index, ruled: i > 0,
+                                    message: m, style: style, position: i,
+                                    selected: i == index, ruled: i > 0,
                                     opens: opens[m.id] ?? []
                                 ) {
                                     index = i
                                 }
+                                // THE CARD DIFFS ON ITS DATA, NOT ON ITS
+                                // CALLBACK. Every card carries a fresh
+                                // `onSelect` closure, and a closure minted in
+                                // this body never compares equal to the last
+                                // one — so without this, ANY invalidation of
+                                // the reader (a row crossing the visibility
+                                // threshold, receipts landing, the unsubscribe
+                                // lookup returning) rebuilt every message card
+                                // and re-ran every web frame's update, none of
+                                // which had changed. See MessageCard's `==`.
+                                .equatable()
                                 .id(i)
-                                .onScrollVisibilityChange(threshold: 0.1) { visible in
-                                    if visible {
-                                        visibleIndices.insert(i)
-                                    } else {
-                                        visibleIndices.remove(i)
-                                    }
-                                }
                                 // WHERE THIS MESSAGE IS IN THE WINDOW, which is
                                 // the minimap's whole input — measured against
                                 // the viewport rather than the document because
@@ -498,6 +559,22 @@ struct ThreadViewer: View {
                             }
 
                             Color.clear.frame(height: tailSpace)
+                        }
+                        // THE WIDTH THE MAIL LAYS OUT AT, taken from the column
+                        // rather than derived from the constants around it: it
+                        // is what every measured height is an answer FOR, and a
+                        // number computed from three paddings in two files
+                        // drifts the moment one of them changes. Measured
+                        // INSIDE the padding, so it is the card's own width;
+                        // the body is inset from that by the card's gutter.
+                        .onGeometryChange(for: CGFloat.self) { $0.size.width } action: { width in
+                            columnWidth = width
+                            // Declared the moment it is known, not when the
+                            // measuring pass starts a beat later: the frames on
+                            // screen are already reporting heights, and they
+                            // would be filed against a width nobody had named
+                            // and then thrown away by the pass that named it.
+                            FrameHeights.shared.using(width: width)
                         }
                         .padding(.horizontal, Self.columnPadding)
                         .padding(.vertical, 4)
@@ -525,6 +602,13 @@ struct ThreadViewer: View {
                     .scrollIndicators(.hidden)
                     .onGeometryChange(for: CGFloat.self) { $0.size.height } action: {
                         viewportHeight = $0
+                    }
+                    // WHOSE SCROLL IS IT. Anything but idle means the reader has
+                    // a hand on it — a wheel, a trackpad, the tail of a flick —
+                    // and while that is true the landing below must keep its
+                    // hands off. It fires twice a gesture, not per tick.
+                    .onScrollPhaseChange { _, phase in
+                        handScrolling = phase != .idle
                     }
                 }
                 // A STEP animates, A JUMP DOES NOT. j/k moves to the neighbouring
@@ -566,7 +650,16 @@ struct ThreadViewer: View {
                     // parked on the newest — a resize, or the card growing as its
                     // images arrive. Somebody who has scrolled back into the
                     // history is not holding a position this may correct.
-                    guard !landed || parkedOnNewest || was.last != now.last else { return }
+                    //
+                    // NOR IS SOMEBODY WHO IS SCROLLING RIGHT NOW. "Parked" allows
+                    // a couple of dozen points of slack, which is about one turn
+                    // of a wheel — so the first nudge off the newest message used
+                    // to be answered by a height landing somewhere in the thread
+                    // and yanking the reader back to where they started. A
+                    // gesture in progress owns the scroll; the window resizing
+                    // (the third arm) is not a gesture and still lands.
+                    guard !landed || (parkedOnNewest && !handScrolling) || was.last != now.last
+                    else { return }
                     proxy.scrollTo(newestIndex, anchor: .top)
                     landed = true
                 }
@@ -608,6 +701,13 @@ struct ThreadViewer: View {
                 // reader is inside its document, which the frame is not asked
                 // anything else.
                 .onChange(of: style) { _, _ in
+                    // THE RAIL IS DRAWN TO THE STYLE'S MEASURE, so a flip makes
+                    // every nub the wrong length until it is redrawn. Taken
+                    // here rather than waiting on the measuring pass: the pass
+                    // has a whole set of heights to take under the new style's
+                    // keys, and a rail that is wrong for a second reads as a
+                    // rail that jumps.
+                    marks = Self.marks(for: messages, style: style)
                     guard landed else { return }
                     let target = anchorId.flatMap { id in messages.firstIndex { $0.id == id } } ?? index
                     settle(
@@ -717,13 +817,56 @@ struct ThreadViewer: View {
     /// messages up is visible from anywhere in the thread); and how long the
     /// message is about to be, which is what holds the map still for the mail the
     /// lazy stack has not laid out yet.
-    private var minimapMarks: [ThreadMinimap.Mark] {
-        messages.map { m in
+    ///
+    /// Derived WHEN THE THREAD LANDS (see `adopt`) and not on every render: it
+    /// is a walk of every message's text, and it was being re-walked whenever
+    /// anything at all invalidated the reader — a row crossing the visibility
+    /// threshold, which happens repeatedly while you scroll. The messages are
+    /// the only input, and they only change when a fetch replaces them.
+    private static func marks(
+        for messages: [ClientMessage], style: ThreadStyle
+    ) -> [ThreadMinimap.Mark] {
+        // ALL MEASURED OR NONE, and that is not fussiness. A map drawn half
+        // from measurements and half from guesses redraws itself as each
+        // measurement lands, which is a rail that crawls while you read it. The
+        // measuring pass fills the whole set and says so once, so the rail
+        // changes scale exactly once per thread — and on the next open there is
+        // nothing left to change.
+        let sizes = messages.map { measuredCard($0, style: style) }
+        let complete = sizes.allSatisfy { $0 != nil }
+        return messages.enumerated().map { i, m in
             ThreadMinimap.Mark(
                 attention: m.needsAttention,
                 tint: Palette.avatarColors(for: m.senderString).fg,
-                estimate: mapEstimate(m))
+                estimate: (complete ? sizes[i] : nil) ?? mapEstimate(m, style: style))
         }
+    }
+
+    /// This message's card at the size it really draws: the body as WebKit
+    /// measured it, plus the chrome the card puts around it. nil while nobody
+    /// has measured it.
+    ///
+    /// A PLAIN-TEXT message counts as measured. It has no web frame to measure
+    /// — and it is the one shape the guess is good at, being a count of lines
+    /// of text in a message that is nothing but lines of text. Holding the
+    /// whole rail hostage to a body no engine will ever be asked to lay out
+    /// would mean a thread with one plain reply never gets a true map at all.
+    private static func measuredCard(_ m: ClientMessage, style: ThreadStyle) -> CGFloat? {
+        guard let html = m.html, !html.isEmpty else {
+            // Its own guess, not `mapEstimate`: this card draws with its quoted
+            // history collapsed behind a chip, exactly as the html ones do, and
+            // the rail must not draw it at the length of the chain it is
+            // answering.
+            return MinimapGeometry.card(
+                bodyHeight: MessageCard.guessedBody(m, style: style),
+                attachments: m.attachmentList.count, style: style)
+        }
+        // Under the STYLE's own key: the same message has one measurement per
+        // measure it was laid out at, and a card's height on a bubble rail is
+        // the wrong length of nub.
+        guard let body = FrameHeights.shared.get(style.frameKey(m.id)) else { return nil }
+        return MinimapGeometry.card(
+            bodyHeight: body, attachments: m.attachmentList.count, style: style)
     }
 
     /// WHAT THIS MESSAGE IS WORTH ON THE RAIL, from its own text and nothing
@@ -733,9 +876,23 @@ struct ThreadViewer: View {
     /// ones redraws itself as the measurements land, which is a rail that crawls
     /// while you read it. A map that is uniformly approximate holds still, and
     /// holding still is the whole job.
-    private func mapEstimate(_ m: ClientMessage) -> CGFloat {
+    private static func mapEstimate(_ m: ClientMessage, style: ThreadStyle) -> CGFloat {
         MinimapGeometry.estimate(
             text: m.content, html: m.html, attachments: m.attachmentList.count, style: style)
+    }
+
+    /// THE WIDTH A BODY IS ACTUALLY LAID OUT AT, which is not the column's: a
+    /// card is inset by its rule gutter on the leading side alone, while a
+    /// bubble is capped at its own narrower measure and inset on both. The
+    /// measuring pass has to render at exactly this or every height it takes is
+    /// an answer to a different question.
+    private var bodyWidth: CGFloat {
+        guard columnWidth > 0 else { return 0 }
+        switch style {
+        case .classic: return max(0, columnWidth - MessageCard.bodyInset)
+        case .bubbles:
+            return max(0, min(columnWidth, Self.bubbleWidth) - MessageCard.bodyInset * 2)
+        }
     }
 
     /// The mail's measure. The dismissible gutter is defined as the complement
@@ -1171,9 +1328,16 @@ struct ThreadViewer: View {
     /// would let a background refresh yank a wheel reader back to the newest.
     /// nil means the reader really is sitting on the newest, which is the one
     /// case a refresh may move them: onto the reply they are waiting for.
+    ///
+    /// Asked of the MAP rather than of a visibility flag per row. The map is
+    /// already tracking every mounted card's rectangle for the rail, and it
+    /// does it in an object — where a per-row `onScrollVisibilityChange` wrote
+    /// reader `@State`, so every message crossing the edge of the window
+    /// re-rendered the whole reader for an answer nothing needed until a
+    /// refresh landed.
     private var anchorId: Int? {
         if index != newestIndex { return messages[safe: index]?.id }
-        guard let top = visibleIndices.min(), top < newestIndex else { return nil }
+        guard let top = map.topmost, top < newestIndex else { return nil }
         return messages[safe: top]?.id
     }
 
@@ -1312,10 +1476,9 @@ struct ThreadViewer: View {
     // MARK: - data
 
     private func load() async {
-        // A fresh thread mounts fresh rows; what was visible of the LAST one
+        // A fresh thread mounts fresh rows; where the LAST one's cards were
         // must not anchor this one, and its shape must not be what the minimap
         // draws for a thread this one knows nothing about yet.
-        visibleIndices.removeAll()
         map.forget()
         newestHeight = 0
         landed = false
@@ -1347,10 +1510,15 @@ struct ThreadViewer: View {
     /// that moved the paragraph somebody was on.
     private func adopt(_ view: ClientThreadView, opening: Bool = false) {
         thread = view
+        // THE STYLE FIRST: the rail below is drawn to its measure, so a mark
+        // taken before the thread has chosen one is drawn for the wrong one.
         if opening {
             style = resolvedStyle(view.messages)
             styledFor = threadId
         }
+        // And the one place the messages change is the one place the rail is
+        // drawn.
+        marks = Self.marks(for: view.messages, style: style)
         // LAND ON THE NEWEST. It is last in the stack now, and `tailSpace` is
         // what lets the scroll put it at the top of the window rather than the
         // bottom.
@@ -1514,17 +1682,43 @@ struct ReaderBackdrop: View {
 /// same quoted-history collapse — moved into a caption over a bubble on the
 /// sender's own side. The rails stay where they are in both, because they are
 /// what j/k moves and a navigation affordance that jumps sides is no affordance.
-private struct MessageCard: View {
-    let message: ClientMessage
-    let style: ThreadStyle
-    let selected: Bool
+private struct MessageCard: View, Equatable {
+    // NONISOLATED, all six: a View is main-actor isolated, and Equatable's
+    // requirement is not, so the comparison below can only reach fields that
+    // have stepped outside the actor. Every one of them is a value type the
+    // wire already declares Sendable, so stepping out costs nothing. The
+    // callback stays isolated, which is exactly why `==` cannot see it.
+    nonisolated let message: ClientMessage
+    /// Cards or bubbles. Part of the comparison because it changes the whole
+    /// arrangement AND the measure the body is laid out at.
+    nonisolated let style: ThreadStyle
+    /// Display index. Carried only so `==` can see it: the callback below
+    /// captures it, so two cards that agree about everything else and disagree
+    /// about this one would select the wrong message if the older callback were
+    /// kept.
+    nonisolated let position: Int
+    nonisolated let selected: Bool
     /// The first message needs no divider above it: that is the top of the
     /// document, not a seam between two messages.
-    let ruled: Bool
+    nonisolated let ruled: Bool
     /// Recorded opens of this message, when it is one of the user's own tracked
     /// sends. Empty for everything else, which renders no mark.
-    let opens: [MessageOpen]
+    nonisolated let opens: [MessageOpen]
     let onSelect: () -> Void
+
+    /// The gutter the rules live in, which every body is inset by. Named
+    /// because the measuring pass has to render at exactly the width the mail
+    /// will be laid out at, and it derives that from the column minus this.
+    static let bodyInset: CGFloat = 13
+
+    /// EVERYTHING BUT THE CALLBACK, which is what makes the card diffable at
+    /// all — see the `.equatable()` at the call site. Rebuilding a card means
+    /// rebuilding its sandboxed web frame's view value and running that frame's
+    /// update, so a card that has not changed must be able to say so.
+    nonisolated static func == (a: MessageCard, b: MessageCard) -> Bool {
+        a.message == b.message && a.style == b.style && a.position == b.position
+            && a.selected == b.selected && a.ruled == b.ruled && a.opens == b.opens
+    }
 
     /// Which side of the conversation this is. Only the chat style asks.
     private var mine: Bool { message.fromMe }
@@ -1556,8 +1750,8 @@ private struct MessageCard: View {
         // j/k moves a rule rather than shifting every body left and right. The
         // chat style reserves the far side too, or a sent bubble would sit
         // against an edge its neighbours keep clear of.
-        .padding(.leading, 13)
-        .padding(.trailing, style == .bubbles ? 13 : 0)
+        .padding(.leading, Self.bodyInset)
+        .padding(.trailing, style == .bubbles ? Self.bodyInset : 0)
         // The divider is what separates two cards; bubbles are separated by the
         // air between them, so that is what the padding buys there.
         .padding(.vertical, style == .bubbles ? 5 : 16)
@@ -1592,6 +1786,29 @@ private struct MessageCard: View {
         }
         .contentShape(Rectangle())
         .onTapGesture(perform: onSelect)
+    }
+
+    /// HOW TALL THIS BODY WILL BE, before anything has rendered it — the size
+    /// the web frame is given while it is still loading, so the message that
+    /// finishes measuring itself mid-scroll corrects its own height by a little
+    /// instead of shoving the rest of the thread down the window.
+    ///
+    /// Off the FLATTENED TEXT with the quoted chain taken off it, because that
+    /// is what the frame will actually draw: the injected script collapses
+    /// trailing quoted history before its first measurement, so a one-line
+    /// reply that quotes a hundred-message thread renders as one line. Guessing
+    /// from the whole body would be as wrong as the flat placeholder was, just
+    /// in the other direction.
+    ///
+    /// Memoized under the SAME key the heights are — style and all, because a
+    /// bubble fits fewer characters on a line than a card does, so the guess is
+    /// a different number for the same words. Read from a view body, and the
+    /// split is a regex walk of every line of the message.
+    static func guessedBody(_ message: ClientMessage, style: ThreadStyle) -> CGFloat {
+        FrameHeights.shared.guess(style.frameKey(message.id)) {
+            MinimapGeometry.textHeight(
+                text: Quotes.splitText(message.content).visible, html: message.html, style: style)
+        }
     }
 
     /// A short message is a short bubble, so the rail cannot be inset as far as
@@ -1685,7 +1902,8 @@ private struct MessageCard: View {
             EmailWebView(
                 html: html, cacheKey: style.frameKey(message.id),
                 allowTrackers: message.allowsTrackers,
-                attachments: message.attachmentList)
+                attachments: message.attachmentList,
+                textHeight: Self.guessedBody(message, style: style))
                 // The web frame's document is hardcoded #fff (EmailFrame), so
                 // white IS this bubble's fill, in either theme.
                 .overlay(alignment: mine ? .bottomTrailing : .bottomLeading) {

@@ -205,27 +205,112 @@ final class PreparedBodies: @unchecked Sendable {
 /// Remembered rendered heights, keyed by message id: a frame with one renders
 /// at its final size instantly, with no resize on reopen (the reader perceives
 /// that resize as flicker).
+///
+/// It also keeps the GUESSED height of a body nothing has measured yet — the
+/// size a message is given while it is scrolling into view for the first time.
+/// The two are deliberately separate maps: a measurement is what the document
+/// turned out to be, a guess is what its text says it will be, and a guess must
+/// never be remembered as though a frame had reported it.
+/// OBSERVABLE, because a height arriving is news. The measuring pass fills this
+/// while the reader is already looking at the thread, and a frame that mounted
+/// before its message was measured has to pick the measurement up when it
+/// lands — otherwise the one message that is always on screen before the pass
+/// starts, the newest, is also the one that never gets a proper size.
 @MainActor
+@Observable
 final class FrameHeights {
-    static let shared = FrameHeights()
-    private var heights: [String: CGFloat] = [:]
+    @ObservationIgnored static let shared = FrameHeights()
+    /// A height and WHERE IT CAME FROM. The two sources are not equally good
+    /// and the difference decides things: the offscreen pass measures at a
+    /// fixed viewport, so nothing it reports can have been influenced by what
+    /// it reported last, while a live frame measures inside a box sized from
+    /// its own previous answer. For most mail they agree. For a body written in
+    /// `vh` units there is no viewport-independent answer at all — the height
+    /// is whatever viewport you ask at — and then only the fixed-viewport
+    /// number means anything.
+    private struct Known {
+        var height: CGFloat
+        var authoritative: Bool
+    }
+
+    private var heights: [String: Known] = [:]
+    private var guesses: [String: CGFloat] = [:]
     private init() {}
 
-    func get(_ key: String) -> CGFloat? { heights[key] }
-    func set(_ key: String, _ height: CGFloat) { heights[key] = height }
+    /// THE WIDTH EVERY HEIGHT IN HERE WAS MEASURED AT. A height is only an
+    /// answer to a question that included the width — mail reflows, and a body
+    /// measured in a wide window is the wrong size in a narrow one.
+    ///
+    /// The STYLE's contribution to the width is already in the key
+    /// (ThreadStyle.frameKey: a bubble is a narrower measure than a card, so
+    /// the same message has one height per style). What is left for this is the
+    /// column itself, which is the same for both styles and changes only when
+    /// the window does — so it is one number rather than part of every key.
+    private(set) var width: CGFloat = 0
 
-    /// Forget a message, in EVERY SPELLING OF ITS KEY. The same message has one
-    /// height per thread style (ThreadStyle.frameKey: a bubble is measured at a
-    /// narrower measure than a card), so a caller that cleared the one spelling
-    /// it happened to know left the other to paint a reopened message at a size
+    /// The reader declaring the width it is laying out at. A different one
+    /// discards the measurements, which is not a loss: the frames on screen
+    /// re-measure themselves as they reflow, and the ones that are not can be
+    /// measured again (see FrameMeasurer). The GUESSES survive — they are made
+    /// from the text and know nothing about the column.
+    func using(width: CGFloat) {
+        guard width > 0, abs(width - self.width) > 0.5 else { return }
+        self.width = width
+        heights.removeAll()
+    }
+
+    /// The best height on file, whoever took it — what a frame is drawn at.
+    func get(_ key: String) -> CGFloat? { heights[key]?.height }
+
+    /// Only a height taken at a FIXED viewport. This is the one a live frame
+    /// must defer to rather than re-deriving, and the one that says a message
+    /// no longer needs measuring.
+    func authoritative(_ key: String) -> CGFloat? {
+        heights[key].flatMap { $0.authoritative ? $0.height : nil }
+    }
+
+    /// A provisional height never displaces a measured one: a live frame's
+    /// answer is a stopgap until the pass reaches that message, and letting it
+    /// overwrite would make the stopgap permanent.
+    func set(_ key: String, _ height: CGFloat, authoritative: Bool = false) {
+        if let known = heights[key], known.authoritative, !authoritative { return }
+        heights[key] = Known(height: height, authoritative: authoritative)
+    }
+
+    /// Forget a message, in EVERY SPELLING OF ITS KEY, and its guess with it.
+    /// The same message has one height per thread style
+    /// (ThreadStyle.frameKey), so a caller that cleared the one spelling it
+    /// happened to know left the other to paint a reopened message at a size
     /// nothing on screen is using. The loop lives here so no caller has to know
     /// there are two.
     func clear(messageId: Int) {
-        for style in ThreadStyle.allCases { heights.removeValue(forKey: style.frameKey(messageId)) }
+        for style in ThreadStyle.allCases {
+            let key = style.frameKey(messageId)
+            heights.removeValue(forKey: key)
+            guesses.removeValue(forKey: key)
+        }
+    }
+
+    /// The guessed height for this message, computed once and kept. Memoized
+    /// because the caller is a view body — it is asked on every render of a
+    /// message card, and the answer is a walk of the body's text (the quoted
+    /// chain has to be split off it first, or a one-line reply quoting a long
+    /// thread is guessed at the length of the whole thread).
+    ///
+    /// Keyed the same way the heights are, style and all: the guess is a line
+    /// count and a bubble fits fewer characters on a line.
+    func guess(_ key: String, _ make: () -> CGFloat) -> CGFloat {
+        if let known = guesses[key] { return known }
+        let made = make()
+        guesses[key] = made
+        return made
     }
 
     /// Forget every height. An account switch: the keys are message ids, one
     /// daemon's, so a surviving entry paints the new account's mail at the old
     /// account's size and then snaps — which reads as a rendering glitch.
-    func wipeAll() { heights.removeAll() }
+    func wipeAll() {
+        heights.removeAll()
+        guesses.removeAll()
+    }
 }

@@ -67,9 +67,7 @@ enum MinimapGeometry {
     private static let markupRatio: CGFloat = 6
 
     /// WHAT A MESSAGE IS WORTH ON THE RAIL, from the only thing knowable without
-    /// laying it out: how much text is in it. Counted in UTF-8 bytes rather than
-    /// characters because this runs for every message on every render and byte
-    /// count is free where grapheme count is a walk.
+    /// laying it out: how much text is in it.
     ///
     /// IT COUNTS LINES AND NOTHING ELSE — images, tables, and signature cards are
     /// all worth zero. Deliberately: guessing a picture's size from its markup is
@@ -78,6 +76,47 @@ enum MinimapGeometry {
     /// thread of its own and has no rail to be wrong about.
     static func estimate(
         text: String, html: String? = nil, attachments: Int = 0, style: ThreadStyle = .classic
+    ) -> CGFloat {
+        min(
+            card(
+                bodyHeight: textHeight(text: text, html: html, style: style),
+                attachments: attachments, style: style),
+            longestGuess)
+    }
+
+    /// A CARD AROUND A BODY OF A KNOWN HEIGHT — the chrome and the strip that
+    /// `estimate` adds to its guess, so a card whose body WebKit actually
+    /// measured is drawn on the same scale as one nobody has rendered yet.
+    ///
+    /// Uncapped, and that is the difference between the two: `longestGuess`
+    /// exists because a number derived from a character count has not earned
+    /// the whole rail. A measurement has. A newsletter that really is ten
+    /// screenfuls has to be drawn as ten screenfuls or the rail is lying about
+    /// the shape of the thread — which is the whole thing it is for.
+    static func card(
+        bodyHeight: CGFloat, attachments: Int = 0, style: ThreadStyle = .classic
+    ) -> CGFloat {
+        max(cardChrome(style) + bodyHeight + (attachments > 0 ? attachmentStrip : 0), minimumCard)
+    }
+
+    /// HOW TALL THIS BODY'S TEXT DRAWS, with no card around it. Split out of
+    /// `estimate` because the READER needs the same number for a different
+    /// reason: a web frame that has not measured itself yet has to be given a
+    /// height, and until this existed that height was a flat 120 points. A
+    /// message that scrolled into view at 120 and then measured at 900 shoved
+    /// everything below it down by the difference, which is the mail lurching
+    /// under somebody who is reading it. The guess does not have to be right —
+    /// it has to be close enough that the correction is not a jump.
+    ///
+    /// STYLE IS PART OF THE QUESTION for the same reason it is part of the
+    /// rail's: a bubble is a narrower measure, so the same words are more lines
+    /// of fewer characters, and a frame opened at the other style's guess opens
+    /// at the wrong size.
+    ///
+    /// Counted in UTF-8 bytes rather than characters because a long thread runs
+    /// this per message and byte count is free where grapheme count is a walk.
+    static func textHeight(
+        text: String, html: String? = nil, style: ThreadStyle = .classic
     ) -> CGFloat {
         let charsPerLine = charsPerLine(style)
         var lines: CGFloat = 0
@@ -103,8 +142,7 @@ enum MinimapGeometry {
             lines = max(1, (visible / charsPerLine).rounded(.up))
         }
 
-        let body = cardChrome(style) + lines * lineHeight + (attachments > 0 ? attachmentStrip : 0)
-        return min(max(body, minimumCard), longestGuess)
+        return lines * lineHeight
     }
 
     /// `estimates` carries one entry per message and IS the map. Nothing measured

@@ -23,6 +23,7 @@ struct MinimapGeometryTests {
         theMapIsTheEstimates()
         measurementNeverMovesTheMap()
         estimateGrowsWithTheText()
+        textHeightIsTheCardWithoutItsChrome()
         theStyleIsTheMeasure()
         windowFromACard()
         windowIsAFractionNotADistance()
@@ -109,6 +110,35 @@ struct MinimapGeometryTests {
                 == MinimapGeometry.estimate(text: "", html: markup), true,
             "whitespace is not text")
 
+    }
+
+    /// THE READER LEANS ON THIS ONE TOO, which is why it is asserted apart from
+    /// the rail's own guess: `textHeight` is the size an unmeasured web frame is
+    /// given while it loads, and a frame that opens at the wrong size shoves the
+    /// rest of the thread when its real height lands. The two callers must stay
+    /// the same guess — the card is this plus its chrome, and nothing else.
+    static func textHeightIsTheCardWithoutItsChrome() {
+        let text = String(repeating: "word ", count: 400)
+        let chrome = MinimapGeometry.estimate(text: "") - MinimapGeometry.textHeight(text: "")
+        equal(
+            MinimapGeometry.estimate(text: text),
+            MinimapGeometry.textHeight(text: text) + chrome,
+            "a card is its text plus a constant")
+        equal(
+            MinimapGeometry.textHeight(text: text) > MinimapGeometry.textHeight(text: "thanks!"),
+            true, "more text is more height")
+        // No floor of its own: the card's minimum is the CARD's, and a frame
+        // that is genuinely one line must be allowed to be one line.
+        equal(
+            MinimapGeometry.textHeight(text: "hi") < MinimapGeometry.minimumCard, true,
+            "a one-line body is not given a card's floor")
+        // Same html stand-in as the rail: a body that is markup with no text
+        // still has to guess tall, or every html-only message opens at a line.
+        let markup = String(repeating: "<td style='padding:0'>hello there</td>", count: 200)
+        equal(
+            MinimapGeometry.textHeight(text: "", html: markup)
+                > MinimapGeometry.textHeight(text: ""), true,
+            "html stands in when the plain text is missing")
     }
 
     /// THE SAME MAIL THROUGH TWO MEASURES. A chat bubble is narrower than the

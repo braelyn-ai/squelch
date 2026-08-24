@@ -60,6 +60,19 @@ final class ThreadMap {
         frames[index] = nil
     }
 
+    /// THE FIRST MESSAGE THE WINDOW IS SHOWING — the lowest-numbered card with
+    /// anything below the top edge. The reader asks this to know which message
+    /// somebody who scrolled with the wheel is on, since the wheel never moves
+    /// the selection.
+    ///
+    /// A lazy stack mounts a row or two beyond the window, so being mounted is
+    /// not being visible: a card entirely above the edge is skipped. Read from
+    /// outside a view body on purpose (the refresh path), which is what keeps
+    /// this an object rather than reader state.
+    var topmost: Int? {
+        frames.filter { $0.value.maxY > 0.5 }.keys.min()
+    }
+
     /// A different thread is a different map.
     func forget() {
         frames.removeAll()
