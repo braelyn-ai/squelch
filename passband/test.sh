@@ -36,6 +36,15 @@ run_suite pairing \
   Sources/Passband/Model/Pairing.swift \
   Tests/PairingTests.swift
 
+# The changelog and the rule that decides which of it a given install is owed.
+# One file, no dependencies: ReleaseNotes.swift is kept free of SwiftUI and
+# Bundle precisely so this suite and make-changelog.sh can both compile it
+# alone, and so the running version arrives as an argument rather than as
+# whatever bundle the binary happens to sit in.
+run_suite release-notes \
+  Sources/Passband/Lib/ReleaseNotes.swift \
+  Tests/ReleaseNotesTests.swift
+
 # One file, no dependencies at all — SubjectText is kept that way on purpose.
 # The marker sanitizer is what lets a stranger's subject line sit inside the
 # assistant's system prompt, so it gets asserted rather than reasoned about.

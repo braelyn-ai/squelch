@@ -76,7 +76,7 @@ enum Analytics {
         "process_completed", "notification_opened", "sealed_revealed",
         "connect_succeeded", "connection_lost", "connection_restored",
         "account_added",
-        "tour_completed", "tour_skipped",
+        "tour_completed", "tour_skipped", "whats_new_shown",
     ]
 
     /// The counter events that ride at `minimal`: anonymous counts and

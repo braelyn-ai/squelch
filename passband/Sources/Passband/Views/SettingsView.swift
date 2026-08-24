@@ -37,6 +37,7 @@ struct SettingsView: View {
                             AppearanceSection()
                             NotificationsSection()
                             TourSection()
+                            WhatsNewSection()
                             DeveloperSection()
                             YouSection()
                         case .mail:
@@ -461,6 +462,26 @@ struct TourSection: View {
             }
             SettingsHint(
                 "Seven steps over your own board: what triage filed, where records live, and how to teach it about a sender."
+            )
+        }
+    }
+}
+
+/// The release notes on demand. The card itself is shown once per version and
+/// then never again, which is the right behaviour and also means the one place
+/// somebody can go looking for it afterwards has to exist.
+struct WhatsNewSection: View {
+    @Environment(AppStore.self) private var store
+
+    var body: some View {
+        SectionCard(label: "What's new") {
+            InlineRow(key: "release notes") {
+                Button("what's new in this version") { store.whatsNew.replay() }
+                    .buttonStyle(.glass)
+                    .controlSize(.small)
+            }
+            SettingsHint(
+                "What the version you are running brought, in the app and in the daemon behind it."
             )
         }
     }

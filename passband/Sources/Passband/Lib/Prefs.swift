@@ -107,6 +107,7 @@ final class Prefs {
         static let rankWeight = "passband.pref.rankWeight"
         static let developerMode = "passband.pref.developerMode"
         static let tourCompleted = "passband.pref.tourCompleted"
+        static let lastSeenReleaseNotes = "passband.pref.lastSeenReleaseNotes"
         static let theme = "passband.pref.theme"
         static let notificationSound = "passband.pref.notificationSound"
         static let userName = "passband.name"
@@ -134,6 +135,7 @@ final class Prefs {
         _rankWeight = defaults.double(forKey: Key.rankWeight)
         _developerMode = defaults.bool(forKey: Key.developerMode)
         _tourCompleted = defaults.bool(forKey: Key.tourCompleted)
+        _lastSeenReleaseNotes = defaults.string(forKey: Key.lastSeenReleaseNotes)
         _theme = ThemeChoice(rawValue: defaults.string(forKey: Key.theme) ?? "") ?? .system
         _notificationSound =
             NotificationSound(rawValue: defaults.string(forKey: Key.notificationSound) ?? "")
@@ -200,6 +202,19 @@ final class Prefs {
         set {
             _tourCompleted = newValue
             defaults.set(newValue, forKey: Key.tourCompleted)
+        }
+    }
+
+    /// The newest release whose notes this install has been shown, or nil for
+    /// an install that has never seen the card. NOT registered with a default:
+    /// absence is a real state (see WhatsNew), and a registered "" would be
+    /// indistinguishable from a stamp somebody wrote.
+    private var _lastSeenReleaseNotes: String?
+    var lastSeenReleaseNotes: String? {
+        get { _lastSeenReleaseNotes }
+        set {
+            _lastSeenReleaseNotes = newValue
+            defaults.set(newValue, forKey: Key.lastSeenReleaseNotes)
         }
     }
 

@@ -133,10 +133,12 @@ struct AccountPage: View {
                     ConnectionSection()
                     AppearanceSection()
                     NotificationsSection()
-                    // NO TourSection: the tour renders in TourOverlay, which is
-                    // mounted by the desktop's ActionLayer and has no iOS host
-                    // yet. The button would set `tour.active` with no surface
-                    // able to show or dismiss it.
+                    // NO TourSection, and NO WhatsNewSection, for the same
+                    // reason: both render through the desktop's ActionLayer,
+                    // which has no iOS host yet. Either button would set state
+                    // (`tour.active`, `whatsNew.notes`) that no surface here is
+                    // able to show or dismiss. The phone's what's-new is the
+                    // App Store's release notes until that host exists.
                     DeveloperSection()
                     YouSection()
                 case .mail:
