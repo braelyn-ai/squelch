@@ -33,17 +33,27 @@ scrape_configs:
       - target_label: __address__
         replacement: blackbox.railway.internal:9115
 
-  # THE LLM CANARY: a real minimal claude-opus-5 call through the public
-  # gateway path every tenant daemon uses, with a dedicated canary virtual
-  # key (see deploy/monitoring/blackbox/blackbox.yml). Its own job because it
-  # spends real money per probe: 5m, not the global 30s, puts the cost around
-  # $5/month; the 2026-08-19 outage ran two days, so 5-minute detection is
-  # plenty. probe_success{job="blackbox-bifrost-llm"} == 0 means LLM calls
-  # are NOT going through in production.
+  # THE LLM CANARY: a real claude-opus-5 call through the public gateway path
+  # every tenant daemon uses, mirroring the daemon's full request shape, with a
+  # dedicated canary virtual key (see deploy/monitoring/blackbox/blackbox.yml).
+  # probe_success{job="blackbox-bifrost-llm"} == 0 means LLM calls are NOT
+  # going through in production.
+  #
+  # Its own job because it spends real money per probe, and the interval is a
+  # COST knob, not a freshness one. A probe now carries a system block and a
+  # real 2000-token ceiling (thinking bills against it), so ~250 in + a few
+  # hundred out at $5/$25 per MTok is on the order of a cent a call: ~$25/month
+  # at 15m, and ~$70/month at the 5m this used to run. The outage it exists to
+  # catch ran for TWO DAYS, so 15-minute detection is far better than needed —
+  # widen it further if the bill annoys you, and do not narrow it without
+  # redoing that arithmetic.
+  #
+  # scrape_timeout is 60s because a reasoning model on a cold prompt cache is
+  # not a 10s request; it must stay >= the module's own timeout.
   - job_name: blackbox-bifrost-llm
     metrics_path: /probe
-    scrape_interval: 5m
-    scrape_timeout: 35s
+    scrape_interval: 15m
+    scrape_timeout: 60s
     params:
       module: [bifrost_llm]
     static_configs:
