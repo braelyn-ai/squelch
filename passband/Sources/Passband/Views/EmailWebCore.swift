@@ -393,12 +393,29 @@ struct EmailWebView: View {
     private var guessedHeight: CGFloat? {
         textHeight > 0 ? textHeight + Self.documentPadding : nil
     }
-    /// MEASURED, then REMEMBERED, then GUESSED. The order is the confidence
-    /// order, and everything above the last resort exists so that the frame
-    /// which lands its measurement mid-scroll corrects by a little instead of
-    /// shoving the rest of the thread down the window.
+    /// THE CONFIDENCE ORDER, and it is not the obvious one: a measurement taken
+    /// at a FIXED viewport outranks what this frame worked out for itself, even
+    /// though this frame is the one on screen. It has to, because what this
+    /// frame worked out was worked out inside a box sized from its own last
+    /// answer — fine for ordinary mail, meaningless for a body written in `vh`
+    /// units, which is one viewport tall whatever viewport you ask at.
+    ///
+    /// Reading it here rather than only at mount is what lets a message adopt
+    /// its size the moment the pass measures it. The newest message is always
+    /// on screen before that pass has started, so it would otherwise be the one
+    /// message that never gets a real one.
+    ///
+    /// UNLESS THE READER CHANGED THE DOCUMENT — unfolded the quoted history,
+    /// let the images in — in which case what is on screen is no longer what
+    /// was measured, and the frame in front of somebody is the only thing that
+    /// knows how tall it is.
     private var displayHeight: CGFloat {
-        height > 0 ? height : (rememberedHeight ?? guessedHeight ?? Self.placeholderHeight)
+        if !sizingIsUserDriven, let key = cacheKey,
+            let measuredHeight = FrameHeights.shared.authoritative(key)
+        {
+            return measuredHeight
+        }
+        return height > 0 ? height : (rememberedHeight ?? guessedHeight ?? Self.placeholderHeight)
     }
 
     @ViewBuilder

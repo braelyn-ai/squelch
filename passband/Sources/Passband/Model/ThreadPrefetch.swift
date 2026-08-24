@@ -211,9 +211,15 @@ final class PreparedBodies: @unchecked Sendable {
 /// The two are deliberately separate maps: a measurement is what the document
 /// turned out to be, a guess is what its text says it will be, and a guess must
 /// never be remembered as though a frame had reported it.
+/// OBSERVABLE, because a height arriving is news. The measuring pass fills this
+/// while the reader is already looking at the thread, and a frame that mounted
+/// before its message was measured has to pick the measurement up when it
+/// lands — otherwise the one message that is always on screen before the pass
+/// starts, the newest, is also the one that never gets a proper size.
 @MainActor
+@Observable
 final class FrameHeights {
-    static let shared = FrameHeights()
+    @ObservationIgnored static let shared = FrameHeights()
     /// A height and WHERE IT CAME FROM. The two sources are not equally good
     /// and the difference decides things: the offscreen pass measures at a
     /// fixed viewport, so nothing it reports can have been influenced by what
