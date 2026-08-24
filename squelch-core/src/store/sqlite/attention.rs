@@ -395,6 +395,15 @@ impl SqliteStore {
     /// - Rows with no triage row at all are absent from both, by the join: a
     ///   message the daemon never triaged is one it cannot speak for.
     ///
+    /// AND IT NEVER LOOKS BACK FURTHER THAN THE LEDGER ITSELF. `opened_at` was
+    /// added to an existing product, so on the day it ships every mailbox has
+    /// years of mail and no opens at all; a window that reached past the
+    /// column's own arrival would divide a full denominator by an empty
+    /// numerator and report that this person opens almost nothing. The caller's
+    /// sample floors cannot catch that - they measure how old the MAIL is,
+    /// which is ample, not how old the LEDGER is, which is seconds. See
+    /// `migrate::stamp_open_ledger_start`.
+    ///
     /// WHAT IT CANNOT SEE is mail read somewhere else. `opened_at` is stamped
     /// by this user's own Passband client and nowhere else, so somebody who
     /// reads half their mail in Gmail on a phone will find this FLATTERINGLY
@@ -407,11 +416,16 @@ impl SqliteStore {
         since: DateTime<Utc>,
     ) -> Result<OpenRate> {
         let conn = self.lock()?;
+        // The window, clamped to the ledger. Whichever floor is LATER wins: a
+        // caller asking for ninety days of a thirty-day-old ledger gets thirty.
+        let ledger_since = open_ledger_since(&conn, account_id)?;
+        let floor = since.max(ledger_since);
+        let floor_text = floor.to_rfc3339();
         let (received, opened): (i64, i64) = conn.query_row(
             "SELECT COUNT(*), COUNT(t.opened_at)
                FROM messages m JOIN triage t ON t.message_id = m.id
               WHERE m.account_id = ?1 AND m.is_sent = 0 AND m.received_at >= ?2",
-            params![account_id, since.to_rfc3339()],
+            params![account_id, floor_text],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )?;
         // The oldest received row in the window, which is what says how much
@@ -420,7 +434,7 @@ impl SqliteStore {
         let oldest: Option<String> = conn.query_row(
             "SELECT MIN(received_at) FROM messages
               WHERE account_id = ?1 AND is_sent = 0 AND received_at >= ?2",
-            params![account_id, since.to_rfc3339()],
+            params![account_id, floor_text],
             |r| r.get(0),
         )?;
         Ok(OpenRate {
@@ -724,4 +738,40 @@ impl SqliteStore {
             last_surfaced_at,
         })
     }
+}
+
+/// The moment an account's open ledger started running.
+///
+/// The migration's stamp when there is one (see
+/// `migrate::stamp_open_ledger_start`), and the ACCOUNT'S OWN `created_at` when
+/// there is not: an account made after the column existed has been recording
+/// since it existed, which is exactly what that says.
+///
+/// EVERY FAILURE FALLS TOWARD "NO EVIDENCE YET". A stamp that will not parse,
+/// or an account row that is not there, resolves to NOW rather than to the
+/// epoch — because the epoch reads as "the ledger has always been running",
+/// which is the one answer that produces the flattering number this whole
+/// mechanism exists to prevent.
+fn open_ledger_since(conn: &Connection, account_id: AccountId) -> Result<DateTime<Utc>> {
+    let stored: Option<String> = conn
+        .query_row(
+            "SELECT value FROM app_settings WHERE account_id = ?1 AND key = ?2",
+            params![account_id, OPEN_LEDGER_SINCE_KEY],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let stored = match stored {
+        Some(s) => Some(s),
+        None => conn
+            .query_row(
+                "SELECT created_at FROM accounts WHERE id = ?1",
+                params![account_id],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()?,
+    };
+    Ok(stored
+        .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
+        .map(|d| d.with_timezone(&Utc))
+        .unwrap_or_else(Utc::now))
 }

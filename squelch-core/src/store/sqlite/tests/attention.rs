@@ -76,12 +76,67 @@ fn the_open_rate_counts_received_mail_and_never_opens_a_sealed_row() {
     assert!(rate.oldest_received_at.is_some());
 }
 
+/// THE DAY THE COLUMN SHIPPED. An established mailbox has years of mail and, the
+/// instant `opened_at` exists, zero opens — so a window reaching past the
+/// ledger's own arrival would divide a full denominator by an empty numerator
+/// and report that this person opens almost none of their mail.
+///
+/// The caller's sample floors cannot catch it: they measure how old the MAIL is.
+/// This is what makes the answer "no evidence yet" instead.
+#[test]
+fn the_window_never_reaches_further_back_than_the_ledger() {
+    let (store, acct) = store();
+    let now = Utc::now();
+
+    // A mailbox with a year of mail behind it, none of it ever opened here.
+    for i in 0..5 {
+        ingest_normal(
+            &store,
+            acct,
+            &format!("g{i}"),
+            &format!("t{i}"),
+            Tier::Signal,
+            50,
+            now - chrono::Duration::days(300 + i),
+        );
+    }
+
+    // The ledger starts NOW (what the migration stamps on an existing account).
+    store
+        .set_app_setting(acct, OPEN_LEDGER_SINCE_KEY, &now.to_rfc3339())
+        .unwrap();
+
+    // Ask for a year. Get the ledger's answer, which is that it has seen
+    // nothing at all — NOT "five received, none opened".
+    let rate = store
+        .share_open_rate(acct, now - chrono::Duration::days(365))
+        .unwrap();
+    assert_eq!(
+        rate.received, 0,
+        "mail that arrived before the ledger is not evidence about the ledger"
+    );
+    assert!(
+        rate.oldest_received_at.is_none(),
+        "and there is no history to date"
+    );
+}
+
 /// The window is a floor on `received_at`, and the oldest row in it is what
 /// says how much history the answer rests on.
 #[test]
 fn the_open_rate_reports_the_reach_of_its_own_evidence() {
     let (store, acct) = store();
     let now = Utc::now();
+    // A ledger that has been running for longer than anything in this test, so
+    // what is being pinned here is the WINDOW's arithmetic and not the clamp's
+    // (which `the_window_never_reaches_further_back_than_the_ledger` owns).
+    store
+        .set_app_setting(
+            acct,
+            OPEN_LEDGER_SINCE_KEY,
+            &(now - chrono::Duration::days(400)).to_rfc3339(),
+        )
+        .unwrap();
 
     let old = now - chrono::Duration::days(60);
     ingest_normal(&store, acct, "g1", "t1", Tier::Signal, 80, old);

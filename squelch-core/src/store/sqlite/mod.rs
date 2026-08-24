@@ -51,6 +51,11 @@ use crate::types::{
     UnsubscribeRecord, Update,
 };
 
+/// `app_settings` key recording when this account's open ledger started, so the
+/// share stat can refuse to look back further than the column has existed. See
+/// `migrate::stamp_open_ledger_start`.
+pub(crate) const OPEN_LEDGER_SINCE_KEY: &str = "opened_ledger_since";
+
 // schema.sql stays beside `store/mod.rs`; this file is `store/sqlite/mod.rs`.
 const SCHEMA: &str = include_str!("../schema.sql");
 
