@@ -1,20 +1,22 @@
-// SHARE PASSBAND: type in a few friends, and each of them gets an invite from
-// YOUR mailbox, with a code that sets up a mailbox of their own.
+// SHARE PASSBAND: address a few friends, edit the mail, send it from YOUR
+// mailbox.
 //
-// THE MAIL IS SHOWN BEFORE IT IS SENT, and that is not a nicety. It goes out
-// over the user's own name, from their own address, to somebody who did not ask
-// for it; the least this screen can do is show them exactly what that says. The
-// preview text comes from the DAEMON, rendered by the same function that
-// renders the real thing (see `sharing::get_invites`), so what is on screen
-// cannot drift from what is sent.
+// IT IS THE COMPOSER, and deliberately so in every way that matters: the same
+// `RecipientField` (pills, backspace staging, autocomplete over people the user
+// has actually written to), the same subject well, and the same
+// `MarkdownTextView` over the same markdown the daemon renders with the
+// composer's own renderer. Somebody who has written an email in this app has
+// already learned this screen, and an invite IS an email.
 //
-// The recipient field is the composer's own `RecipientField`: pills, backspace
-// staging, and autocomplete over people the user has actually written to. An
-// invite is a mail like any other, so it is addressed like one.
+// THE DRAFT COMES FROM THE DAEMON, not from here. The one line in it that has
+// to be true — "I only open about N% of my email" — is a fact only that machine
+// can compute, and a client that wrote its own copy would drift from what the
+// product says about itself. After that the words are the user's.
 //
-// WHAT THIS SCREEN NEVER DOES: invent a number. The "% of my email" line in the
-// preview is either the user's real one or absent entirely, decided by the
-// daemon (`sharing::share_stat`) and never by this view.
+// THE ONE THING THEY DO NOT EDIT is the invite marker, and only because
+// everything it expands to is a fact the daemon guarantees: the link, that
+// friend's own code, and the true expiry. Editing it away is a refusal the
+// daemon makes and this screen warns about first.
 
 import SwiftUI
 
@@ -27,7 +29,12 @@ struct SharePanel: View {
     /// The wire string `RecipientField` parses into pills. Comma-joined, which
     /// is also exactly what the POST wants split.
     @State private var to = ""
-    @State private var note = ""
+    /// The draft: seeded from the daemon on load, and the user's from then on.
+    /// Named `draft` rather than `body` because a `View` already has one of
+    /// those, and a body that is sometimes markdown and sometimes a view is a
+    /// thing nobody should have to hold in their head.
+    @State private var subject = ""
+    @State private var draft = ""
     @State private var availability: InviteAvailability?
     @State private var loadFailed = false
     @State private var sending = false
@@ -36,13 +43,15 @@ struct SharePanel: View {
     @State private var outcome: InviteSendResponse?
     @State private var sendError: String?
 
-    @FocusState private var focus: Field?
-    private enum Field: Hashable { case to, note }
+    /// Named `FocusTarget` and not `Field`, like the composer's: `Field` is the
+    /// shared label-plus-well view, and a private enum of that name shadows it
+    /// inside this file only, which is the most confusing place for it to.
+    @FocusState private var focus: FocusTarget?
+    private enum FocusTarget: Hashable { case to, subject, body }
 
     /// The daemon's ceiling, mirrored so the form can refuse before the round
     /// trip. It is the daemon's number that actually enforces it.
     private static let maxRecipients = 5
-    private static let maxNote = 500
 
     private var recipients: [String] {
         to.split(separator: ",")
@@ -121,77 +130,79 @@ struct SharePanel: View {
     // MARK: - the form
 
     private func form(_ availability: InviteAvailability) -> some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 18) {
-                Text(
-                    "Each friend gets one email from your address, with an invite code that sets "
-                        + "up a mailbox of their own. Nobody on it can see who else you invited."
-                )
-                .font(Typo.rowSub)
-                .foregroundStyle(Palette.inkDim)
-                .fixedSize(horizontal: false, vertical: true)
+        VStack(alignment: .leading, spacing: 12) {
+            Text(
+                "Each friend gets one of these from your own address, with an invite code of "
+                    + "their own. Nobody on it can see who else you invited."
+            )
+            .font(Typo.rowSub)
+            .foregroundStyle(Palette.inkDim)
+            .fixedSize(horizontal: false, vertical: true)
 
-                RecipientField(text: $to, focus: $focus, field: Field.to)
+            RecipientField(text: $to, focus: $focus, field: FocusTarget.to)
 
-                VStack(alignment: .leading, spacing: 5) {
-                    FieldLabel("say something (optional)")
-                    TextField("", text: $note, axis: .vertical)
-                        .textFieldStyle(.plain)
-                        .lineLimit(2...5)
-                        .focused($focus, equals: .note)
-                        .fieldWell()
-                    if note.count > Self.maxNote {
-                        Text("that is longer than a note (\(note.count) of \(Self.maxNote))")
-                            .font(Typo.micro)
-                            .foregroundStyle(Palette.danger)
-                    }
-                }
-
-                preview(availability)
-
-                if let sendError {
-                    Text(sendError)
-                        .font(Typo.rowSub)
-                        .foregroundStyle(Palette.danger)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-
-                sendRow
+            Field(label: "subject") {
+                TextField("", text: $subject)
+                    .textFieldStyle(.plain)
+                    .focused($focus, equals: .subject)
             }
-            .padding(20)
+
+            VStack(alignment: .leading, spacing: 5) {
+                HStack(spacing: 6) {
+                    Text("body").font(Typo.micro).foregroundStyle(Palette.inkFaint)
+                    Text("markdown: **bold**, *italic*, `code`, [links](url)")
+                        .font(Typo.micro)
+                        .foregroundStyle(Palette.inkFaintest)
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.85)
+                }
+                MarkdownTextView(text: $draft)
+                    .frame(minHeight: 220, maxHeight: .infinity)
+                    .padding(8)
+                    .background(
+                        RoundedRectangle(cornerRadius: 9, style: .continuous)
+                            .fill(Palette.canvas.opacity(0.65))
+                    )
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 9, style: .continuous)
+                            .strokeBorder(Palette.hairlineStrong, lineWidth: 0.75))
+            }
+            .frame(maxHeight: .infinity)
+
+            markerHint(availability)
+
+            if let sendError {
+                Text(sendError)
+                    .font(Typo.rowSub)
+                    .foregroundStyle(Palette.danger)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            sendRow
         }
+        .padding(20)
     }
 
-    /// The mail, as it will go out. The user's own note sits above the daemon's
-    /// text exactly where it will land in the real thing.
-    private func preview(_ availability: InviteAvailability) -> some View {
-        VStack(alignment: .leading, spacing: 5) {
-            FieldLabel("what they get")
-            VStack(alignment: .leading, spacing: 10) {
-                if !note.trimmed.isEmpty {
-                    Text(note.trimmed)
-                        .foregroundStyle(Palette.ink)
-                }
-                Text(availability.preview ?? "")
-                    .foregroundStyle(Palette.inkDim)
-            }
-            .font(.system(size: 12))
-            .textSelection(.enabled)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .padding(12)
-            .background(
-                RoundedRectangle(cornerRadius: 9, style: .continuous)
-                    .fill(Palette.readerBackground)
-            )
-            .overlay(
-                RoundedRectangle(cornerRadius: 9, style: .continuous)
-                    .strokeBorder(Palette.hairline, lineWidth: 0.75)
-            )
-            // The code in the preview is not a real one, and somebody will try
-            // to use it if nothing here says so.
-            Text("the code above is a placeholder; each friend gets their own.")
+    /// What the marker is, and a warning when it has been edited away.
+    ///
+    /// The daemon refuses a draft without it — an invite mail with no invite in
+    /// it is one nobody can act on — so saying so here is what turns that
+    /// refusal into something a person can see coming instead of meet.
+    @ViewBuilder
+    private func markerHint(_ availability: InviteAvailability) -> some View {
+        let marker = availability.invite_marker ?? "{{invite}}"
+        if draft.contains(marker) {
+            Text("\(marker) becomes each friend's own link, code and expiry.")
                 .font(Typo.micro)
                 .foregroundStyle(Palette.inkFaintest)
+        } else {
+            Text(
+                "put \(marker) back where the invite should go. without it there is nothing "
+                    + "to accept."
+            )
+            .font(Typo.micro)
+            .foregroundStyle(Palette.warn)
+            .fixedSize(horizontal: false, vertical: true)
         }
     }
 
@@ -220,7 +231,11 @@ struct SharePanel: View {
         !sending
             && !recipients.isEmpty
             && recipients.count <= Self.maxRecipients
-            && note.count <= Self.maxNote
+            && !subject.trimmed.isEmpty
+            && !draft.trimmed.isEmpty
+            // The daemon refuses this too; refusing it here is what keeps a
+            // press from costing a round trip to be told so.
+            && draft.contains(availability?.invite_marker ?? "{{invite}}")
     }
 
     // MARK: - the receipt
@@ -279,7 +294,13 @@ struct SharePanel: View {
 
     private func load() async {
         do {
-            availability = try await APIClient.shared.inviteAvailability()
+            let found = try await APIClient.shared.inviteAvailability()
+            availability = found
+            // SEEDED ONCE. A reload must never overwrite words somebody has
+            // already typed, so the draft is taken only when the fields are
+            // still empty.
+            if subject.isEmpty { subject = found.subject ?? "" }
+            if draft.isEmpty { draft = found.body ?? "" }
             focus = .to
         } catch {
             loadFailed = true
@@ -293,7 +314,7 @@ struct SharePanel: View {
         defer { sending = false }
         do {
             let sent = try await APIClient.shared.sendInvites(
-                to: recipients, note: note.trimmed.isEmpty ? nil : note.trimmed)
+                to: recipients, subject: subject.trimmed, body: draft)
             outcome = sent
             // ONLY WHEN SOMETHING ACTUALLY WENT. A press where every invite
             // failed is not a share, and an `invite_sent` counting it would

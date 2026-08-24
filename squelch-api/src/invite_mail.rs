@@ -1,86 +1,89 @@
-//! The invite mail: what a friend actually receives.
+//! The invite mail: a DRAFT the user edits, and the one block they cannot.
 //!
-//! THIS FILE IS PRODUCT COPY, and it is reviewed as copy rather than as code.
-//! Anything changed here changes what goes out over a user's own name, from
-//! their own mailbox, to somebody who did not ask for it. That is the whole
-//! reason the rules below are rules.
+//! THIS FILE IS PRODUCT COPY, and it is reviewed as copy rather than as code —
+//! but only as a STARTING POINT now. What goes out is whatever the person
+//! pressing send left in the composer, over their own name, from their own
+//! mailbox. What is written here is the draft they open on.
 //!
-//! THE VOICE IS THE USER'S, NOT THE PRODUCT'S. The mail is sent by the user's
-//! Gmail, so it is written in first person and it says as little marketing as
-//! it can get away with. Every sentence in it is one a person could plausibly
-//! have typed. That is not decoration: a marketing email arriving from a
-//! friend's real address is worse than no email, because it spends the friend's
-//! credibility rather than ours.
+//! THE VOICE IS THE USER'S, NOT THE PRODUCT'S, which is why it can be handed
+//! over: the mail is sent by their Gmail and reads as something a person typed,
+//! so letting them actually type it is the honest end of that idea rather than
+//! a departure from it.
 //!
-//! THE NUMBER IS REAL OR IT IS ABSENT. When the copy says "I only need to
-//! manually open about 15% of it", 15 was computed from this user's own mailbox
-//! by [`crate::sharing::share_stat`], which refuses to answer at all unless
-//! there is enough history behind it, enough mail behind it, and the answer is
-//! worth saying. There is no default, no rounded-up guess, and no house
-//! average: with no number the mail uses copy that makes no numeric claim.
-//! See `share_stat` for the one bias that survives every guard.
+//! THE ONE THING THEY DO NOT EDIT IS `{{invite}}`. It expands, per recipient,
+//! into the link, that friend's own code, and the true expiry. A single marker
+//! rather than four, deliberately: everything inside it is a FACT THE DAEMON
+//! GUARANTEES, and prose the user can reword sits outside. Nobody has to be
+//! trusted to keep a link and a code and an expiry in step by hand, and nobody
+//! has to look at four sets of braces to write two sentences.
+//!
+//! MARKDOWN IN, exactly like the composer (`body_format: "markdown"`), and the
+//! HTML half is rendered by [`crate::markdown`] from the same source the
+//! outbound guard scanned. That is not a convenience: it means an invite cannot
+//! carry markup the composer would have refused, and there is no second
+//! renderer here to drift from the first.
+//!
+//! THE NUMBER IS REAL OR IT IS ABSENT. When the draft says "about 15% of it",
+//! 15 came from this user's own mailbox via [`crate::sharing::share_stat`],
+//! which refuses to answer at all without enough history, enough mail, and an
+//! answer worth saying. There is no default and no house average.
 //!
 //! HOUSE COPY RULES: the product is Passband, the voice is lowercase, and there
 //! are no em dashes in anything a person reads.
-//!
-//! WHAT IS NEVER IN HERE: the share token, anything about the sender's mailbox
-//! beyond the one rounded number, and any other recipient. One mail, one
-//! friend, and nobody on it can tell who else was invited.
 
 use crate::gmail_write::ReplyParts;
 
-/// The subject line. First person, because of who it is from.
-const SUBJECT: &str = "I invited you to Passband";
+/// The marker the invite block replaces. Doubled braces because a single brace
+/// is a character people type; this pair is not.
+pub const INVITE_MARKER: &str = "{{invite}}";
 
-/// The opening, when this mailbox produced a number worth quoting. `{percent}`
-/// is a whole number of percent, already rounded and already bounds-checked.
-fn opening_with_stat(percent: u32) -> String {
+/// Where the footer link points. The one piece of branding on a mail that is
+/// otherwise entirely personal, and the only URL in here that is not the
+/// deployment's own.
+const SITE_URL: &str = "https://passband.app";
+
+/// The subject the draft opens on. First person, because of who it is from.
+pub const DEFAULT_SUBJECT: &str = "I invited you to Passband";
+
+/// The body the draft opens on, in markdown.
+///
+/// `open_percent` is this mailbox's real open rate, or `None` when there is no
+/// honest one — in which case the opening makes the same claim in words rather
+/// than in digits, which is the only truthful way to say it without a
+/// measurement behind it.
+pub fn default_body(open_percent: Option<u32>) -> String {
+    let opening = match open_percent {
+        Some(percent) => format!(
+            "I have been using Passband for my email. turns out I only need to manually open \
+             about {percent}% of it, and agents filter out the rest. thought you might find it \
+             useful too."
+        ),
+        None => "I have been using Passband for my email. agents filter out the noise so I only \
+                 open what actually needs me. thought you might find it useful too."
+            .to_string(),
+    };
     format!(
-        "I have been using Passband for my email. turns out I only need to manually open about \
-         {percent}% of it, and agents filter out the rest. thought you might find it useful too."
+        "{opening}
+
+I had an invite spare:
+
+{INVITE_MARKER}
+
+--
+sent with [Passband]({SITE_URL})
+"
     )
 }
 
-/// The opening when there is no honest number to give: a new mailbox, a quiet
-/// one, or one whose owner opens most of their mail anyway.
-///
-/// It makes the same claim in words rather than in digits, which is the only
-/// honest way to say it without a measurement behind it.
-const OPENING_WITHOUT_STAT: &str = "I have been using Passband for my email. agents filter out the noise so I only open what \
-     actually needs me. thought you might find it useful too.";
-
-/// The line above the code.
-const HANDOFF: &str = "I had an invite spare:";
-
-/// The expiry line. A DAY IS NOT DAYS: the copy is a sentence somebody could
-/// have typed, and "one use, 1 days" is a sentence nobody has ever typed.
-fn expiry_line(days: i64) -> String {
-    if days == 1 {
-        "one use, and it expires tomorrow.".to_string()
-    } else {
-        format!("one use, {days} days.")
-    }
-}
-
-/// The footer. The one piece of branding on a mail that is otherwise entirely
-/// personal, and deliberately the quietest thing in it.
-const FOOTER: &str = "sent with Passband";
-
-/// What the mail is made of. Assembled by the caller so that everything
-/// variable is visible in one place and nothing in this module reads the world.
-pub struct InviteCopy<'a> {
+/// What one recipient's invite block expands to.
+pub struct InviteBlock<'a> {
     /// The invite code, `XXXX-XXXX-XXXX-XXXX`.
     pub code: &'a str,
     /// Where it is redeemed, from the control plane rather than hardcoded.
     pub signup_url: &'a str,
-    /// Whole days until the code lapses, from the control plane's own expiry,
-    /// so the mail cannot promise a window the code does not have.
+    /// Whole days until it lapses, from the control plane's own expiry, so the
+    /// mail cannot promise a window the code does not have.
     pub expires_in_days: i64,
-    /// This mailbox's open rate as a whole percent, or `None` when there is no
-    /// honest one. See the module header.
-    pub open_percent: Option<u32>,
-    /// The user's own line, if they wrote one. Their words, above ours.
-    pub note: Option<&'a str>,
 }
 
 /// The one-click link: the signup page with the code already in the field.
@@ -91,11 +94,11 @@ pub struct InviteCopy<'a> {
 /// and single use is what bounds that. The bare code sits below it for the
 /// client that mangles the link, the forwarded copy, and the person finishing
 /// on another device.
-fn invite_link(copy: &InviteCopy<'_>) -> String {
+fn invite_link(block: &InviteBlock<'_>) -> String {
     format!(
         "{}/?invite={}",
-        copy.signup_url.trim_end_matches('/'),
-        percent_encode(copy.code)
+        block.signup_url.trim_end_matches('/'),
+        percent_encode(block.code)
     )
 }
 
@@ -115,108 +118,65 @@ fn percent_encode(s: &str) -> String {
     out
 }
 
-/// The plain-text part, which is also what the guard scans and what the user
-/// is shown as a preview before they send.
+/// The block itself, in markdown.
 ///
-/// The code sits ALONE ON A LINE so that every mail client in the world lets
-/// somebody select it. The link above it is the fast path, not the only one.
-pub fn text_body(copy: &InviteCopy<'_>) -> String {
-    let opening = match copy.open_percent {
-        Some(percent) => opening_with_stat(percent),
-        None => OPENING_WITHOUT_STAT.to_string(),
-    };
-    let note = match copy.note.map(str::trim).filter(|n| !n.is_empty()) {
-        // The user's own words go FIRST and stand alone. Nothing is added to
-        // them, nothing is corrected in them, and the product's copy starts
-        // underneath.
-        Some(note) => format!("{note}\n\n"),
-        None => String::new(),
+/// The code sits in a fenced span on its own line so that every mail client
+/// lets somebody select it, and so the markdown renderer cannot take a dash in
+/// it for anything else. The link above it is the fast path, not the only one.
+fn render_block(block: &InviteBlock<'_>) -> String {
+    let expiry = if block.expires_in_days == 1 {
+        "one use, and it expires tomorrow.".to_string()
+    } else {
+        format!("one use, {} days.", block.expires_in_days)
     };
     format!(
-        "{note}{opening}
-
-{HANDOFF}
-
-{link}
+        "[Set up your mailbox]({link})
 
 or go to {signup} and paste this in:
 
-{code}
+`{code}`
 
-{expiry}
-
---
-{FOOTER}
-",
-        link = invite_link(copy),
-        signup = copy.signup_url,
-        code = copy.code,
-        expiry = expiry_line(copy.expires_in_days),
+{expiry}",
+        link = invite_link(block),
+        signup = block.signup_url,
+        code = block.code,
     )
 }
 
-/// The HTML part.
+/// Put one recipient's invite into the user's draft.
 ///
-/// Everything interpolated is escaped, including the values this daemon
-/// produced itself: "this one was checked already" is how the exception becomes
-/// the rule. The note is the one genuinely user-authored string, and it is
-/// escaped like everything else and rendered as plain lines rather than as
-/// markup, because a mail going out under somebody's name is not a place to
-/// start interpreting formatting.
-///
-/// NO REMOTE IMAGES AND NO MARK. The control plane's own invite mail carries a
-/// wordmark, because it comes from Passband. This one comes from a person, and
-/// a logo in it is exactly the thing that turns a personal note into an ad.
-pub fn html_body(copy: &InviteCopy<'_>) -> String {
-    let opening = escape_html(&match copy.open_percent {
-        Some(percent) => opening_with_stat(percent),
-        None => OPENING_WITHOUT_STAT.to_string(),
-    });
-    let note = match copy.note.map(str::trim).filter(|n| !n.is_empty()) {
-        Some(note) => format!("<p>{}</p>\n", escape_html(note).replace('\n', "<br>\n")),
-        None => String::new(),
-    };
-    let link = escape_html(&invite_link(copy));
-    let code = escape_html(copy.code);
-    let signup = escape_html(copy.signup_url);
-    format!(
-        r#"<div style="font: 16px/1.55 ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; color: #1a1a1a;">
-{note}<p>{opening}</p>
-<p>{HANDOFF}</p>
-<p><a href="{link}" style="display: inline-block; background: #1a1a1a; color: #fbfaf8; text-decoration: none; padding: 12px 22px; border-radius: 8px; font-weight: 500;">Set up your mailbox</a></p>
-<p style="color: #6b6b6b;">or go to <a href="{signup}">{signup}</a> and paste this in:</p>
-<p style="font: 18px/1.4 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; letter-spacing: 0.04em; background: #f3f1ed; border-radius: 8px; padding: 14px 16px; display: inline-block;">{code}</p>
-<p style="color: #6b6b6b;">{expiry}</p>
-<p style="color: #9a9a9a; font-size: 13px; margin-top: 28px;">{FOOTER}</p>
-</div>
-"#,
-        expiry = escape_html(&expiry_line(copy.expires_in_days)),
-    )
+/// Every occurrence, not just the first: somebody who pasted the marker twice
+/// meant it twice, and a half-substituted body would mail a friend the literal
+/// characters `{{invite}}`.
+pub fn fill(body: &str, block: &InviteBlock<'_>) -> String {
+    body.replace(INVITE_MARKER, &render_block(block))
 }
 
-/// Escape text for interpolation into HTML markup. `&` first, or it would
-/// double-escape the entities emitted after it.
-fn escape_html(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-        .replace('\'', "&#39;")
+/// Whether a draft still carries the marker.
+///
+/// Checked before ANY code is minted. An invite mail with no invite in it is a
+/// mail nobody can act on, and a code minted for one is quota the user spent on
+/// nothing.
+pub fn has_marker(body: &str) -> bool {
+    body.contains(INVITE_MARKER)
 }
 
 /// The whole message, ready for [`crate::gmail_write::build_reply_rfc822`].
 ///
 /// A COLD SEND: no `In-Reply-To`, no `References`, no thread. It is a new
 /// conversation with somebody, and threading it onto anything would be wrong.
-pub fn compose(to: &str, copy: &InviteCopy<'_>) -> ReplyParts {
+///
+/// `body` is the FILLED markdown; the HTML half is rendered from it by the same
+/// module the composer's sends go through.
+pub fn compose(to: &str, subject: &str, body: &str) -> ReplyParts {
     ReplyParts {
         to: to.to_string(),
         cc: None,
-        subject: SUBJECT.to_string(),
-        body: text_body(copy),
+        subject: subject.to_string(),
+        body: body.to_string(),
         in_reply_to: None,
         references: None,
-        body_html: Some(html_body(copy)),
+        body_html: Some(crate::markdown::render_email_html(body)),
         // NEVER. A read receipt on an invite would report a stranger's open of
         // a mail they did not ask for, back to somebody they have not agreed to
         // be tracked by. Tracking is per-send and opt-in everywhere else in
@@ -232,98 +192,106 @@ mod tests {
     const CODE: &str = "ABCD-EFGH-JKMN-PQRS";
     const SIGNUP: &str = "https://signup.passband.app";
 
-    fn copy(open_percent: Option<u32>, note: Option<&'static str>) -> InviteCopy<'static> {
-        InviteCopy {
+    fn block() -> InviteBlock<'static> {
+        InviteBlock {
             code: CODE,
             signup_url: SIGNUP,
             expires_in_days: 30,
-            open_percent,
-            note,
         }
     }
 
-    /// Both parts carry the code, the link, and the true expiry, and the code
-    /// is selectable on its own line in the text part.
+    /// The draft the composer opens on: prose, one marker, and a footer that
+    /// links to the site.
     #[test]
-    fn both_parts_carry_the_code_and_where_to_spend_it() {
-        let c = copy(Some(15), None);
-        let text = text_body(&c);
-        let html = html_body(&c);
-        for part in [&text, &html] {
-            assert!(part.contains(CODE), "{part}");
-            assert!(part.contains(SIGNUP), "{part}");
-            assert!(part.contains("one use, 30 days"), "{part}");
-            // House copy rule.
-            assert!(!part.contains('\u{2014}'), "{part}");
-        }
-        assert!(text.contains(&format!("\n\n{CODE}\n\n")), "{text}");
-        assert!(text.contains(&format!("{SIGNUP}/?invite={CODE}")), "{text}");
+    fn the_draft_carries_one_marker_and_a_linked_footer() {
+        let body = default_body(Some(15));
+        assert!(has_marker(&body), "{body}");
+        assert_eq!(body.matches(INVITE_MARKER).count(), 1, "{body}");
+        assert!(body.contains("about 15% of it"), "{body}");
+        assert!(
+            body.contains(&format!("sent with [Passband]({SITE_URL})")),
+            "the footer links to the site: {body}"
+        );
+        // House copy rule.
+        assert!(!body.contains('\u{2014}'), "{body}");
+        // No code, no link, no expiry in the DRAFT: those are facts, and they
+        // arrive per recipient.
+        assert!(!body.contains("one use"), "{body}");
     }
 
-    /// The expiry is the control plane's, not a constant compiled in here: a
-    /// mail that says 30 days while the code lasts 14 is a mail that lies.
-    #[test]
-    fn the_expiry_is_whatever_it_was_told() {
-        let mut c = copy(None, None);
-        c.expires_in_days = 14;
-        assert!(text_body(&c).contains("one use, 14 days"));
-        assert!(html_body(&c).contains("one use, 14 days"));
-    }
-
-    /// One day is not "1 days". The copy has to read like a sentence somebody
-    /// typed, in every branch, including the one nobody looks at.
-    #[test]
-    fn the_last_day_reads_like_a_sentence() {
-        let mut c = copy(None, None);
-        c.expires_in_days = 1;
-        for part in [text_body(&c), html_body(&c)] {
-            assert!(!part.contains("1 days"), "{part}");
-            assert!(part.contains("expires tomorrow"), "{part}");
-        }
-    }
-
-    /// The number appears only when there is one, and the no-number copy makes
+    /// The number appears only when there is one, and the no-number draft makes
     /// no numeric claim at all rather than a softer one.
     #[test]
     fn the_stat_is_present_or_the_sentence_is_different() {
-        let with = text_body(&copy(Some(15), None));
+        let with = default_body(Some(15));
         assert!(with.contains("about 15% of it"), "{with}");
 
-        let without = text_body(&copy(None, None));
+        let without = default_body(None);
         assert!(!without.contains('%'), "{without}");
         assert!(without.contains("filter out the noise"), "{without}");
-        // And no digits smuggled in as words either.
         assert!(!without.contains("percent"), "{without}");
     }
 
-    /// The user's line goes first, in their words, and nothing is added to it.
+    /// Filling puts the link, the code and the true expiry where the marker was
+    /// and leaves everything the user wrote alone.
     #[test]
-    fn a_personal_note_leads_and_is_left_alone() {
-        let text = text_body(&copy(Some(15), Some("thought of you on this one")));
-        assert!(text.starts_with("thought of you on this one\n\n"), "{text}");
-        // Blank and whitespace-only notes are the same as no note.
-        let none = text_body(&copy(Some(15), Some("   \n ")));
-        assert!(none.starts_with("I have been using Passband"), "{none}");
+    fn filling_replaces_the_marker_and_nothing_else() {
+        let draft = "my own words\n\n{{invite}}\n\nand my own sign-off";
+        let filled = fill(draft, &block());
+        assert!(filled.starts_with("my own words"), "{filled}");
+        assert!(filled.ends_with("and my own sign-off"), "{filled}");
+        assert!(!filled.contains(INVITE_MARKER), "{filled}");
+        assert!(filled.contains(CODE), "{filled}");
+        assert!(
+            filled.contains(&format!("{SIGNUP}/?invite={CODE}")),
+            "{filled}"
+        );
+        assert!(filled.contains("one use, 30 days."), "{filled}");
     }
 
-    /// The one genuinely user-authored string cannot become markup. It is going
-    /// into a mail sent from somebody's real address, so a note that closes the
-    /// tag it is inside of is not an option.
+    /// Every occurrence: a half-substituted body would mail somebody the
+    /// literal braces.
     #[test]
-    fn a_note_cannot_carry_markup_into_the_html() {
-        let html = html_body(&copy(None, Some("<script>alert(1)</script> & <b>hi</b>")));
-        assert!(!html.contains("<script>"), "{html}");
-        assert!(!html.contains("<b>hi</b>"), "{html}");
-        assert!(html.contains("&lt;script&gt;"), "{html}");
-        assert!(html.contains("&amp;"), "{html}");
+    fn filling_replaces_every_marker() {
+        let filled = fill("{{invite}} and again {{invite}}", &block());
+        assert!(!filled.contains(INVITE_MARKER), "{filled}");
+        // Counted on the block's own first line, not on the code: the code
+        // appears TWICE inside one block (in the link and on its own), so
+        // counting it would pass for the wrong reason.
+        assert_eq!(filled.matches("Set up your mailbox").count(), 2, "{filled}");
     }
 
-    /// A cold send, and never a tracked one.
+    /// The expiry is the control plane's, not a constant compiled in here, and
+    /// one day is not "1 days".
+    #[test]
+    fn the_expiry_is_whatever_it_was_told() {
+        let mut b = block();
+        b.expires_in_days = 14;
+        assert!(fill(INVITE_MARKER, &b).contains("one use, 14 days."));
+        b.expires_in_days = 1;
+        let last = fill(INVITE_MARKER, &b);
+        assert!(!last.contains("1 days"), "{last}");
+        assert!(last.contains("expires tomorrow"), "{last}");
+    }
+
+    /// A draft with the marker torn out is refused before anything is minted;
+    /// this is the predicate that does it.
+    #[test]
+    fn a_draft_without_the_marker_is_recognisable() {
+        assert!(has_marker(&default_body(None)));
+        assert!(!has_marker("just some words with no invite in them"));
+        // A single brace is a character people type, and is not the marker.
+        assert!(!has_marker("{invite}"));
+    }
+
+    /// The HTML half comes from the composer's own renderer, which is what
+    /// stops an invite carrying markup a composed mail could not.
     #[test]
     fn composes_a_new_conversation_with_no_pixel() {
-        let parts = compose("friend@example.com", &copy(Some(15), None));
+        let filled = fill(&default_body(Some(15)), &block());
+        let parts = compose("friend@example.com", DEFAULT_SUBJECT, &filled);
         assert_eq!(parts.to, "friend@example.com");
-        assert_eq!(parts.subject, SUBJECT);
+        assert_eq!(parts.subject, DEFAULT_SUBJECT);
         assert!(parts.in_reply_to.is_none());
         assert!(parts.references.is_none());
         assert!(parts.cc.is_none());
@@ -331,6 +299,23 @@ mod tests {
             parts.pixel_url.is_none(),
             "an invite must never carry a tracking pixel"
         );
-        assert!(parts.body_html.is_some());
+        let html = parts.body_html.expect("an html alternative");
+        assert!(html.contains(CODE), "{html}");
+        assert!(html.contains(SITE_URL), "the footer link survives: {html}");
+    }
+
+    /// Typed HTML is characters, not markup — the composer's contract, inherited
+    /// here for free by going through the same renderer.
+    #[test]
+    fn a_users_draft_cannot_carry_markup_into_the_html() {
+        let parts = compose(
+            "friend@example.com",
+            DEFAULT_SUBJECT,
+            "<script>alert(1)</script> & <b>hi</b>",
+        );
+        let html = parts.body_html.unwrap();
+        assert!(!html.contains("<script>"), "{html}");
+        assert!(!html.contains("<b>hi</b>"), "{html}");
+        assert!(html.contains("&lt;script&gt;"), "{html}");
     }
 }

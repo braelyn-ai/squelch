@@ -286,14 +286,17 @@ actor APIClient {
     /// request finishing is what tells the user which ones went; giving up on it
     /// early would leave them staring at mail that may or may not have been
     /// sent under their name.
-    func sendInvites(to recipients: [String], note: String?) async throws -> InviteSendResponse {
-        struct Body: Encodable {
+    func sendInvites(to recipients: [String], subject: String, body: String) async throws
+        -> InviteSendResponse
+    {
+        struct Payload: Encodable {
             let recipients: [String]
-            let note: String?
+            let subject: String
+            let body: String
         }
         return try await post(
             "/client/invites",
-            body: Body(recipients: recipients, note: note),
+            body: Payload(recipients: recipients, subject: subject, body: body),
             timeout: 90)
     }
 

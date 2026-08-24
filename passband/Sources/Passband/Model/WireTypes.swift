@@ -577,10 +577,19 @@ struct InviteAvailability: Codable, Sendable, Hashable {
     /// will not help is worse than telling them nothing.
     var reason: String?
     var open_percent: Int?
-    /// The mail as it will go out, rendered by the DAEMON so the preview on
-    /// screen cannot drift from what is sent. Absent when this daemon cannot
-    /// share (there is no mail to preview) and on one too old to render one.
-    var preview: String?
+    /// The DRAFT the composer opens on: the daemon's first version of the mail,
+    /// which the user then edits. Absent when this daemon cannot share, because
+    /// there is no mail to draft.
+    ///
+    /// Written by the daemon rather than the app because the one thing in it
+    /// that must be TRUE - the open rate - is a fact only that machine can
+    /// compute.
+    var subject: String?
+    var body: String?
+    /// The token in `body` that becomes each friend's own invite. Sent rather
+    /// than hardcoded so the composer can name it in its own hint and refuse a
+    /// draft that has lost it, without the two ever disagreeing.
+    var invite_marker: String?
 }
 
 /// One friend's outcome. `error` is copy the daemon wrote for a human; it never

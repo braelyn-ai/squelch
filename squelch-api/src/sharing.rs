@@ -291,7 +291,7 @@ use serde_json::json;
 
 use crate::error::ApiError;
 use crate::handlers::{audit_action, store_call};
-use crate::invite_mail::{self, InviteCopy};
+use crate::invite_mail::{self, InviteBlock};
 use crate::state::ApiState;
 
 /// How many friends one press may reach.
@@ -302,9 +302,11 @@ use crate::state::ApiState;
 /// request can sit on.
 const MAX_RECIPIENTS: usize = 5;
 
-/// Ceiling on the user's own line. Long enough for a sentence or three, short
-/// enough that this is a note and not a newsletter.
-const MAX_NOTE: usize = 500;
+/// Ceilings on what the composer may hand back. Generous - this is an email,
+/// and people write long ones - and present so that a runaway paste is a
+/// refusal rather than something Gmail has to answer for.
+const MAX_SUBJECT: usize = 200;
+const MAX_BODY: usize = 20_000;
 
 /// `POST /client/invites` request body.
 #[derive(Debug, serde::Deserialize)]
@@ -313,8 +315,11 @@ pub struct ShareBody {
     /// sends N separate messages rather than one with N recipients, which is
     /// the difference between an invitation and a mailing list.
     recipients: Vec<String>,
-    /// The user's own line, optional.
-    note: Option<String>,
+    /// The subject, as the user left it.
+    subject: String,
+    /// The body, as the user left it: markdown, carrying the invite marker.
+    /// Everything in it is theirs except what the marker expands to.
+    body: String,
 }
 
 /// One recipient's outcome. The address is echoed back because the client sent
@@ -355,28 +360,21 @@ pub async fn get_invites(State(state): State<ApiState>) -> Result<impl IntoRespo
     })
     .await?;
     let open_percent = share_stat(&rate, chrono::Utc::now());
-    // THE MAIL ITSELF, so the app can show it before anyone presses send.
-    // Rendered by the same function that renders the real one, from a sample
-    // code, because a preview the client wrote in its own words would drift
-    // from what actually goes out - and this mail goes out over the user's own
-    // name, from their own address, which is exactly the case where they are
-    // owed a look at it first.
+    // THE DRAFT, not a preview: the app opens a composer on this and the user
+    // edits it. The daemon writes the first version because the one thing in it
+    // that must be true - the open rate - is a fact only this machine can
+    // compute, and because a client that invented its own copy would drift from
+    // what the product says about itself.
     //
-    // NO NOTE: theirs is not typed yet. It is inserted verbatim at the top of
-    // this text (see `invite_mail::text_body`), which is where the sheet shows
-    // it, so the two agree without the note having to make a round trip per
-    // keystroke.
-    let preview = invite_mail::text_body(&InviteCopy {
-        code: PREVIEW_CODE,
-        signup_url: PREVIEW_SIGNUP_URL,
-        expires_in_days: PREVIEW_EXPIRY_DAYS,
-        open_percent,
-        note: None,
-    });
+    // The invite marker rides in it unexpanded. What replaces it is per
+    // recipient and is not knowable here.
     Ok(Json(json!({
         "can_share": true,
         "open_percent": open_percent,
-        "preview": preview,
+        "subject": invite_mail::DEFAULT_SUBJECT,
+        "body": invite_mail::default_body(open_percent),
+        // The one thing the composer has to be able to say about itself.
+        "invite_marker": invite_mail::INVITE_MARKER,
     })))
 }
 
@@ -394,20 +392,6 @@ fn unavailable_reason(state: &ApiState) -> Option<&'static str> {
     }
     None
 }
-
-/// What the preview stands in with. Shaped like a real code so the block is the
-/// right size on screen, and obviously not one: `XXXX` is not in the Crockford
-/// alphabet, so this can never be mistaken for something to type in.
-const PREVIEW_CODE: &str = "XXXX-XXXX-XXXX-XXXX";
-
-/// And where it would be spent. The real one comes from the control plane per
-/// mint; this is the deployment everybody who can see this screen is on.
-const PREVIEW_SIGNUP_URL: &str = "https://signup.passband.app";
-
-/// The expiry the copy quotes in a preview. The real one is whatever the
-/// control plane stamps on the code it mints; this matches its default, and a
-/// preview being a day out is not a promise anybody acts on.
-const PREVIEW_EXPIRY_DAYS: i64 = 30;
 
 /// `POST /client/invites` - mint a code per friend and mail each of them from
 /// the user's own mailbox.
@@ -461,39 +445,45 @@ pub async fn post_invites(
             return Err(ApiError::bad_request("that is not an email address"));
         }
     }
-    let note = body
-        .note
-        .map(|n| n.trim().to_string())
-        .filter(|n| !n.is_empty());
-    if note.as_ref().is_some_and(|n| n.chars().count() > MAX_NOTE) {
+    let subject = body.subject.trim().to_string();
+    let draft = body.body.trim().to_string();
+    if subject.is_empty() || draft.is_empty() {
+        return Err(ApiError::bad_request(
+            "an invite needs a subject and a body",
+        ));
+    }
+    if subject.chars().count() > MAX_SUBJECT || draft.chars().count() > MAX_BODY {
+        return Err(ApiError::bad_request("that invite is longer than an email"));
+    }
+    // AN INVITE WITH NO INVITE IN IT is a mail nobody can act on, and a code
+    // minted for one is quota spent on nothing. Refused here, with every other
+    // free refusal, so it costs no code to find out.
+    if !invite_mail::has_marker(&draft) {
         return Err(ApiError::bad_request(format!(
-            "a note is at most {MAX_NOTE} characters"
+            "the body needs {} where each friend's invite goes",
+            invite_mail::INVITE_MARKER
         )));
     }
-    // THE SAME OUTBOUND GUARD EVERY OTHER SEND PASSES. The note is free text
-    // the user typed, and this send is no less real than the ones they compose
-    // by hand; a pasted API key on its way out is exactly what the guard is
-    // for. Kinds only, never the matched text.
-    if let Some(note) = note.as_deref() {
-        let matches = crate::guard::scan_kinds(note);
-        if !matches.is_empty() {
-            audit_action(&state, "invite", None, "rejected:guard").await;
-            return Err(ApiError::bad_request(
-                "that note looks like it has a secret in it",
-            ));
-        }
+    // THE SAME OUTBOUND GUARD EVERY OTHER SEND PASSES, over the WHOLE draft now
+    // rather than one note: every word of it is text the user typed, this send
+    // is no less real than one they compose by hand, and a pasted key on its
+    // way out is exactly what the guard is for. Kinds only, never the matched
+    // text. The subject rides along - it is as outbound as the body.
+    if !crate::guard::scan_kinds(&draft).is_empty()
+        || !crate::guard::scan_kinds(&subject).is_empty()
+    {
+        audit_action(&state, "invite", None, "rejected:guard").await;
+        return Err(ApiError::bad_request(
+            "that draft looks like it has a secret in it",
+        ));
     }
 
     // Before any mint: a code minted with no way to mail it is spent quota.
     let client = crate::handlers::write_client(&state)?;
 
-    let since = chrono::Utc::now() - chrono::Duration::days(STAT_WINDOW_DAYS);
-    let rate = store_call(&state, move |store, account_id| {
-        store.share_open_rate(account_id, since)
-    })
-    .await?;
-    let open_percent = share_stat(&rate, chrono::Utc::now());
-
+    // NO OPEN RATE ON THIS PATH. It shaped the DRAFT, back when the composer was
+    // opened; by now the words are the user's, and recomputing the number here
+    // could only disagree with what is on their screen.
     let mut results = Vec::with_capacity(recipients.len());
     let mut remaining: Option<i64> = None;
     let mut queue = recipients.into_iter();
@@ -529,14 +519,16 @@ pub async fn post_invites(
         };
         remaining = Some(minted.remaining);
 
-        let copy = InviteCopy {
-            code: &minted.code,
-            signup_url: &minted.signup_url,
-            expires_in_days: days_until(&minted.expires_at),
-            open_percent,
-            note: note.as_deref(),
-        };
-        let parts = invite_mail::compose(&email, &copy);
+        // THE USER'S DRAFT, with this friend's own invite where the marker was.
+        let filled = invite_mail::fill(
+            &draft,
+            &InviteBlock {
+                code: &minted.code,
+                signup_url: &minted.signup_url,
+                expires_in_days: days_until(&minted.expires_at),
+            },
+        );
+        let parts = invite_mail::compose(&email, &subject, &filled);
         let raw = match crate::gmail_write::build_reply_rfc822(&parts) {
             Ok(raw) => raw,
             Err(_) => {

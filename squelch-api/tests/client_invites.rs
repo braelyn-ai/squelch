@@ -167,7 +167,7 @@ async fn a_daemon_with_no_control_plane_cannot_share() {
         .oneshot(authed_json(
             "POST",
             "/client/invites",
-            json!({ "recipients": ["friend@example.com"] }),
+            json!({ "recipients": ["friend@example.com"], "subject": "s", "body": "{{invite}}" }),
         ))
         .await
         .unwrap();
@@ -213,7 +213,7 @@ async fn a_daemon_that_cannot_send_mail_cannot_share_either() {
         .oneshot(authed_json(
             "POST",
             "/client/invites",
-            json!({ "recipients": ["friend@example.com"] }),
+            json!({ "recipients": ["friend@example.com"], "subject": "s", "body": "{{invite}}" }),
         ))
         .await
         .unwrap();
@@ -235,7 +235,8 @@ async fn the_minted_code_reaches_the_friend_and_the_friend_never_reaches_the_con
         .oneshot(authed_json(
             "POST",
             "/client/invites",
-            json!({ "recipients": ["friend@example.com"], "note": "thought of you" }),
+            json!({ "recipients": ["friend@example.com"], "subject": "come try this",
+                     "body": "thought of you\n\n{{invite}}" }),
         ))
         .await
         .unwrap();
@@ -254,12 +255,12 @@ async fn the_minted_code_reaches_the_friend_and_the_friend_never_reaches_the_con
     // decoded message rather than on the wire bytes.
     let decoded = decode_sent_raw(raw);
     assert!(decoded.contains("To: friend@example.com"), "{decoded}");
-    assert!(
-        decoded.contains("Subject: I invited you to Passband"),
-        "{decoded}"
-    );
-    assert!(decoded.contains(CODE), "{decoded}");
+    // THE USER'S SUBJECT AND THE USER'S WORDS, not the daemon's draft.
+    assert!(decoded.contains("Subject: come try this"), "{decoded}");
     assert!(decoded.contains("thought of you"), "{decoded}");
+    // And the marker replaced by this friend's own invite.
+    assert!(decoded.contains(CODE), "{decoded}");
+    assert!(!decoded.contains("{{invite}}"), "{decoded}");
     // A cold send: it joins no conversation.
     assert!(!decoded.contains("In-Reply-To:"), "{decoded}");
 
@@ -277,7 +278,7 @@ async fn the_minted_code_reaches_the_friend_and_the_friend_never_reaches_the_con
     );
     assert!(
         !mint_body.contains("thought of you"),
-        "and neither must the note: {mint_body}"
+        "and neither must what they wrote: {mint_body}"
     );
 }
 
@@ -304,7 +305,8 @@ async fn one_failure_does_not_take_the_others_with_it() {
         .oneshot(authed_json(
             "POST",
             "/client/invites",
-            json!({ "recipients": ["a@example.com", "b@example.com", "c@example.com"] }),
+            json!({ "recipients": ["a@example.com", "b@example.com", "c@example.com"],
+                     "subject": "s", "body": "{{invite}}" }),
         ))
         .await
         .unwrap();
@@ -331,7 +333,8 @@ async fn a_quota_refusal_still_answers_for_every_name() {
         .oneshot(authed_json(
             "POST",
             "/client/invites",
-            json!({ "recipients": ["a@example.com", "b@example.com", "c@example.com"] }),
+            json!({ "recipients": ["a@example.com", "b@example.com", "c@example.com"],
+                     "subject": "s", "body": "{{invite}}" }),
         ))
         .await
         .unwrap();
@@ -360,13 +363,26 @@ async fn nothing_is_minted_for_a_request_that_could_never_send() {
     let h = sharing_app(Some(control), gmail);
 
     for body in [
-        json!({ "recipients": [] }),
-        json!({ "recipients": ["   "] }),
-        json!({ "recipients": ["not-an-address"] }),
-        json!({ "recipients": ["a@x.test", "b@x.test", "c@x.test", "d@x.test", "e@x.test", "f@x.test"] }),
-        // A note with a secret in it: the same outbound guard every other send
+        json!({ "recipients": [], "subject": "s", "body": "{{invite}}" }),
+        json!({ "recipients": ["   "], "subject": "s", "body": "{{invite}}" }),
+        json!({ "recipients": ["not-an-address"], "subject": "s", "body": "{{invite}}" }),
+        json!({ "recipients": ["a@x.test", "b@x.test", "c@x.test", "d@x.test", "e@x.test", "f@x.test"],
+                "subject": "s", "body": "{{invite}}" }),
+        // An empty draft is not a mail.
+        json!({ "recipients": ["a@x.test"], "subject": "", "body": "{{invite}}" }),
+        json!({ "recipients": ["a@x.test"], "subject": "s", "body": "   " }),
+        // A DRAFT WITH THE MARKER TORN OUT. An invite mail with no invite in it
+        // is one nobody can act on, and minting a code for it would spend quota
+        // on nothing.
+        json!({ "recipients": ["a@x.test"], "subject": "s", "body": "just some words" }),
+        // A secret in the draft: the same outbound guard every other send
         // passes, on a send that is no less real for being an invite.
-        json!({ "recipients": ["a@x.test"], "note": "my key is sk-ant-api03-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" }),
+        json!({ "recipients": ["a@x.test"], "subject": "s",
+                "body": "my key is sk-ant-api03-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA {{invite}}" }),
+        // And in the subject, which is as outbound as the body.
+        json!({ "recipients": ["a@x.test"],
+                "subject": "sk-ant-api03-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+                "body": "{{invite}}" }),
     ] {
         let resp = h
             .app
@@ -396,7 +412,8 @@ async fn a_repeated_name_is_one_invite() {
         .oneshot(authed_json(
             "POST",
             "/client/invites",
-            json!({ "recipients": ["Friend@Example.com", "friend@example.com", "  "] }),
+            json!({ "recipients": ["Friend@Example.com", "friend@example.com", "  "],
+                     "subject": "s", "body": "{{invite}}" }),
         ))
         .await
         .unwrap();
@@ -406,10 +423,10 @@ async fn a_repeated_name_is_one_invite() {
     assert_eq!(sends.await.unwrap().len(), 1);
 }
 
-/// The preview is the real copy, rendered by the daemon, so the app cannot show
-/// one thing and send another.
+/// The GET hands back a DRAFT the composer opens on, with the marker in it and
+/// the footer linking to the site.
 #[tokio::test]
-async fn the_preview_is_the_mail() {
+async fn the_get_hands_back_an_editable_draft() {
     let (control, _log) = spawn_control(vec![]).await;
     let (gmail, _g) = mock_gmail(0).await;
     let h = sharing_app(Some(control), gmail);
@@ -422,13 +439,20 @@ async fn the_preview_is_the_mail() {
         .unwrap();
     let body = body_json(resp).await;
     assert_eq!(body["can_share"], true);
-    let preview = body["preview"].as_str().expect("a preview came back");
-    assert!(preview.contains("Passband"), "{preview}");
-    assert!(preview.contains("XXXX-XXXX-XXXX-XXXX"), "{preview}");
-    assert!(preview.contains("one use"), "{preview}");
+    assert_eq!(body["subject"], "I invited you to Passband");
+    assert_eq!(body["invite_marker"], "{{invite}}");
+    let draft = body["body"].as_str().expect("a draft came back");
+    assert!(draft.contains("{{invite}}"), "{draft}");
+    assert!(
+        draft.contains("[Passband](https://passband.app)"),
+        "the footer links to the site: {draft}"
+    );
     // A fresh in-memory store has no mail, so there is no honest number and the
-    // copy makes no numeric claim.
-    assert!(!preview.contains('%'), "{preview}");
+    // draft makes no numeric claim.
+    assert!(!draft.contains('%'), "{draft}");
+    // And no code, link or expiry: those are per recipient, and they arrive
+    // with the marker's expansion.
+    assert!(!draft.contains("one use"), "{draft}");
 }
 
 /// The open ledger is written by the CLIENT saying so, not by serving a thread:
@@ -514,7 +538,9 @@ async fn the_bearer_layer_wraps_both_routes() {
             .method("POST")
             .uri("/client/invites")
             .header(header::CONTENT_TYPE, "application/json")
-            .body(Body::from(r#"{"recipients":["a@x.test"]}"#))
+            .body(Body::from(
+                r#"{"recipients":["a@x.test"],"subject":"s","body":"{{invite}}"}"#,
+            ))
             .unwrap(),
     ] {
         let resp = h.app.clone().oneshot(req).await.unwrap();
