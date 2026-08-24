@@ -569,6 +569,13 @@ struct StoreStats: Codable, Sendable, Hashable {
 /// quoting). The sheet must have copy for both, and it must never invent one.
 struct InviteAvailability: Codable, Sendable, Hashable {
     var can_share: Bool
+    /// WHY not, when `can_share` is false. `no_control_plane` is a property of
+    /// the deployment and nothing the reader can act on; `no_write_credential`
+    /// names a command that fixes it. Absent when sharing is possible, and on a
+    /// daemon too old to say — which the sheet reads as the first, the more
+    /// conservative of the two, because telling somebody to run a command that
+    /// will not help is worse than telling them nothing.
+    var reason: String?
     var open_percent: Int?
     /// The mail as it will go out, rendered by the DAEMON so the preview on
     /// screen cannot drift from what is sent. Absent when this daemon cannot

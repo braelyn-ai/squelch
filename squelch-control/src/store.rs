@@ -895,6 +895,72 @@ impl ControlStore {
         .transpose()
     }
 
+    /// Mint one code against this tenant's quota, ATOMICALLY.
+    ///
+    /// Returns how many codes are left in the window afterwards, or `None` when
+    /// the quota was already spent and nothing was written.
+    ///
+    /// ONE TRANSACTION, AND IT TAKES A ROW LOCK FIRST, because counting and
+    /// then inserting is not a quota. Two requests presenting the same share
+    /// token can read the same count and both insert, and the overshoot is
+    /// however many of them arrive at once: fine for a person pressing a button
+    /// on two devices, and not fine at all for the case the quota actually
+    /// guards, which is somebody who has taken a share token and can issue a
+    /// hundred requests in parallel. `SELECT ... FOR UPDATE` on the tenant row
+    /// serializes exactly the mints that share a tenant and blocks nothing
+    /// else.
+    ///
+    /// The lock is on `tenants`, not on `invite_codes`: there is no row in the
+    /// latter to lock before the insert, and locking the table would serialize
+    /// every tenant's mints against each other.
+    pub async fn mint_shared_invite(
+        &self,
+        tenant_id: i64,
+        code_hash: &str,
+        expires_at: DateTime<Utc>,
+        window_start: DateTime<Utc>,
+        limit: i64,
+    ) -> Result<Option<i64>> {
+        let mut client = self.client().await?;
+        let tx = client.transaction().await?;
+        // The gate. A tenant that vanished mid-request locks nothing and mints
+        // nothing, which is the same refusal an unknown token gets.
+        if tx
+            .query_opt(
+                "SELECT id FROM tenants WHERE id = $1 FOR UPDATE",
+                &[&tenant_id],
+            )
+            .await?
+            .is_none()
+        {
+            return Ok(None);
+        }
+        let used: i64 = tx
+            .query_one(
+                "SELECT COUNT(*) FROM invite_codes
+                  WHERE invited_by = $1 AND created_at >= $2",
+                &[&tenant_id, &stamp(window_start)],
+            )
+            .await?
+            .try_get(0)?;
+        if used >= limit {
+            return Ok(None);
+        }
+        tx.execute(
+            "INSERT INTO invite_codes(code_hash, created_at, expires_at, invited_by)
+             VALUES($1, $2, $3, $4)",
+            &[
+                &code_hash,
+                &stamp(Utc::now()),
+                &stamp(expires_at),
+                &tenant_id,
+            ],
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(Some(limit - (used + 1)))
+    }
+
     /// How many codes this tenant has minted since `since`. The quota, counted
     /// rather than stored.
     ///
@@ -1219,7 +1285,29 @@ async fn migrate(tx: &Transaction<'_>) -> Result<()> {
     add_missing_columns(tx, "invite_codes", &ADDED_COLUMNS).await?;
     add_missing_columns(tx, "tenants", &TENANT_ADDED_COLUMNS).await?;
     add_share_token_index(tx).await?;
+    add_invited_by_index(tx).await?;
     backfill_expiry(tx).await
+}
+
+/// The index behind the share quota's `COUNT`.
+///
+/// HERE RATHER THAN IN [`SCHEMA`] for the same reason the share-token index is:
+/// the column arrives by migration, and an index over it would fail on every
+/// database that predates it.
+///
+/// PARTIAL, so it holds only the shared codes: every invite an operator minted
+/// carries NULL here, and those are the majority today. It earns its place
+/// because the count runs inside the transaction that takes the tenant's row
+/// lock ([`ControlStore::mint_shared_invite`]) — a sequential scan there is
+/// lock held over a growing table rather than merely a slow read.
+async fn add_invited_by_index(tx: &Transaction<'_>) -> Result<()> {
+    tx.execute(
+        "CREATE INDEX IF NOT EXISTS idx_invite_codes_invited_by
+             ON invite_codes(invited_by, created_at) WHERE invited_by IS NOT NULL",
+        &[],
+    )
+    .await?;
+    Ok(())
 }
 
 /// The point-lookup index behind [`ControlStore::tenant_by_share_token`], and
@@ -2275,6 +2363,112 @@ SQUELCH_TEST_PG_URL is not set, and these tests run against a real Postgres.
                 .unwrap()
                 .is_none()
         );
+    }
+
+    /// The quota is enforced in the SAME transaction that mints, so requests
+    /// racing on one share token cannot walk past it together.
+    ///
+    /// The check-then-insert this replaced was fine for a person pressing a
+    /// button twice and useless against the case the quota exists for: somebody
+    /// holding a stolen share token who can issue a hundred requests at once,
+    /// every one of them reading the same count.
+    #[tokio::test]
+    async fn concurrent_mints_cannot_outrun_the_quota() {
+        let s = std::sync::Arc::new(store().await);
+        s.insert_tenant("ada", "ada@example.com").await.unwrap();
+        let ada = tenant_id(&s, "ada").await;
+        let now = now();
+        let window = now - days(share::QUOTA_WINDOW_DAYS);
+        let limit = 5;
+
+        // Twenty at once against a limit of five. Without the row lock this
+        // lands somewhere between six and twenty.
+        let mut set = tokio::task::JoinSet::new();
+        for _ in 0..20 {
+            let s = s.clone();
+            set.spawn(async move {
+                s.mint_shared_invite(
+                    ada,
+                    &invites::mint().unwrap().code_hash,
+                    now + days(30),
+                    window,
+                    limit,
+                )
+                .await
+                .unwrap()
+            });
+        }
+        let mut minted = 0;
+        while let Some(res) = set.join_next().await {
+            if res.unwrap().is_some() {
+                minted += 1;
+            }
+        }
+        assert_eq!(
+            minted, limit,
+            "exactly the limit, however many raced for it"
+        );
+        assert_eq!(s.share_quota_used(ada, window).await.unwrap(), limit);
+    }
+
+    /// The `remaining` it hands back counts down to zero and stops, so the copy
+    /// built on it ("3 invites left") is never a lie.
+    #[tokio::test]
+    async fn a_mint_reports_what_is_left_after_it() {
+        let s = store().await;
+        s.insert_tenant("ada", "ada@example.com").await.unwrap();
+        let ada = tenant_id(&s, "ada").await;
+        let now = now();
+        let window = now - days(share::QUOTA_WINDOW_DAYS);
+
+        for expected in (0..3).rev() {
+            let left = s
+                .mint_shared_invite(
+                    ada,
+                    &invites::mint().unwrap().code_hash,
+                    now + days(30),
+                    window,
+                    3,
+                )
+                .await
+                .unwrap();
+            assert_eq!(left, Some(expected));
+        }
+        assert_eq!(
+            s.mint_shared_invite(
+                ada,
+                &invites::mint().unwrap().code_hash,
+                now + days(30),
+                window,
+                3
+            )
+            .await
+            .unwrap(),
+            None,
+            "the next one is refused and writes nothing"
+        );
+        assert_eq!(s.share_quota_used(ada, window).await.unwrap(), 3);
+    }
+
+    /// A tenant that vanished mid-request mints nothing, which is the same
+    /// refusal an unknown token gets.
+    #[tokio::test]
+    async fn a_mint_for_a_tenant_that_is_not_there_writes_nothing() {
+        let s = store().await;
+        let now = now();
+        assert_eq!(
+            s.mint_shared_invite(
+                9_999,
+                &invites::mint().unwrap().code_hash,
+                now + days(30),
+                now - days(30),
+                10
+            )
+            .await
+            .unwrap(),
+            None
+        );
+        assert!(s.list_invites().await.unwrap().is_empty());
     }
 
     /// The quota counts this tenant's codes inside the window and nobody

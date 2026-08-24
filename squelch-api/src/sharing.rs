@@ -108,6 +108,39 @@ pub struct MintedInvite {
     pub remaining: i64,
 }
 
+impl MintedInvite {
+    /// Whether this answer is one we are willing to put in somebody's mail.
+    ///
+    /// Bounds and a transport check, not a grammar: the daemon does not decide
+    /// what a code looks like (the control plane mints it and may change the
+    /// alphabet), only that what came back is small enough to be one and that
+    /// the URL beside it is somewhere a browser should be sent. `https`
+    /// anywhere, plain `http` only on loopback, which is the same bar
+    /// `Stage2Config::validated_base_url` holds a gateway URL to and for the
+    /// same reason: a dev mock is loopback, and everything else is the wire.
+    fn is_usable(&self) -> bool {
+        (1..=MAX_CODE_LEN).contains(&self.code.len())
+            && self.code.bytes().all(|b| b.is_ascii_graphic())
+            && is_web_url(&self.signup_url)
+    }
+}
+
+/// Ceiling on a code. A real one is 19 characters; this is far above that and
+/// far below "a megabyte in an email".
+const MAX_CODE_LEN: usize = 128;
+
+/// Where a link in an invite may point: https anywhere, http only on loopback.
+fn is_web_url(url: &str) -> bool {
+    if url.len() > 512 || !url.bytes().all(|b| b.is_ascii_graphic()) {
+        return false;
+    }
+    if let Some(rest) = url.strip_prefix("https://") {
+        return !rest.is_empty();
+    }
+    url.strip_prefix("http://")
+        .is_some_and(|rest| rest.starts_with("127.0.0.1") || rest.starts_with("localhost"))
+}
+
 /// Why a mint did not happen. Each maps to copy the app shows; nothing here
 /// carries a code, a token, or an address.
 #[derive(Debug, thiserror::Error)]
@@ -175,7 +208,20 @@ impl Sharing {
         match resp.status().as_u16() {
             200 => {
                 let body = read_capped(resp).await?;
-                serde_json::from_slice(&body).map_err(|_| ShareError::Unreachable)
+                let minted: MintedInvite =
+                    serde_json::from_slice(&body).map_err(|_| ShareError::Unreachable)?;
+                // THE CONTROL PLANE'S ANSWER IS UNTRUSTED INPUT, even though the
+                // control plane is ours. This is the rule `squelch_control`'s
+                // own warden client keeps about the warden ("its `deep_link`
+                // would become an `href`, so it is shape-checked here"), and it
+                // applies harder in this direction: what comes back becomes a
+                // LINK IN A MAIL SENT FROM THE USER'S OWN ADDRESS. A control
+                // plane that had been tampered with could otherwise put any URL
+                // it liked in front of that person's friends, over their name.
+                if !minted.is_usable() {
+                    return Err(ShareError::Unreachable);
+                }
+                Ok(minted)
             }
             401 | 403 => Err(ShareError::Unauthorized),
             429 => Err(ShareError::QuotaExhausted),
@@ -288,8 +334,17 @@ struct ShareResult {
 /// The app asks before it shows anything, so a self-hosted daemon and a tenant
 /// nobody has run `share mint` for never render a button that could only fail.
 pub async fn get_invites(State(state): State<ApiState>) -> Result<impl IntoResponse, ApiError> {
-    if state.sharing().is_none() {
-        return Ok(Json(json!({ "can_share": false })));
+    // TWO THINGS HAVE TO BE TRUE, and the second one is easy to forget because
+    // on hosted it always is: this daemon needs somewhere to mint a code AND
+    // the ability to send mail as the user. A daemon with a control plane and
+    // no write credential would answer `can_share: true` and then 403 every
+    // press, which is the one thing this route exists to prevent.
+    //
+    // The reason is named, rather than collapsed into the boolean, because the
+    // app's copy for the two is different and only one of them is fixable by
+    // the person reading it.
+    if let Some(reason) = unavailable_reason(&state) {
+        return Ok(Json(json!({ "can_share": false, "reason": reason })));
     }
     // The rate is read even when it will not clear the floor: `share_stat` is
     // the only thing that decides whether there is a number, and it decides it
@@ -323,6 +378,21 @@ pub async fn get_invites(State(state): State<ApiState>) -> Result<impl IntoRespo
         "open_percent": open_percent,
         "preview": preview,
     })))
+}
+
+/// Why this daemon cannot share, or `None` when it can.
+///
+/// Two reasons, and they are told apart because the copy is: one is a property
+/// of the deployment (nothing the user can do), and the other names a command
+/// whose whole job is to fix it.
+fn unavailable_reason(state: &ApiState) -> Option<&'static str> {
+    if state.sharing().is_none() {
+        return Some("no_control_plane");
+    }
+    if state.write_creds().is_none() {
+        return Some("no_write_credential");
+    }
+    None
 }
 
 /// What the preview stands in with. Shaped like a real code so the block is the
@@ -363,11 +433,16 @@ pub async fn post_invites(
         ));
     };
 
+    // DEDUPED, case-insensitively, and before the count is checked. A pasted
+    // list with a repeat in it would otherwise mint two codes for one person,
+    // mail them twice, and spend two of their friend's invites doing it.
+    let mut seen = std::collections::HashSet::new();
     let recipients: Vec<String> = body
         .recipients
         .iter()
         .map(|r| r.trim().to_string())
         .filter(|r| !r.is_empty())
+        .filter(|r| seen.insert(r.to_ascii_lowercase()))
         .collect();
     if recipients.is_empty() {
         return Err(ApiError::bad_request(
@@ -596,6 +671,43 @@ mod tests {
         let now = Utc::now();
         assert_eq!(share_stat(&rate(1000, 0, 90), now), Some(STAT_ROUNDING));
         assert_eq!(share_stat(&rate(1000, 1, 90), now), Some(STAT_ROUNDING));
+    }
+
+    fn answer(code: &str, signup_url: &str) -> MintedInvite {
+        MintedInvite {
+            code: code.into(),
+            signup_url: signup_url.into(),
+            expires_at: "2026-09-23T00:00:00Z".into(),
+            remaining: 9,
+        }
+    }
+
+    /// The control plane's answer becomes a link in a mail sent from the user's
+    /// own address, so it is checked before it is used. Ours today; untrusted
+    /// input regardless.
+    #[test]
+    fn refuses_a_mint_answer_it_will_not_put_in_somebodys_mail() {
+        assert!(answer("ABCD-EFGH-JKMN-PQRS", "https://signup.passband.app").is_usable());
+        // A dev mock on loopback is the one plain-http exception.
+        assert!(answer("ABCD", "http://127.0.0.1:8080").is_usable());
+
+        for bad in [
+            // Anywhere but the wire, over plain http.
+            answer("ABCD", "http://evil.test"),
+            answer("ABCD", "ftp://evil.test"),
+            answer("ABCD", "javascript:alert(1)"),
+            answer("ABCD", "https://"),
+            answer("ABCD", ""),
+            // A code that is not one.
+            answer("", "https://signup.passband.app"),
+            answer(&"A".repeat(MAX_CODE_LEN + 1), "https://signup.passband.app"),
+            // Whitespace and control bytes: a header injection somewhere else's
+            // problem, and a broken mail here.
+            answer("ABCD EFGH", "https://signup.passband.app"),
+            answer("ABCD\r\nX", "https://signup.passband.app"),
+        ] {
+            assert!(!bad.is_usable(), "{}", bad.signup_url);
+        }
     }
 
     /// The resolver's absent cases, which are every self-hosted daemon.

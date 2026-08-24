@@ -86,9 +86,9 @@ pub struct InviteMinted {
 
 /// `POST /tenant/invite` - mint one invite code for the presenting tenant.
 ///
-/// The order is deliberate and it is the same order [`crate::handlers::signup`]
-/// uses: everything that can refuse runs BEFORE anything is written, so a
-/// refusal leaves no row behind and a retry is free.
+/// Every refusal leaves NO ROW BEHIND, so a retry is free. The one thing that
+/// happens before the last refusal is the mint itself, and a code that is only
+/// a string in this process is not a row; see the comment at that line.
 pub async fn invite(state: State<ControlState>, headers: axum::http::HeaderMap) -> Response {
     let State(state) = state;
 
@@ -106,26 +106,14 @@ pub async fn invite(state: State<ControlState>, headers: axum::http::HeaderMap) 
         return refuse(StatusCode::UNAUTHORIZED, UNAUTHORIZED);
     };
 
-    let window_start = Utc::now() - chrono::Duration::days(share::QUOTA_WINDOW_DAYS);
-    let used = match state
-        .store()
-        .share_quota_used(sharer.id, window_start)
-        .await
-    {
-        Ok(n) => n,
-        Err(e) => {
-            tracing::error!(error = %e, label = %sharer.label, "reading a share quota failed");
-            return refuse(StatusCode::SERVICE_UNAVAILABLE, UNAVAILABLE);
-        }
-    };
-    if used >= share::QUOTA_PER_WINDOW {
-        // The label may be logged; the mailbox behind it may not.
-        tracing::info!(label = %sharer.label, used, "share quota exhausted");
-        return refuse(StatusCode::TOO_MANY_REQUESTS, QUOTA_EXHAUSTED);
-    }
-
     // ---- from here on, the half that writes ----
-
+    //
+    // THE CODE IS MINTED BEFORE THE QUOTA IS CHECKED, which looks backwards and
+    // is not. The quota check and the insert have to be ONE transaction (see
+    // [`crate::store::ControlStore::mint_shared_invite`]), so the hash it
+    // inserts has to exist before it is called. A code minted and then refused
+    // by the quota is a string this process drops on the floor: nothing was
+    // written, nobody was told, and the entropy cost is a few dozen bytes.
     let minted = match invites::mint() {
         Ok(m) => m,
         Err(_) => {
@@ -134,18 +122,33 @@ pub async fn invite(state: State<ControlState>, headers: axum::http::HeaderMap) 
         }
     };
     let expires_at = Utc::now() + chrono::Duration::days(invites::DEFAULT_TTL_DAYS);
-    if let Err(e) = state
+    let window_start = Utc::now() - chrono::Duration::days(share::QUOTA_WINDOW_DAYS);
+    let remaining = match state
         .store()
-        .insert_invite(&minted.code_hash, expires_at, Some(sharer.id))
+        .mint_shared_invite(
+            sharer.id,
+            &minted.code_hash,
+            expires_at,
+            window_start,
+            share::QUOTA_PER_WINDOW,
+        )
         .await
     {
-        tracing::error!(error = %e, label = %sharer.label, "recording a shared invite failed");
-        return refuse(StatusCode::SERVICE_UNAVAILABLE, UNAVAILABLE);
-    }
+        Ok(Some(remaining)) => remaining,
+        Ok(None) => {
+            // The label may be logged; the mailbox behind it may not.
+            tracing::info!(label = %sharer.label, "share quota exhausted");
+            return refuse(StatusCode::TOO_MANY_REQUESTS, QUOTA_EXHAUSTED);
+        }
+        Err(e) => {
+            tracing::error!(error = %e, label = %sharer.label, "recording a shared invite failed");
+            return refuse(StatusCode::SERVICE_UNAVAILABLE, UNAVAILABLE);
+        }
+    };
 
     // PRIVACY: the label and a count. Never the code, and never the mailbox
     // this tenant is about to send it to, which this process was never told.
-    tracing::info!(label = %sharer.label, used = used + 1, "invite shared");
+    tracing::info!(label = %sharer.label, remaining, "invite shared");
 
     (
         StatusCode::OK,
@@ -153,7 +156,7 @@ pub async fn invite(state: State<ControlState>, headers: axum::http::HeaderMap) 
             code: minted.code,
             signup_url: state.config().public_url.clone(),
             expires_at: expires_at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
-            remaining: share::QUOTA_PER_WINDOW - (used + 1),
+            remaining,
         }),
     )
         .into_response()

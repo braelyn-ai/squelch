@@ -156,6 +156,7 @@ async fn a_daemon_with_no_control_plane_cannot_share() {
     assert_eq!(resp.status(), StatusCode::OK);
     let body = body_json(resp).await;
     assert_eq!(body["can_share"], false);
+    assert_eq!(body["reason"], "no_control_plane");
     // No mail to preview, because there is no mail.
     assert!(body["preview"].is_null(), "{body}");
 
@@ -171,6 +172,52 @@ async fn a_daemon_with_no_control_plane_cannot_share() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+/// A daemon that can MINT but cannot SEND is not a daemon that can share, and
+/// the two refusals are told apart because only one of them names a command
+/// that fixes it.
+///
+/// On hosted this cannot happen (signup asks for all three Gmail scopes in one
+/// consent), which is exactly why it is worth a test: the case nobody meets is
+/// the case nobody notices breaking.
+#[tokio::test]
+async fn a_daemon_that_cannot_send_mail_cannot_share_either() {
+    let (control, _log) = spawn_control(vec![]).await;
+    // The full harness minus the write credential: sharing configured, no way
+    // to send.
+    let (state, store, acct) = common::state_with(|_, _| {});
+    let state: ApiState =
+        state.with_sharing(squelch_api::Sharing::new(control, "pbs_share_token".into()));
+    let h = Harness {
+        app: router(state),
+        store,
+        acct,
+    };
+
+    let body = body_json(
+        h.app
+            .clone()
+            .oneshot(authed("GET", "/client/invites"))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(body["can_share"], false, "{body}");
+    assert_eq!(body["reason"], "no_write_credential");
+
+    // And the POST refuses on the same fact, before minting anything.
+    let resp = h
+        .app
+        .clone()
+        .oneshot(authed_json(
+            "POST",
+            "/client/invites",
+            json!({ "recipients": ["friend@example.com"] }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
 }
 
 /// The whole seam, end to end: the code the control plane minted is the code in
@@ -333,6 +380,30 @@ async fn nothing_is_minted_for_a_request_that_could_never_send() {
         log.lock().unwrap().is_empty(),
         "a refused press mints nothing"
     );
+}
+
+/// The same name twice is one invite. A pasted list with a repeat in it would
+/// otherwise mail somebody twice and spend two of their friend's codes.
+#[tokio::test]
+async fn a_repeated_name_is_one_invite() {
+    let (control, log) = spawn_control(vec![minted(9), minted(8)]).await;
+    let (gmail, sends) = mock_gmail(1).await;
+    let h = sharing_app(Some(control), gmail);
+
+    let resp = h
+        .app
+        .clone()
+        .oneshot(authed_json(
+            "POST",
+            "/client/invites",
+            json!({ "recipients": ["Friend@Example.com", "friend@example.com", "  "] }),
+        ))
+        .await
+        .unwrap();
+    let body = body_json(resp).await;
+    assert_eq!(body["results"].as_array().unwrap().len(), 1, "{body}");
+    assert_eq!(log.lock().unwrap().len(), 1, "one code, not two");
+    assert_eq!(sends.await.unwrap().len(), 1);
 }
 
 /// The preview is the real copy, rendered by the daemon, so the app cannot show

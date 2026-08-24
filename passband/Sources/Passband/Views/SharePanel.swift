@@ -86,15 +86,25 @@ struct SharePanel: View {
                 "Passband could not reach your daemon to set this up.",
                 detail: "Try again in a moment.")
         } else if let availability, !availability.can_share {
-            // The honest version of "you cannot do this": it is a property of
-            // the daemon, not of the person, and there is nothing for them to
-            // press.
-            message(
-                "This mailbox cannot send invites.",
-                detail:
-                    "Invites are minted by the hosted control plane, so a self-hosted daemon has "
-                    + "nowhere to ask. If this is a hosted mailbox, the operator can turn sharing on."
-            )
+            // The honest version of "you cannot do this", and WHICH honest
+            // version depends on why: one of these is nothing the reader can
+            // act on, and the other is one command.
+            if availability.reason == "no_write_credential" {
+                message(
+                    "Passband cannot send mail as you yet.",
+                    detail:
+                        "An invite is sent from your own mailbox, which needs the write "
+                        + "credential. Run `squelchd auth --write` on your daemon and come back."
+                )
+            } else {
+                message(
+                    "This mailbox cannot send invites.",
+                    detail:
+                        "Invites are minted by the hosted control plane, so a self-hosted daemon "
+                        + "has nowhere to ask. If this is a hosted mailbox, the operator can turn "
+                        + "sharing on."
+                )
+            }
         } else if let availability {
             form(availability)
         } else {
