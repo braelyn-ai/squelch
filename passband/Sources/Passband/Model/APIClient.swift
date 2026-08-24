@@ -257,6 +257,19 @@ actor APIClient {
 
     func getStats() async throws -> StoreStats { try await get("/client/stats") }
 
+    /// Tell the daemon a thread was OPENED. Fire and forget: it is a ledger
+    /// write with nothing to show for it, and a failed one costs a rounding
+    /// error in a statistic, never anything the user sees.
+    ///
+    /// Its own call rather than a side effect of `getThread` because a warmed
+    /// thread opens from the prefetch cache without a request, so the reader is
+    /// the only thing that knows a person looked at it.
+    func markThreadOpened(_ threadId: String) async throws {
+        let escaped =
+            threadId.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? threadId
+        try await postNoContent("/client/thread/\(escaped)/opened")
+    }
+
     /// Whether this daemon can share invites, and what the mail could say.
     /// Asked before anything is shown, so a daemon that cannot share never
     /// renders a button whose only outcome is a refusal.

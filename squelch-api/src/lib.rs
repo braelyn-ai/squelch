@@ -93,6 +93,15 @@ fn client_router(state: ApiState) -> Router {
         )
         .route("/client/refresh", post(handlers::refresh_now))
         .route("/client/thread/{thread_id}", get(handlers::get_thread))
+        // "I opened this." Its own route rather than a side effect of the GET
+        // above, because the client warms threads it has not shown and opens
+        // warmed ones without asking: see `handlers::mark_thread_opened`.
+        // HUMAN DOOR ONLY, and not merely by being on this tree — it is a
+        // statement about what a PERSON looked at, which an agent cannot make.
+        .route(
+            "/client/thread/{thread_id}/opened",
+            post(handlers::mark_thread_opened),
+        )
         .route("/client/attachments/{id}", get(handlers::get_attachment))
         .route("/client/shipments", get(handlers::get_shipments))
         // Force a carrier pass. HUMAN DOOR ONLY: the agent door reads the

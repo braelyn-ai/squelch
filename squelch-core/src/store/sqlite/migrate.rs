@@ -112,7 +112,7 @@ pub(super) fn migrate(conn: &Connection) -> Result<()> {
     // the standing band (that column is one of its arms).
     add_column_if_missing(conn, "triage", "remind_at", "TEXT")?;
     add_column_if_missing(conn, "triage", "reminded_at", "TEXT")?;
-    // WHEN THE HUMAN DOOR LAST SERVED THIS ROW'S BODY. NULL on every
+    // WHEN THE USER OPENED THIS MAIL. NULL on every
     // pre-existing row and NOT backfilled, and the absence is honest rather
     // than convenient: nothing recorded opens before this column existed, and
     // inventing them would put a number in front of a user that their own

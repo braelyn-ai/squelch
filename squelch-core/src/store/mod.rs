@@ -1316,6 +1316,12 @@ pub trait Store: Send + Sync {
     /// Returns the first-open count.
     fn mark_opened(&self, account_id: AccountId, message_ids: &[i64]) -> Result<usize>;
 
+    /// The same, for every message in one thread. What the human door's
+    /// "I opened this" call goes through: the reader shows a whole thread, and
+    /// the client should not have to hand back a list of ids the daemon gave
+    /// it.
+    fn mark_thread_opened(&self, account_id: AccountId, thread_id: &str) -> Result<usize>;
+
     /// Received vs opened over the window since `since`, for the one caller
     /// that puts a number in front of a human. See the implementation for what
     /// each side counts and, more importantly, what `opened` cannot see.

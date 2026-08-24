@@ -498,19 +498,6 @@ pub async fn get_thread(
                 sender_known,
             });
         }
-        // THE OPEN LEDGER, and this is the one door that writes it: a body
-        // left this daemon, which is the user reading the mail rather than
-        // scrolling past it in a list (see `triage.opened_at` in schema.sql).
-        // Stamped after the view is assembled, so a read that failed to
-        // assemble records nothing, and first-open-only, so re-reading a thread
-        // next week does not move the stamp.
-        //
-        // EVERY MESSAGE IN THE THREAD, not just the newest: the reader shows
-        // them all, oldest first, and the user has to deal with the whole
-        // thread once they are in it.
-        let ids: Vec<i64> = messages.iter().map(|m| m.message.id).collect();
-        store.mark_opened(account_id, &ids)?;
-
         Ok(ThreadResponse {
             thread_id: view.thread_id,
             subject: view.subject,
@@ -518,6 +505,39 @@ pub async fn get_thread(
         })
     })
     .await
+}
+
+// --- POST /client/thread/{thread_id}/opened ---------------------------------
+
+/// Record that the user OPENED this thread. See `triage.opened_at`.
+///
+/// A ROUTE OF ITS OWN, and not a side effect of `GET /client/thread/{id}`,
+/// which is where this started and which was wrong in both directions:
+///
+/// - The client PREFETCHES threads (the sitrep warms every standing item, the
+///   inbox warms on hover), so the GET fires for mail nobody has looked at. The
+///   updates list solved the same problem with `peek`, and a flag would have
+///   fixed this half.
+/// - The other half a flag cannot fix: a warmed thread OPENS FROM CACHE and
+///   never reaches this daemon at all, so the real opens would be the ones that
+///   went unrecorded. That biases the rate DOWN, which is the direction that
+///   makes `share_stat` flatter the product, and flattering it with a number is
+///   exactly what that whole path exists to avoid.
+///
+/// So the client says so, once, when a person actually opens something. It is
+/// the only party that knows.
+///
+/// IDEMPOTENT AND CHEAP: first-open-only in SQL, so a reopen writes nothing and
+/// the client can fire it without bookkeeping.
+pub async fn mark_thread_opened(
+    State(state): State<ApiState>,
+    Path(thread_id): Path<String>,
+) -> Result<impl IntoResponse, ApiError> {
+    let opened = store_call(&state, move |store, account_id| {
+        store.mark_thread_opened(account_id, &thread_id)
+    })
+    .await?;
+    Ok(Json(json!({ "opened": opened })))
 }
 
 // --- GET /client/attachments/{id} -------------------------------------------

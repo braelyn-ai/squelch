@@ -360,6 +360,72 @@ async fn the_preview_is_the_mail() {
     assert!(!preview.contains('%'), "{preview}");
 }
 
+/// The open ledger is written by the CLIENT saying so, not by serving a thread:
+/// the app prefetches threads nobody looked at, and opens warmed ones from its
+/// own cache without asking this daemon anything.
+#[tokio::test]
+async fn opening_is_a_thing_the_client_says_not_a_thing_the_get_infers() {
+    let (gmail, _g) = mock_gmail(0).await;
+    let h = sharing_app(None, gmail);
+    let m = h
+        .store
+        .upsert_message(&msg(h.acct, "g1", "t1", "hi", "body"))
+        .unwrap();
+    h.store
+        .set_triage(
+            m,
+            h.acct,
+            80,
+            squelch_core::types::Tier::Signal,
+            squelch_core::types::Sensitivity::Normal,
+            None,
+            "one line",
+            "reason",
+            None,
+        )
+        .unwrap();
+
+    // Reading the thread stamps NOTHING. This is the prefetch's path.
+    let resp = h
+        .app
+        .clone()
+        .oneshot(authed("GET", "/client/thread/t1"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let rate = h
+        .store
+        .share_open_rate(h.acct, chrono::Utc::now() - chrono::Duration::days(1))
+        .unwrap();
+    assert_eq!(rate.received, 1);
+    assert_eq!(rate.opened, 0, "serving a body is not evidence of an open");
+
+    // Saying so does.
+    let resp = h
+        .app
+        .clone()
+        .oneshot(authed("POST", "/client/thread/t1/opened"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(body_json(resp).await["opened"], 1);
+    let rate = h
+        .store
+        .share_open_rate(h.acct, chrono::Utc::now() - chrono::Duration::days(1))
+        .unwrap();
+    assert_eq!(rate.opened, 1);
+
+    // And saying it twice writes nothing, so the client can fire it on every
+    // open without keeping books.
+    let resp = h
+        .app
+        .clone()
+        .oneshot(authed("POST", "/client/thread/t1/opened"))
+        .await
+        .unwrap();
+    assert_eq!(body_json(resp).await["opened"], 0);
+}
+
 /// Both routes sit behind the bearer, like every other human-door route.
 #[tokio::test]
 async fn the_bearer_layer_wraps_both_routes() {

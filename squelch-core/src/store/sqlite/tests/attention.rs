@@ -6,6 +6,10 @@ use crate::types::{SealedKind, Tier};
 
 /// The two stamps are DIFFERENT FACTS. Surfacing a row (a list door) must not
 /// make it look opened, or the share stat would measure scrolling.
+///
+/// `id` is unused past the seed: the open is addressed BY THREAD, which is the
+/// whole point of `mark_thread_opened` - the client never hands back a list of
+/// message ids the daemon gave it.
 #[test]
 fn opening_and_surfacing_are_separate_stamps() {
     let (store, acct) = store();
@@ -19,16 +23,17 @@ fn opening_and_surfacing_are_separate_stamps() {
     assert_eq!(rate.received, 1);
     assert_eq!(rate.opened, 0, "a surfaced row is not an opened one");
 
-    assert_eq!(store.mark_opened(acct, &[id]).unwrap(), 1);
+    assert_eq!(store.mark_thread_opened(acct, "t1").unwrap(), 1);
     let rate = store
         .share_open_rate(acct, now - chrono::Duration::days(1))
         .unwrap();
     assert_eq!(rate.opened, 1);
 
     // FIRST OPEN ONLY: re-reading a thread says nothing new, and a moving
-    // stamp would make the rate drift with re-reads.
+    // stamp would make the rate drift with re-reads. The client fires the
+    // route on every open precisely because the daemon settles this in SQL.
     assert_eq!(
-        store.mark_opened(acct, &[id]).unwrap(),
+        store.mark_thread_opened(acct, "t1").unwrap(),
         0,
         "a second open transitions nothing"
     );
@@ -51,12 +56,18 @@ fn the_open_rate_counts_received_mail_and_never_opens_a_sealed_row() {
         .seed(&store);
 
     store.mark_opened(acct, &[opened]).unwrap();
-    // The human door never serves a sealed body through this path; the SQL
-    // guard is what makes that true rather than merely customary.
+    // A sealed thread is never opened in the reader, so the client never says
+    // so; the SQL guard is what makes that true rather than merely customary,
+    // and it holds on BOTH doors into the stamp.
     assert_eq!(
         store.mark_opened(acct, &[sealed]).unwrap(),
         0,
         "a sealed row is never stamped opened"
+    );
+    assert_eq!(
+        store.mark_thread_opened(acct, "t3").unwrap(),
+        0,
+        "and not by thread either"
     );
 
     let rate = store.share_open_rate(acct, since).unwrap();

@@ -313,12 +313,12 @@ impl SqliteStore {
         Ok(first_surfaced)
     }
 
-    /// Stamp `opened_at` on rows whose BODY the human door just served.
+    /// Stamp `opened_at` on rows the user has opened.
     ///
     /// Deliberately NOT folded into [`Self::mark_surfaced`], which every list
     /// door calls: the two answer different questions, and merging them would
     /// make "opened" mean "appeared in a list" (see the column comment in
-    /// `schema.sql`). Callers that serve a body call both.
+    /// `schema.sql`).
     ///
     /// FIRST OPEN ONLY, like `surfaced_at`: re-reading a thread next week says
     /// nothing new about whether it needed opening, and a moving stamp would
@@ -349,6 +349,38 @@ impl SqliteStore {
         Ok(first_opened)
     }
 
+    /// Stamp every message in one thread opened, by thread id.
+    ///
+    /// THE THREAD, NOT A LIST OF IDS, because the client should not have to
+    /// tell the daemon which messages a thread holds - it would be sending back
+    /// a list the daemon gave it, and the two could disagree after a sync. The
+    /// reader shows the whole thread oldest-first anyway, so opening it is
+    /// opening all of it.
+    ///
+    /// Returns the first-open count.
+    pub(super) fn mark_thread_opened(
+        &self,
+        account_id: AccountId,
+        thread_id: &str,
+    ) -> Result<usize> {
+        let conn = self.lock()?;
+        // The sealed guard and the once-only guard are the same ones
+        // `mark_opened` keeps, in one statement because the ids are a subquery
+        // rather than a caller's list.
+        let n = conn.execute(
+            "UPDATE triage
+                SET opened_at = ?1
+              WHERE account_id = ?2
+                AND sensitivity != 'sealed'
+                AND opened_at IS NULL
+                AND message_id IN (
+                    SELECT id FROM messages WHERE account_id = ?2 AND thread_id = ?3
+                )",
+            params![Utc::now().to_rfc3339(), account_id, thread_id],
+        )?;
+        Ok(n)
+    }
+
     /// How much of this mailbox's incoming mail the user has had to open, over
     /// the rows received since `since`.
     ///
@@ -364,8 +396,9 @@ impl SqliteStore {
     ///   message the daemon never triaged is one it cannot speak for.
     ///
     /// WHAT IT CANNOT SEE is mail read somewhere else. `opened_at` is stamped
-    /// by this daemon's human door and nowhere else, so a user who reads half
-    /// their mail in Gmail on a phone will find this number FLATTERINGLY LOW.
+    /// by this user's own Passband client and nowhere else, so somebody who
+    /// reads half their mail in Gmail on a phone will find this FLATTERINGLY
+    /// LOW.
     /// Every consumer has to carry that caveat with it, and the one consumer
     /// (the invite mail) does.
     pub(super) fn share_open_rate(

@@ -1225,6 +1225,15 @@ final class AppStore {
                 "via_reply": replyTo != nil,
                 "from_noise": activeView == .emails && mailMode == .noise,
             ])
+        // THE OPEN LEDGER (`triage.opened_at`), and this is the only place that
+        // writes it: opening the reader is the one moment a PERSON has looked
+        // at mail, and a warmed thread renders from the prefetch cache without
+        // the daemon hearing about it at all. Fire and forget, and deliberately
+        // not awaited: it is a statistic, and the reader must not wait on one.
+        //
+        // Same-thread reopens fire it too; the daemon stamps first-open-only,
+        // so the second one writes nothing.
+        Task { try? await APIClient.shared.markThreadOpened(threadId) }
         // A DIFFERENT thread drops the summary NOW rather than when the new one
         // lands: in that gap the reader is showing thread B while this still
         // described A, and the ask bar would pin B's id under A's subject and

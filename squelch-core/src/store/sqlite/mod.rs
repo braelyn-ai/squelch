@@ -805,6 +805,10 @@ impl Store for SqliteStore {
         self.mark_opened(account_id, message_ids)
     }
 
+    fn mark_thread_opened(&self, account_id: AccountId, thread_id: &str) -> Result<usize> {
+        self.mark_thread_opened(account_id, thread_id)
+    }
+
     fn share_open_rate(&self, account_id: AccountId, since: DateTime<Utc>) -> Result<OpenRate> {
         self.share_open_rate(account_id, since)
     }
