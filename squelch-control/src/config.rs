@@ -121,7 +121,17 @@ pub const MAX_LLM_BUDGET_USD: f64 = 1_000.0;
 /// `SQUELCH_CONTROL_LLM_MODELS` says nothing. NEVER empty: on the live
 /// gateway an empty `allowed_models` is deny-all, and wildcards are
 /// unreliable, so "no list" must mean "the product's list", not "nothing".
-pub const DEFAULT_LLM_MODELS: &str = "claude-haiku-4-5,claude-sonnet-5";
+///
+/// BOTH spellings of every id, deliberately. The gateway matches
+/// `allowed_models` against the model string the daemon actually sent, and a
+/// hosted daemon sends the `anthropic/` prefix only once it is rolled onto a
+/// warden config that sets `SQUELCH_WARDEN_LLM_STAGE1_MODEL`. Carrying both is
+/// what lets a rolled daemon and an unrolled one share one key mid-roll.
+/// `claude-opus-5` is in here because that is what the warden's stage models
+/// name: a default that omitted it would mint keys that 403 the real triage
+/// call. Drop the bare half once the whole fleet is past the roll.
+pub const DEFAULT_LLM_MODELS: &str = "claude-haiku-4-5,claude-sonnet-5,claude-opus-5,\
+     anthropic/claude-haiku-4-5,anthropic/claude-sonnet-5,anthropic/claude-opus-5";
 
 /// The monthly spend a tenant's ASSISTANT key is minted with when
 /// `SQUELCH_CONTROL_ASSISTANT_BUDGET_USD` says nothing. Higher than triage's:
@@ -132,8 +142,10 @@ pub const DEFAULT_ASSISTANT_BUDGET_USD: f64 = 10.00;
 /// The models allowed on every minted ASSISTANT key when
 /// `SQUELCH_CONTROL_ASSISTANT_MODELS` says nothing. Never empty, for the same
 /// deny-all reason as the triage list; a different set because the assistant
-/// wants a frontier model where triage wants a cheap one.
-pub const DEFAULT_ASSISTANT_MODELS: &str = "claude-haiku-4-5,claude-opus-4-8";
+/// wants a frontier model where triage wants a cheap one. Both spellings of
+/// each, for the reason the triage list gives.
+pub const DEFAULT_ASSISTANT_MODELS: &str = "claude-haiku-4-5,claude-opus-4-8,\
+     anthropic/claude-haiku-4-5,anthropic/claude-opus-4-8";
 
 /// Ceiling on one configured model name. Real ids are ~30 characters; a
 /// larger one is a paste accident.
@@ -726,15 +738,31 @@ fn parse_budget(name: &str, raw: Option<String>, default: f64) -> Result<f64, Co
 /// Parse a comma-separated model allow-list. Empty segments (a trailing
 /// comma) are tolerated; what remains must be at least one name, each held to
 /// the same allowlist bar as every other value that lands in an outbound
-/// request: model ids are made of letters, digits, `-`, `_`, `.` and nothing
-/// that could restructure JSON or a log line. An EMPTY list is refused rather
-/// than passed through, because on the live gateway empty `allowed_models` is
-/// deny-all.
+/// request: nothing that could restructure JSON or a log line.
+///
+/// A model id is letters, digits, `-`, `_`, `.`, and OPTIONALLY one `/`
+/// qualifying it with a provider: `anthropic/claude-opus-5`. That prefix is
+/// not decoration. The Bifrost gateway answers a BARE id with 400 "could not
+/// auto resolve a provider for the request", and answers a key whose
+/// `allowed_models` spells the model the other way from the request with 403,
+/// so both spellings have to be expressible here — see the list defaults for
+/// why one deployment needs both at once. A `/` cannot restructure a JSON
+/// string or a log line, so admitting it costs nothing; what stays refused is
+/// a SECOND slash and any segment not opening on a letter or digit, which is
+/// what keeps `claude/../x` and a bare `anthropic/` out.
+///
+/// An EMPTY list is refused rather than passed through, because on the live
+/// gateway empty `allowed_models` is deny-all.
 fn parse_models(name: &str, raw: &str) -> Result<Vec<String>, ConfigError> {
     let ok = |m: &str| {
         m.len() <= MAX_LLM_MODEL_LEN
-            && m.bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.')
+            && m.matches('/').count() <= 1
+            && m.split('/').all(|seg| {
+                seg.starts_with(|c: char| c.is_ascii_alphanumeric())
+                    && seg
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.')
+            })
     };
     let models: Vec<String> = raw
         .split(',')
@@ -751,7 +779,8 @@ fn parse_models(name: &str, raw: &str) -> Result<Vec<String>, ConfigError> {
     if let Some(bad) = models.iter().find(|m| !ok(m)) {
         return Err(ConfigError::invalid(format!(
             "invalid {name} entry `{bad}`: expected a model id made of \
-             letters, digits, `-`, `_`, `.`"
+             letters, digits, `-`, `_`, `.`, optionally provider-qualified as \
+             `provider/model` (e.g. `anthropic/claude-opus-5`)"
         )));
     }
     Ok(models)
@@ -1039,15 +1068,20 @@ mod tests {
         .expect("url + credential switches the feature on");
         assert_eq!(on.url, "https://bifrost.example");
         assert_eq!(on.budget_usd, DEFAULT_LLM_BUDGET_USD);
-        // The default model lists are the product's, and never empty.
-        assert_eq!(on.models, vec!["claude-haiku-4-5", "claude-sonnet-5"]);
+        // The default model lists are the product's, and never empty. Read
+        // from the constants rather than spelled again here: the lists move
+        // when the gateway's routing does, and a second copy of them in a test
+        // only ever discovers that a day late.
+        assert_eq!(on.models, DEFAULT_LLM_MODELS.split(',').collect::<Vec<_>>());
+        assert!(!on.models.is_empty());
         // The assistant key gets its own defaults: a bigger budget and a
         // frontier model where triage runs a cheap one.
         assert_eq!(on.assistant_budget_usd, DEFAULT_ASSISTANT_BUDGET_USD);
         assert_eq!(
             on.assistant_models,
-            vec!["claude-haiku-4-5", "claude-opus-4-8"]
+            DEFAULT_ASSISTANT_MODELS.split(',').collect::<Vec<_>>()
         );
+        assert!(!on.assistant_models.is_empty());
 
         let on = bifrost_from(
             some("https://bifrost.example"),
@@ -1192,7 +1226,20 @@ mod tests {
         }
         // A model list that is empty once parsed, or carries a name that
         // could restructure a request, refuses to boot — either list.
-        for bad in ["", " , ,", "claude haiku", "claude/../x", "mod\"el"] {
+        for bad in [
+            "",
+            " , ,",
+            "claude haiku",
+            "claude/../x",
+            "mod\"el",
+            // One `/` is a provider qualifier; a second is somebody building a
+            // path, and `..` is that same somebody being explicit about it.
+            "anthropic/claude/opus-5",
+            "anthropic/../claude-opus-5",
+            // A qualifier with a missing half is a truncated paste, not an id.
+            "anthropic/",
+            "/claude-opus-5",
+        ] {
             assert!(
                 bifrost_from(
                     some("https://bifrost.example"),
@@ -1216,6 +1263,58 @@ mod tests {
                 )
                 .is_err(),
                 "assistant: {bad:?}"
+            );
+        }
+    }
+
+    /// The gateway routes on `anthropic/claude-opus-5` and a daemon that has
+    /// not been rolled yet still sends the bare `claude-opus-5`, so ONE list
+    /// has to hold both spellings at once. This is the exact shape that took
+    /// the control plane down on 2026-08-24: the operator widened the variable
+    /// to cover the roll, and a validator that only knew bare ids refused to
+    /// boot on it.
+    #[test]
+    fn a_model_list_may_be_provider_qualified() {
+        let some = |s: &str| Some(s.to_string());
+        let token = format!("admin:{}", "b".repeat(MIN_BIFROST_TOKEN_LEN));
+        let both = "claude-opus-5,anthropic/claude-opus-5";
+
+        let cfg = bifrost_from(
+            some("https://bifrost.example"),
+            some(&token),
+            None,
+            some(both),
+            None,
+            some(both),
+        )
+        .unwrap()
+        .expect("the gateway pair switches the feature on");
+        assert_eq!(cfg.models, ["claude-opus-5", "anthropic/claude-opus-5"]);
+        assert_eq!(
+            cfg.assistant_models,
+            ["claude-opus-5", "anthropic/claude-opus-5"]
+        );
+
+        // And the defaults ship that same superset, so an unset variable
+        // cannot quietly mint a key every gateway call will 403.
+        let cfg = bifrost_from(
+            some("https://bifrost.example"),
+            some(&token),
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap()
+        .expect("the gateway pair switches the feature on");
+        for list in [&cfg.models, &cfg.assistant_models] {
+            assert!(
+                list.iter().any(|m| m.starts_with("anthropic/")),
+                "default carries a provider-qualified id: {list:?}"
+            );
+            assert!(
+                list.iter().any(|m| !m.contains('/')),
+                "default still carries the bare id an unrolled daemon sends: {list:?}"
             );
         }
     }
