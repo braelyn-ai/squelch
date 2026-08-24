@@ -941,6 +941,46 @@ request, so a token you think leaked is a token you can simply change.
 With the trio unset the waitlist and `/admin` are not mounted at all: an
 unconfigured deployment answers 404 there, not 403.
 
+### Letting a tenant invite their own friends
+
+Sharing is **off for every tenant until an operator turns it on**, one at a
+time, the same shape `llm mint` has:
+
+```sh
+railway ssh --service control
+squelch-control share mint <label>      # mint, record the hash, install it
+squelch-control share revoke <label>    # forget the hash, pull it from the pod
+```
+
+`share mint` mints a share token, records only its SHA-256 against the tenant
+row, and PUTs the plaintext to the warden, which writes it into a
+`<label>-control` Secret and rolls the pod so the daemon picks up
+`SQUELCH_CONTROL_TOKEN`. The token is never printed: nothing needs to read it
+but the pod.
+
+With it installed the tenant's own Passband offers a share sheet, and each
+invite it sends is **mailed by the user's own Gmail, not by Resend** — the
+control plane mints the code and is never told who it was for. The cap is 10
+codes per tenant per rolling 30 days, counted from `invite_codes.invited_by`
+rather than stored, so changing the limit takes effect at once.
+
+**Both halves of a revoke matter.** Clearing the hash stops the token working
+immediately, whatever the pod still holds; pulling it from the pod is what stops
+the app OFFERING a button whose every press would be refused. `share revoke`
+does both, in that order, so an interrupted run has already done the part that
+protects the mint.
+
+`invite list` shows codes minted this way alongside operator-minted ones. The
+tenant behind each is `invite_codes.invited_by`, which is the referral funnel and
+the only thing the control plane records about a share: **not** the recipient,
+who has consented to nothing and whose address never leaves their friend's
+daemon.
+
+A tenant nobody has run `share mint` for boots fine and reports
+`invite_sharing: false` on `/client/stats`, so the app shows no button and the
+two-week nudge never fires. Same for every self-hosted daemon, which has no
+control plane to mint against at all.
+
 ## Backups
 
 Two mechanisms, split by which disk they cover:
