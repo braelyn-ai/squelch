@@ -74,6 +74,11 @@ final class FrameMeasurer {
     private var pass: Task<Void, Never>?
     /// Whose pass this is — the thread id. See `cancel(token:)`.
     private var token: String?
+    /// WHICH ARRANGEMENT is being measured. It decides the key each height is
+    /// filed under, and the caller has already turned it into the `width` these
+    /// documents are rendered at — a bubble is a narrower measure than a card,
+    /// so the same message is two different heights and neither is the other's.
+    private var style: ThreadStyle = .classic
 
     // MARK: - the pass
 
@@ -82,8 +87,8 @@ final class FrameMeasurer {
     /// back immediately with nothing to do, which is what a second open looks
     /// like.
     func measure(
-        _ messages: [ClientMessage], width: CGFloat, viewport: CGFloat, allowRemote: Bool,
-        token: String, onFinished: @escaping () -> Void
+        _ messages: [ClientMessage], width: CGFloat, viewport: CGFloat, style: ThreadStyle,
+        allowRemote: Bool, token: String, onFinished: @escaping () -> Void
     ) {
         reset()
         guard width > 0 else { return }
@@ -91,6 +96,7 @@ final class FrameMeasurer {
         // A window too short to be a reading surface is a window mid-animation;
         // a screenful is the better guess than a sliver.
         self.viewportHeight = max(400, viewport)
+        self.style = style
         self.token = token
 
         // NEWEST FIRST: the thread opens on the newest message with the history
@@ -100,7 +106,7 @@ final class FrameMeasurer {
             // AUTHORITATIVE, not merely present: a height a live frame put
             // there is a stopgap taken inside a box it had sized itself, and
             // replacing exactly those is what this pass is for.
-            return FrameHeights.shared.authoritative(String(message.id)) == nil
+            return FrameHeights.shared.authoritative(style.frameKey(message.id)) == nil
         }
         guard !jobs.isEmpty else {
             onFinished()
@@ -119,7 +125,8 @@ final class FrameMeasurer {
                 let height = await self.measure(message, allowRemote: allowRemote)
                 if Task.isCancelled { return }
                 if height > 0 {
-                    FrameHeights.shared.set(String(message.id), height, authoritative: true)
+                    FrameHeights.shared.set(
+                        style.frameKey(message.id), height, authoritative: true)
                     misses = 0
                 } else {
                     misses += 1

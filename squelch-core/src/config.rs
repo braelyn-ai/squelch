@@ -203,7 +203,7 @@ impl Default for SyncConfig {
     fn default() -> Self {
         Self {
             backfill_days: 30,
-            poll_secs: 45,
+            poll_secs: 5,
         }
     }
 }
@@ -1920,7 +1920,7 @@ mod tests {
     fn sync_defaults_are_sane() {
         let c = Config::default();
         assert_eq!(c.sync.backfill_days, 30);
-        assert_eq!(c.sync.poll_secs, 45);
+        assert_eq!(c.sync.poll_secs, 5);
         assert!(c.client_id.is_none());
     }
 
@@ -2030,7 +2030,7 @@ backfill_days = 90
         assert_eq!(c.db_path, PathBuf::from("/tmp/squelch.db"));
         assert_eq!(c.sync.backfill_days, 90);
         // unspecified sync field falls back to default
-        assert_eq!(c.sync.poll_secs, 45);
+        assert_eq!(c.sync.poll_secs, 5);
         std::fs::remove_dir_all(&dir).ok();
     }
 

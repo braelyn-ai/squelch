@@ -121,6 +121,11 @@ struct Harness {
     app: Router,
     state: ControlState,
     rec: Shared,
+    /// The schema this harness's store lives in, for the assertions that read a
+    /// column no method returns. `ControlStore::client` is crate-private, so a
+    /// test that needs raw SQL opens its own connection and can only land on the
+    /// same schema if it is given the same URL.
+    db_url: String,
 }
 
 impl Harness {
@@ -169,7 +174,7 @@ impl Harness {
             }),
         };
 
-        let (store, _url) = common::fresh_store().await;
+        let (store, db_url) = common::fresh_store().await;
         let warden = Arc::new(
             HttpWarden::new(
                 "http://127.0.0.1:1".into(),
@@ -183,7 +188,19 @@ impl Harness {
             app: router(state.clone()),
             state,
             rec,
+            db_url,
         }
+    }
+
+    /// The `analytics_id` on one row, read raw: no store method returns it,
+    /// because it must never travel beside an address.
+    async fn analytics_id(&self, id: i64) -> String {
+        common::raw_client(&self.db_url)
+            .await
+            .query_one("SELECT analytics_id FROM users WHERE id = $1", &[&id])
+            .await
+            .unwrap()
+            .get(0)
     }
 
     async fn get(&self, uri: &str, cookie: Option<&str>) -> (StatusCode, HeaderMap, String) {
@@ -256,7 +273,7 @@ impl Harness {
 
     /// The id of the single waitlist row.
     async fn only_row_id(&self) -> i64 {
-        let rows = self.state.store().list_waitlist().await.unwrap();
+        let rows = self.state.store().list_users().await.unwrap();
         assert_eq!(rows.len(), 1, "expected exactly one waitlist row");
         rows[0].id
     }
@@ -266,7 +283,7 @@ impl Harness {
         let row = self
             .state
             .store()
-            .waitlist_entry(id)
+            .user_entry(id)
             .await
             .unwrap()
             .expect("the row is there");
@@ -367,7 +384,7 @@ async fn a_submission_lands_on_the_list_once() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body, r#"{"ok":true}"#);
 
-    let rows = h.state.store().list_waitlist().await.unwrap();
+    let rows = h.state.store().list_users().await.unwrap();
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].email, APPLICANT, "stored normalized");
     assert_eq!(rows[0].status, "pending");
@@ -389,7 +406,7 @@ async fn a_malformed_address_is_refused_readably() {
         );
         assert_eq!(header_of(&headers, header::CACHE_CONTROL), "no-store");
     }
-    assert!(h.state.store().list_waitlist().await.unwrap().is_empty());
+    assert!(h.state.store().list_users().await.unwrap().is_empty());
 
     // The preflight the site does not currently need, answered anyway.
     let resp = h
@@ -485,6 +502,8 @@ async fn approving_mails_a_code_that_redeems() {
     h.join(APPLICANT).await;
     let id = h.only_row_id().await;
     let cookie = h.sign_in().await;
+    // The id analytics knows them by, minted when they joined the list.
+    let analytics_id = h.analytics_id(id).await;
 
     let (status, headers, _) = h
         .post_form("/admin/approve", format!("id={id}"), Some(&cookie))
@@ -535,6 +554,18 @@ async fn approving_mails_a_code_that_redeems() {
     let (_, _, page) = h.get("/admin", Some(&cookie)).await;
     assert!(!page.contains(&code), "{page}");
     assert!(page.contains("Invited"), "{page}");
+
+    // APPROVAL IS NOT A NEW PERSON. Minting a code, pointing the row at it and
+    // stamping the send are three writes to this row, and the id analytics has
+    // been calling them survives all three; a rotation here would split one
+    // person in two on the day they were let in.
+    assert_eq!(
+        h.analytics_id(id).await,
+        analytics_id,
+        "the same person before and after they were approved"
+    );
+    // ...and it is not on the page beside their address.
+    assert!(!page.contains(&analytics_id), "{page}");
 }
 
 /// A double-clicked button, a refreshed POST, two operators: the store's guard
@@ -857,7 +888,7 @@ async fn two_racing_sends_mail_one_code() {
         .unwrap();
     assert!(
         !store
-            .set_waitlist_invite(id, loser, Some(first))
+            .set_user_invite(id, loser, Some(first))
             .await
             .unwrap(),
         "the pointer moved, so this write is refused"

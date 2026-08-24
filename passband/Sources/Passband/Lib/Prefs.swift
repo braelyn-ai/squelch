@@ -108,6 +108,7 @@ final class Prefs {
         static let developerMode = "passband.pref.developerMode"
         static let tourCompleted = "passband.pref.tourCompleted"
         static let theme = "passband.pref.theme"
+        static let threadStyle = "passband.pref.threadStyle"
         static let notificationSound = "passband.pref.notificationSound"
         static let userName = "passband.name"
         static let signature = "passband.pref.signature"
@@ -124,6 +125,7 @@ final class Prefs {
             Key.developerMode: false,
             Key.tourCompleted: false,
             Key.theme: ThemeChoice.system.rawValue,
+            Key.threadStyle: ThreadStyleDefault.auto.rawValue,
             Key.notificationSound: NotificationSound.system.rawValue,
             Key.telemetry: TelemetryLevel.full.rawValue,
         ])
@@ -135,6 +137,8 @@ final class Prefs {
         _developerMode = defaults.bool(forKey: Key.developerMode)
         _tourCompleted = defaults.bool(forKey: Key.tourCompleted)
         _theme = ThemeChoice(rawValue: defaults.string(forKey: Key.theme) ?? "") ?? .system
+        _threadStyle =
+            ThreadStyleDefault(rawValue: defaults.string(forKey: Key.threadStyle) ?? "") ?? .auto
         _notificationSound =
             NotificationSound(rawValue: defaults.string(forKey: Key.notificationSound) ?? "")
             ?? .system
@@ -220,6 +224,19 @@ final class Prefs {
         set {
             _theme = newValue
             defaults.set(newValue.rawValue, forKey: Key.theme)
+        }
+    }
+
+    /// How threads are drawn where nothing else has been said — including
+    /// `auto`, which is an instruction to read the thread rather than a style
+    /// (see ThreadStyle.automatic). A thread the reader has switched by hand
+    /// keeps its own answer (ThreadStyleLedger) and ignores this.
+    private var _threadStyle: ThreadStyleDefault
+    var threadStyle: ThreadStyleDefault {
+        get { _threadStyle }
+        set {
+            _threadStyle = newValue
+            defaults.set(newValue.rawValue, forKey: Key.threadStyle)
         }
     }
 

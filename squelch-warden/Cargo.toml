@@ -36,6 +36,11 @@ age = { workspace = true }
 # template and the init container reinstalls it. No other cryptography here:
 # the sealing is the control plane's and the opening is the tenant's.
 sha2 = "0.10"
+# ONE timestamp type, shared with the control plane that reads it: the
+# activation route parses what `squelchd token first-paired` printed and hands
+# it straight back on the wire, and a hand-rolled RFC3339 parser here would be a
+# second opinion about what a valid instant is.
+chrono = { workspace = true }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 

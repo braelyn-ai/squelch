@@ -41,10 +41,26 @@ enum MinimapGeometry {
     static let longestGuess: CGFloat = 2400
 
     /// Rendered text metrics for the reader's column, near enough for a drawing.
-    private static let charsPerLine: CGFloat = 105
+    /// A chat bubble is the same text through a narrower measure — 620 points
+    /// against the column's 900 — so the same message is more lines of fewer
+    /// characters, and the map has to say so or a switched thread's rail stops
+    /// matching what is under it.
+    private static func charsPerLine(_ style: ThreadStyle) -> CGFloat {
+        switch style {
+        case .classic: 105
+        case .bubbles: 72
+        }
+    }
     private static let lineHeight: CGFloat = 20
     /// Header, sender row, padding, rule: what a message costs before its text.
-    private static let cardChrome: CGFloat = 132
+    /// A bubble spends less: one caption line instead of an avatar row, air
+    /// between bubbles instead of a divider.
+    private static func cardChrome(_ style: ThreadStyle) -> CGFloat {
+        switch style {
+        case .classic: 132
+        case .bubbles: 84
+        }
+    }
     private static let attachmentStrip: CGFloat = 54
     /// Bytes of markup per byte of visible text, for the one case that has to be
     /// counted through the tags. A blunt instrument for a blunt situation.
@@ -58,9 +74,13 @@ enum MinimapGeometry {
     /// guessing, and the rail only draws for a thread of two or more messages,
     /// which is a conversation, which is text. A newsletter is one message in a
     /// thread of its own and has no rail to be wrong about.
-    static func estimate(text: String, html: String? = nil, attachments: Int = 0) -> CGFloat {
+    static func estimate(
+        text: String, html: String? = nil, attachments: Int = 0, style: ThreadStyle = .classic
+    ) -> CGFloat {
         min(
-            card(bodyHeight: textHeight(text: text, html: html), attachments: attachments),
+            card(
+                bodyHeight: textHeight(text: text, html: html, style: style),
+                attachments: attachments, style: style),
             longestGuess)
     }
 
@@ -73,8 +93,10 @@ enum MinimapGeometry {
     /// the whole rail. A measurement has. A newsletter that really is ten
     /// screenfuls has to be drawn as ten screenfuls or the rail is lying about
     /// the shape of the thread — which is the whole thing it is for.
-    static func card(bodyHeight: CGFloat, attachments: Int = 0) -> CGFloat {
-        max(cardChrome + bodyHeight + (attachments > 0 ? attachmentStrip : 0), minimumCard)
+    static func card(
+        bodyHeight: CGFloat, attachments: Int = 0, style: ThreadStyle = .classic
+    ) -> CGFloat {
+        max(cardChrome(style) + bodyHeight + (attachments > 0 ? attachmentStrip : 0), minimumCard)
     }
 
     /// HOW TALL THIS BODY'S TEXT DRAWS, with no card around it. Split out of
@@ -86,9 +108,17 @@ enum MinimapGeometry {
     /// under somebody who is reading it. The guess does not have to be right —
     /// it has to be close enough that the correction is not a jump.
     ///
+    /// STYLE IS PART OF THE QUESTION for the same reason it is part of the
+    /// rail's: a bubble is a narrower measure, so the same words are more lines
+    /// of fewer characters, and a frame opened at the other style's guess opens
+    /// at the wrong size.
+    ///
     /// Counted in UTF-8 bytes rather than characters because a long thread runs
     /// this per message and byte count is free where grapheme count is a walk.
-    static func textHeight(text: String, html: String? = nil) -> CGFloat {
+    static func textHeight(
+        text: String, html: String? = nil, style: ThreadStyle = .classic
+    ) -> CGFloat {
+        let charsPerLine = charsPerLine(style)
         var lines: CGFloat = 0
         var run: CGFloat = 0
         var ink = false

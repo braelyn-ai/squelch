@@ -239,9 +239,13 @@ final class FrameHeights {
 
     /// THE WIDTH EVERY HEIGHT IN HERE WAS MEASURED AT. A height is only an
     /// answer to a question that included the width — mail reflows, and a body
-    /// measured in a wide window is the wrong size in a narrow one. There is
-    /// exactly one reading column, so this is one number rather than part of
-    /// every key.
+    /// measured in a wide window is the wrong size in a narrow one.
+    ///
+    /// The STYLE's contribution to the width is already in the key
+    /// (ThreadStyle.frameKey: a bubble is a narrower measure than a card, so
+    /// the same message has one height per style). What is left for this is the
+    /// column itself, which is the same for both styles and changes only when
+    /// the window does — so it is one number rather than part of every key.
     private(set) var width: CGFloat = 0
 
     /// The reader declaring the width it is laying out at. A different one
@@ -272,9 +276,19 @@ final class FrameHeights {
         if let known = heights[key], known.authoritative, !authoritative { return }
         heights[key] = Known(height: height, authoritative: authoritative)
     }
-    func clear(_ key: String) {
-        heights.removeValue(forKey: key)
-        guesses.removeValue(forKey: key)
+
+    /// Forget a message, in EVERY SPELLING OF ITS KEY, and its guess with it.
+    /// The same message has one height per thread style
+    /// (ThreadStyle.frameKey), so a caller that cleared the one spelling it
+    /// happened to know left the other to paint a reopened message at a size
+    /// nothing on screen is using. The loop lives here so no caller has to know
+    /// there are two.
+    func clear(messageId: Int) {
+        for style in ThreadStyle.allCases {
+            let key = style.frameKey(messageId)
+            heights.removeValue(forKey: key)
+            guesses.removeValue(forKey: key)
+        }
     }
 
     /// The guessed height for this message, computed once and kept. Memoized
@@ -282,6 +296,9 @@ final class FrameHeights {
     /// message card, and the answer is a walk of the body's text (the quoted
     /// chain has to be split off it first, or a one-line reply quoting a long
     /// thread is guessed at the length of the whole thread).
+    ///
+    /// Keyed the same way the heights are, style and all: the guess is a line
+    /// count and a bubble fits fewer characters on a line.
     func guess(_ key: String, _ make: () -> CGFloat) -> CGFloat {
         if let known = guesses[key] { return known }
         let made = make()

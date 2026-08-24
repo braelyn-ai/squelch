@@ -46,7 +46,7 @@ use crate::handlers::{field, field_capped};
 use crate::invites;
 use crate::pages;
 use crate::state::ControlState;
-use crate::store::{WAITLIST_APPROVED, WAITLIST_PENDING, WaitlistRow};
+use crate::store::{USER_APPROVED, USER_PENDING, UserRow};
 
 /// Ceiling on the presented admin token. Well above any token an operator
 /// would generate, because a value truncated on the way in fails the compare
@@ -315,7 +315,7 @@ pub async fn invite(
 /// `POST /admin/approve` — let one person in.
 ///
 /// The store's own guard decides whether this call is the one that approves:
-/// [`crate::store::ControlStore::approve_waitlist`] moves the row out of
+/// [`crate::store::ControlStore::approve_user`] moves the row out of
 /// `pending` in a single statement, so a double click, a refreshed POST, and
 /// two operators on the same row produce exactly one minted invite and one
 /// email between them.
@@ -334,11 +334,11 @@ pub async fn approve(
         return dashboard(&state, Some(NO_SUCH_ROW)).await;
     };
 
-    match state.store().approve_waitlist(id, Utc::now()).await {
+    match state.store().approve_user(id, Utc::now()).await {
         Ok(true) => {}
         Ok(false) => return dashboard(&state, Some(ALREADY_APPROVED)).await,
         Err(e) => {
-            tracing::error!(id, error = %e, "approving a waitlist row failed");
+            tracing::error!(id, error = %e, "approving a user row failed");
             return dashboard(&state, Some(STORE_TROUBLE)).await;
         }
     }
@@ -367,15 +367,15 @@ pub async fn send(State(state): State<ControlState>, headers: HeaderMap, body: B
         return dashboard(&state, Some(NO_SUCH_ROW)).await;
     };
 
-    let row = match state.store().waitlist_entry(id).await {
+    let row = match state.store().user_entry(id).await {
         Ok(Some(row)) => row,
         Ok(None) => return dashboard(&state, Some(NO_SUCH_ROW)).await,
         Err(e) => {
-            tracing::error!(id, error = %e, "reading a waitlist row failed");
+            tracing::error!(id, error = %e, "reading a user row failed");
             return dashboard(&state, Some(STORE_TROUBLE)).await;
         }
     };
-    if row.status != WAITLIST_APPROVED {
+    if row.status != USER_APPROVED {
         return dashboard(&state, Some(NOT_APPROVED)).await;
     }
 
@@ -427,7 +427,7 @@ pub async fn send(State(state): State<ControlState>, headers: HeaderMap, body: B
 /// the caller must render; `None` means the row itself now tells the story.
 ///
 /// THE POINTER WRITE IS THE GATE ON THE SEND. Two presses of one button both
-/// mint, and [`crate::store::ControlStore::set_waitlist_invite`] compares the
+/// mint, and [`crate::store::ControlStore::set_user_invite`] compares the
 /// pointer each of them read before it writes, so exactly one wins. The loser
 /// revokes what it just minted and mails NOTHING: a second live code in the
 /// applicant's inbox is a second mailbox they can provision, and one no row
@@ -447,17 +447,17 @@ async fn mint_and_send(
     expected_prior: Option<i64>,
 ) -> Option<&'static str> {
     let (resend, _) = state.waitlist()?;
-    let row = match state.store().waitlist_entry(id).await {
+    let row = match state.store().user_entry(id).await {
         Ok(Some(row)) => row,
         Ok(None) => {
             tracing::warn!(
                 id,
-                "the waitlist row went away before its invite was minted"
+                "the user row went away before its invite was minted"
             );
             return Some(NO_SUCH_ROW);
         }
         Err(e) => {
-            tracing::error!(id, error = %e, "reading the waitlist row failed");
+            tracing::error!(id, error = %e, "reading the user row failed");
             return Some(STORE_TROUBLE);
         }
     };
@@ -483,7 +483,7 @@ async fn mint_and_send(
     };
     match state
         .store()
-        .set_waitlist_invite(id, invite_id, expected_prior)
+        .set_user_invite(id, invite_id, expected_prior)
         .await
     {
         Ok(true) => {}
@@ -492,7 +492,7 @@ async fn mint_and_send(
             return Some(ALREADY_HANDLED);
         }
         Err(e) => {
-            tracing::error!(id, invite_id, error = %e, "pointing the waitlist row at its invite failed");
+            tracing::error!(id, invite_id, error = %e, "pointing the user row at its invite failed");
             discard(state, id, invite_id).await;
             return Some(STORE_TROUBLE);
         }
@@ -505,7 +505,7 @@ async fn mint_and_send(
         Ok(()) => {
             match state
                 .store()
-                .mark_waitlist_notified(id, invite_id, Utc::now())
+                .mark_user_notified(id, invite_id, Utc::now())
                 .await
             {
                 // The row moved to a newer code while this send was in flight,
@@ -515,16 +515,16 @@ async fn mint_and_send(
                     tracing::info!(id, "an invite was delivered after its row moved on");
                     return None;
                 }
-                Ok(true) => tracing::info!(id, "waitlist invite sent"),
+                Ok(true) => tracing::info!(id, "invite sent"),
                 Err(e) => {
-                    tracing::error!(id, error = %e, "stamping the waitlist row as notified failed");
+                    tracing::error!(id, error = %e, "stamping the user row as notified failed");
                     return None;
                 }
             }
         }
         // The row stays approved with no stamp, which is the badge and the
         // button. The provider's own words are not in this error type.
-        Err(e) => tracing::warn!(id, error = %e, "sending the waitlist invite failed"),
+        Err(e) => tracing::warn!(id, error = %e, "sending the invite failed"),
     }
     None
 }
@@ -588,18 +588,18 @@ fn is_admin(state: &ControlState, headers: &HeaderMap) -> bool {
 /// The dashboard, listed fresh. `error` is a banner over a correct list, never
 /// a page in place of one.
 async fn dashboard(state: &ControlState, error: Option<&str>) -> Response {
-    let rows = match state.store().list_waitlist().await {
+    let rows = match state.store().list_users().await {
         Ok(rows) => rows,
         Err(e) => {
             // An empty page under a banner that says the store did not answer.
             // Rendering "nobody is waiting" with no explanation would be the
             // one wrong thing to show an operator.
-            tracing::error!(error = %e, "listing the waitlist failed");
+            tracing::error!(error = %e, "listing the funnel failed");
             return pages::admin_page(&[], &[], Some(STORE_TROUBLE));
         }
     };
-    let (pending, approved): (Vec<WaitlistRow>, Vec<WaitlistRow>) =
-        rows.into_iter().partition(|r| r.status == WAITLIST_PENDING);
+    let (pending, approved): (Vec<UserRow>, Vec<UserRow>) =
+        rows.into_iter().partition(|r| r.status == USER_PENDING);
     pages::admin_page(&pending, &approved, error)
 }
 

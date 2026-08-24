@@ -48,6 +48,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // Attachment bytes staged for Quick Look are torn down when the panel
         // closes; this is the sweep for the ones a crash or a hard quit stranded.
         StagedAttachment.purgeRoot()
+        // Same rule, same reason: a banner's sender tile is written to disk for
+        // the system to carry off, and this clears the ones it never took.
+        NotificationIcon.purgeRoot()
         Analytics.start()
         // The boot view never passes through route(to:), so its screen event
         // is recorded here or not at all.

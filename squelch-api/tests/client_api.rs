@@ -4366,6 +4366,22 @@ async fn stats_expose_stage2_usage_and_cost() {
 }
 
 #[tokio::test]
+async fn stats_carry_the_capability_flags_the_client_gates_on() {
+    // `forward_of_message_id` is `#[serde(default)]`, so a daemon predating
+    // forwarding IGNORES it rather than rejecting it: the request degrades into
+    // a bare cold send of the note, with the original nowhere in it and nothing
+    // in the response saying so. The flag is what lets the client refuse to
+    // offer the composer instead of sending that quietly.
+    let Harness { app, .. } = harness(|_, _| {});
+    let resp = app.oneshot(authed("GET", "/client/stats")).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+    assert_eq!(json["forwarding"], serde_json::json!(true));
+    // Its neighbour, present for the same reason: an answer, never absence.
+    assert!(json.get("assistant_relay").is_some());
+}
+
+#[tokio::test]
 async fn stats_carry_gmail_inbox_unread_only_once_the_sync_loop_has_fetched_it() {
     // Never fetched (old DB, or every fetch so far failed): the key is ABSENT.
     // A zeroed object would read as "your inbox is clear", which is a claim this
@@ -4549,7 +4565,15 @@ async fn thread_response_carries_html_field() {
             )
             .unwrap();
 
-        let plain = msg(acct, "g-plain", "t-html", "Newsletter", "just text");
+        // RENAMED mid-thread, which is what makes the per-message subject differ
+        // from the thread's (the thread's is the OLDEST message's).
+        let plain = msg(
+            acct,
+            "g-plain",
+            "t-html",
+            "Re: Newsletter - unsubscribe?",
+            "just text",
+        );
         let p = store.upsert_message(&plain).unwrap();
         store
             .set_triage(
@@ -4582,6 +4606,12 @@ async fn thread_response_carries_html_field() {
     // Per-message triage rides along for in-thread attention highlighting.
     assert_eq!(msgs[0]["tier"], "signal");
     assert_eq!(msgs[0]["attention_open"], true, "unresolved row reads open");
+    // ...and so does each message's OWN subject. The thread's is the oldest
+    // message's, which titles the conversation and mis-titles a forward of any
+    // message inside it the moment somebody renames the thread.
+    assert_eq!(json["subject"], "Newsletter");
+    assert_eq!(msgs[0]["subject"], "Newsletter");
+    assert_eq!(msgs[1]["subject"], "Re: Newsletter - unsubscribe?");
 }
 
 // --- UNSUBSCRIBE endpoints ---------------------------------------------------
@@ -6389,6 +6419,65 @@ async fn thread_view_marks_sent_to_senders_known_and_strangers_not() {
 }
 
 #[tokio::test]
+async fn thread_view_flags_the_users_own_sent_copies() {
+    // WIRE CONTRACT: `is_sent` is a plain bool on EVERY message of the thread,
+    // true when THIS ACCOUNT AUTHORED the message — its stored outbound copy, or
+    // a received copy whose From is the account's own address — and false for
+    // mail from anybody else. The reader right-aligns the user's bubbles on it,
+    // so a missing key is not an acceptable "false".
+    //
+    // The stored `is_sent` column alone would NOT satisfy this: it is a
+    // visibility flag, sticky to 0, and self-addressed mail (self-Cc, mail to
+    // oneself, a group echo) is deliberately kept at 0 so the visible copy wins.
+    // Hence the From-address arm, exercised by the third message here.
+    let Harness { app, .. } = harness(|store, acct| {
+        store
+            .upsert_message(&msg(acct, "g-in", "t1", "lunch?", "what they wrote"))
+            .unwrap();
+        store
+            .upsert_message(&sent_msg(
+                acct,
+                "g-out",
+                "t1",
+                "Re: lunch?",
+                "Alice <alice@example.com>",
+            ))
+            .unwrap();
+        // Written by the user with themselves on Cc: it landed through the INBOX
+        // walk, so it is stored is_sent = 0 forever. Cased unlike the accounts
+        // row on purpose — the match is case-insensitive.
+        let mut self_cc = msg(acct, "g-cc", "t1", "Re: lunch?", "what I wrote to us both");
+        self_cc.from_addr = "Me@Example.COM".into();
+        self_cc.from_name = Some("Me".into());
+        store.upsert_message(&self_cc).unwrap();
+    });
+
+    let resp = app
+        .oneshot(authed("GET", "/client/thread/t1"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+    let msgs = json["messages"].as_array().unwrap();
+    assert_eq!(msgs.len(), 3);
+    for m in msgs {
+        assert!(
+            m["is_sent"].is_boolean(),
+            "every message answers is_sent: {m}"
+        );
+    }
+    let is_sent = |gmail_subject: &str| -> Value {
+        msgs.iter()
+            .find(|m| m["content"] == gmail_subject)
+            .unwrap_or_else(|| panic!("{gmail_subject} missing from the thread"))["is_sent"]
+            .clone()
+    };
+    assert_eq!(is_sent("what they wrote"), Value::Bool(false));
+    assert_eq!(is_sent("what I wrote"), Value::Bool(true));
+    assert_eq!(is_sent("what I wrote to us both"), Value::Bool(true));
+}
+
+#[tokio::test]
 async fn thread_view_sender_known_needs_a_sent_message_not_merely_contact_row() {
     use squelch_core::store::ContactEntry;
     let Harness { app, .. } = harness(|store, acct| {
@@ -6508,6 +6597,26 @@ fn original_raw_b64(body_html: &str) -> String {
          --orig--\r\n"
     );
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(eml)
+}
+
+/// The `(text, html)` a recipient's client would SEE in a sent forward, decoded
+/// out of the quoted-printable transfer encoding both body parts carry. Header
+/// and structure assertions read the raw mime; CONTENT assertions come through
+/// here.
+fn forward_bodies(mime: &str) -> (String, String) {
+    let parsed = mail_parser::MessageParser::default()
+        .parse(mime.as_bytes())
+        .expect("the sent forward parses");
+    (
+        parsed
+            .body_text(0)
+            .expect("a text alternative")
+            .into_owned(),
+        parsed
+            .body_html(0)
+            .expect("an html alternative")
+            .into_owned(),
+    )
 }
 
 /// The `format=raw` response body carrying [`original_raw_b64`].
@@ -6722,16 +6831,20 @@ async fn forward_success_sends_a_new_conversation_carrying_the_original() {
     assert!(mime.contains("Subject: Fwd: Quarterly numbers\r\n"));
     assert!(!mime.contains("In-Reply-To"), "{mime}");
     assert!(!mime.contains("References"), "{mime}");
-    // The note, then the quoted block, in both alternatives.
-    assert!(mime.contains("worth a read"));
+    // The note, then the quoted block, in both alternatives. Read DECODED: a
+    // forward's body parts ride quoted-printable, because what they carry is a
+    // stranger's mail (see gmail_write::qp_encode).
+    let (text, html) = forward_bodies(&mime);
+    assert!(text.contains("worth a read"));
     assert_eq!(
-        mime.matches("---------- Forwarded message ---------")
+        format!("{text}{html}")
+            .matches("---------- Forwarded message ---------")
             .count(),
         2
     );
-    assert!(mime.contains("From: Alice <alice@example.com>\r\n"));
+    assert!(text.contains("From: Alice <alice@example.com>\r\n"));
     // The original's html rides verbatim, and the part its cid names rides with it.
-    assert!(mime.contains("<p>chart</p><img src=\"cid:logo@corp\">"));
+    assert!(html.contains("<p>chart</p><img src=\"cid:logo@corp\">"));
     assert!(mime.contains("filename=\"logo.png\""));
     assert!(mime.contains("Content-ID: <logo@corp>\r\n"));
     assert!(mime.contains("Content-Transfer-Encoding: base64\r\n"));
@@ -7012,6 +7125,127 @@ async fn the_guard_reads_the_html_half_a_clean_text_half_would_hide() {
             .iter()
             .any(|a| a.action == "send" && a.detail.as_deref() == Some("blocked:guard"))
     );
+}
+
+/// A `format=raw` response for an original whose BODIES are clean and whose
+/// `text/plain` attachment is not: a key pasted into `notes.txt` and dragged
+/// onto a mail, which is at least as natural an accident as pasting it inline.
+fn text_attachment_raw_response(note: &str) -> String {
+    use base64::Engine as _;
+    let eml = format!(
+        "From: Alice <alice@example.com>\r\n\
+         To: Me <me@example.com>\r\n\
+         Subject: Quarterly numbers\r\n\
+         MIME-Version: 1.0\r\n\
+         Content-Type: multipart/mixed; boundary=\"m\"\r\n\
+         \r\n\
+         --m\r\n\
+         Content-Type: text/plain; charset=\"UTF-8\"\r\n\
+         \r\n\
+         nothing to see here\r\n\
+         --m\r\n\
+         Content-Type: text/plain; charset=\"UTF-8\"\r\n\
+         Content-Disposition: attachment; filename=\"notes.txt\"\r\n\
+         \r\n\
+         {note}\r\n\
+         --m--\r\n"
+    );
+    format!(
+        "{{\"id\":\"gmail-original\",\"threadId\":\"thread-77\",\
+          \"internalDate\":\"1783591200000\",\"raw\":\"{}\"}}",
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(eml)
+    )
+}
+
+#[tokio::test]
+async fn the_guard_reads_a_text_attachment_the_bodies_would_hide() {
+    // A clean note, a clean body, and the key sitting in an attached notes.txt.
+    // Scanning only the bodies shipped it while this code called forwarding the
+    // classic exfil shape.
+    let secret = "-----BEGIN RSA PRIVATE KEY-----";
+    let (base, handle) = mock_gmail_seq(vec![(200, text_attachment_raw_response(secret))]).await;
+    let Harness { app, store, acct } = app_with_writes(base, |store, acct| {
+        seed_one_signal(
+            store,
+            acct,
+            "gmail-original",
+            "thread-77",
+            "Quarterly numbers",
+        );
+    });
+    let id = store.search(acct, "quarterly", 10, 0).unwrap()[0].id;
+
+    let resp = app
+        .oneshot(authed_json(
+            "POST",
+            "/client/actions/send",
+            serde_json::json!({
+                "forward_of_message_id": id,
+                "to": "carol@example.com",
+                "body": "thought you should see this",
+                "confirm": true
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let json = body_json(resp).await;
+    let err = json["error"].as_str().unwrap();
+    assert!(err.contains("pem_block"), "422 lists redacted kinds: {err}");
+    assert!(!err.contains("PRIVATE KEY"), "must NEVER echo the match");
+    assert_eq!(
+        handle.await.unwrap().len(),
+        1,
+        "read the original, sent nothing"
+    );
+    let audit = store.list_audit(acct, 10).unwrap();
+    assert!(
+        audit
+            .iter()
+            .any(|a| a.action == "send" && a.detail.as_deref() == Some("blocked:guard"))
+    );
+
+    // ...and the override is still the ceremony's second act: same request, one
+    // flag, and the attachment goes out with the bypass on the record.
+    let (base, handle) = mock_gmail_seq(vec![
+        (200, text_attachment_raw_response(secret)),
+        (200, "{}".to_string()),
+    ])
+    .await;
+    let Harness { app, store, acct } = app_with_writes(base, |store, acct| {
+        seed_one_signal(
+            store,
+            acct,
+            "gmail-original",
+            "thread-77",
+            "Quarterly numbers",
+        );
+    });
+    let id = store.search(acct, "quarterly", 10, 0).unwrap()[0].id;
+    let resp = app
+        .oneshot(authed_json(
+            "POST",
+            "/client/actions/send",
+            serde_json::json!({
+                "forward_of_message_id": id,
+                "to": "carol@example.com",
+                "body": "thought you should see this",
+                "confirm": true,
+                "override_guard": true
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let reqs = handle.await.unwrap();
+    assert_eq!(reqs.len(), 2);
+    assert!(sent_mime(&reqs[1]).contains("filename=\"notes.txt\""));
+    let audit = store.list_audit(acct, 10).unwrap();
+    assert!(audit.iter().any(|a| {
+        a.detail
+            .as_deref()
+            .is_some_and(|d| d.starts_with("guard_override:") && d.contains("pem_block"))
+    }));
 }
 
 #[tokio::test]

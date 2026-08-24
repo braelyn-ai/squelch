@@ -45,6 +45,8 @@
 //! - [`drift`] - reading a live tenant back: who else owns part of it, and what
 //!   an apply of today's render would change.
 //! - [`pair`] - reading `squelchd pair`'s output back.
+//! - [`devices`] - reading `squelchd token first-paired`'s output back: one
+//!   timestamp, which is the whole of the activation signal.
 //! - [`auth`] / [`ratelimit`] / [`handlers`] - the wire.
 //!
 //! The static infrastructure that installs the warden itself, and the runbook
@@ -65,6 +67,7 @@ use axum::{
 pub mod auth;
 pub mod cluster;
 pub mod config;
+pub mod devices;
 pub mod drift;
 pub mod handlers;
 pub mod identity;
@@ -165,6 +168,7 @@ pub fn router(state: WardenState) -> Router {
         )
         .route("/v1/tenants/{label}/llm-key", put(handlers::set_llm_key))
         .route("/v1/tenants/{label}/drift", get(handlers::get_drift))
+        .route("/v1/tenants/{label}/devices", get(handlers::get_devices))
         .route(
             "/v1/tenants/{label}/reconcile",
             post(handlers::reconcile_tenant),

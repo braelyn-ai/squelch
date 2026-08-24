@@ -57,7 +57,7 @@ use axum::{
 use chrono::{DateTime, Duration, Utc};
 use serde::Deserialize;
 use squelch_core::store::sqlite::device_tokens::{
-    PAIRING_CODE_LEN, PAIRING_TTL_SECS, normalize_pairing_code,
+    CONSOLE_DEVICE_NAME, PAIRING_CODE_LEN, PAIRING_TTL_SECS, normalize_pairing_code,
 };
 use squelch_core::store::{DeviceToken, Store};
 
@@ -76,10 +76,6 @@ const COOKIE_NAME: &str = "passband_console";
 /// own (it lives until revoked), so this only bounds how long a browser will keep
 /// presenting one nobody signed out of. Sign out revokes; this is the backstop.
 const COOKIE_TTL_SECS: i64 = 30 * 24 * 60 * 60;
-
-/// The `device_tokens.name` every console session carries, so `squelchd token
-/// list` and the devices table below both show a browser for what it is.
-const CONSOLE_DEVICE_NAME: &str = "console";
 
 /// Ceiling on a console POST body. The largest form here is one pairing code.
 const MAX_BODY_BYTES: usize = 4096;
