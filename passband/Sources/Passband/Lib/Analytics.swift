@@ -124,6 +124,11 @@ enum Analytics {
             "haiku", "opus",
             // assistant_asked transports
             "relay", "byok",
+            // invite_sent sources — where the share sheet was raised from
+            // (`ShareOrigin`). "settings" is also a MainView above; a Set union
+            // makes the duplicate free, and naming it here is what keeps this
+            // list readable as the vocabulary of THIS event.
+            "rail", "settings", "nudge",
         ])
 
     /// Screen views ride at `minimal` alongside lifecycle events.

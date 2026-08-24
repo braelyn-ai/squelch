@@ -146,7 +146,7 @@ struct SidebarRail: View {
     private var shareButton: some View {
         if store.shareAvailable {
             Button {
-                store.shareSheetOpen = true
+                store.openShareSheet(from: .rail)
             } label: {
                 Image(systemName: "gift")
                     .font(.system(size: 16, weight: .regular))

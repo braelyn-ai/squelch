@@ -19,6 +19,9 @@
 import SwiftUI
 
 struct SharePanel: View {
+    /// Read for ONE thing: which surface raised this sheet, for the analytics
+    /// property on a successful send. Nothing on this screen renders from it.
+    @Environment(AppStore.self) private var store
     @Environment(\.dismiss) private var dismiss
 
     /// The wire string `RecipientField` parses into pills. Comma-joined, which
@@ -292,9 +295,24 @@ struct SharePanel: View {
             let sent = try await APIClient.shared.sendInvites(
                 to: recipients, note: note.trimmed.isEmpty ? nil : note.trimmed)
             outcome = sent
-            Analytics.capture(
-                "invite_sent",
-                ["count": sent.results.filter(\.sent).count, "failed": sent.results.filter { !$0.sent }.count])
+            // ONLY WHEN SOMETHING ACTUALLY WENT. A press where every invite
+            // failed is not a share, and an `invite_sent` counting it would
+            // make the funnel read best exactly when the feature is most
+            // broken. The failures ride along as a property, so a run of them
+            // is still visible — under an event whose name is true.
+            let delivered = sent.results.filter(\.sent).count
+            if delivered > 0 {
+                Analytics.capture(
+                    "invite_sent",
+                    [
+                        "count": delivered,
+                        "failed": sent.results.count - delivered,
+                        // WHICH SURFACE drove this. The whole reason the event
+                        // is worth having: "people share" is not actionable,
+                        // "the two-week ask is where shares come from" is.
+                        "source": store.shareOrigin.rawValue,
+                    ])
+            }
         } catch {
             // The daemon's own copy where it wrote some, and a plain sentence
             // where it did not. Never the transport error: it says nothing a

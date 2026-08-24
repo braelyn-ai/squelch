@@ -13,6 +13,19 @@ import SwiftUI
 
 /// Which primary surface the rail is showing. `sitrep` is the abstracted
 /// dashboard (the default on launch); `emails` is the classic band list.
+/// Where the share sheet was raised from. The raw values are ANALYTICS STRINGS
+/// and must appear in `Analytics.allowedStrings`, which is a closed set: a value
+/// missing from it is a fatal assertion at the event site in a debug build, not
+/// a silently dropped property.
+enum ShareOrigin: String, Sendable, Hashable {
+    /// The `gift` tile in the sidebar rail.
+    case rail
+    /// The button in Settings > Account.
+    case settings
+    /// The two-week ask.
+    case nudge
+}
+
 enum MainView: String, Sendable, Hashable, CaseIterable {
     case sitrep, emails, auth, rules, audit, usage, settings, process
 
@@ -388,10 +401,21 @@ final class AppStore {
     /// unmount and the account already on screen would go with it.
     var addAccountSheetOpen = false
 
-    /// The Share Passband sheet. Raised by Settings and by the two-week nudge,
-    /// and hung on the shell for the same reason Add Account is: neither raiser
-    /// can be sure which page is on screen.
+    /// The Share Passband sheet. Raised from three places, and hung on the shell
+    /// for the same reason Add Account is: no raiser can be sure which page is
+    /// on screen.
+    ///
+    /// Written through [`openShareSheet(from:)`] rather than directly, so the
+    /// flag and the origin beside it cannot disagree. A drag-down or a Done
+    /// still sets it false on its own; the origin is only ever read while it is
+    /// true, so a stale one is unreachable.
     var shareSheetOpen = false
+
+    /// WHICH SURFACE raised the sheet, for the one analytics property that
+    /// makes the event worth having: whether shares come from the rail, from
+    /// Settings, or from the two-week ask. Without it `invite_sent` says people
+    /// share and nothing about what makes them.
+    private(set) var shareOrigin: ShareOrigin = .settings
 
     // MARK: sitrep slice
     var sitrep = SitrepData()
@@ -1989,6 +2013,12 @@ final class AppStore {
     var relayAvailable: Bool { sitrep.stats?.assistant_relay == true }
 
     // MARK: - invite sharing
+
+    /// Raise the share sheet, remembering what raised it.
+    func openShareSheet(from origin: ShareOrigin) {
+        shareOrigin = origin
+        shareSheetOpen = true
+    }
 
     /// Whether this daemon can mint and send invites. Read off the same sitrep
     /// stats the relay switch is, for the same reason: /client/stats is already

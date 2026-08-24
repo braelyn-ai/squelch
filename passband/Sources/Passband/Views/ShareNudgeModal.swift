@@ -74,7 +74,7 @@ struct ShareNudgeModal: View {
 
     private func share() {
         nudge.showingNudge = false
-        store.shareSheetOpen = true
+        store.openShareSheet(from: .nudge)
         Analytics.capture("invite_nudge_accepted")
     }
 }

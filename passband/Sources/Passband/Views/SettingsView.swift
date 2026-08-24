@@ -1269,7 +1269,7 @@ struct AccountSection: View {
             if store.shareAvailable {
                 SectionCard(label: "Invites") {
                     HStack(spacing: 12) {
-                        Button("Share Passband…") { store.shareSheetOpen = true }
+                        Button("Share Passband…") { store.openShareSheet(from: .settings) }
                             .buttonStyle(.glassProminent)
                             .tint(Palette.accent)
                         Text("your friends get an invite from your own address")
