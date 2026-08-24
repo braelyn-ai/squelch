@@ -46,9 +46,9 @@ use crate::store::{
 use crate::types::{
     AccountId, AttachmentInfo, AttentionStatus, AttentionUpdate, AuditEntry, BandCounts, Banking,
     CalendarUpdate, ClientAttachment, ClientMessage, ClientThreadView, Deadline, Disposition,
-    Event, EventKind, NewMessage, Receipt, SanitizedMessage, SearchHit, SenderRule, Sensitivity,
-    ShredCandidate, StoreStats, ThreadView, Tier, TriageAxis, TriageFeedback, UnsubscribeRecord,
-    Update,
+    Event, EventKind, NewMessage, OpenRate, Receipt, SanitizedMessage, SearchHit, SenderRule,
+    Sensitivity, ShredCandidate, StoreStats, ThreadView, Tier, TriageAxis, TriageFeedback,
+    UnsubscribeRecord, Update,
 };
 
 // schema.sql stays beside `store/mod.rs`; this file is `store/sqlite/mod.rs`.
@@ -799,6 +799,14 @@ impl Store for SqliteStore {
 
     fn mark_surfaced(&self, account_id: AccountId, message_ids: &[i64]) -> Result<usize> {
         self.mark_surfaced(account_id, message_ids)
+    }
+
+    fn mark_opened(&self, account_id: AccountId, message_ids: &[i64]) -> Result<usize> {
+        self.mark_opened(account_id, message_ids)
+    }
+
+    fn share_open_rate(&self, account_id: AccountId, since: DateTime<Utc>) -> Result<OpenRate> {
+        self.share_open_rate(account_id, since)
     }
 
     fn set_attention_status(

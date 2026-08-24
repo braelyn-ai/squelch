@@ -4,6 +4,102 @@ use super::super::*;
 use super::support::*;
 use crate::types::{SealedKind, Tier};
 
+/// The two stamps are DIFFERENT FACTS. Surfacing a row (a list door) must not
+/// make it look opened, or the share stat would measure scrolling.
+#[test]
+fn opening_and_surfacing_are_separate_stamps() {
+    let (store, acct) = store();
+    let now = Utc::now();
+    let id = ingest_normal(&store, acct, "g1", "t1", Tier::Signal, 80, now);
+
+    store.mark_surfaced(acct, &[id]).unwrap();
+    let rate = store
+        .share_open_rate(acct, now - chrono::Duration::days(1))
+        .unwrap();
+    assert_eq!(rate.received, 1);
+    assert_eq!(rate.opened, 0, "a surfaced row is not an opened one");
+
+    assert_eq!(store.mark_opened(acct, &[id]).unwrap(), 1);
+    let rate = store
+        .share_open_rate(acct, now - chrono::Duration::days(1))
+        .unwrap();
+    assert_eq!(rate.opened, 1);
+
+    // FIRST OPEN ONLY: re-reading a thread says nothing new, and a moving
+    // stamp would make the rate drift with re-reads.
+    assert_eq!(
+        store.mark_opened(acct, &[id]).unwrap(),
+        0,
+        "a second open transitions nothing"
+    );
+}
+
+/// What each side of the rate counts. Sealed mail is in the denominator (it
+/// arrived and nobody had to open it, which is the point) and can never be in
+/// the numerator; sent mail is in neither.
+#[test]
+fn the_open_rate_counts_received_mail_and_never_opens_a_sealed_row() {
+    let (store, acct) = store();
+    let now = Utc::now();
+    let since = now - chrono::Duration::days(30);
+
+    let opened = ingest_normal(&store, acct, "g1", "t1", Tier::Signal, 80, now);
+    let _unopened = ingest_normal(&store, acct, "g2", "t2", Tier::Noise, 10, now);
+    let sealed = triaged(acct, "g3", "t3")
+        .received_at(now)
+        .sealed(SealedKind::Otp)
+        .seed(&store);
+
+    store.mark_opened(acct, &[opened]).unwrap();
+    // The human door never serves a sealed body through this path; the SQL
+    // guard is what makes that true rather than merely customary.
+    assert_eq!(
+        store.mark_opened(acct, &[sealed]).unwrap(),
+        0,
+        "a sealed row is never stamped opened"
+    );
+
+    let rate = store.share_open_rate(acct, since).unwrap();
+    assert_eq!(rate.received, 3, "sealed mail counts as mail that arrived");
+    assert_eq!(rate.opened, 1);
+    assert!(rate.oldest_received_at.is_some());
+}
+
+/// The window is a floor on `received_at`, and the oldest row in it is what
+/// says how much history the answer rests on.
+#[test]
+fn the_open_rate_reports_the_reach_of_its_own_evidence() {
+    let (store, acct) = store();
+    let now = Utc::now();
+
+    let old = now - chrono::Duration::days(60);
+    ingest_normal(&store, acct, "g1", "t1", Tier::Signal, 80, old);
+    ingest_normal(&store, acct, "g2", "t2", Tier::Signal, 80, now);
+
+    // A window that reaches past the older row sees both, and dates itself to
+    // the older one.
+    let wide = store
+        .share_open_rate(acct, now - chrono::Duration::days(90))
+        .unwrap();
+    assert_eq!(wide.received, 2);
+    assert!(wide.oldest_received_at.unwrap() - old < chrono::Duration::seconds(2));
+
+    // A narrower one sees only the recent row, and says so.
+    let narrow = store
+        .share_open_rate(acct, now - chrono::Duration::days(7))
+        .unwrap();
+    assert_eq!(narrow.received, 1);
+    assert!(narrow.oldest_received_at.unwrap() - now < chrono::Duration::seconds(2));
+
+    // An empty window has no evidence at all, which the caller reads as "no
+    // number" rather than as a rate of zero.
+    let empty = store
+        .share_open_rate(acct, now + chrono::Duration::days(1))
+        .unwrap();
+    assert_eq!(empty.received, 0);
+    assert!(empty.oldest_received_at.is_none());
+}
+
 #[test]
 fn mark_surfaced_is_stamp_once_and_promotes_new_to_open() {
     let (store, acct) = store();

@@ -14,8 +14,10 @@ mod events;
 pub mod gmail_write;
 pub mod guard;
 mod handlers;
+mod invite_mail;
 mod markdown;
 mod pair;
+mod sharing;
 mod state;
 pub mod tracking;
 pub mod unsubscribe;
@@ -162,6 +164,14 @@ fn client_router(state: ApiState) -> Router {
         .route("/client/marketing", get(handlers::get_marketing))
         .route("/client/audit", get(handlers::get_audit))
         .route("/client/stats", get(handlers::get_stats))
+        // SHARING. The GET is a read (may this daemon share, and what could the
+        // mail say); the POST spends a quota and sends mail as the user, so it
+        // sits with the write routes below rather than here... except it does
+        // not, and that is deliberate: the action routes are gated on the WRITE
+        // credential being configured at all, and this route's own refusal says
+        // something more useful than a blanket 403. See `sharing::post_invites`.
+        .route("/client/invites", get(sharing::get_invites))
+        .route("/client/invites", post(sharing::post_invites))
         .route("/client/usage", get(handlers::get_usage))
         .route(
             "/client/triage-config",

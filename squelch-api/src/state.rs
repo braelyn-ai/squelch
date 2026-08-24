@@ -142,6 +142,13 @@ pub struct ApiState {
     /// `/client/assistant/messages` answers 404 and the app falls back to BYOK.
     /// HUMAN DOOR ONLY: the request spends the tenant's assistant budget.
     pub(crate) assistant: Option<Arc<crate::assistant::AssistantRelay>>,
+    /// Invite sharing: the control plane to mint a code at, and the share token
+    /// to mint with. `None` (no `SQUELCH_CONTROL_URL` + `SQUELCH_CONTROL_TOKEN`,
+    /// which is every self-host and every tenant nobody has run `share mint`
+    /// for) means `/client/invites` reports `can_share: false` and the app never
+    /// offers a button that could only fail. HUMAN DOOR ONLY: it spends a quota
+    /// and sends mail as the user.
+    pub(crate) sharing: Option<Arc<crate::sharing::Sharing>>,
     /// The carrier poller's kick handle plus the carriers it was built over,
     /// behind `POST /client/shipments/poll`. `None` when no poller runs — which
     /// is the resting state of every daemon with no carrier credentials — and
@@ -341,6 +348,7 @@ impl ApiState {
             )),
             rule_infer: None,
             assistant: None,
+            sharing: None,
             shipment_poll: None,
             shipment_policy: squelch_core::config::ShipmentListPolicy::default(),
         }
@@ -540,6 +548,17 @@ impl ApiState {
         self.assistant.as_ref()
     }
 
+    /// Point this daemon at a control plane it may mint invites against.
+    pub fn with_sharing(mut self, sharing: Option<crate::sharing::Sharing>) -> Self {
+        self.sharing = sharing.map(Arc::new);
+        self
+    }
+
+    /// The invite minter, if this daemon has one.
+    pub(crate) fn sharing(&self) -> Option<&Arc<crate::sharing::Sharing>> {
+        self.sharing.as_ref()
+    }
+
     /// Set the Stage-2 model + provider labels surfaced on `/client/usage`, so
     /// the usage page shows what model produced the spend.
     pub fn with_stage2_model(mut self, model: impl Into<String>, provider: Option<String>) -> Self {
@@ -667,8 +686,18 @@ impl ApiState {
         // Console SSO is env-only and hosted-only: the warden sets it when it
         // provisions a tenant, and a self-host leaves it unset, which is what
         // keeps the Google button off a page that has no control plane behind it.
+        // Sharing is env-only and hosted-only for the same reason console SSO
+        // is: the warden sets both when it provisions a tenant, and a self-host
+        // has no control plane to mint a code at. The pair is resolved together
+        // (see `Sharing::new`), so a half-configured daemon is simply not
+        // sharing rather than sharing badly.
+        let sharing = crate::sharing::Sharing::new(
+            std::env::var("SQUELCH_CONTROL_URL").unwrap_or_default(),
+            std::env::var("SQUELCH_CONTROL_TOKEN").unwrap_or_default(),
+        );
         Ok(Self::new(store, account_id, token)
-            .with_console_sso_url(std::env::var("SQUELCH_CONSOLE_SSO_URL").ok()))
+            .with_console_sso_url(std::env::var("SQUELCH_CONSOLE_SSO_URL").ok())
+            .with_sharing(sharing))
     }
 
     /// THE one way a binary turns a loaded [`Config`] into serving state:

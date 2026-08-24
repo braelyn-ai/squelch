@@ -313,6 +313,94 @@ impl SqliteStore {
         Ok(first_surfaced)
     }
 
+    /// Stamp `opened_at` on rows whose BODY the human door just served.
+    ///
+    /// Deliberately NOT folded into [`Self::mark_surfaced`], which every list
+    /// door calls: the two answer different questions, and merging them would
+    /// make "opened" mean "appeared in a list" (see the column comment in
+    /// `schema.sql`). Callers that serve a body call both.
+    ///
+    /// FIRST OPEN ONLY, like `surfaced_at`: re-reading a thread next week says
+    /// nothing new about whether it needed opening, and a moving stamp would
+    /// make the rate drift with re-reads. Sealed rows are excluded, which is
+    /// belt and braces - the human door never serves one through this path -
+    /// and it keeps the denominator and numerator counting the same universe.
+    pub(super) fn mark_opened(&self, account_id: AccountId, message_ids: &[i64]) -> Result<usize> {
+        if message_ids.is_empty() {
+            return Ok(0);
+        }
+        let mut conn = self.lock()?;
+        let now = Utc::now().to_rfc3339();
+        let tx = conn.transaction()?;
+        let mut first_opened = 0usize;
+        {
+            let mut stmt = tx.prepare(
+                "UPDATE triage
+                 SET opened_at = ?1
+                 WHERE account_id = ?2 AND message_id = ?3
+                   AND sensitivity != 'sealed'
+                   AND opened_at IS NULL",
+            )?;
+            for &id in message_ids {
+                first_opened += stmt.execute(params![now, account_id, id])?;
+            }
+        }
+        tx.commit()?;
+        Ok(first_opened)
+    }
+
+    /// How much of this mailbox's incoming mail the user has had to open, over
+    /// the rows received since `since`.
+    ///
+    /// WHAT IT COUNTS, and every exclusion is a decision:
+    ///
+    /// - RECEIVED MAIL ONLY (`is_sent = 0`). Nobody opens their own outbox, and
+    ///   counting it would dilute the rate with a number that has no opinion.
+    /// - SEALED MAIL IS IN THE DENOMINATOR. A login code is mail that arrived
+    ///   and did not need opening, which is the most honest example there is of
+    ///   the thing being measured. It can never be in the numerator, because
+    ///   [`Self::mark_opened`] refuses to stamp it.
+    /// - Rows with no triage row at all are absent from both, by the join: a
+    ///   message the daemon never triaged is one it cannot speak for.
+    ///
+    /// WHAT IT CANNOT SEE is mail read somewhere else. `opened_at` is stamped
+    /// by this daemon's human door and nowhere else, so a user who reads half
+    /// their mail in Gmail on a phone will find this number FLATTERINGLY LOW.
+    /// Every consumer has to carry that caveat with it, and the one consumer
+    /// (the invite mail) does.
+    pub(super) fn share_open_rate(
+        &self,
+        account_id: AccountId,
+        since: DateTime<Utc>,
+    ) -> Result<OpenRate> {
+        let conn = self.lock()?;
+        let (received, opened): (i64, i64) = conn.query_row(
+            "SELECT COUNT(*), COUNT(t.opened_at)
+               FROM messages m JOIN triage t ON t.message_id = m.id
+              WHERE m.account_id = ?1 AND m.is_sent = 0 AND m.received_at >= ?2",
+            params![account_id, since.to_rfc3339()],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        // The oldest received row in the window, which is what says how much
+        // history the answer actually rests on. A mailbox synced three days ago
+        // has a rate; it does not have a rate worth mailing to a stranger.
+        let oldest: Option<String> = conn.query_row(
+            "SELECT MIN(received_at) FROM messages
+              WHERE account_id = ?1 AND is_sent = 0 AND received_at >= ?2",
+            params![account_id, since.to_rfc3339()],
+            |r| r.get(0),
+        )?;
+        Ok(OpenRate {
+            received: received.max(0) as u64,
+            opened: opened.max(0) as u64,
+            oldest_received_at: oldest.and_then(|s| {
+                DateTime::parse_from_rfc3339(&s)
+                    .ok()
+                    .map(|d| d.with_timezone(&Utc))
+            }),
+        })
+    }
+
     pub(super) fn set_attention_status(
         &self,
         account_id: AccountId,

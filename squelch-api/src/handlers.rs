@@ -498,6 +498,19 @@ pub async fn get_thread(
                 sender_known,
             });
         }
+        // THE OPEN LEDGER, and this is the one door that writes it: a body
+        // left this daemon, which is the user reading the mail rather than
+        // scrolling past it in a list (see `triage.opened_at` in schema.sql).
+        // Stamped after the view is assembled, so a read that failed to
+        // assemble records nothing, and first-open-only, so re-reading a thread
+        // next week does not move the stamp.
+        //
+        // EVERY MESSAGE IN THE THREAD, not just the newest: the reader shows
+        // them all, oldest first, and the user has to deal with the whole
+        // thread once they are in it.
+        let ids: Vec<i64> = messages.iter().map(|m| m.message.id).collect();
+        store.mark_opened(account_id, &ids)?;
+
         Ok(ThreadResponse {
             thread_id: view.thread_id,
             subject: view.subject,
@@ -1641,6 +1654,11 @@ pub async fn get_stats(State(state): State<ApiState>) -> Result<impl IntoRespons
     // relay (hosted, gateway configured) or 404 (self-host, BYOK in the app).
     // Always present so a client reads an answer, not absence.
     body["assistant_relay"] = json!(state.assistant().is_some());
+    // The same, for invite sharing: whether `/client/invites` will mint (hosted,
+    // a share token installed) or report `can_share: false` (self-host, or a
+    // tenant nobody has turned it on for). Always present, so a client reads an
+    // answer rather than absence, and an OLD daemon's silence reads as "no".
+    body["invite_sharing"] = json!(state.sharing().is_some());
     Ok(Json(body))
 }
 
@@ -2072,7 +2090,7 @@ async fn resolve_sender_done(state: &ApiState, sender: &str) {
 }
 
 /// Resolve the WRITE-bound gmail client, or 403 with a hint if none configured.
-fn write_client(state: &ApiState) -> Result<GmailWriteClient, ApiError> {
+pub(crate) fn write_client(state: &ApiState) -> Result<GmailWriteClient, ApiError> {
     match state.write_creds() {
         Some(creds) => Ok(match state.write_api_base() {
             Some(base) => {

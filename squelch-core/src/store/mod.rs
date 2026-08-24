@@ -15,9 +15,9 @@ use crate::triage::extract::shipments::ShipmentsApplied;
 use crate::triage::{CalendarInfo, CarrierTrack, DeadlineHit, ReceiptInfo, ShipmentInfo};
 use crate::types::{
     AccountId, AttachmentInfo, AttentionStatus, AttentionUpdate, AuditEntry, Banking,
-    CalendarUpdate, Deadline, Disposition, Event, EventKind, FieldReasons, NewMessage, Receipt,
-    SealedKind, SearchHit, SenderRule, Sensitivity, ShredCandidate, StoreStats, ThreadView, Tier,
-    TriageAxis, TriageFeedback, UnsubscribeRecord, Update,
+    CalendarUpdate, Deadline, Disposition, Event, EventKind, FieldReasons, NewMessage, OpenRate,
+    Receipt, SealedKind, SearchHit, SenderRule, Sensitivity, ShredCandidate, StoreStats,
+    ThreadView, Tier, TriageAxis, TriageFeedback, UnsubscribeRecord, Update,
 };
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -1309,6 +1309,17 @@ pub trait Store: Send + Sync {
     /// `new`->`open`. Sealed rows are guarded out in SQL. Returns the
     /// first-surface count (rows whose `surfaced_at` transitioned from NULL).
     fn mark_surfaced(&self, account_id: AccountId, message_ids: &[i64]) -> Result<usize>;
+
+    /// THE OTHER STAMP: for each non-sealed message id set `opened_at=now` only
+    /// if currently NULL. Called ONLY where a message BODY is served, which is
+    /// what makes it mean "the user opened this" rather than "we showed this".
+    /// Returns the first-open count.
+    fn mark_opened(&self, account_id: AccountId, message_ids: &[i64]) -> Result<usize>;
+
+    /// Received vs opened over the window since `since`, for the one caller
+    /// that puts a number in front of a human. See the implementation for what
+    /// each side counts and, more importantly, what `opened` cannot see.
+    fn share_open_rate(&self, account_id: AccountId, since: DateTime<Utc>) -> Result<OpenRate>;
 
     /// Set the attention status of one message's triage row. `Done` stamps
     /// `resolved_at=now`; `Open`/`New` clear it. Sealed rows are excluded in SQL,

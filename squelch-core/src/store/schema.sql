@@ -191,6 +191,21 @@ CREATE TABLE IF NOT EXISTS triage (
     -- and left alone by a plain clear — clearing a pending reminder says nothing
     -- about one that already came due.
     reminded_at     TEXT,
+    -- WHEN THE HUMAN DOOR LAST SERVED THIS ROW'S BODY, NULL until it does.
+    --
+    -- NOT `surfaced_at`, AND THE DIFFERENCE IS THE WHOLE POINT. A row is
+    -- surfaced the first time it flows out through ANY read door, which
+    -- includes appearing in a list the user scrolled past; it means "this was
+    -- in front of them". This column is stamped only where a MESSAGE BODY is
+    -- served, which is the reader actually opening the thread. One is what we
+    -- showed, the other is what they read, and only the second can answer "how
+    -- much of my mail do I still have to open myself".
+    --
+    -- IT SEES ONLY PASSBAND. Mail read in Gmail on a phone is never stamped
+    -- here, so anything computed from it UNDERSTATES opens and flatters the
+    -- product. Every consumer has to know that; see `Store::share_open_rate`,
+    -- which is the only one, and which says so.
+    opened_at       TEXT,
     status          TEXT NOT NULL DEFAULT 'new',
     surfaced_at     TEXT,
     resolved_at     TEXT,

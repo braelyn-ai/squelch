@@ -112,6 +112,14 @@ pub(super) fn migrate(conn: &Connection) -> Result<()> {
     // the standing band (that column is one of its arms).
     add_column_if_missing(conn, "triage", "remind_at", "TEXT")?;
     add_column_if_missing(conn, "triage", "reminded_at", "TEXT")?;
+    // WHEN THE HUMAN DOOR LAST SERVED THIS ROW'S BODY. NULL on every
+    // pre-existing row and NOT backfilled, and the absence is honest rather
+    // than convenient: nothing recorded opens before this column existed, and
+    // inventing them would put a number in front of a user that their own
+    // mailbox does not support. `share_open_rate` refuses to answer until the
+    // column has been there long enough to mean something.
+    add_column_if_missing(conn, "triage", "opened_at", "TEXT")?;
+
     // AND THE SWEEP'S INDEX, HERE rather than in schema.sql, for the reason
     // spelled out at that file's `idx_triage_remind_at` note: it runs before this
     // function, so an index over a just-migrated column takes the open down. The
