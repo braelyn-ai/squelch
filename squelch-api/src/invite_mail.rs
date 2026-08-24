@@ -23,7 +23,8 @@
 //! carry markup the composer would have refused, and there is no second
 //! renderer here to drift from the first.
 //!
-//! THE NUMBER IS REAL OR IT IS ABSENT. When the draft says "about 15% of it",
+//! THE NUMBER IS REAL OR IT IS ABSENT. When the draft says "about 15% of my
+//! emails",
 //! 15 came from this user's own mailbox via [`crate::sharing::share_stat`],
 //! which refuses to answer at all without enough history, enough mail, and an
 //! answer worth saying. There is no default and no house average.
@@ -55,11 +56,11 @@ pub fn default_body(open_percent: Option<u32>) -> String {
     let opening = match open_percent {
         Some(percent) => format!(
             "I have been using Passband for my email. turns out I only need to manually open \
-             about {percent}% of it, and agents filter out the rest. thought you might find it \
-             useful too."
+             about {percent}% of my emails and agents sort the rest. I thought you might find \
+             it useful too."
         ),
-        None => "I have been using Passband for my email. agents filter out the noise so I only \
-                 open what actually needs me. thought you might find it useful too."
+        None => "I have been using Passband for my email. agents sort it so I only open what \
+                 actually needs me. I thought you might find it useful too."
             .to_string(),
     };
     format!(
@@ -207,7 +208,7 @@ mod tests {
         let body = default_body(Some(15));
         assert!(has_marker(&body), "{body}");
         assert_eq!(body.matches(INVITE_MARKER).count(), 1, "{body}");
-        assert!(body.contains("about 15% of it"), "{body}");
+        assert!(body.contains("about 15% of my emails"), "{body}");
         assert!(
             body.contains(&format!("sent with [Passband]({SITE_URL})")),
             "the footer links to the site: {body}"
@@ -224,11 +225,11 @@ mod tests {
     #[test]
     fn the_stat_is_present_or_the_sentence_is_different() {
         let with = default_body(Some(15));
-        assert!(with.contains("about 15% of it"), "{with}");
+        assert!(with.contains("about 15% of my emails"), "{with}");
 
         let without = default_body(None);
         assert!(!without.contains('%'), "{without}");
-        assert!(without.contains("filter out the noise"), "{without}");
+        assert!(without.contains("agents sort it"), "{without}");
         assert!(!without.contains("percent"), "{without}");
     }
 
