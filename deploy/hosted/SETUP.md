@@ -385,11 +385,44 @@ The gateway, on Railway:
    from Bifrost's own catalog, and routing resolves keys only through a
    virtual key's `provider_configs.key_ids`. The control plane handles the
    latter when it mints (it discovers key ids from
-   `/api/providers/anthropic/keys`); the former is one `PUT` on the provider
-   key setting `models` to the explicit list (`claude-haiku-4-5`,
-   `claude-sonnet-5`). Verify with a curl through a test virtual key before
-   pointing any tenant at it — the failure mode is a 400 `no keys found for
-   provider`, not a misrouted call.
+   `/api/providers/anthropic/keys`); the former is what
+   `squelch-control llm sync` is for, and it is not a one-time setup step.
+   Run it once here, and again after **every** change to the model the fleet
+   runs. `squelch-control llm sync --check` reports and exits 1 without
+   writing, so it can run as a check.
+
+   **A model is allow-listed twice, and the second list is the one that gets
+   forgotten.** A virtual key's `allowed_models` is matched against the id
+   the daemon sent (`anthropic/claude-opus-5`). The provider key's `models`
+   is matched *after* the provider prefix is resolved away
+   (`claude-opus-5`). A model in the first and not the second answers **400
+   `no keys found that support model: <model>`** — not `no keys found for
+   provider`, which is the different failure of a virtual key with no
+   `key_ids`.
+
+   That gap is what took the hosted fleet down for four days in August 2026.
+   `SQUELCH_CONTROL_LLM_MODELS`, the warden's stage models, and every virtual
+   key had moved to `claude-opus-5`; this list still said `claude-opus-4-8`,
+   so every tenant 400'd at routing and ran heuristics-only while every place
+   an operator would look read as correct. `llm sync` exists so this list has
+   an owner instead of a person who has to remember it.
+
+   Two properties of this key are worth knowing before touching it by hand:
+
+   - **Empty does not mean "allow everything."** Verified live on
+     2026-08-25: emptying `models` leaves the key serving nothing at all,
+     the same as the `["*"]` wildcard. It is an allow-list that has to name
+     every model, which is why the answer is a sync command and not a
+     deletion.
+   - **A read masks the credential.** The key comes back with the Anthropic
+     key as `sk-a****gQAA` plus a `ref` naming the env var holding the real
+     one. The obvious read-modify-write therefore persists asterisks as your
+     Anthropic key and takes every tenant down at once. `llm sync` sends the
+     reference alone and refuses a key stored any other way; if you `PUT` it
+     by hand, do the same.
+
+   Verify with a curl through a test virtual key before pointing any tenant
+   at it.
 
 Then point both planes at it:
 

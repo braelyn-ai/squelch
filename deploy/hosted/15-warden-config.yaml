@@ -136,6 +136,19 @@ data:
   # Railway service. If these two disagree, the canary is probing a request the
   # fleet does not send, and a green light stops meaning the fleet works.
   #
+  # AND WITH THE GATEWAY, which allow-lists a model TWICE: on each virtual key
+  # (matched against the qualified id below) and on the provider key (matched
+  # with the prefix already resolved away). Changing these two values without
+  # the gateway is the 2026-08-21 outage: every tenant 400ing with "no keys
+  # found that support model" while this file, the virtual keys and the daemon
+  # all named the model correctly. Whenever a stage model moves here, run
+  #
+  #     squelch-control llm sync
+  #
+  # which rewrites the provider key from the control plane's own model config,
+  # and reports any virtual key that needs an `llm mint`. `--check` answers
+  # "are they in lockstep right now" without writing.
+  #
   # Revisit if the gateway is ever upgraded to a build that resolves bare ids:
   # dropping the prefix is then a one-knob revert (plus the canary's var).
   SQUELCH_WARDEN_LLM_STAGE1_MODEL: "anthropic/claude-opus-5"

@@ -117,6 +117,28 @@ enum LlmCommand {
     /// Revoke a tenant's recorded virtual keys — both of them — in Bifrost
     /// and forget them.
     Revoke { label: String },
+    /// Converge the gateway's model configuration onto this control plane's,
+    /// and report what it cannot fix.
+    ///
+    /// The provider key's `models` list is the one place a model id is
+    /// spelled that NOTHING owned: not the warden, not signup, not `llm
+    /// mint`. It is a second allow-list sitting behind every virtual key's,
+    /// and on 2026-08-25 it was still naming `claude-opus-4-8` while the
+    /// whole fleet had moved to `claude-opus-5`, so every tenant's triage
+    /// call died at routing and the fleet ran heuristics-only for days. This
+    /// writes that list from `SQUELCH_CONTROL_LLM_MODELS` and
+    /// `SQUELCH_CONTROL_ASSISTANT_MODELS`, which is what makes those two
+    /// variables the actual source of truth rather than two thirds of one.
+    ///
+    /// Virtual keys are REPORTED, never rewritten: a tenant's allow-list is
+    /// fixed by `llm mint <label>`, which rotates the key through the warden
+    /// so the pod receives what the gateway now believes.
+    Sync {
+        /// Report drift and change nothing. Exits 1 if anything has drifted,
+        /// so it can be run as a check rather than read by a human.
+        #[arg(long)]
+        check: bool,
+    },
 }
 
 /// The share-token operator commands. Like `llm`, these need the warden pair
@@ -394,16 +416,27 @@ fn llm(command: LlmCommand) -> anyhow::Result<()> {
              SQUELCH_CONTROL_ASSISTANT_BUDGET_USD, and SQUELCH_CONTROL_ASSISTANT_MODELS)"
         );
     };
-    let (warden_url, warden_token) =
-        config::warden_from_env().map_err(|e| anyhow::anyhow!("squelch-control: {e}"))?;
-
-    let warden = HttpWarden::new(warden_url, warden_token, OUTBOUND_TIMEOUT)?;
     let bifrost = BifrostClient::new(
         llm.url.clone(),
         llm.admin_token.clone(),
         llm.models.clone(),
         OUTBOUND_TIMEOUT,
     )?;
+
+    // `sync` is the one command in this group that needs NEITHER the store nor
+    // the warden: it reads and writes the GATEWAY's own model configuration and
+    // nothing else. Both are therefore acquired past this point rather than
+    // before it — the operator most likely to reach for `sync` is one whose
+    // fleet cannot reach its model, and making that person first assemble a
+    // Postgres URL and a warden bearer is how a small outage becomes an
+    // unreadable one. Same principle the module header states for `invite`.
+    if let LlmCommand::Sync { check } = command {
+        return runtime()?.block_on(llm_sync(&bifrost, &llm, check));
+    }
+
+    let (warden_url, warden_token) =
+        config::warden_from_env().map_err(|e| anyhow::anyhow!("squelch-control: {e}"))?;
+    let warden = HttpWarden::new(warden_url, warden_token, OUTBOUND_TIMEOUT)?;
 
     runtime()?.block_on(async {
         // Opened inside the runtime with everything else it takes: the store is
@@ -412,6 +445,7 @@ fn llm(command: LlmCommand) -> anyhow::Result<()> {
         match command {
             LlmCommand::Mint { label } => llm_mint(&store, &bifrost, &warden, &llm, &label).await,
             LlmCommand::Revoke { label } => llm_revoke(&store, &bifrost, &label).await,
+            LlmCommand::Sync { .. } => unreachable!("answered above, before store and warden"),
         }
     })
 }
@@ -556,6 +590,153 @@ async fn llm_revoke(
         );
     }
     Ok(())
+}
+
+/// Converge the gateway's model configuration onto this control plane's.
+///
+/// Two halves, because only one of them is ours to write:
+///
+/// - THE PROVIDER KEY is written. Its `models` list is a second allow-list
+///   sitting behind every virtual key's, matched with the provider prefix
+///   already stripped, and until this command existed nothing owned it. It
+///   was edited once by hand at gateway setup and then silently outlived two
+///   model migrations.
+/// - VIRTUAL KEYS are only reported. Rewriting a tenant's allow-list here
+///   would converge the gateway and leave the POD holding a key the warden
+///   installed, so the fix is `llm mint <label>`, which rotates both ends.
+///
+/// The whitespace check is not decoration. The canary's virtual key was typed
+/// into the gateway UI as `anthropic/claude-opus-5 , claude-opus-5 ` and
+/// stored with the spaces intact; the gateway matches exactly, so every probe
+/// 403'd for four days while the entry LOOKED right in every listing. An
+/// untrimmed entry is reported for every key, managed or not, because it is
+/// invisible in exactly the places a human would go to check.
+async fn llm_sync(bifrost: &BifrostClient, llm: &BifrostConfig, check: bool) -> anyhow::Result<()> {
+    let want = squelch_control::bifrost::provider_key_models(&llm.models, &llm.assistant_models);
+    let mut drifted = false;
+
+    eprintln!(
+        "squelch-control: provider key models are derived from SQUELCH_CONTROL_LLM_MODELS + \
+         SQUELCH_CONTROL_ASSISTANT_MODELS, provider prefixes stripped."
+    );
+    for key in bifrost.provider_keys().await? {
+        let same = key.models.len() == want.len()
+            && want.iter().all(|m| key.models.iter().any(|k| k == m));
+        eprintln!("\nprovider key {} ({})", key.name, key.id);
+        eprintln!("  has:  {}", render(&key.models));
+        eprintln!("  want: {}", render(&want));
+        if same {
+            eprintln!("  in sync");
+            continue;
+        }
+        drifted = true;
+        if check {
+            eprintln!("  DRIFTED (--check, nothing written)");
+            continue;
+        }
+        match bifrost.set_provider_key_models(&key, &want).await {
+            Ok(()) => eprintln!("  rewritten"),
+            // Not fatal for the whole run: the report below is still worth
+            // printing, and the exit code still carries the failure.
+            Err(e) => eprintln!("  COULD NOT WRITE: {e}"),
+        }
+    }
+
+    eprintln!("\nsquelch-control: virtual keys (reported, never rewritten here)");
+    for vk in bifrost.list_virtual_keys().await? {
+        let untrimmed: Vec<&String> = vk
+            .allowed_models
+            .iter()
+            .filter(|m| m.trim() != m.as_str())
+            .collect();
+        // Which list a key SHOULD carry depends on its job, and the only thing
+        // this command has to read the job from is the name Bifrost stores.
+        // That name cannot always answer it. A label may contain interior
+        // hyphens, so a tenant may legitimately be called `my-assistant`, and
+        // then `tenant-my-assistant` is BOTH that tenant's triage key and
+        // tenant `my`'s assistant key. The store could disambiguate; opening
+        // it would cost this command its independence from Postgres, which is
+        // the property that makes it usable mid-outage. So an ambiguous name
+        // is checked against BOTH lists and passes if it satisfies either.
+        // Today the two lists are identical and nothing turns on this; the
+        // whole point of the command is that they will not stay that way.
+        let candidates: Vec<&Vec<String>> = match vk.name.strip_prefix("tenant-") {
+            Some(rest) if rest.ends_with("-assistant") => {
+                vec![&llm.assistant_models, &llm.models]
+            }
+            Some(_) => vec![&llm.models],
+            None => Vec::new(),
+        };
+        if candidates.is_empty() {
+            eprintln!("  {:<32} unmanaged (not a tenant key)", vk.name);
+            // An untrimmed entry is still worth shouting about on a key
+            // nothing here manages: that is precisely what the canary was.
+            if !untrimmed.is_empty() {
+                drifted = true;
+                eprintln!(
+                    "  {:<32} UNTRIMMED {untrimmed:?} (the gateway matches exactly, so these \
+                     can never hit)",
+                    ""
+                );
+            }
+            continue;
+        }
+
+        // `missing` against the closest candidate, so the advice names the
+        // shorter gap rather than whichever list was tried first.
+        let missing = candidates
+            .iter()
+            .map(|want| {
+                want.iter()
+                    .filter(|m| !vk.allowed_models.iter().any(|a| a.trim() == m.as_str()))
+                    .cloned()
+                    .collect::<Vec<String>>()
+            })
+            .min_by_key(Vec::len)
+            .unwrap_or_default();
+
+        if missing.is_empty() && untrimmed.is_empty() {
+            eprintln!("  {:<32} in sync", vk.name);
+            continue;
+        }
+        drifted = true;
+        if !untrimmed.is_empty() {
+            eprintln!(
+                "  {:<32} UNTRIMMED {untrimmed:?} (the gateway matches exactly, so these can \
+                 never hit)",
+                vk.name
+            );
+        }
+        if !missing.is_empty() {
+            eprintln!("  {:<32} missing {missing:?}", vk.name);
+        }
+        let label = vk
+            .name
+            .strip_prefix("tenant-")
+            .unwrap_or(&vk.name)
+            .trim_end_matches("-assistant");
+        eprintln!("  {:<32} fix with: llm mint {label}", "");
+    }
+
+    if drifted && check {
+        anyhow::bail!("the gateway's model configuration has drifted (nothing was written)");
+    }
+    if drifted {
+        anyhow::bail!(
+            "the gateway still has drift this command cannot fix; see the virtual keys above"
+        );
+    }
+    eprintln!("\nsquelch-control: the gateway's model configuration matches this control plane.");
+    Ok(())
+}
+
+fn render(models: &[String]) -> String {
+    if models.is_empty() {
+        // Worth spelling out: on this gateway an empty list serves NOTHING,
+        // which is the opposite of what "no filter" suggests.
+        return "(empty: this key serves no model at all)".to_string();
+    }
+    models.join(", ")
 }
 
 /// The cluster commands need the warden pair, and a fleet-wide `drift` needs
