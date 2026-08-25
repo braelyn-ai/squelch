@@ -1797,6 +1797,24 @@ pub trait Store: Send + Sync {
         day: &str,
     ) -> Result<u32>;
 
+    /// Give back one charge from [`Store::stage2_increment_budget`], for a call
+    /// that was charged and then rejected at CONFIG level.
+    ///
+    /// Charging before the call is what stops a retry storm exceeding the cap,
+    /// and that stays. But a config-level rejection (see
+    /// [`crate::triage::llm::is_config_failure`]) is a 4xx in ~0ms that spends
+    /// no tokens and no money — and because it is shared by every queued row,
+    /// one broken config can charge the whole day's cap in minutes. That is not
+    /// a hypothetical: on 2026-08-25 a hosted tenant's gateway misconfiguration
+    /// burned 498 of a 500-call daily cap, and because the day key is UTC, the
+    /// fleet stayed capped for 22 hours AFTER the gateway was fixed. Fixing an
+    /// outage has to restore service, not schedule it for tomorrow.
+    ///
+    /// Row-level permanent failures (`json_parse`, `max_tokens_truncation`)
+    /// deliberately keep their charge: the model ran and was paid for.
+    fn stage2_refund_budget(&self, account_id: AccountId, thread_id: &str, day: &str)
+    -> Result<()>;
+
     /// Apply a parsed Stage-2 result onto a triage row IN ONE TRANSACTION:
     /// overwrite importance/tier/one_line/reason, stamp `model_used` (leaving the
     /// queue), and (re)write the `deadlines` row when the model extracted one.

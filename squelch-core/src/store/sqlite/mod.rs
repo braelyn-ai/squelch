@@ -1134,6 +1134,15 @@ impl Store for SqliteStore {
         self.stage2_increment_budget(account_id, thread_id, day)
     }
 
+    fn stage2_refund_budget(
+        &self,
+        account_id: AccountId,
+        thread_id: &str,
+        day: &str,
+    ) -> Result<()> {
+        self.stage2_refund_budget(account_id, thread_id, day)
+    }
+
     fn stage2_apply(&self, applied: &Stage2Applied) -> Result<bool> {
         self.stage2_apply(applied)
     }

@@ -1096,6 +1096,28 @@ impl SqliteStore {
         Ok(n.max(0) as u32)
     }
 
+    /// Give back one charge taken by [`Self::stage2_increment_budget`].
+    ///
+    /// FLOORED AT ZERO, and the floor is not paranoia: the counter is keyed by
+    /// UTC day, so a call charged at 23:59:59 and refunded at 00:00:01 lands on
+    /// the NEXT day's row, which has nothing in it. `MAX(0, ...)` makes that
+    /// refund a no-op instead of a negative balance that would silently hand
+    /// the new day a free call.
+    pub(super) fn stage2_refund_budget(
+        &self,
+        account_id: AccountId,
+        thread_id: &str,
+        day: &str,
+    ) -> Result<()> {
+        let conn = self.lock()?;
+        conn.execute(
+            "UPDATE wake_budget SET model_calls = MAX(0, model_calls - 1)
+             WHERE account_id=?1 AND thread_id=?2 AND day=?3",
+            params![account_id, thread_id, day],
+        )?;
+        Ok(())
+    }
+
     pub(super) fn stage2_apply(&self, applied: &Stage2Applied) -> Result<bool> {
         let mut conn = self.lock()?;
         let tx = conn.transaction()?;
