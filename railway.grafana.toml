@@ -1,5 +1,15 @@
 # Railway deployment config for Grafana (Dockerfile.grafana). Selected in the
 # service's settings under "Config-as-code file path" (deploy/DEPLOY.md §8).
+#
+# THIS SERVICE DEPLOYS ITSELF FROM `main`. It carries a GitHub deployment
+# trigger on that branch, so shipping a dashboard change is merging it — do not
+# reach for `railway up`, which uploads a working tree rather than a commit.
+# Unlike railway.bifrost.toml and railway.blackbox.toml, there is no staging-dir
+# dance to perform here. Root CLAUDE.md has the table of which services deploy
+# how, and the one exception.
+#
+# The trigger does NOT wait for CI (`checkSuites: false`): a merge starts a
+# build whether or not the Rust job passed. Green on the PR is the only gate.
 [build]
 builder = "dockerfile"
 dockerfilePath = "Dockerfile.grafana"

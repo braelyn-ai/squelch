@@ -5,6 +5,11 @@
 # No healthcheckPath: Prometheus sits entirely behind basic auth and Railway's
 # checker cannot send credentials.
 #
+# NORMALLY YOU DEPLOY THIS BY MERGING TO `main`: the service carries a GitHub
+# deployment trigger on that branch, so a merge rebuilds it. Everything below
+# is the ESCAPE HATCH for pushing a branch to production without merging it,
+# not the routine path. See the root CLAUDE.md.
+#
 # DEPLOY QUIRK (same as railway.bifrost.toml): `railway up` from the repo root
 # is accepted and then silently SKIPPED — the deployment lands in the list as
 # SKIPPED, no build runs, and the previous image keeps serving, so a config

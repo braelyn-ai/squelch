@@ -23,9 +23,26 @@ Prometheus stores 30 days on its volume, receives `remote_write` from carrier
 
 Grafana provisions its datasource and the `passband-health` dashboard from
 files baked into the image. Edit the dashboard by editing
-`grafana/dashboards/passband-health.json` and redeploying (`railway up -s
-grafana`), not in the UI — UI edits die with the next deploy
-(`allowUiUpdates: false` says so out loud).
+`grafana/dashboards/passband-health.json` and **merging it to `main`**, not in
+the UI — UI edits die with the next deploy (`allowUiUpdates: false` says so out
+loud).
+
+All three of these services deploy themselves when `main` moves; they are wired
+to this repo with a deployment trigger on `main`, so a merge is the deploy.
+(This paragraph used to say `railway up -s grafana`, which sent at least one
+person down a staging-dir rabbit hole to do by hand what a merge does on its
+own. `railway up` uploads your working tree, so it can put a build into
+production that exists in no commit, and from the repo root it is silently
+SKIPPED on these services. See the root `CLAUDE.md`.)
+
+Because the dashboard ships inside the image, **merging a panel change is not
+the same as seeing it** — the service has to finish rebuilding. Check the thing
+itself rather than the deploy status:
+
+```sh
+railway ssh --service grafana -- grep -c last_over_time \
+  /etc/grafana/dashboards/passband-health.json
+```
 
 Credentials: `PROM_REMOTE_WRITE_PASSWORD` (plain) + `PROM_WEB_BCRYPT` (its
 bcrypt) on prometheus; the same plain value as `PROM_PASSWORD` on grafana,
