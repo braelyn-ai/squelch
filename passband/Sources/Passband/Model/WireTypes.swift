@@ -354,6 +354,13 @@ struct Shipment: Codable, Sendable, Identifiable, Hashable {
     /// Rate limits and transport errors never count, which is what makes a
     /// nonzero value evidence about the NUMBER rather than about the network.
     var poll_failures: Int?
+
+    /// The item name as a LABEL: emoji dropped, whitespace collapsed. The
+    /// daemon lifts this out of a subject line and its strip leaves pictographs
+    /// standing, so "🚚 Your order from X" reaches us with the truck attached.
+    /// Empty when nothing survives (a name that was only decoration), which is
+    /// each caller's cue to use its own fallback.
+    var displayItem: String { item_name.withoutEmoji }
 }
 
 /// What `POST /client/shipments/poll` answers. `kicked` is false, with an empty

@@ -55,6 +55,7 @@ run_suite subject-text \
 # The attachment buckets against the wire type they bucket. WireTypes is pure
 # Codable structs, so the pair builds with no app and no daemon.
 run_suite attachment-kinds \
+  Sources/Passband/Model/SubjectText.swift \
   Sources/Passband/Model/WireTypes.swift \
   Sources/Passband/Lib/AttachmentKinds.swift \
   Tests/AttachmentKindsTests.swift
@@ -63,6 +64,7 @@ run_suite attachment-kinds \
 # staging rules are the last thing standing between an attachment named
 # `invoice.html` and WebKit, so they are asserted rather than read.
 run_suite staged-attachment \
+  Sources/Passband/Model/SubjectText.swift \
   Sources/Passband/Model/WireTypes.swift \
   Sources/Passband/Lib/AttachmentKinds.swift \
   Sources/Passband/Lib/StagedAttachment.swift \
@@ -80,6 +82,7 @@ run_suite email-images \
 # the real pipeline: what it takes out of a body is what neither answer here may
 # still claim.
 run_suite cid-images \
+  Sources/Passband/Model/SubjectText.swift \
   Sources/Passband/Model/WireTypes.swift \
   Sources/Passband/Lib/AttachmentKinds.swift \
   Sources/Passband/Lib/HTMLImg.swift \

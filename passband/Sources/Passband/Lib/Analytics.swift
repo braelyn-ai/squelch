@@ -89,6 +89,7 @@ enum Analytics {
         "thread_opened", "undo_fired", "assistant_asked",
         "triage_corrected", "triage_digest", "rule_created", "rule_deleted",
         "process_completed", "notification_opened", "sealed_revealed",
+        "shipment_cleared", "shipments_poll_kicked",
         "connect_succeeded", "connection_lost", "connection_restored",
         "account_added",
         "tour_completed", "tour_skipped", "whats_new_shown",

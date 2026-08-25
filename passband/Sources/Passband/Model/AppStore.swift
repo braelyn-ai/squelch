@@ -1548,8 +1548,8 @@ final class AppStore {
     /// What a cleared shipment is CALLED in its toast: the card's own title rule
     /// (item name, else the carrier), kept short enough to sit in one.
     private static func shipmentLabel(_ s: Shipment) -> String {
-        let trimmed = s.item_name.trimmingCharacters(in: .whitespaces)
-        return trimmed.isEmpty ? s.carrier.label : trimmed
+        let name = s.displayItem
+        return name.isEmpty ? s.carrier.label : name
     }
 
     // MARK: - the flat mail pages

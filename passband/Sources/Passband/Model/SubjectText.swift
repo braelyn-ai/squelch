@@ -1,8 +1,8 @@
 // SUBJECT LINES ARE SOMEBODY ELSE'S TEXT. Every one of them was typed by a
-// stranger, and this file holds the three things the app does about that: name
-// the blank ones, flatten the multi-line ones, and — where a subject rides
-// inside a prompt's data markers — make sure it cannot spell the marker that
-// would close its own frame.
+// stranger, and this file holds the four things the app does about that: name
+// the blank ones, flatten the multi-line ones, drop the decoration a marketer
+// put in front of them, and — where a subject rides inside a prompt's data
+// markers — make sure it cannot spell the marker that would close its own frame.
 //
 // Deliberately Foundation-only and free of app types, so `test.sh` can compile
 // it on its own next to Tests/SubjectTextTests.swift. The marker rule is the
@@ -24,6 +24,22 @@ extension String {
     /// want — a body's own newlines are its formatting, not the caller's.
     func flattenedLine(cap: Int) -> String {
         Self.capped(Self.flattened(self), cap: cap)
+    }
+
+    /// The line with its EMOJI REMOVED. Only for text the app re-uses as a
+    /// LABEL — a shipment's item name, lifted out of "🚚 Your order from …" —
+    /// never for a subject shown as a subject, where the sender's decoration is
+    /// part of what they wrote.
+    ///
+    /// Presentation, not the `isEmoji` property, decides. That property is true
+    /// of `#`, `*` and every ASCII digit (they are emoji BASES, waiting on a
+    /// variation selector), so stripping on it alone would eat the "5" out of
+    /// "5 Port USB Hub". A scalar goes only when it renders as emoji by default
+    /// or when its own cluster carries the U+FE0F that makes it render that way.
+    /// Whole GRAPHEME CLUSTERS go at once, which is what takes a ZWJ family or a
+    /// skin-toned hand out in one piece instead of leaving its joiners behind.
+    var withoutEmoji: String {
+        Self.flattened(String(filter { !$0.isEmojiCluster }))
     }
 
     /// The line as a PROMPT may state it inside data markers: flattened, with
@@ -101,5 +117,16 @@ extension String {
         }
         flush()
         return String(out)
+    }
+}
+
+extension Character {
+    /// Does this grapheme cluster RENDER as emoji? See `withoutEmoji` for why
+    /// the default-presentation test and the explicit U+FE0F test are both
+    /// needed and why neither `isEmoji` alone would do.
+    fileprivate var isEmojiCluster: Bool {
+        guard let first = unicodeScalars.first else { return false }
+        if first.properties.isEmojiPresentation { return true }
+        return first.properties.isEmoji && unicodeScalars.contains("\u{FE0F}")
     }
 }
