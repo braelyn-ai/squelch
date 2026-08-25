@@ -4,11 +4,12 @@
 //! the warden.
 //!
 //! Bifrost is the LLM gateway the hosted tier fronts every tenant daemon with.
-//! This module speaks three of its routes: list the provider keys a virtual
-//! key must be attached to, mint a virtual key with a monthly budget, and
-//! revoke one by id. All three were verified against the deployed gateway
-//! (Bifrost v1.6.9, 2026-08-13); where the docs and the wire disagreed, the
-//! wire won:
+//! This module speaks five of its routes: list the provider keys a virtual key
+//! must be attached to, REWRITE a provider key's model filter, list the
+//! virtual keys it holds, mint a virtual key with a monthly budget, and revoke
+//! one by id. All were verified against the deployed gateway (Bifrost v1.6.9,
+//! 2026-08-13 and 2026-08-25); where the docs and the wire disagreed, the wire
+//! won:
 //!
 //! - The budget field is `budgets`, an ARRAY. A singular `budget` object is
 //!   silently IGNORED and the key mints unbudgeted, which on our Anthropic key
@@ -24,6 +25,22 @@
 //!   `/api/*`. The credential can mint unbounded spend, so it gets the same
 //!   handling as the warden bearer: presented on every request, never logged,
 //!   redirects refused.
+//! - A MODEL IS ALLOW-LISTED TWICE, and the second list is easy to forget. A
+//!   virtual key's `allowed_models` is matched against the id the daemon sent
+//!   (`anthropic/claude-opus-5`); the PROVIDER key's `models` is matched after
+//!   the provider prefix is resolved away (`claude-opus-5`). A model in the
+//!   first and not the second answers 400 "no keys found that support model",
+//!   which is how the whole fleet ran heuristics-only for days in August 2026
+//!   while every virtual key looked correct. [`BifrostClient::
+//!   set_provider_key_models`] and `squelch-control llm sync` exist so that
+//!   second list has an owner.
+//! - EMPTY IS NOT "ALLOW EVERYTHING" on either list. Verified live on
+//!   2026-08-25: emptying a provider key's `models` left it serving nothing,
+//!   the same as the `["*"]` wildcard. Both lists must name every model.
+//! - A READ MASKS THE PROVIDER CREDENTIAL (`sk-a****gQAA`) and names the env
+//!   var the real one comes from. The obvious read-modify-write therefore
+//!   persists asterisks as the Anthropic key; only the reference is ever sent
+//!   back, and a key stored any other way is refused rather than guessed at.
 //!
 //! THE KEY VALUE IS THE SECRET, AND THE ID IS THE RECORD. What Bifrost answers
 //! with is a live `sk-bf-...` bearer plus an id naming it. The value exists in
@@ -45,6 +62,14 @@ use serde::{Deserialize, Serialize};
 /// Ceiling on a governance response body. A mint answer is a few hundred
 /// bytes; anything bigger is not the API we know.
 const MAX_RESPONSE_BODY: usize = 64 * 1024;
+
+/// Ceiling on a LISTING body, which is a different size class: every virtual
+/// key the gateway holds, each carrying its provider configs, and the hosted
+/// tier mints two per tenant against a 100-tenant cap. At roughly 2 KB a key
+/// the 64 KB above would start truncating at about fifteen tenants, and a
+/// truncated listing does not error, it deserializes into a SHORTER list —
+/// which a drift report would render as "these tenants are fine".
+const MAX_LISTING_BODY: usize = 4 * 1024 * 1024;
 
 /// Every minted key's budget resets monthly. Pinned rather than configurable:
 /// the budget AMOUNT is the operator's knob, the cadence is the product's.
@@ -103,6 +128,15 @@ pub enum BifrostError {
     /// from a mint. A corrupt store row, caught before it reaches a URL path.
     #[error("refusing a virtual-key id this client would not have accepted")]
     BadId,
+    /// The provider key's credential is not an env reference, so the only
+    /// copy of it the gateway will hand back is a mask. Writing the key back
+    /// would persist that mask over the real Anthropic credential and take
+    /// every tenant down, so the model list has to be changed by hand.
+    #[error(
+        "the provider key's credential is not an env reference, so writing it back would \
+         overwrite it with the gateway's own mask; edit its models list in the gateway UI"
+    )]
+    OpaqueCredential,
     /// The label failed validation. Should be unreachable (every caller
     /// validates first); it means the validators have drifted.
     #[error("refusing a label this client would not have validated")]
@@ -121,6 +155,80 @@ pub struct VirtualKey {
     /// The live `sk-bf-...` bearer. NEVER stored, NEVER logged; held only for
     /// the call that installs it via the warden.
     pub value: String,
+}
+
+/// One provider key as the gateway holds it: the credential the real
+/// Anthropic traffic goes out on, and the key-level model filter in front of
+/// it.
+///
+/// Unlike [`VirtualKey`] this carries no secret — `models` and a reference to
+/// where the credential is read from — so it derives freely and is safe to
+/// print.
+#[derive(Debug, Clone)]
+pub struct ProviderKeyState {
+    pub id: String,
+    pub name: String,
+    /// The key-level model filter, and the THIRD PLACE a model id has to be
+    /// spelled correctly for the fleet to work (issue #51). The other two are
+    /// a virtual key's `allowed_models` and the warden's stage models.
+    ///
+    /// Spellings here are BARE. The gateway resolves the provider from a
+    /// request's `anthropic/`-qualified id and then matches the remainder
+    /// against this list, which is why a fleet sending
+    /// `anthropic/claude-opus-5` fails against a list holding
+    /// `claude-opus-4-8` with `no keys found that support model:
+    /// claude-opus-5` — the prefix is already gone by the time it is compared.
+    ///
+    /// EMPTY IS NOT "ALLOW EVERYTHING". Verified against the live gateway
+    /// (v1.6.9, 2026-08-25): emptying this list left the key serving nothing
+    /// at all, exactly as the `["*"]` wildcard does. It is an allow-list that
+    /// has to name every model the fleet uses.
+    pub models: Vec<String>,
+    /// `Some(reference)` when the credential is read from the gateway's
+    /// environment, which is the only case this client will write the key
+    /// back in. `None` for a credential held in the gateway's own store,
+    /// where a read gives back a mask rather than the secret.
+    pub env_ref: Option<String>,
+}
+
+/// One virtual key as the gateway holds it, MINUS its value.
+///
+/// The listing this comes from carries a live `sk-bf-...` per entry; none of
+/// them are read. What a drift report needs is the name and the allow-list.
+#[derive(Debug, Clone)]
+pub struct VirtualKeyState {
+    pub id: String,
+    pub name: String,
+    /// The union of every provider config's `allowed_models`. There is one
+    /// provider config today (anthropic), so this is that config's list.
+    pub allowed_models: Vec<String>,
+}
+
+/// The model list a PROVIDER key must carry, derived from the virtual-key
+/// allow-lists this control plane is configured with.
+///
+/// Two transformations, both forced by the gateway's own matching:
+///
+/// - The provider prefix is STRIPPED, because the gateway resolves the
+///   provider first and compares only the remainder against a provider key's
+///   list. `anthropic/claude-opus-5` and `claude-opus-5` are the same entry
+///   here, and carrying the qualified spelling would add a line that can
+///   never match.
+/// - Triage and assistant lists are UNIONED, because one provider key serves
+///   both and a model missing from this list is refused no matter which
+///   virtual key asked for it.
+///
+/// Order follows first appearance so a rewritten list stays diffable against
+/// the last one.
+pub fn provider_key_models(triage: &[String], assistant: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for m in triage.iter().chain(assistant) {
+        let bare = m.rsplit('/').next().unwrap_or(m).trim();
+        if !bare.is_empty() && !out.iter().any(|k| k == bare) {
+            out.push(bare.to_string());
+        }
+    }
+    out
 }
 
 /// `POST /api/governance/virtual-keys` request body, in the shape the LIVE
@@ -191,6 +299,82 @@ struct ProviderKeysResponse {
 #[derive(Deserialize)]
 struct ProviderKey {
     id: String,
+    #[serde(default)]
+    name: String,
+    /// The key-level model filter. See [`ProviderKeyState::models`].
+    #[serde(default)]
+    models: Vec<String>,
+    #[serde(default)]
+    value: Option<ProviderKeyValue>,
+}
+
+/// How the gateway stores a provider key's credential.
+///
+/// `type: "env"` means the real key is read from the gateway process's
+/// environment at `ref`, and the `value` field is a MASK (`sk-a****gQAA`),
+/// not the credential. Anything else means the credential itself lives in the
+/// gateway's database and a read gives back only that mask — which is why
+/// [`BifrostClient::set_provider_key_models`] refuses to write such a key.
+#[derive(Deserialize)]
+struct ProviderKeyValue {
+    #[serde(default, rename = "type")]
+    kind: String,
+    #[serde(default, rename = "ref")]
+    reference: Option<String>,
+}
+
+/// `PUT /api/providers/anthropic/keys/{id}` body.
+///
+/// `value` carries the ENV REFERENCE ALONE. The GET that sourced this key
+/// answers `value.value` as a MASK, and echoing that mask back would replace
+/// the live Anthropic credential with a string of asterisks and take every
+/// tenant's inference down at once. The reference is the only part of that
+/// object this client will ever send.
+#[derive(Serialize)]
+struct ProviderKeyUpdate<'a> {
+    name: &'a str,
+    value: ProviderKeyRef<'a>,
+    models: &'a [String],
+    blacklisted_models: [(); 0],
+    weight: u32,
+    enabled: bool,
+    use_for_batch_api: bool,
+    use_anthropic_endpoints: bool,
+}
+
+#[derive(Serialize)]
+struct ProviderKeyRef<'a> {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    #[serde(rename = "ref")]
+    reference: &'a str,
+}
+
+/// `GET /api/governance/virtual-keys` answer.
+///
+/// NOTE WHAT IS NOT DESERIALIZED: every entry in this listing carries a live
+/// `sk-bf-...` in `value`, and this client reads none of them. A drift report
+/// needs names and model lists; pulling the secrets into the process to print
+/// a diff would undo the rule the rest of this module keeps.
+#[derive(Deserialize)]
+struct VirtualKeysResponse {
+    #[serde(default)]
+    virtual_keys: Vec<WireVirtualKey>,
+}
+
+#[derive(Deserialize)]
+struct WireVirtualKey {
+    id: String,
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    provider_configs: Vec<WireProviderConfig>,
+}
+
+#[derive(Deserialize)]
+struct WireProviderConfig {
+    #[serde(default)]
+    allowed_models: Vec<String>,
 }
 
 /// The real client: one reqwest client, one admin credential, one base URL,
@@ -254,7 +438,7 @@ impl BifrostClient {
             .map_err(|_| BifrostError::Unreachable)?;
         match resp.status().as_u16() {
             200 => {
-                let body = read_capped(resp).await?;
+                let body = read_capped(resp, MAX_RESPONSE_BODY).await?;
                 let parsed: ProviderKeysResponse =
                     serde_json::from_slice(&body).map_err(|_| BifrostError::NoProviderKeys)?;
                 let ids: Vec<String> = parsed.keys.into_iter().map(|k| k.id).collect();
@@ -265,6 +449,133 @@ impl BifrostClient {
                     return Err(BifrostError::NoProviderKeys);
                 }
                 Ok(ids)
+            }
+            401 | 403 => Err(BifrostError::Unauthorized),
+            _ => Err(BifrostError::Failed),
+        }
+    }
+
+    /// Every anthropic provider key with the fields a model sync reads.
+    ///
+    /// Same route as [`Self::provider_key_ids`], read for more of its answer.
+    pub async fn provider_keys(&self) -> Result<Vec<ProviderKeyState>, BifrostError> {
+        let resp = self
+            .http
+            .get(self.url(&format!("/api/providers/{PROVIDER}/keys")))
+            .header(reqwest::header::AUTHORIZATION, &self.auth_header)
+            .send()
+            .await
+            .map_err(|_| BifrostError::Unreachable)?;
+        match resp.status().as_u16() {
+            200 => {
+                let body = read_capped(resp, MAX_LISTING_BODY).await?;
+                let parsed: ProviderKeysResponse =
+                    serde_json::from_slice(&body).map_err(|_| BifrostError::NoProviderKeys)?;
+                if parsed.keys.is_empty() || !parsed.keys.iter().all(|k| is_id(&k.id)) {
+                    return Err(BifrostError::NoProviderKeys);
+                }
+                Ok(parsed
+                    .keys
+                    .into_iter()
+                    .map(|k| ProviderKeyState {
+                        id: k.id,
+                        name: k.name,
+                        models: k.models,
+                        env_ref: k
+                            .value
+                            .and_then(|v| (v.kind == "env").then_some(v.reference).flatten()),
+                    })
+                    .collect())
+            }
+            401 | 403 => Err(BifrostError::Unauthorized),
+            _ => Err(BifrostError::Failed),
+        }
+    }
+
+    /// Rewrite ONE provider key's model filter, leaving its credential alone.
+    ///
+    /// The credential is the whole risk here. The gateway answers a read with
+    /// `value.value` MASKED, so the naive write — read the key, change
+    /// `models`, put it back — persists `sk-a****gQAA` as the Anthropic key
+    /// and takes every tenant's inference down at once. This sends the env
+    /// REFERENCE instead, and refuses outright ([`BifrostError::Opaque
+    /// Credential`]) for any key not stored that way, because for those there
+    /// is no safe body to send.
+    ///
+    /// `models` must be non-empty for the same reason `allowed_models` must:
+    /// verified live, an empty list serves nothing rather than everything.
+    pub async fn set_provider_key_models(
+        &self,
+        key: &ProviderKeyState,
+        models: &[String],
+    ) -> Result<(), BifrostError> {
+        if models.is_empty() {
+            return Err(BifrostError::BadKey);
+        }
+        if !is_id(&key.id) {
+            return Err(BifrostError::BadId);
+        }
+        let Some(reference) = key.env_ref.as_deref() else {
+            return Err(BifrostError::OpaqueCredential);
+        };
+        let resp = self
+            .http
+            .put(self.url(&format!("/api/providers/{PROVIDER}/keys/{}", key.id)))
+            .header(reqwest::header::AUTHORIZATION, &self.auth_header)
+            .json(&ProviderKeyUpdate {
+                name: &key.name,
+                value: ProviderKeyRef {
+                    kind: "env",
+                    reference,
+                },
+                models,
+                blacklisted_models: [],
+                weight: 1,
+                enabled: true,
+                use_for_batch_api: false,
+                use_anthropic_endpoints: true,
+            })
+            .send()
+            .await
+            .map_err(|_| BifrostError::Unreachable)?;
+        match resp.status().as_u16() {
+            200 | 201 | 204 => Ok(()),
+            401 | 403 => Err(BifrostError::Unauthorized),
+            _ => Err(BifrostError::Failed),
+        }
+    }
+
+    /// Every virtual key the gateway holds, name and allow-list only.
+    ///
+    /// For reporting drift, never for writing: a tenant's allow-list is fixed
+    /// by re-minting (`llm mint <label>`), which rotates the key through the
+    /// warden so the pod actually receives it.
+    pub async fn list_virtual_keys(&self) -> Result<Vec<VirtualKeyState>, BifrostError> {
+        let resp = self
+            .http
+            .get(self.url("/api/governance/virtual-keys"))
+            .header(reqwest::header::AUTHORIZATION, &self.auth_header)
+            .send()
+            .await
+            .map_err(|_| BifrostError::Unreachable)?;
+        match resp.status().as_u16() {
+            200 => {
+                let body = read_capped(resp, MAX_LISTING_BODY).await?;
+                let parsed: VirtualKeysResponse =
+                    serde_json::from_slice(&body).map_err(|_| BifrostError::BadKey)?;
+                Ok(parsed
+                    .virtual_keys
+                    .into_iter()
+                    .map(|k| VirtualKeyState {
+                        id: k.id,
+                        name: k.name,
+                        allowed_models: k
+                            .provider_configs
+                            .into_iter()
+                            .flat_map(|p| p.allowed_models)
+                            .collect(),
+                    })
+                    .collect())
             }
             401 | 403 => Err(BifrostError::Unauthorized),
             _ => Err(BifrostError::Failed),
@@ -338,7 +649,7 @@ impl BifrostClient {
         match resp.status().as_u16() {
             // Bifrost has answered both on a create, depending on version.
             200 | 201 => {
-                let body = read_capped(resp).await?;
+                let body = read_capped(resp, MAX_RESPONSE_BODY).await?;
                 let parsed: MintResponse =
                     serde_json::from_slice(&body).map_err(|_| BifrostError::BadKey)?;
                 let key = VirtualKey {
@@ -428,10 +739,17 @@ fn is_value(v: &str) -> bool {
     (1..=MAX_VALUE).contains(&v.len()) && v.bytes().all(|b| b.is_ascii_graphic())
 }
 
-async fn read_capped(mut resp: reqwest::Response) -> Result<Vec<u8>, BifrostError> {
+/// Read a body, refusing anything past `cap`.
+///
+/// The cap is a PARAMETER rather than one constant because the two size
+/// classes want opposite failures: a mint answer bigger than a few hundred
+/// bytes is not the API we know and should be refused tightly, while a
+/// listing legitimately grows with the fleet and must not be cut short —
+/// truncation there would deserialize into a shorter list, not an error.
+async fn read_capped(mut resp: reqwest::Response, cap: usize) -> Result<Vec<u8>, BifrostError> {
     let mut out = Vec::new();
     while let Some(chunk) = resp.chunk().await.map_err(|_| BifrostError::Unreachable)? {
-        if out.len() + chunk.len() > MAX_RESPONSE_BODY {
+        if out.len() + chunk.len() > cap {
             return Err(BifrostError::Unreachable);
         }
         out.extend_from_slice(&chunk);
@@ -483,6 +801,16 @@ mod tests {
         keys_response: Option<(u16, String)>,
         /// When set, the revoke route answers this status.
         revoke_status: Option<u16>,
+        /// The `value` object the provider-keys route reports. Defaults to an
+        /// env reference with the credential MASKED, which is what the live
+        /// gateway answers.
+        provider_key_value: Option<Value>,
+        /// The `models` the provider-keys route reports.
+        provider_key_models: Vec<String>,
+        /// Bodies of provider-key PUTs, by key id.
+        provider_puts: Vec<(String, Value)>,
+        /// What the virtual-key LISTING route answers.
+        listing: Option<Value>,
     }
 
     type Shared = Arc<Mutex<Recorder>>;
@@ -506,10 +834,40 @@ mod tests {
                         if let Some((status, body)) = r.keys_response.clone() {
                             return (StatusCode::from_u16(status).unwrap(), body).into_response();
                         }
+                        // The live gateway MASKS the credential on a read and
+                        // names where the real one is read from. Both halves
+                        // matter: the mask is what must never be written back,
+                        // the reference is what makes writing back possible.
+                        let value = r.provider_key_value.clone().unwrap_or(json!({
+                            "value": "sk-a************************gQAA",
+                            "ref": "env.ANTHROPIC_API_KEY",
+                            "type": "env",
+                        }));
+                        let models = r.provider_key_models.clone();
                         Json(json!({
-                            "keys": [{ "id": "ANTHROPIC_API_KEY_auto_detected", "models": [] }],
+                            "keys": [{
+                                "id": "ANTHROPIC_API_KEY_auto_detected",
+                                "name": "ANTHROPIC_API_KEY_auto_detected",
+                                "models": models,
+                                "value": value,
+                            }],
                         }))
                         .into_response()
+                    },
+                ),
+            )
+            .route(
+                "/api/providers/anthropic/keys/{id}",
+                axum::routing::put(
+                    |AxumState(rec): AxumState<Shared>,
+                     axum::extract::Path(id): axum::extract::Path<String>,
+                     headers: HeaderMap,
+                     body: String| async move {
+                        let mut r = rec.lock().unwrap();
+                        r.auths.push(auth_of(&headers));
+                        r.provider_puts
+                            .push((id, serde_json::from_str(&body).unwrap_or(Value::Null)));
+                        StatusCode::OK
                     },
                 ),
             )
@@ -539,6 +897,17 @@ mod tests {
                             })),
                         )
                             .into_response()
+                    },
+                )
+                .get(
+                    |AxumState(rec): AxumState<Shared>, headers: HeaderMap| async move {
+                        let mut r = rec.lock().unwrap();
+                        r.auths.push(auth_of(&headers));
+                        // Entries carry a live `value` the client must not
+                        // read. It is present here precisely so the test can
+                        // prove nothing pulls it into the process.
+                        let body = r.listing.clone().unwrap_or(json!({ "virtual_keys": [] }));
+                        Json(body).into_response()
                     },
                 ),
             )
@@ -848,5 +1217,143 @@ mod tests {
                 "{bad:?}"
             );
         }
+    }
+
+    /// The provider key's list is derived from the two virtual-key lists, and
+    /// the derivation is not a copy: the provider prefix is stripped (the
+    /// gateway resolves the provider first and compares only the remainder),
+    /// the two lists are unioned (one provider key serves both), duplicates
+    /// collapse, and first-appearance order is kept so a rewrite stays
+    /// diffable.
+    #[test]
+    fn provider_models_strip_the_prefix_union_and_dedupe() {
+        let triage = vec![
+            "claude-haiku-4-5".to_string(),
+            "anthropic/claude-haiku-4-5".to_string(),
+            "anthropic/claude-opus-5".to_string(),
+        ];
+        let assistant = vec![
+            "anthropic/claude-sonnet-5".to_string(),
+            "claude-opus-5".to_string(),
+        ];
+        assert_eq!(
+            provider_key_models(&triage, &assistant),
+            vec!["claude-haiku-4-5", "claude-opus-5", "claude-sonnet-5"]
+        );
+    }
+
+    /// The whitespace that took the canary down for four days does not survive
+    /// the derivation either.
+    #[test]
+    fn provider_models_trim() {
+        let triage = vec!["anthropic/claude-opus-5 ".to_string(), " ".to_string()];
+        assert_eq!(provider_key_models(&triage, &[]), vec!["claude-opus-5"]);
+    }
+
+    /// THE CREDENTIAL TEST. A read gives back the Anthropic key MASKED, so the
+    /// write must send the env REFERENCE and never that mask — echoing it back
+    /// would persist `sk-a****gQAA` as the real key and take every tenant's
+    /// inference down at once.
+    #[tokio::test]
+    async fn writing_a_provider_key_sends_the_env_ref_and_never_the_mask() {
+        let rec: Shared = Arc::new(Mutex::new(Recorder {
+            provider_key_models: vec!["claude-opus-4-8".into()],
+            ..Default::default()
+        }));
+        let c = client_for(&rec).await;
+
+        let keys = c.provider_keys().await.unwrap();
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].models, vec!["claude-opus-4-8"]);
+        assert_eq!(keys[0].env_ref.as_deref(), Some("env.ANTHROPIC_API_KEY"));
+
+        let want = vec!["claude-haiku-4-5".to_string(), "claude-opus-5".to_string()];
+        c.set_provider_key_models(&keys[0], &want).await.unwrap();
+
+        let r = rec.lock().unwrap();
+        let (id, body) = &r.provider_puts[0];
+        assert_eq!(id, "ANTHROPIC_API_KEY_auto_detected");
+        assert_eq!(body["models"], json!(["claude-haiku-4-5", "claude-opus-5"]));
+        assert_eq!(
+            body["value"],
+            json!({ "type": "env", "ref": "env.ANTHROPIC_API_KEY" })
+        );
+        // The mask appears NOWHERE in what was sent.
+        assert!(
+            !serde_json::to_string(body).unwrap().contains('*'),
+            "the masked credential rode along in the write: {body}"
+        );
+    }
+
+    /// A credential the gateway holds itself reads back as a mask with no
+    /// reference to rebuild it from, so there is no safe body to send and the
+    /// client refuses rather than guessing.
+    #[tokio::test]
+    async fn writing_refuses_a_credential_that_is_not_an_env_reference() {
+        let rec: Shared = Arc::new(Mutex::new(Recorder {
+            provider_key_value: Some(json!({
+                "value": "sk-a************************gQAA",
+                "type": "plain_text",
+            })),
+            ..Default::default()
+        }));
+        let c = client_for(&rec).await;
+
+        let keys = c.provider_keys().await.unwrap();
+        assert_eq!(keys[0].env_ref, None);
+        let err = c
+            .set_provider_key_models(&keys[0], &["claude-opus-5".to_string()])
+            .await
+            .unwrap_err();
+        assert!(matches!(err, BifrostError::OpaqueCredential), "{err:?}");
+        // Nothing was sent at all.
+        assert!(rec.lock().unwrap().provider_puts.is_empty());
+    }
+
+    /// Empty is not "allow everything" on this gateway, it serves nothing, so
+    /// an empty list is refused before it can be written.
+    #[tokio::test]
+    async fn writing_refuses_an_empty_model_list() {
+        let rec: Shared = Arc::new(Mutex::new(Recorder::default()));
+        let c = client_for(&rec).await;
+        let keys = c.provider_keys().await.unwrap();
+        let err = c.set_provider_key_models(&keys[0], &[]).await.unwrap_err();
+        assert!(matches!(err, BifrostError::BadKey), "{err:?}");
+        assert!(rec.lock().unwrap().provider_puts.is_empty());
+    }
+
+    /// The listing yields names and allow-lists, and the live `sk-bf-...` each
+    /// entry carries is left on the wire.
+    #[tokio::test]
+    async fn listing_virtual_keys_reads_names_and_models_but_not_values() {
+        let rec: Shared = Arc::new(Mutex::new(Recorder {
+            listing: Some(json!({
+                "virtual_keys": [
+                    {
+                        "id": "vk-1",
+                        "name": "tenant-ada",
+                        "value": "sk-bf-A-LIVE-SECRET",
+                        "provider_configs": [{
+                            "allowed_models": ["claude-opus-5", "anthropic/claude-opus-5 "],
+                        }],
+                    },
+                    { "id": "vk-2", "name": "Canary", "value": "sk-bf-ANOTHER" },
+                ],
+            })),
+            ..Default::default()
+        }));
+        let c = client_for(&rec).await;
+
+        let keys = c.list_virtual_keys().await.unwrap();
+        assert_eq!(keys.len(), 2);
+        assert_eq!(keys[0].name, "tenant-ada");
+        assert_eq!(
+            keys[0].allowed_models,
+            vec!["claude-opus-5", "anthropic/claude-opus-5 "]
+        );
+        // A key with no provider configs at all parses to an empty list rather
+        // than failing the whole listing.
+        assert_eq!(keys[1].name, "Canary");
+        assert!(keys[1].allowed_models.is_empty());
     }
 }
