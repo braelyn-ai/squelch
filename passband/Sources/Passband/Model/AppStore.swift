@@ -1356,7 +1356,8 @@ final class AppStore {
     var modalOverlayOpen: Bool {
         askBarOpen || shortcutsOpen || processModeOpen
             || triageFix != nil || remindTarget != nil || ruleEditor != nil
-            || !authQueue.isEmpty || tour.wantsBlur || whatsNew.active
+            || !authQueue.isEmpty || retriage != nil
+            || tour.wantsBlur || whatsNew.active
     }
 
     // MARK: - sitrep zones
@@ -1550,6 +1551,90 @@ final class AppStore {
     private static func shipmentLabel(_ s: Shipment) -> String {
         let name = s.displayItem
         return name.isEmpty ? s.carrier.label : name
+    }
+
+    // MARK: - dev re-triage
+
+    /// A dev re-triage in flight. NON-NIL BLOCKS THE APP: the modal covers
+    /// everything and takes every click, because a re-triage rewrites tiers and
+    /// bands underneath whatever page you would otherwise be reading.
+    var retriage: RetriageRun?
+
+    /// How often the modal asks the daemon where it is. A re-triage takes
+    /// minutes and the poll is one indexed aggregate, so this is about how alive
+    /// the counter should FEEL, not about cost.
+    private static let retriagePollSeconds: UInt64 = 2
+
+    /// Kick a re-triage of the trailing `days` and watch it to the end.
+    ///
+    /// The kick's own `reset` seeds the total so the modal opens with a real
+    /// number instead of a zero that ticks up; the first poll then replaces it
+    /// with the SERVER's total, which is the authority (a second kick, or a
+    /// per-message re-triage from the fix palette, joins the same run).
+    func startRetriage(days: Int) async {
+        guard retriage == nil else { return }
+        retriage = RetriageRun()
+        do {
+            let result = try await APIClient.shared.retriage(.days(days))
+            // Nothing to do is not a run: opening a blocking modal over zero
+            // rows would be a wall the user has to dismiss to learn nothing
+            // happened.
+            guard result.reset > 0 else {
+                retriage = nil
+                pushToast("nothing to re-triage in the last \(days)d", .info)
+                return
+            }
+            retriage?.total = result.reset
+        } catch {
+            retriage = nil
+            pushToast(errText(error, "re-triage failed"), .error)
+            return
+        }
+        await watchRetriage()
+    }
+
+    /// Poll until the queues drain, then let the board catch up. Ends by itself
+    /// on completion; `endRetriage` is the human's way out from the modal, and
+    /// the `retriage != nil` guards are what make that immediate — the server
+    /// keeps working either way, this only stops WATCHING.
+    private func watchRetriage() async {
+        while retriage != nil {
+            try? await Task.sleep(for: .seconds(Self.retriagePollSeconds))
+            guard retriage != nil else { return }
+            do {
+                let p = try await APIClient.shared.retriageProgress()
+                guard retriage != nil else { return }
+                retriage?.adopt(p)
+            } catch {
+                guard retriage != nil else { return }
+                // A daemon too old to answer cannot be waited on: say so and
+                // leave the modal standing on its "close" button rather than
+                // spinning against a route that will never exist.
+                if let api = error as? APIError, api.kind == .notFound {
+                    retriage?.unsupported = true
+                    return
+                }
+                retriage?.failure = errText(error, "lost the daemon")
+                return
+            }
+            if retriage?.finished == true { break }
+        }
+        guard retriage != nil else { return }
+        // The whole point of the wait: the tiers on screen are the OLD verdicts
+        // until this lands.
+        let count = retriage?.total ?? 0
+        retriage = nil
+        // The same join-then-pull a triage correction uses: a poll already in
+        // flight may have read the daemon mid-run, so its rows are not the ones
+        // to settle on.
+        await SitrepPoller.shared.refreshAfterCorrection()
+        pushToast("re-triaged \(count) email\(count == 1 ? "" : "s")", .success)
+    }
+
+    /// Stop watching. The daemon's queues are untouched — they drain on their
+    /// own — so this is only about giving the window back.
+    func endRetriage() {
+        retriage = nil
     }
 
     // MARK: - the flat mail pages

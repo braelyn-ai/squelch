@@ -188,8 +188,10 @@ struct AuthView: View {
                 let i = shown.firstIndex(of: m) ?? 0
                 AuthRow(
                     meta: m, selected: i == index, code: codes[m.id] ?? nil,
-                    onSelect: { index = i },
-                    onOpen: { Task { await reveal(m) } })
+                    onSelect: {
+                        index = i
+                        revealing = m
+                    })
                 .id(m.id)
             }
         }
@@ -465,8 +467,15 @@ private struct AuthRow: View {
     let meta: SealedMeta
     let selected: Bool
     let code: String?
+    /// Focus the row AND open the mail. One click, because the mail is what a
+    /// row on this page is FOR — a click that only moved a cursor left the page
+    /// looking inert, and the second click that used to open it was undiscoverable.
+    ///
+    /// Opening reveals, and revealing is audited server-side. That is the
+    /// contract this page has always had and it is not weakened here: a click is
+    /// a human action, which is the only thing the seal ever asked for. What it
+    /// never does is reveal on LOAD.
     let onSelect: () -> Void
-    let onOpen: () -> Void
 
     var body: some View {
         ListRow(
@@ -503,7 +512,6 @@ private struct AuthRow: View {
                     .frame(width: 30, alignment: .trailing)
             }
         }
-        .simultaneousGesture(TapGesture(count: 2).onEnded { onOpen() })
     }
 }
 

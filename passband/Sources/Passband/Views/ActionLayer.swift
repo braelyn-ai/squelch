@@ -47,6 +47,9 @@ struct ActionLayer: View {
             if let target = store.remindTarget {
                 RemindPalette(target: target) { store.closeRemind() }
             }
+            // ABOVE the rest of this layer: a re-triage rewrites what every
+            // other overlay is about, so nothing may be opened over it.
+            if let run = store.retriage { RetriageModal(run: run) }
             if store.askBarOpen { AskBar { store.askBarOpen = false } }
             if store.shortcutsOpen { ShortcutsOverlay { store.shortcutsOpen = false } }
             // LAST, so it stacks above every other overlay in this layer. It is

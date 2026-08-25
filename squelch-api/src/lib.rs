@@ -194,7 +194,10 @@ fn client_router(state: ApiState) -> Router {
             get(handlers::get_triage_feedback).post(handlers::post_triage_feedback),
         )
         // Dev re-triage + inspector: human-door only.
-        .route("/client/retriage", post(handlers::retriage))
+        .route(
+            "/client/retriage",
+            get(handlers::retriage_progress).post(handlers::retriage),
+        )
         .route(
             "/client/triage-debug/{message_id}",
             get(handlers::triage_debug),

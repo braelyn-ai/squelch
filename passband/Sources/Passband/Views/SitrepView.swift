@@ -754,31 +754,25 @@ private struct StatusStrip: View {
 // MARK: - dev re-triage button
 
 /// DEV-MODE re-triage: renders nothing unless the developerMode pref is on.
-/// Fires POST /client/retriage for the trailing 7 days and toasts the count.
+/// Fires POST /client/retriage for the trailing 7 days and then hands the window
+/// to `RetriageModal`, which blocks the app until the queues drain — the run
+/// rewrites every tier on the board, so there is nothing here worth reading
+/// while it happens. `busy` is the STORE's run, not a local flag: the modal
+/// outlives this button (a re-triage kicked from the sitrep survives navigating
+/// away), so the only honest source for "already going" is the run itself.
 struct RetriageButton: View {
     @Environment(AppStore.self) private var store
     @Environment(Prefs.self) private var prefs
-    @State private var busy = false
 
     private static let days = 7
+
+    private var busy: Bool { store.retriage != nil }
 
     var body: some View {
         if prefs.developerMode {
             Button {
                 guard !busy else { return }
-                busy = true
-                Task {
-                    do {
-                        let result = try await APIClient.shared.retriage(.days(Self.days))
-                        store.pushToast(
-                            result.reset > 0
-                                ? "re-triaging \(result.reset) email\(result.reset == 1 ? "" : "s") (last \(Self.days)d)…"
-                                : "nothing to re-triage in the window", .info)
-                    } catch {
-                        store.pushToast(errText(error, "re-triage failed"), .error)
-                    }
-                    busy = false
-                }
+                Task { await store.startRetriage(days: Self.days) }
             } label: {
                 Label("re-triage 7d", systemImage: "arrow.trianglehead.2.clockwise")
                     .font(Typo.micro)

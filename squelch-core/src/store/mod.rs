@@ -16,7 +16,8 @@ use crate::triage::{CalendarInfo, CarrierTrack, DeadlineHit, ReceiptInfo, Shipme
 use crate::types::{
     AccountId, AttachmentInfo, AttentionStatus, AttentionUpdate, AuditEntry, Banking,
     CalendarUpdate, Deadline, Disposition, Event, EventKind, FieldReasons, NewMessage, OpenRate,
-    Receipt, SealedKind, SearchHit, SenderRule, Sensitivity, ShredCandidate, StoreStats,
+    Receipt, RetriageProgress, SealedKind, SearchHit, SenderRule, Sensitivity, ShredCandidate,
+    StoreStats,
     ThreadView, Tier, TriageAxis, TriageFeedback, UnsubscribeRecord, Update,
 };
 use chrono::{DateTime, Utc};
@@ -1152,6 +1153,12 @@ pub trait Store: Send + Sync {
     /// MECHANISM), so sealing scrubs a donated name even from a row another
     /// message feeds, and resets the source with it.
     fn shipments_extract_apply(&self, applied: &ShipmentsApplied) -> Result<bool>;
+
+    /// How far the live dev re-triage has got, for the progress modal that
+    /// blocks the app while one runs. Read-only and cheap: one aggregate over
+    /// the rows carrying a live `retriage_at` stamp — see [`RetriageProgress`].
+    /// A zero `total` means no run is in flight.
+    fn retriage_progress(&self, account_id: AccountId) -> Result<RetriageProgress>;
 
     /// DEV RE-TRIAGE: clear the LLM markers on non-sealed, non-sent inbound rows
     /// so they re-enter the Stage-1 queue, deleting their stale `banking`,

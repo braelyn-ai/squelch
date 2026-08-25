@@ -983,6 +983,18 @@ struct TriageDebug: Codable, Sendable, Hashable {
     var thread_id: String?
 }
 
+/// What `GET /client/retriage` answers: how far the live dev re-triage has got.
+/// `total == 0` means no run is in flight. A daemon too old to serve the route
+/// 404s, which is NOT zero — the modal has to say "no counter" rather than
+/// "finished". See `RetriageRun`.
+struct RetriageProgress: Codable, Sendable, Hashable {
+    var total: Int
+    var done: Int
+    /// The oldest live stamp: when the counted run began. Absent exactly when
+    /// `total` is 0.
+    var started_at: String?
+}
+
 struct ShredStats: Codable, Sendable, Hashable {
     var enabled: Bool
     var after_days: Int

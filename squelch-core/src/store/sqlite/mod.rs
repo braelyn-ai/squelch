@@ -46,9 +46,9 @@ use crate::store::{
 use crate::types::{
     AccountId, AttachmentInfo, AttentionStatus, AttentionUpdate, AuditEntry, BandCounts, Banking,
     CalendarUpdate, ClientAttachment, ClientMessage, ClientThreadView, Deadline, Disposition,
-    Event, EventKind, NewMessage, OpenRate, Receipt, SanitizedMessage, SearchHit, SenderRule,
-    Sensitivity, ShredCandidate, StoreStats, ThreadView, Tier, TriageAxis, TriageFeedback,
-    UnsubscribeRecord, Update,
+    Event, EventKind, NewMessage, OpenRate, Receipt, RetriageProgress, SanitizedMessage, SearchHit,
+    SenderRule, Sensitivity, ShredCandidate, StoreStats, ThreadView, Tier, TriageAxis,
+    TriageFeedback, UnsubscribeRecord, Update,
 };
 
 /// `app_settings` key recording when this account's open ledger started, so the
@@ -626,6 +626,10 @@ impl Store for SqliteStore {
         days: u32,
     ) -> Result<u64> {
         self.retriage_reset(account_id, message_id, days)
+    }
+
+    fn retriage_progress(&self, account_id: AccountId) -> Result<RetriageProgress> {
+        self.retriage_progress(account_id)
     }
 
     fn extract_mark_processed(
