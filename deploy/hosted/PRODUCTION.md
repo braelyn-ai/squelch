@@ -649,15 +649,83 @@ in its history by design**: nine tenants behind is nine failed Jobs and then a
 green one, every image bump. An alert on `kube_job_status_failed{namespace="warden"}`
 alone will page on every ordinary rollout and be ignored inside a week.
 
-Alert on the exit code instead, which kube-state-metrics exposes per pod.
-**Page on 4 and nothing else:**
+**The exit code itself is not in metrics, and cannot be.** kube-state-metrics
+builds `kube_pod_container_status_last_terminated_exitcode` from a container's
+`lastState` - the state it was in before its LAST RESTART. A roll pod runs once
+and exits, so its code lands in `state.terminated`, `lastState` stays `{}`, and
+no metric anywhere carries a current terminated state's exit code. The query
+this section recommended until 2026-08-25 -
+`kube_pod_container_status_last_terminated_exitcode{namespace="warden",container="roll"} == 4` -
+therefore matched nothing, on any cluster, on any day, including every day a
+casualty would have frozen the fleet. Checked against production: that metric
+had exactly ONE series in the whole cluster, belonging to a `helm-install` pod
+that happened to retry.
+
+**The Job's failure REASON is exported, so that is what carries the signal.**
+`90-warden-roller.yaml` gives the jobTemplate a `podFailurePolicy` whose single
+rule fails the Job on exit code 4. The Job controller then writes
+`reason: PodFailurePolicy` on that Job's Failed condition, where every other
+nonzero exit gets `reason: BackoffLimitExceeded`. **Page on this:**
 
 ```promql
-kube_pod_container_status_last_terminated_exitcode{namespace="warden",container="roll"} == 4
+count(
+  (kube_job_status_failed{namespace="warden", reason!~"BackoffLimitExceeded|DeadlineExceeded|Evicted"} > 0)
+  and on(namespace, job_name)
+  (time() - kube_job_status_start_time{namespace="warden"} < 3600)
+) > 0
 ```
+
+Three parts, each load-bearing:
+
+- **The negation, rather than `reason="PodFailurePolicy"`.** kube-state-metrics
+  hardcodes `jobFailureReasons = {BackoffLimitExceeded, DeadlineExceeded,
+  Evicted}` and files every other reason under the empty string - which
+  Prometheus drops on ingest, so a casualty arrives with no `reason` label at
+  all. The negation matches that series today AND keeps matching on the day
+  upstream adds `PodFailurePolicy` to its list and the label appears for real.
+  Do not tidy this into an equality match; it would be correct for one KSM
+  release and silent after it.
+- **`> 0`.** Every roll Job publishes a reason-less series worth 0 while it is
+  healthy, and that series matches the negation too. The comparison is the whole
+  difference between a casualty and a green run.
+- **The one-hour window.** A failed Job object survives until 24 more failures
+  push it out of history, so an unwindowed query stays red for days after the
+  fleet is fixed - the same trap that had "Pods not ready" reading 3 over
+  yesterday's corpses. The window costs nothing, because a frozen fleet
+  RE-RAISES the casualty on every tick: the read pass halts before writing on
+  every run, so the signal renews itself every fifteen minutes for as long as
+  the problem is real, and goes cold within an hour of being fixed.
 
 That is the frozen fleet: nothing converged, and nothing will until a person
 acts. Everything else belongs on a board.
+
+Sixty seconds of probe proves the whole path - Job controller, kube-state-metrics,
+remote_write, Prometheus - without waiting for a real casualty:
+
+```sh
+kubectl create ns roll-exit-probe
+for CODE in 3 4; do kubectl apply -f - <<EOF
+apiVersion: batch/v1
+kind: Job
+metadata: {name: probe-exit$CODE, namespace: roll-exit-probe}
+spec:
+  backoffLimit: 0
+  podFailurePolicy:
+    rules:
+      - action: FailJob
+        onExitCodes: {containerName: roll, operator: In, values: [4]}
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - {name: roll, image: busybox:1.36, command: ["/bin/sh","-c","exit $CODE"]}
+EOF
+done
+# exit 3 -> BackoffLimitExceeded, exit 4 -> PodFailurePolicy
+kubectl -n roll-exit-probe get job -o jsonpath='{range .items[*]}{.metadata.name}{"  "}{.status.conditions[?(@.type=="Failed")].reason}{"\n"}{end}'
+# then the query above with namespace="roll-exit-probe" should count exactly 1
+kubectl delete ns roll-exit-probe
+```
 
 The split matters more than it looks, because codes 1, 2 and 3 can all be
 **permanent**. A stranded mailbox raises 1 every fifteen minutes until somebody
@@ -674,10 +742,37 @@ weekly cleanup. 3 is healthy unless its `still behind` count stops falling
 across consecutive runs, which is the stall signature and worth its own alert:
 
 ```promql
-min_over_time(
-  kube_pod_container_status_last_terminated_exitcode{namespace="warden",container="roll"}[2h]
-) == 3
+min_over_time(BEHIND[2h:5m]) > 0
+  and
+(max_over_time(BEHIND[2h:5m]) - min_over_time(BEHIND[2h:5m])) == 0
 ```
+
+where `BEHIND` is the fleet's own convergence gap, the expression behind the
+dashboard's "Off the majority image":
+
+```promql
+count(kube_pod_container_info{namespace="tenants", container="squelchd"})
+  - max(count by (image_spec) (kube_pod_container_info{namespace="tenants", container="squelchd"}))
+```
+
+Read it as "the fleet has been behind for two hours and the number never once
+went down". A healthy roll drains one tenant per tick, so eight ticks with no
+movement at all is a queue that is not draining rather than a queue that is
+long. This replaces a second query that died with the first one - it too read
+the exit code out of a metric that was never emitted.
+
+**Exit 64 pages through neither of these**, because a mistyped `args:` fails the
+Job the ordinary way and the fleet simply stops converging in silence. What
+catches it is the timer itself going quiet:
+
+```promql
+time() - max(kube_cronjob_status_last_schedule_time{namespace="warden"}) > 4200
+```
+
+Seventy minutes rather than twenty, because `concurrencyPolicy: Forbid` means a
+run that overruns its tick legitimately delays the next schedule, and
+`activeDeadlineSeconds` allows an hour of that. Both this and the stall query
+are on the dashboard's "Daemon rollout" row.
 
 ```sh
 kubectl -n warden get cronjob squelch-warden-roll         # last schedule, ACTIVE, suspended or not

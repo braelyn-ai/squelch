@@ -68,7 +68,9 @@
 #     means "rolled one, more queued", and Kubernetes knows zero and non-zero
 #     and nothing else. Nine tenants behind is nine failed Jobs and then a
 #     green one. An alert that pages on `kube_job_status_failed` alone will fire
-#     on every ordinary image bump; see PRODUCTION.md for what to alert on.
+#     on every ordinary image bump. What makes the one failure that matters
+#     tellable from those is `podFailurePolicy` in the jobTemplate below, which
+#     gets exit 4 a Failed condition of its own; PRODUCTION.md has the query.
 #   - **Convergence time is the schedule times the fleet.** Raising the schedule
 #     below is the lever, and it trades directly against how long a bad render
 #     has to be noticed in. Fifteen minutes was chosen when the fleet was small.
@@ -192,9 +194,12 @@ spec:
   # which is 96 Jobs a day, and a handful of slots means the evidence is gone
   # within the hour and long before anyone reads it. Twenty-four is six hours of
   # ticks. Each one is a completed pod holding a few kilobytes of log on a node
-  # that carries tenants, which is what stops this being a much larger number;
-  # the real fix is an alert on `kube_job_status_failed{namespace="warden"}`,
-  # which is an open item in PRODUCTION.md.
+  # that carries tenants, which is what stops this being a much larger number.
+  #
+  # These corpses are counted by nothing, and that is deliberate: a Job pod ends
+  # every run not-ready and stays that way forever, so any pod-health query has
+  # to exclude Job-owned pods outright rather than by phase. The dashboard's
+  # "Pods not ready" read 3 for a day over three of them before it learned that.
   successfulJobsHistoryLimit: 3
   failedJobsHistoryLimit: 24
   jobTemplate:
@@ -218,6 +223,55 @@ spec:
       # Being cut off is safe but not free: the tenant that was mid-roll is
       # picked up by the next run, and the fleet is split-version until then.
       activeDeadlineSeconds: 3600
+      # THE CASUALTY'S ONLY WAY OUT OF THIS POD. It changes no behaviour at all:
+      # with `backoffLimit: 0` the Job already failed on the first failed pod and
+      # already never retried, and it still does both. What it changes is the
+      # WORD Kubernetes writes on the failure, which is the only part of an exit
+      # code that survives into metrics.
+      #
+      # kube-state-metrics does not export a one-shot pod's exit code. It builds
+      # `kube_pod_container_status_last_terminated_exitcode` from a container's
+      # `lastState`, and a pod that runs once and exits puts its code in
+      # `state.terminated` and leaves `lastState` empty - so the query
+      # PRODUCTION.md recommended for two months matched nothing, ever, on any
+      # cluster. A frozen fleet was silent. That is what this rule fixes, and the
+      # method is to make the Job controller do the classifying: a pod failure
+      # matching a `FailJob` rule sets the Job's Failed condition reason to
+      # `PodFailurePolicy` instead of `BackoffLimitExceeded`, and the reason IS
+      # exported, as a label on `kube_job_status_failed`.
+      #
+      # So exit 4 becomes a different series from every other nonzero exit, which
+      # is the whole ask: 4 pages, everything else goes on a board. See
+      # PRODUCTION.md, "Alerting on this, without alerting on normal", for the
+      # query, the kube-state-metrics wrinkle underneath it, and a probe you can
+      # run in sixty seconds to prove the whole path still works.
+      #
+      # ONLY exit 4 belongs here, and only `FailJob`.
+      #
+      #   - Adding 1, 2 or 3 would spend the one bit this mechanism has on codes
+      #     that are permanent by design (a stranded mailbox raises 1 every tick
+      #     forever) and put the casualty back in a bucket somebody mutes.
+      #   - `action: Ignore` is not an option for anything, however tempting it
+      #     looks for the ordinary exit 3 that leaves failed Jobs lying around.
+      #     Ignore means the failure does not count against `backoffLimit`, and a
+      #     Job under its backoff limit CREATES A REPLACEMENT POD - so the roll
+      #     that just took a mailbox down would immediately run again. "A halted
+      #     roll wants a human, not a retry loop" is the rule above, and Ignore
+      #     is that retry loop with a quieter name.
+      #   - No `onPodConditions` rule either, for the same reason: an evicted or
+      #     preempted roll is a failed Job today, and it should stay one.
+      #
+      # `containerName` must stay `roll`, matching the container below. A rule
+      # with no containerName matches any container in the pod, which is the same
+      # thing while this pod has one container and a silent widening the day it
+      # grows a sidecar.
+      podFailurePolicy:
+        rules:
+          - action: FailJob
+            onExitCodes:
+              containerName: roll
+              operator: In
+              values: [4]
       template:
         metadata:
           # NOT `app.kubernetes.io/name: squelch-warden`. That label is the

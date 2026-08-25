@@ -50,7 +50,9 @@ No inbound port; the firewall stays 22/80/443. Total footprint ~200 MB.
   shows here first), Traefik request/5xx/latency.
 - **Tenants** — pod count vs the 100-user cap, per-tenant CPU/memory/PVC/restarts.
 - **Daemon rollout** — which image version each tenant pod runs, and the
-  switchover as it happens. See below.
+  switchover as it happens, plus the roller's own two vital signs: a casualty
+  (a roll that exited 4, the fleet frozen, the one thing worth a page) and how
+  long since the timer last fired. See below.
 - **Inside squelchd** — sync staleness per tenant, Gmail API errors by kind,
   24h LLM spend, store size, triage throughput.
 

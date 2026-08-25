@@ -2392,6 +2392,136 @@
    }
   },
   {
+   "type": "stat",
+   "title": "Roll casualty (page on this)",
+   "id": 49,
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prometheus"
+   },
+   "description": "The fleet is FROZEN: a roll exited 4, meaning a tenant carries today's render and is not serving it, so the run halted before writing to anyone and no tick will converge anything until a person acts. Suspend the CronJob and look at that tenant's pod. The exit code is not in any metric (kube-state-metrics only exports an exit code for a container that RESTARTED, and a Job pod runs once), so what this counts is the Job's failure reason: podFailurePolicy in 90-warden-roller.yaml gets exit 4 a Failed condition of its own, and kube-state-metrics files that reason under no label at all, which is what the negation matches. Windowed to an hour because a failed Job object lingers for 24 more failures, and a genuinely frozen fleet re-raises this every 15 minutes anyway. The code itself is in the pod's log: kubectl -n warden logs job/<name>",
+   "gridPos": {
+    "h": 5,
+    "w": 6,
+    "x": 0,
+    "y": 71
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prometheus"
+     },
+     "expr": "count((kube_job_status_failed{namespace=\"warden\", reason!~\"BackoffLimitExceeded|DeadlineExceeded|Evicted\"} > 0) and on(namespace, job_name) (time() - kube_job_status_start_time{namespace=\"warden\"} < 3600)) OR on() vector(0)",
+     "refId": "A",
+     "instant": true,
+     "range": false
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "mappings": [],
+     "unit": "short",
+     "thresholds": {
+      "mode": "absolute",
+      "steps": [
+       {
+        "color": "green",
+        "value": null
+       },
+       {
+        "color": "red",
+        "value": 1
+       }
+      ]
+     },
+     "noValue": "NO DATA",
+     "decimals": 0
+    },
+    "overrides": []
+   },
+   "options": {
+    "colorMode": "value",
+    "graphMode": "none",
+    "justifyMode": "auto",
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ],
+     "fields": "",
+     "values": false
+    },
+    "textMode": "auto"
+   }
+  },
+  {
+   "type": "stat",
+   "title": "Roller last fired",
+   "id": 50,
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prometheus"
+   },
+   "description": "Time since the CronJob controller last started a roll, whatever that roll then did. This is the timer's own pulse, and it is the only thing that catches the failures the exit code cannot describe: a CronJob left suspended after an incident, a timer retired by the controller after a hundred missed starts (startingDeadlineSeconds in 90-warden-roller.yaml), or an args list so wrong the binary exits 64 every tick while the fleet quietly stops converging. Yellow past 25 minutes, red past 70: concurrencyPolicy Forbid lets a run that overruns its tick delay the next schedule, and activeDeadlineSeconds allows an hour of that, so anything under an hour can still be one long legitimate roll",
+   "gridPos": {
+    "h": 5,
+    "w": 6,
+    "x": 6,
+    "y": 71
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prometheus"
+     },
+     "expr": "time() - max(kube_cronjob_status_last_schedule_time{namespace=\"warden\"})",
+     "refId": "A",
+     "instant": true,
+     "range": false
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "mappings": [],
+     "unit": "s",
+     "thresholds": {
+      "mode": "absolute",
+      "steps": [
+       {
+        "color": "green",
+        "value": null
+       },
+       {
+        "color": "yellow",
+        "value": 1500
+       },
+       {
+        "color": "red",
+        "value": 4200
+       }
+      ]
+     },
+     "noValue": "NO DATA",
+     "decimals": 0
+    },
+    "overrides": []
+   },
+   "options": {
+    "colorMode": "value",
+    "graphMode": "none",
+    "justifyMode": "auto",
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ],
+     "fields": "",
+     "values": false
+    },
+    "textMode": "auto"
+   }
+  },
+  {
    "type": "timeseries",
    "title": "Pods by image version (what Kubernetes was told to run)",
    "id": 42,
@@ -2404,7 +2534,7 @@
     "h": 8,
     "w": 12,
     "x": 0,
-    "y": 71
+    "y": 76
    },
    "targets": [
     {
@@ -2481,7 +2611,7 @@
     "h": 8,
     "w": 12,
     "x": 12,
-    "y": 71
+    "y": 76
    },
    "targets": [
     {
@@ -2558,7 +2688,7 @@
     "h": 10,
     "w": 24,
     "x": 0,
-    "y": 79
+    "y": 84
    },
    "targets": [
     {
@@ -2636,7 +2766,7 @@
     "h": 8,
     "w": 24,
     "x": 0,
-    "y": 89
+    "y": 94
    },
    "targets": [
     {
@@ -2846,7 +2976,7 @@
     "h": 1,
     "w": 24,
     "x": 0,
-    "y": 97
+    "y": 102
    },
    "panels": []
   },
@@ -2863,7 +2993,7 @@
     "h": 8,
     "w": 12,
     "x": 0,
-    "y": 98
+    "y": 103
    },
    "targets": [
     {
@@ -2948,7 +3078,7 @@
     "h": 8,
     "w": 12,
     "x": 12,
-    "y": 98
+    "y": 103
    },
    "targets": [
     {
@@ -3029,7 +3159,7 @@
     "h": 8,
     "w": 8,
     "x": 0,
-    "y": 106
+    "y": 111
    },
    "targets": [
     {
@@ -3098,7 +3228,7 @@
     "h": 8,
     "w": 8,
     "x": 8,
-    "y": 106
+    "y": 111
    },
    "targets": [
     {
@@ -3172,7 +3302,7 @@
     "h": 8,
     "w": 8,
     "x": 16,
-    "y": 106
+    "y": 111
    },
    "targets": [
     {
@@ -3246,7 +3376,7 @@
     "h": 8,
     "w": 12,
     "x": 0,
-    "y": 114
+    "y": 119
    },
    "targets": [
     {
@@ -3331,7 +3461,7 @@
     "h": 8,
     "w": 12,
     "x": 12,
-    "y": 114
+    "y": 119
    },
    "targets": [
     {

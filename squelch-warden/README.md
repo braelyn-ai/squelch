@@ -577,6 +577,14 @@ non-zero and nothing else — so **a fleet mid-roll leaves failed Jobs in its
 history by design**. `PRODUCTION.md`, "Alerting on this, without alerting on
 normal", is what to page on instead.
 
+What makes `4` tellable from the rest is in the CronJob rather than in this
+binary: a `podFailurePolicy` rule fails the Job on exit `4` alone, so the
+casualty gets a Failed condition of its own (`PodFailurePolicy` rather than
+`BackoffLimitExceeded`) and an alert can match on that. It has to be done that
+way round because no metric anywhere carries a one-shot pod's exit code —
+kube-state-metrics reads exit codes out of `lastState`, which a container that
+never restarted does not have.
+
 A run that halts on the SAME label every tick is a render the cluster refuses
 rather than a flaky tenant — the apply was rejected, so nothing was written, so
 that tenant is still drifted and first in the queue again fifteen minutes later.
