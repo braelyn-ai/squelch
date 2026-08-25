@@ -323,6 +323,9 @@ The actual path, in order:
    privacy policy, data-handling doc, Google verification + CASA for the one project
    with both clients. Longest lead time, zero code. **Still open**, and it is the
    gate on user 101: the unverified cap is 100, and nothing below moves it.
+   The submission itself — the three gates, the scope justifications, the demo
+   video shot list, and what is still blocking — is
+   [docs/VERIFICATION.md](VERIFICATION.md).
 2. **Phase 1 — self-host as a product: SHIPPED.** GHCR multi-arch image on every
    daemon tag (`v*` then, `daemon-X.Y.Z` since the 2026-08 consolidation —
    `docs/RELEASING.md`), `auth --export`/`--import` consent, first-run auth UX.

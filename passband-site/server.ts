@@ -32,6 +32,11 @@ const pages: Record<string, string> = {
   "/icon-512.png": "icon-512.png",
   // Newsreader, subset to Latin from the same TTF the Swift client bundles.
   "/newsreader-var.woff2": "newsreader-var.woff2",
+  // The OAuth "application home page" Google verification is filed against:
+  // static, so a reviewer's automated fetch sees the app description and the
+  // privacy link without executing the bundle. The React homepage cannot,
+  // because it serves an empty #root.
+  "/about": "about.html",
   "/privacy": "privacy.html",
   "/self-host": "selfhost.html",
   "/terms": "terms.html",

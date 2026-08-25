@@ -1,0 +1,243 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>About &middot; Passband</title>
+    <meta
+      name="description"
+      content="Passband is an email client for Mac and iOS that syncs your Gmail mailbox, triages it so the inbox holds only what matters, and lets you read, archive, label, and send mail."
+    />
+    <link
+      rel="icon"
+      type="image/svg+xml"
+      href="/icon.svg"
+      media="(prefers-color-scheme: light)"
+    />
+    <link
+      rel="icon"
+      type="image/svg+xml"
+      href="/icon-dark.svg"
+      media="(prefers-color-scheme: dark)"
+    />
+    <link rel="apple-touch-icon" href="/icon-180.png" />
+    <style>
+      body {
+        margin: 0;
+        background: #0f0f10;
+        color: #d6d6d9;
+        font-family: system-ui, sans-serif;
+        line-height: 1.65;
+      }
+      main {
+        max-width: 42rem;
+        margin: 0 auto;
+        padding: 3rem 1.5rem 5rem;
+      }
+      .home {
+        display: inline-flex;
+        align-items: center;
+        gap: 0.6rem;
+        color: #8a8a90;
+        text-decoration: none;
+        font-size: 0.9rem;
+        margin-bottom: 2rem;
+      }
+      .home img {
+        width: 28px;
+        height: 28px;
+        border-radius: 7px;
+      }
+      h1 {
+        color: #f5f5f7;
+        font-size: 2rem;
+        margin: 0 0 0.25rem;
+      }
+      .sub {
+        color: #8a8a90;
+        margin: 0 0 2.5rem;
+      }
+      h2 {
+        color: #f5f5f7;
+        font-size: 1.15rem;
+        margin: 2.5rem 0 0.75rem;
+      }
+      p {
+        margin: 0.75rem 0;
+      }
+      a {
+        color: #b8b8bd;
+      }
+      ul {
+        padding-left: 1.4rem;
+      }
+      li {
+        margin: 0.5rem 0;
+      }
+      code {
+        font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      }
+      p code, li code, td code {
+        background: #17171a;
+        border: 1px solid #26262b;
+        border-radius: 0.3rem;
+        padding: 0.1rem 0.35rem;
+        font-size: 0.85em;
+      }
+      table {
+        border-collapse: collapse;
+        width: 100%;
+        font-size: 0.9rem;
+        margin: 1rem 0;
+      }
+      th, td {
+        border: 1px solid #26262b;
+        padding: 0.5rem 0.65rem;
+        text-align: left;
+        vertical-align: top;
+      }
+      th {
+        background: #17171a;
+        color: #f5f5f7;
+        font-weight: 600;
+      }
+      .links {
+        margin-top: 3rem;
+        padding-top: 1.5rem;
+        border-top: 1px solid #26262b;
+        font-size: 0.9rem;
+      }
+      .links a {
+        margin-right: 1.25rem;
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <a class="home" href="/"><img src="/icon.svg" alt="" />Passband</a>
+      <h1>About Passband</h1>
+      <p class="sub">
+        An email client for Mac and iOS that triages your Gmail.
+      </p>
+
+      <p>
+        Passband is two pieces. <strong>squelchd</strong> is a daemon that
+        connects to your Gmail mailbox over the Gmail API, syncs your messages,
+        and scores each one so that the mail worth your attention is separated
+        from the mail that is not. <strong>Passband</strong> is the app you
+        read it in, on macOS and iOS.
+      </p>
+      <p>
+        The name is the point. A squelch mutes everything below a threshold; the
+        passband is the band a filter lets through. The inbox holds what made it
+        through, and everything else is filed without asking you first.
+      </p>
+
+      <h2>What it does</h2>
+      <ul>
+        <li>
+          <strong>Triage.</strong> Every incoming message is scored and sorted
+          into a tier, using rules you write in plain language plus an
+          importance model. Newsletters, receipts, and notifications are filed
+          automatically; mail from people you correspond with is always let
+          through.
+        </li>
+        <li>
+          <strong>Read.</strong> Threads are rendered oldest to newest, with
+          inline images and attachments, full-text search across your mailbox,
+          and Quick Look preview for anything attached.
+        </li>
+        <li>
+          <strong>Act.</strong> Archive, label, mark read or unread, and park a
+          thread until a time you name so it comes back when it is relevant.
+        </li>
+        <li>
+          <strong>Write.</strong> Compose, reply, and forward with Markdown
+          formatting, contact autocomplete, and attachments, sent from your own
+          Gmail address.
+        </li>
+        <li>
+          <strong>Extract.</strong> Deadlines, verification codes, and package
+          tracking are pulled out of your mail and surfaced as cards, so you do
+          not have to reopen a message to find the one line that mattered.
+        </li>
+        <li>
+          <strong>Ask.</strong> A built-in assistant can search and summarize
+          your mailbox, and drafts any action for your confirmation before it
+          touches anything.
+        </li>
+      </ul>
+
+      <h2>How it uses your Google account</h2>
+      <p>
+        Passband connects to Gmail through the Gmail API with your consent, over
+        OAuth. It requests these permissions and no others:
+      </p>
+      <table>
+        <tr><th>Permission</th><th>Why Passband needs it</th></tr>
+        <tr>
+          <td><code>gmail.readonly</code></td>
+          <td>
+            Read your messages so they can be triaged, threaded, searched, and
+            displayed, and so deadlines and tracking numbers can be extracted.
+          </td>
+        </tr>
+        <tr>
+          <td><code>gmail.modify</code></td>
+          <td>
+            Apply what triage or you decided: archive a message, add or remove a
+            label, mark it read or unread, bring a parked thread back.
+          </td>
+        </tr>
+        <tr>
+          <td><code>gmail.send</code></td>
+          <td>
+            Send the mail you write in Passband: replies, forwards, new
+            messages, and invitations you choose to share.
+          </td>
+        </tr>
+      </table>
+      <p>
+        Read access and write access are held as separate credentials, and the
+        sync path is structurally unable to load the one that can write. What is
+        stored, where it lives, and who can reach it is set out in full in the
+        <a href="/privacy">Privacy Policy</a>.
+      </p>
+
+      <h2>Two ways to run it</h2>
+      <p>
+        <strong>Self-host.</strong> Run the daemon on your own machine, NAS, or
+        server. Your mail and your Google credentials stay on your disk and
+        never reach infrastructure we operate. The software is open source under
+        the MIT license, and the setup is written up on the
+        <a href="/self-host">self-host page</a>.
+      </p>
+      <p>
+        <strong>Hosted.</strong> We run the daemon for you, one isolated
+        instance per account, which is what makes always-on triage and mobile
+        push possible. Your mail and your Google refresh token are stored on our
+        servers; the <a href="/privacy">Privacy Policy</a> explains exactly what
+        that means. Hosted accounts are invitation-only while the product is in
+        preview.
+      </p>
+
+      <h2>Who makes it</h2>
+      <p>
+        Passband is built by Braelyn Boynton. The source is public at
+        <a href="https://github.com/braelyn-ai/squelch">github.com/braelyn-ai/squelch</a>,
+        including the
+        <a href="https://github.com/braelyn-ai/squelch/blob/main/docs/SECURITY.md">threat
+        model</a>. Questions, privacy requests, and vulnerability reports go to
+        <a href="mailto:bboynton97@gmail.com">bboynton97@gmail.com</a>.
+      </p>
+
+      <div class="links">
+        <a href="/">Home</a>
+        <a href="/privacy">Privacy Policy</a>
+        <a href="/terms">Terms of Service</a>
+        <a href="/self-host">Self-host</a>
+        <a href="https://github.com/braelyn-ai/squelch">GitHub</a>
+      </div>
+    </main>
+  </body>
+</html>
