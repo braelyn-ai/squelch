@@ -106,7 +106,7 @@ enum ReleaseNotes {
         ReleaseNote(
             version: "0.0.4",
             date: "2026-08-24",
-            headline: "Forwarding, reminders, and mail that renders like its sender meant it to.",
+            headline: "Forwarding, reminders, invites, and mail that renders like its sender meant it to.",
             items: [
                 ReleaseItem(
                     .app,
@@ -120,12 +120,28 @@ enum ReleaseNotes {
                         + "board on the day you named."),
                 ReleaseItem(
                     .app,
+                    "Invite a friend. The share sheet writes the mail, shows you exactly what is "
+                        + "going out, and sends it from your own mailbox under your own name."),
+                ReleaseItem(
+                    .app,
+                    "Threads read the way you want them to. Email cards, chat bubbles, or "
+                        + "Automatic, which picks per thread from how the conversation actually "
+                        + "reads."),
+                ReleaseItem(
+                    .app,
                     "Embedded images render where their sender put them, instead of collecting at "
                         + "the bottom as attachments."),
                 ReleaseItem(
                     .app,
+                    "Notification banners carry the sender's own mark, a brand's logo or a "
+                        + "correspondent's initials, so you know who wrote before you open it."),
+                ReleaseItem(
+                    .app,
                     "The window reads as one bar. The email's subject sits up beside the traffic "
                         + "lights, and the mail bar stops shuffling when you switch pages."),
+                ReleaseItem(
+                    .app,
+                    "A long thread scrolls without stutter, however far back it goes."),
                 ReleaseItem(
                     .app,
                     "Unsubscribing or blocking a sender closes the email and moves you on, rather "
@@ -157,6 +173,15 @@ enum ReleaseNotes {
                     .daemon,
                     "Reminders and forwarding are served by the daemon, so both work from any "
                         + "client you have paired."),
+                ReleaseItem(
+                    .daemon,
+                    "New mail reaches the screen in seconds. Gmail is polled every five seconds "
+                        + "rather than every forty-five, so a login code is in front of you about "
+                        + "as fast as it arrives."),
+                ReleaseItem(
+                    .daemon,
+                    "An invite you send goes out through your own Gmail, and the address you sent "
+                        + "it to never leaves your machine."),
             ]),
         ReleaseNote(
             version: "0.0.3",

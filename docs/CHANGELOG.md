@@ -13,14 +13,18 @@ self-host box, so every note says which one it landed in.
 
 ## 0.0.4 (2026-08-24)
 
-Forwarding, reminders, and mail that renders like its sender meant it to.
+Forwarding, reminders, invites, and mail that renders like its sender meant it to.
 
 ### App
 
 - Forward what you are reading. The f key in the reader opens a composer with the original already in it, quote and attachments and all, and shows you exactly what is going along before you send it.
 - Park an email until later. The h key asks when, in the words you would use ("next tuesday", "the 24th"), and the thread comes back at the top of your board on the day you named.
+- Invite a friend. The share sheet writes the mail, shows you exactly what is going out, and sends it from your own mailbox under your own name.
+- Threads read the way you want them to. Email cards, chat bubbles, or Automatic, which picks per thread from how the conversation actually reads.
 - Embedded images render where their sender put them, instead of collecting at the bottom as attachments.
+- Notification banners carry the sender's own mark, a brand's logo or a correspondent's initials, so you know who wrote before you open it.
 - The window reads as one bar. The email's subject sits up beside the traffic lights, and the mail bar stops shuffling when you switch pages.
+- A long thread scrolls without stutter, however far back it goes.
 - Unsubscribing or blocking a sender closes the email and moves you on, rather than leaving you holding the thing you just got rid of.
 - The banking card clears once you have actually seen it, and stays cleared across a restart.
 - The s key in the reader searches everything from that sender.
@@ -32,6 +36,8 @@ Forwarding, reminders, and mail that renders like its sender meant it to.
 - Login codes and 2FA mail stay sealed even when they are worded oddly enough to dodge the usual patterns.
 - A triage outage no longer costs you mail. Rows stay queued when the model is unreachable and get judged when it comes back, instead of being filed on a guess.
 - Reminders and forwarding are served by the daemon, so both work from any client you have paired.
+- New mail reaches the screen in seconds. Gmail is polled every five seconds rather than every forty-five, so a login code is in front of you about as fast as it arrives.
+- An invite you send goes out through your own Gmail, and the address you sent it to never leaves your machine.
 
 ## 0.0.3 (2026-08-18)
 
