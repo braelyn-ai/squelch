@@ -478,7 +478,7 @@
     "type": "prometheus",
     "uid": "prometheus"
    },
-   "description": "A real claude-opus-5 call through the public gateway path every tenant daemon uses (blackbox bifrost_llm module, every 5m). FAILING = LLM calls are not going through in production and every tenant is running heuristic-only triage - the 2026-08-19 failure mode. NO DATA = the canary itself is not scraping (key unset, blackbox down).",
+   "description": "A real anthropic/claude-opus-5 call through the public gateway path every tenant daemon uses (blackbox bifrost_llm module, every 15m). FAILING = LLM calls are not going through in production and every tenant is running heuristic-only triage, the 2026-08-19 failure mode. NO DATA = the canary itself is not probing (key unset, blackbox down). The last_over_time wrapper is load-bearing: the probe runs every 15m and an instant query only looks back 5m, so the bare series is absent two thirds of the time. That absence rendered as NO DATA, which reads as 'monitoring is broken' rather than 'the fleet is down', and it hid a genuinely red canary from 2026-08-21 to 2026-08-25. The window must stay wider than blackbox-bifrost-llm's scrape_interval.",
    "gridPos": {
     "h": 4,
     "w": 6,
@@ -491,7 +491,7 @@
       "type": "prometheus",
       "uid": "prometheus"
      },
-     "expr": "probe_success{job=\"blackbox-bifrost-llm\"}",
+     "expr": "last_over_time(probe_success{job=\"blackbox-bifrost-llm\"}[20m])",
      "refId": "A",
      "instant": true,
      "range": false
