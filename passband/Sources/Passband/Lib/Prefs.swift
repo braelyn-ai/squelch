@@ -149,7 +149,7 @@ final class Prefs {
         _userName = defaults.string(forKey: Key.userName) ?? ""
         _signature = defaults.string(forKey: Key.signature) ?? ""
         _assistantModel =
-            AssistantModel(rawValue: defaults.string(forKey: Key.assistantModel) ?? "")
+            AssistantModel.migrating(rawValue: defaults.string(forKey: Key.assistantModel) ?? "")
             ?? .haiku
         _assistantTransport =
             AssistantTransport(rawValue: defaults.string(forKey: Key.assistantTransport) ?? "")
@@ -336,9 +336,32 @@ final class Prefs {
 }
 
 /// Model options offered in Settings. Cheap-first: Haiku is the default.
+///
+/// These raw values are BARE ids, which is correct for BYOK (Anthropic's own
+/// endpoint rejects a provider prefix) and is deliberately not the whole story
+/// on hosted: the daemon's relay qualifies the id before it reaches the
+/// gateway, because only the daemon knows which endpoint is downstream. See
+/// `qualify_model_for_gateway` in squelch-api.
+///
+/// A raw value here must also appear in the hosted allow-lists
+/// (`SQUELCH_CONTROL_ASSISTANT_MODELS` and the gateway's provider key, which
+/// `squelch-control llm sync` writes) or a hosted turn 403s. `claude-opus-4-8`
+/// was offered here long after it had fallen out of both, so the Opus option
+/// could not have worked on hosted even once the prefix was right.
 enum AssistantModel: String, CaseIterable, Sendable {
     case haiku = "claude-haiku-4-5"
-    case opus = "claude-opus-4-8"
+    case opus = "claude-opus-5"
+
+    /// Raw values that used to name a still-offered option, mapped forward.
+    /// Without this, `AssistantModel(rawValue:)` fails for anyone whose stored
+    /// preference predates the rename and they are silently moved to Haiku,
+    /// which is a quieter kind of wrong than an error.
+    static func migrating(rawValue: String) -> AssistantModel? {
+        switch rawValue {
+        case "claude-opus-4-8": .opus
+        default: AssistantModel(rawValue: rawValue)
+        }
+    }
 
     var shortLabel: String {
         switch self {
@@ -350,7 +373,7 @@ enum AssistantModel: String, CaseIterable, Sendable {
     var label: String {
         switch self {
         case .haiku: "Haiku 4.5 — fast & cheap (recommended)"
-        case .opus: "Opus 4.8 — smartest, pricier"
+        case .opus: "Opus 5 — smartest, pricier"
         }
     }
 

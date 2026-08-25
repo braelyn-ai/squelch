@@ -590,6 +590,39 @@ pub fn is_gateway_url(url: &str) -> bool {
     url != API_URL
 }
 
+/// The provider qualifier a fronting gateway needs on a model id.
+///
+/// Anthropic's own endpoint takes a BARE id and rejects this prefix; the
+/// gateway is the opposite, and cannot auto-resolve a provider from a bare id
+/// at all. So the prefix is a property of the ENDPOINT, never of the model,
+/// which is why it lives beside [`is_gateway_url`] rather than in any
+/// model list.
+pub const GATEWAY_PROVIDER_PREFIX: &str = "anthropic/";
+
+/// Qualify a model id for a gateway, or `None` if it already is.
+///
+/// The gateway resolves a provider before it looks at anything else, so a bare
+/// `claude-opus-5` answers 400 "could not auto resolve a provider for the
+/// request, please specify a provider explicitly" — *before* the virtual key,
+/// its allow-list, or the budget are consulted. No amount of allow-list
+/// editing can fix that, which is what makes this a wire concern.
+///
+/// Triage never needs this: the warden hands hosted daemons an already
+/// qualified `SQUELCH_WARDEN_LLM_STAGE{1,2}_MODEL`. The ASSISTANT does, because
+/// its model is chosen in the app, and the app cannot know the answer: the same
+/// setting drives BYOK, which talks straight to Anthropic where the prefix is
+/// invalid. Only the daemon knows which endpoint is downstream.
+///
+/// Any `/` means the caller has already named a provider (`openai/gpt-x`
+/// included), and their choice is left alone rather than second-guessed.
+pub fn qualify_gateway_model(model: &str) -> Option<String> {
+    let trimmed = model.trim();
+    if trimmed.is_empty() || trimmed.contains('/') {
+        return None;
+    }
+    Some(format!("{GATEWAY_PROVIDER_PREFIX}{trimmed}"))
+}
+
 /// True when a permanent-failure kind is a CONFIG-LEVEL failure: the request
 /// was rejected for a reason shared by every queued row, never a fact about the
 /// message being classified. A wrong credential (`http_401`/`http_403`), an

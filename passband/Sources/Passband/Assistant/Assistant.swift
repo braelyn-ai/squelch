@@ -1048,7 +1048,7 @@ enum AssistantUsageLedger {
             // at the last model's rates, once — what the old estimate did.
             estimatedCost: dict["estimatedCost"] as? Double
                 ?? price(
-                    AssistantModel(rawValue: lastModel ?? "") ?? .haiku,
+                    AssistantModel.migrating(rawValue: lastModel ?? "") ?? .haiku,
                     inputTokens: inputTokens, outputTokens: outputTokens),
             lastModel: lastModel,
             lastAt: dict["lastAt"] as? String)
