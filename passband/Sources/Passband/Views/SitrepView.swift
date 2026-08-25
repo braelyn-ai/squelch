@@ -63,10 +63,6 @@ struct SitrepView: View {
     /// so the first pass lays out side-by-side rather than flashing stacked.
     @State private var pageWidth: CGFloat = .infinity
 
-    /// Zone data lives in the STORE, not in `@State`: `@State` is discarded on
-    /// navigate-away, so a revisit would show empty cards until refetch.
-    private var rulesCount: Int? { store.zones.rulesCount }
-
     /// The rows the cursor can reach, recomputed at KEY-PRESS time. The render
     /// path does NOT come through here — `body` ranks once into a `let` and
     /// passes the result down.
@@ -111,7 +107,7 @@ struct SitrepView: View {
                         // Same key as the pinned rail below: whichever layout is
                         // on screen is the one the tour's ring finds.
                         railCards.tourTarget(.records)
-                        StatusStrip(rulesCount: rulesCount)
+                        StatusStrip()
                     }
                     .padding(.top, 14)
                     .padding(.bottom, 28)
@@ -125,7 +121,7 @@ struct SitrepView: View {
                     ScrollView(.vertical) {
                         VStack(spacing: 16) {
                             leftZones(visible: visible, overflow: overflow)
-                            StatusStrip(rulesCount: rulesCount)
+                            StatusStrip()
                         }
                         .padding(.top, 14)
                         .padding(.bottom, 28)
@@ -712,7 +708,6 @@ private struct ObligationWash: View {
 
 private struct StatusStrip: View {
     @Environment(AppStore.self) private var store
-    let rulesCount: Int?
     @State private var refreshing = false
 
     var body: some View {
@@ -742,13 +737,6 @@ private struct StatusStrip: View {
                     .help("today's stage-2 triage cost estimate")
             }
 
-            if let rulesCount {
-                ChromeChip(
-                    text: "\(rulesCount) \(rulesCount == 1 ? "rule" : "rules")",
-                    icon: "slider.horizontal.3",
-                    tone: Palette.inkDim, help: "sender rules"
-                ) { store.setView(.rules) }
-            }
             Spacer(minLength: 0)
         }
         .padding(.top, 2)

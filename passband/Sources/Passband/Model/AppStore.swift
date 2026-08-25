@@ -146,7 +146,6 @@ struct SitrepZoneCache: Sendable {
     var banking: [BankingRecord] = []
     var receipts: [Receipt] = []
     var newsletters: [Newsletter] = []
-    var rulesCount: Int?
     /// When the last full refresh COMPLETED. nil = never loaded.
     var loadedAt: Date?
 }
@@ -1402,13 +1401,12 @@ final class AppStore {
         case shipments([Shipment]?)
         case banking([BankingRecord]?)
         case receipts([Receipt]?)
-        case rules(Int?)
         case newsletters([Newsletter])
     }
 
     private func performZoneRefresh() async {
         let e = epoch
-        // Six independent fetches racing in one group, each zone written the
+        // Five independent fetches racing in one group, each zone written the
         // moment ITS fetch answers — completion order, not a fixed await
         // order, which is what actually keeps one wedged endpoint riding out
         // its timeout from holding every later zone's paint hostage. Every
@@ -1423,7 +1421,6 @@ final class AppStore {
             }
             group.addTask { .banking(try? await APIClient.shared.getBanking()) }
             group.addTask { .receipts(try? await APIClient.shared.getReceipts()) }
-            group.addTask { .rules((try? await APIClient.shared.listRules())?.count) }
             group.addTask { .newsletters(await NewsletterFeed.load()) }
             for await answer in group {
                 guard e == epoch else {
@@ -1435,12 +1432,11 @@ final class AppStore {
                 case .shipments(let rows?): zones.shipments = rows
                 case .banking(let rows?): zones.banking = rows
                 case .receipts(let rows?): zones.receipts = rows
-                case .rules(let count?): zones.rulesCount = count
                 case .newsletters(let rows):
                     if !rows.isEmpty || zones.newsletters.isEmpty {
                         zones.newsletters = rows
                     }
-                case .calendar, .shipments, .banking, .receipts, .rules: break
+                case .calendar, .shipments, .banking, .receipts: break
                 }
             }
         }
