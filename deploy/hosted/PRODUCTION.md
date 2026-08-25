@@ -145,6 +145,55 @@ refuses to boot if any of the rest are set without it),
 `SQUELCH_WARDEN_LLM_STAGE1_DAILY_CAP`, `SQUELCH_WARDEN_LLM_STAGE2_DAILY_CAP`.
 Install procedure: `SETUP.md` → "LLM triage through the gateway".
 
+**A model is allow-listed twice, in two different spellings.** This is the
+single most load-bearing fact about the gateway and it has now caused two
+separate multi-day outages.
+
+| Where | Spelling it matches | Written by |
+|---|---|---|
+| Virtual key `allowed_models` | the id the daemon sent, `anthropic/claude-opus-5` | `squelch-control llm mint` |
+| Provider key `models` | the same id with the provider resolved away, `claude-opus-5` | `squelch-control llm sync` |
+
+A model present in the first and absent from the second answers **400 `no keys
+found that support model: <model>`**. Nothing about that failure is visible
+from the cluster: the daemon's config is right, the warden's config is right,
+the tenant's virtual key is right, and the call still dies at the gateway. Run
+`squelch-control llm sync` after every change to the fleet's model, and
+`squelch-control llm sync --check` to ask whether everything agrees now.
+
+> **History, 2026-08-21 to 2026-08-25: the fleet was dark and the canary that
+> exists to say so was also dark.** Two independent faults, and either one
+> alone would have been caught in an hour.
+>
+> The fleet fault: the provider key's `models` still read `claude-opus-4-8`
+> from the gateway's first setup, months after everything else moved to
+> `claude-opus-5`. Every tenant's Stage-1 and Stage-2 call 400'd at routing and
+> every row fell back to its ingest heuristic. Bifrost's own budget ledger read
+> `current_usage: 0` for every tenant key, which is what "the whole fleet
+> triaged nothing" looks like from the outside. Fixed by putting that list
+> under `squelch-control llm sync`; it had no owner before, which is why it
+> outlived two model migrations.
+>
+> The canary fault: the canary's virtual key had been typed into the Bifrost UI
+> comma-space separated, so its `allowed_models` were stored as
+> `["anthropic/claude-opus-5 ", "claude-opus-5 "]`. The gateway matches
+> exactly. Every probe answered 403 while the list rendered as correct in the
+> UI and in every JSON listing, because a trailing space inside a quoted string
+> is invisible in both.
+>
+> And the reason four days passed: the Grafana panel queried
+> `probe_success{job="blackbox-bifrost-llm"}` as an instant query against a job
+> that scrapes every 15m. An instant query looks back 5m, so the series was
+> absent two thirds of the time and the panel rendered its `noValue` string —
+> `NO DATA`, which the panel's own description glosses as "the canary itself is
+> not scraping". The one panel that exists to say the fleet cannot reach its
+> model spent most of its life pointing at the monitoring instead, and was
+> never once seen red. Now wrapped in `last_over_time[20m]`.
+>
+> The lesson worth keeping is not any of the three bugs. It is that a probe
+> whose failure mode renders as "no data" is not a probe. Check what a red
+> canary actually looks like on the dashboard, not just that a green one does.
+
 > **History.** Before the gateway, keyed tenants ran on a shared
 > `anthropic-api-key` Secret in ns `tenants` — the pre-gateway bridge, removed
 > from the warden 2026-08-13. Removing the code touches no tenant that already
