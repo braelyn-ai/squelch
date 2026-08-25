@@ -415,7 +415,7 @@
     "type": "prometheus",
     "uid": "prometheus"
    },
-   "description": "Cluster-wide, completed jobs excluded. Anything nonzero deserves a look",
+   "description": "Pods that are supposed to be serving and are not: not-ready pods owned by a Deployment, DaemonSet or StatefulSet. Job pods are excluded outright, not just the Succeeded ones. A Job pod ends every run not-ready and stays that way as a record: the roller exits 3 on every ordinary rollout (normal, the fleet is still converging), Kubernetes files that Job as Failed, and failedJobsHistoryLimit keeps the corpse for 24 of them, so counting them reads a rollout from yesterday as an outage now. Read the Daemon rollout row for the roller. Anything nonzero here deserves a look",
    "gridPos": {
     "h": 4,
     "w": 3,
@@ -428,7 +428,7 @@
       "type": "prometheus",
       "uid": "prometheus"
      },
-     "expr": "sum(kube_pod_status_ready{condition=\"false\"} unless on(namespace, pod) (kube_pod_status_phase{phase=\"Succeeded\"} == 1)) OR on() vector(0)",
+     "expr": "sum(kube_pod_status_ready{condition=\"false\"} unless on(namespace, pod) kube_pod_owner{owner_kind=\"Job\"}) OR on() vector(0)",
      "refId": "A",
      "instant": true,
      "range": false
@@ -1355,7 +1355,7 @@
       "type": "prometheus",
       "uid": "prometheus"
      },
-     "expr": "sum(kube_pod_status_ready{condition=\"false\"} unless on(namespace, pod) (kube_pod_status_phase{phase=\"Succeeded\"} == 1)) OR on() vector(0)",
+     "expr": "sum(kube_pod_status_ready{condition=\"false\"} unless on(namespace, pod) kube_pod_owner{owner_kind=\"Job\"}) OR on() vector(0)",
      "refId": "A",
      "range": true,
      "instant": false,
