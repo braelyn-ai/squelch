@@ -55,6 +55,16 @@ modules:
   # BLACKBOX_BIFROST_CANARY_KEY is unset the module renders with a dead key and
   # the probe fails visibly — configure it, don't delete the module.
   #
+  # TYPE THAT MODEL LIST WITH NO SPACES AFTER THE COMMAS. The gateway stores
+  # `allowed_models` verbatim and matches it EXACTLY, so a list pasted as
+  # `anthropic/claude-opus-5 , claude-opus-5 ` becomes two entries that can
+  # never match anything. That is not hypothetical: it is how this canary was
+  # first configured, and it answered 403 "Model 'claude-opus-5' is not
+  # allowed for this virtual key" on every probe from 2026-08-21 to
+  # 2026-08-25 while rendering as correct in the UI and in every JSON listing.
+  # `squelch-control llm sync --check` flags untrimmed entries on every key,
+  # including this one, which is the cheapest way to catch it.
+  #
   # BLACKBOX_CANARY_MODEL MUST MATCH WHAT THE WARDEN HANDS TENANTS
   # (SQUELCH_WARDEN_LLM_STAGE1_MODEL / _STAGE2_MODEL, deploy/hosted/
   # 15-warden-config.yaml). If the canary probes a model string the fleet does

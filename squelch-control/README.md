@@ -175,6 +175,8 @@ squelch-control invite revoke <id>        # revoke an unused code
 squelch-control tenants                   # what has been provisioned
 squelch-control llm mint <label>          # mint + install a Bifrost virtual key (also rotates)
 squelch-control llm revoke <label>        # revoke the recorded key and forget it
+squelch-control llm sync                  # converge the gateway's model config onto this one
+squelch-control llm sync --check          # ...report only. Exits 1 when anything has drifted
 squelch-control drift                     # what has been changed on every tenant's workload
 squelch-control drift <label>             # ...on one. Exits 1 when anything has drifted
 squelch-control reconcile <label>         # converge ONE tenant back onto the warden's render
@@ -239,6 +241,31 @@ up while Bifrost was down (signup is fail-soft about the key: an outage costs
 the tenant its key, never the signup), and rotates one that has a key already;
 rotation prints the old key's id, which stays live in Bifrost until revoked
 there. Key **values** are never printed, stored, or logged — only ids are.
+
+`llm sync` is the exception to that paragraph twice over: it needs **neither
+the store nor the warden**, only the Bifrost trio, because it reads and writes
+the gateway's own model configuration and nothing else. The operator most
+likely to run it is one whose fleet cannot reach its model, and making that
+person assemble a Postgres URL and a warden bearer first is how a small outage
+becomes an unreadable one.
+
+What it converges is the **provider key's `models` list**, which is the second
+place a model has to be allow-listed and the one nothing owned. A virtual key's
+`allowed_models` is matched against the id the daemon sent
+(`anthropic/claude-opus-5`); the provider key's list is matched after the
+provider prefix is resolved away (`claude-opus-5`). A model in the first and
+not the second answers `400 no keys found that support model`, which is how
+every hosted tenant ran heuristic-only triage for four days in August 2026
+while each tenant's virtual key, the warden's config and the daemon all named
+the model correctly. Run it after **every** change to the fleet's model, and
+run `--check` to ask whether they agree right now.
+
+Virtual keys are **reported, never rewritten**: converging one here would leave
+the pod holding whatever the warden last installed, so the fix it names is `llm
+mint <label>`, which rotates both ends. The report also flags any allow-list
+entry with leading or trailing whitespace, on managed and unmanaged keys alike,
+because the gateway matches exactly and an entry typed as `claude-opus-5 `
+renders as correct everywhere a human would look while matching nothing.
 
 ## Tests need a real Postgres
 

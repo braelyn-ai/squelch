@@ -40,13 +40,25 @@ scrape_configs:
   # going through in production.
   #
   # Its own job because it spends real money per probe, and the interval is a
-  # COST knob, not a freshness one. A probe now carries a system block and a
-  # real 2000-token ceiling (thinking bills against it), so ~250 in + a few
-  # hundred out at $5/$25 per MTok is on the order of a cent a call: ~$25/month
-  # at 15m, and ~$70/month at the 5m this used to run. The outage it exists to
-  # catch ran for TWO DAYS, so 15-minute detection is far better than needed —
-  # widen it further if the bill annoys you, and do not narrow it without
-  # redoing that arithmetic.
+  # COST knob, not a freshness one. The estimate here used to be a cent a call
+  # (~$25/month at 15m); MEASURED against the gateway's own budget ledger on
+  # 2026-08-25, once the probe actually started succeeding, a probe costs
+  # $0.0014 — about $4/month at 15m, and about $12/month at 5m. The earlier
+  # figure was a six-fold overestimate because it assumed the 2000-token
+  # ceiling gets spent, and a one-field verdict at low effort does not come
+  # close to it.
+  #
+  # 15m is kept anyway: the outages this exists to catch ran for two days and
+  # four days respectively, so detection speed is nowhere near the binding
+  # constraint. The number is now cheap enough that narrowing it is a real
+  # option rather than an expensive one; re-measure from the ledger rather
+  # than from the token ceiling if you do.
+  #
+  # WHATEVER THIS INTERVAL BECOMES, the Grafana panel's last_over_time window
+  # must stay wider than it. An instant query looks back 5m, so at 15m the
+  # series is simply absent two thirds of the time, and the panel rendered
+  # that absence as NO DATA rather than as a failure for the whole four days
+  # the canary was red. See the "LLM canary" panel in passband-health.json.
   #
   # scrape_timeout is 60s because a reasoning model on a cold prompt cache is
   # not a 10s request; it must stay >= the module's own timeout.
