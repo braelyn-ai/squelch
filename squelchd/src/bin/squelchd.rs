@@ -1547,9 +1547,14 @@ struct ReadinessFlags {
     /// A watch sender rather than an `AtomicBool` because two things now read
     /// this bit: `/healthz`, and the sync engine, whose first backfill parks
     /// until the embedder init has resolved (see
-    /// `SyncEngine::with_embedder_gate`). ONE bit for both, so there is no way
-    /// to settle the probe without releasing the backfill or the other way
-    /// round, and no second flag to forget in a new arm of the init task.
+    /// `SyncEngine::with_embedder_gate`). ONE bit for both, so settling the
+    /// probe always releases the backfill, and there is no second flag to forget
+    /// in a new arm of the init task. The reverse does not hold: the backfill
+    /// also releases ITSELF at `EMBEDDER_GATE_CEILING` (three minutes) with the
+    /// probe still 503, and that is the same 180 s as the warden's default ready
+    /// timeout, so a wedged init fails the signup at about the instant the
+    /// backfill starts without it. The ceiling's log line describes the
+    /// daemon, not the tenant's fate.
     embedder_settled: tokio::sync::watch::Sender<bool>,
 }
 

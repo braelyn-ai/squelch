@@ -133,10 +133,11 @@ const BACKOFF_CAP: Duration = Duration::from_secs(5 * 60);
 /// the alert line for the duration.
 ///
 /// The trade against releasing early is bounded now: a backfill that starts
-/// unembedded costs one vector pass at `embed.backfill_batch`, +324 MB at a
-/// batch of 8, not the +1.7 GB a batch of 64 cost. It is also paid AGAIN per
-/// retry, because a backfill that errors before the cursor is stored comes back
-/// through here on the next lifecycle.
+/// unembedded costs one vector pass at `embed.backfill_batch`, about +123 MB
+/// at a batch of 8 under the shipped 256-token `embed.max_tokens` (+324 MB was
+/// the same batch at the model's 512-token ceiling, and +1.7 GB was a batch of
+/// 64 there). It is also paid AGAIN per retry, because a backfill that errors
+/// before the cursor is stored comes back through here on the next lifecycle.
 const EMBEDDER_GATE_CEILING: Duration = Duration::from_secs(3 * 60);
 
 /// How a wait on the embedder gate ended. Every variant but `Settled` says the
@@ -164,6 +165,19 @@ pub enum EmbedderGate {
 /// burst minutes out, which would leave a metadata GET per Sent message racing a
 /// 30-day raw backfill on one credential.
 pub async fn wait_for_embedder_gate(gate: &mut tokio::sync::watch::Receiver<bool>) -> EmbedderGate {
+    let deadline = tokio::time::Instant::now() + EMBEDDER_GATE_CEILING;
+    wait_for_embedder_gate_until(gate, deadline).await
+}
+
+/// [`wait_for_embedder_gate`] against a FIXED deadline, for a caller that may
+/// have to park more than once (the sync engine re-enters after a shutdown
+/// wakeup that carried no shutdown). The deadline is computed once by that
+/// caller, so re-entering cannot re-arm the ceiling and turn a bounded wait
+/// into an unbounded one.
+pub async fn wait_for_embedder_gate_until(
+    gate: &mut tokio::sync::watch::Receiver<bool>,
+    deadline: tokio::time::Instant,
+) -> EmbedderGate {
     if *gate.borrow() {
         return EmbedderGate::Settled;
     }
@@ -172,7 +186,7 @@ pub async fn wait_for_embedder_gate(gate: &mut tokio::sync::watch::Receiver<bool
             Ok(_) => EmbedderGate::Settled,
             Err(_) => EmbedderGate::Dropped,
         },
-        _ = tokio::time::sleep(EMBEDDER_GATE_CEILING) => EmbedderGate::TimedOut,
+        _ = tokio::time::sleep_until(deadline) => EmbedderGate::TimedOut,
     }
 }
 
@@ -606,46 +620,47 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
             return true;
         }
         eprintln!("squelch: waiting for the embedder before the first backfill");
-        tokio::select! {
-            how = wait_for_embedder_gate(&mut gate) => match how {
-                EmbedderGate::Settled => {
-                    eprintln!("squelch: embedder settled; starting the first backfill")
+        // One deadline for the whole wait, however many times it parks: a
+        // wakeup on the shutdown watch that carries no shutdown re-enters the
+        // select below, and a ceiling armed per entry would be no ceiling.
+        let deadline = tokio::time::Instant::now() + EMBEDDER_GATE_CEILING;
+        loop {
+            tokio::select! {
+                how = wait_for_embedder_gate_until(&mut gate, deadline) => {
+                    match how {
+                        EmbedderGate::Settled => {
+                            eprintln!("squelch: embedder settled; starting the first backfill")
+                        }
+                        EmbedderGate::Dropped => eprintln!(
+                            "squelch: embedder gate dropped; the first backfill is running without the \
+                             embedder, and its vectors will be drained by the vector backfill pass"
+                        ),
+                        EmbedderGate::TimedOut => {
+                            self.metrics.record_embedder_gate_timeout();
+                            eprintln!(
+                                "squelch: embedder still not settled after {}m; the first backfill is \
+                                 running without the embedder, and its vectors will be drained by the \
+                                 vector backfill pass",
+                                EMBEDDER_GATE_CEILING.as_secs() / 60
+                            )
+                        }
+                    }
+                    return true;
                 }
-                // The sender is gone, so whatever would have opened this is gone
-                // too and nothing is ever arriving. Same outcome as the ceiling.
-                EmbedderGate::Dropped => eprintln!(
-                    "squelch: embedder gate dropped; the first backfill is running without the \
-                     embedder, and its vectors will be drained by the backfill pass"
-                ),
-                EmbedderGate::TimedOut => {
-                    // The one event that re-arms the memory this whole gate
-                    // exists to avoid, so it goes to the scrape and not only to
-                    // this line. See `EMBEDDER_GATE_CEILING`.
-                    self.metrics.record_embedder_gate_timeout();
-                    eprintln!(
-                        "squelch: embedder still not settled after {}m; the first backfill is \
-                         running without the embedder, and its vectors will be drained by the \
-                         backfill pass",
-                        EMBEDDER_GATE_CEILING.as_secs() / 60
-                    )
+                _ = shutdown.changed() => {
+                    if *shutdown.borrow() {
+                        return false;
+                    }
+                    // A wakeup that did not carry a shutdown (a same-value send,
+                    // or the sender going away) is not permission to run the
+                    // backfill unembedded: the gate is still the thing being
+                    // waited on, and the deadline above still bounds it. Nothing
+                    // in production sends `false` today; this is what keeps a
+                    // future second signal on that watch from silently
+                    // reopening the 2026-08-19 memory profile.
                 }
-            },
-            _ = shutdown.changed() => {
-                // `changed()` fires on any send and on the last sender dropping,
-                // so the VALUE decides. Only a real shutdown skips the backfill:
-                // reporting one that did not happen would end the whole sync
-                // lifecycle, because `run` treats an `Ok` from `run_once` as
-                // "shutdown, we are done" and returns.
-                if *shutdown.borrow() {
-                    return false;
-                }
-                eprintln!(
-                    "squelch: embedder gate wait interrupted; starting the first backfill \
-                     without it"
-                );
             }
         }
-        true
     }
 
     /// Authenticated GET returning parsed JSON. A 404 surfaces as
@@ -4773,25 +4788,35 @@ mod tests {
     /// all: `run_once` returns `Ok` on a reported shutdown and `run` reads that
     /// as "we are done" and stops the lifecycle.
     ///
-    /// MUTATION: `_ = shutdown.changed() => return false`, dropping the value
-    /// check — the obvious reading. This asserts the wait reports "go ahead".
+    /// MUTATION 1: `_ = shutdown.changed() => return false`, dropping the value
+    /// check, the obvious reading: the wait reports "shut down" and the sync
+    /// lifecycle ends. MUTATION 2: the arm returning `true` instead of
+    /// re-parking: the backfill runs unembedded on a wakeup that asked for
+    /// nothing. This asserts both halves: the wait is still parked after the
+    /// wakeup, and it releases only when the gate opens.
     #[tokio::test(start_paused = true)]
     async fn a_shutdown_wakeup_carrying_false_is_not_a_shutdown() {
-        let (_gate_tx, gate_rx) = tokio::sync::watch::channel(false);
+        let (gate_tx, gate_rx) = tokio::sync::watch::channel(false);
         let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
         // Unseen by this receiver, so `changed()` completes the instant the
         // engine parks. The VALUE stays false: nobody asked for a shutdown.
         shutdown_tx.send(false).unwrap();
         let e = gated_engine(gate_rx, SyncMetrics::new());
 
-        // Half the ceiling: any implementation that sits the wakeup out fails
-        // here rather than hanging, because the paused clock advances itself.
-        let go_ahead = tokio::time::timeout(
-            EMBEDDER_GATE_CEILING / 2,
-            e.wait_for_embedder(&mut shutdown_rx),
-        )
-        .await
-        .expect("a wakeup releases the wait");
+        let wait = e.wait_for_embedder(&mut shutdown_rx);
+        tokio::pin!(wait);
+        // Still parked after the wakeup: under the paused clock a one-second
+        // timeout elapses before the three-minute ceiling could.
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), &mut wait)
+                .await
+                .is_err(),
+            "a false shutdown wakeup released the first backfill"
+        );
+        gate_tx.send(true).unwrap();
+        let go_ahead = tokio::time::timeout(EMBEDDER_GATE_CEILING / 2, &mut wait)
+            .await
+            .expect("the gate opening releases the wait");
         assert!(go_ahead, "false on the shutdown watch is not a shutdown");
     }
 

@@ -234,6 +234,9 @@ pub struct SyncMetrics {
     /// First backfills that gave up waiting for the embedder to settle and ran
     /// without it (see `sync::EMBEDDER_GATE_CEILING`). Rare to the point that a
     /// single one is worth looking at: each is a mailbox ingested with no
+    /// Counted per ATTEMPT: a first run whose backfill errors before the cursor
+    /// is stored comes back through the gate on the next lifecycle and pays the
+    /// ceiling again, so a wedged init reads as a train of these, not one.
     /// vectors, which the batch pass then has to embed, which is the memory that
     /// OOM-killed two tenant daemons on 2026-08-19. A counter and not a stderr
     /// line alone, because nobody reads a tenant's stderr until something has
