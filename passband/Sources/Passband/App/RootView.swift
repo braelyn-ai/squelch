@@ -312,6 +312,15 @@ struct MainShell: View {
     /// them working with a search/compose field focused, since a chord is not a
     /// typed character.
     private var globalBindings: [KeyBinding] {
+        // THE ONE MODAL THAT REALLY IS MODAL. Every other overlay COMPOSES with
+        // this set deliberately (see KeyDispatch's header: "1..5 view nav and ⌘K
+        // keep firing from inside a modal") — which is right for a palette you
+        // are meant to act from, and wrong for a re-triage: the board behind the
+        // scrim is mid-rewrite, so navigating to it, searching it, or undoing
+        // into it are all reads and writes against verdicts that are being
+        // replaced. Refusing the whole set HERE is the only place that covers
+        // every one of them at once.
+        guard store.retriage == nil else { return [] }
         var bindings: [KeyBinding] = MainView.mainViews.enumerated().map { index, view in
             KeyBinding("\(index + 1)", "go to \(view.rawValue)") { store.setView(view) }
         }

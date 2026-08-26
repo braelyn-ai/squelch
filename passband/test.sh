@@ -70,6 +70,14 @@ run_suite staged-attachment \
   Sources/Passband/Lib/StagedAttachment.swift \
   Tests/StagedAttachmentTests.swift
 
+# The blocking re-triage modal's state machine. Pure value logic, so it builds
+# with the wire type alone — no store, no daemon, no SwiftUI.
+run_suite retriage-run \
+  Sources/Passband/Model/SubjectText.swift \
+  Sources/Passband/Model/WireTypes.swift \
+  Sources/Passband/Model/RetriageRun.swift \
+  Tests/RetriageRunTests.swift
+
 run_suite email-images \
   Sources/Passband/Lib/ImageProxy.swift \
   Tests/EmailImagesTests.swift

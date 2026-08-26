@@ -118,7 +118,7 @@ struct RetriageModal: View {
             // Still polling — the run may simply be behind a slow cycle — but
             // the door is open now.
             note(
-                "the counter hasn't moved in a few minutes. It may still be working; "
+                "the counter hasn't moved in a while. It may still be working; "
                     + "closing this stops the watching, not the run.", tone: Palette.warn)
             closeButton("Close anyway")
         } else if !run.counted {

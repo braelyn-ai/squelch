@@ -1573,9 +1573,11 @@ final class AppStore {
     /// per-message re-triage from the fix palette, joins the same run).
     func startRetriage(days: Int) async {
         guard retriage == nil else { return }
+        let e = epoch
         retriage = RetriageRun()
         do {
             let result = try await APIClient.shared.retriage(.days(days))
+            guard e == epoch else { return endRetriage() }
             // Nothing to do is not a run: opening a blocking modal over zero
             // rows would be a wall the user has to dismiss to learn nothing
             // happened.
@@ -1590,23 +1592,29 @@ final class AppStore {
             pushToast(errText(error, "re-triage failed"), .error)
             return
         }
-        await watchRetriage()
+        await watchRetriage(epoch: e)
     }
 
     /// Poll until the queues drain, then let the board catch up. Ends by itself
     /// on completion; `endRetriage` is the human's way out from the modal, and
     /// the `retriage != nil` guards are what make that immediate — the server
     /// keeps working either way, this only stops WATCHING.
-    private func watchRetriage() async {
+    ///
+    /// EVERY RESUME IS FENCED ON THE EPOCH, like every other write in this file.
+    /// An account switch mid-run points `APIClient` at a DIFFERENT daemon, and
+    /// without the fence this loop would go on polling — counting the new
+    /// mailbox's re-triage, or reading its empty `total` as this run finishing
+    /// and closing the modal on a success toast about mail it never touched.
+    private func watchRetriage(epoch e: Int) async {
         while retriage != nil {
             try? await Task.sleep(for: .seconds(Self.retriagePollSeconds))
-            guard retriage != nil else { return }
+            guard retriage != nil, e == epoch else { return endRetriage() }
             do {
                 let p = try await APIClient.shared.retriageProgress()
-                guard retriage != nil else { return }
+                guard retriage != nil, e == epoch else { return endRetriage() }
                 retriage?.adopt(p)
             } catch {
-                guard retriage != nil else { return }
+                guard retriage != nil, e == epoch else { return endRetriage() }
                 // A daemon too old to answer cannot be waited on: say so and
                 // leave the modal standing on its "close" button rather than
                 // spinning against a route that will never exist.
@@ -1619,7 +1627,7 @@ final class AppStore {
             }
             if retriage?.finished == true { break }
         }
-        guard retriage != nil else { return }
+        guard retriage != nil, e == epoch else { return endRetriage() }
         // The whole point of the wait: the tiers on screen are the OLD verdicts
         // until this lands.
         let count = retriage?.total ?? 0

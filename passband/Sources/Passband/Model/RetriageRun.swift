@@ -31,11 +31,16 @@ struct RetriageRun: Sendable, Equatable {
     /// would otherwise cost the user a force-quit.
     var stalled = false
 
-    /// Four missed ticks. The daemon's sync loop runs every 45s by default and
-    /// does `batch_per_cycle` rows per stage per tick, so `done` legitimately
-    /// sits still for the better part of a minute at a time; anything under
-    /// three ticks would call a healthy run stuck.
-    private static let stallSeconds: TimeInterval = 180
+    /// Sized on what a human will stare at, NOT on the daemon's cadence — which
+    /// this client cannot see and which has already moved once (`sync.poll_secs`
+    /// went 45 -> 5), so a threshold derived from it would be wrong on exactly
+    /// the installs it was tuned against.
+    ///
+    /// The asymmetry is what makes that safe: firing early only OPENS A DOOR —
+    /// nothing closes, nothing stops, and a run that wakes up clears the flag on
+    /// its next poll — while firing late is a person stuck behind a dead counter
+    /// with force-quit as the only way out. So err short.
+    private static let stallSeconds: TimeInterval = 90
 
     /// Adopt a poll. The SERVER's total wins over the kick's seed: a second
     /// kick, or a per-message re-triage from the fix palette, is the same run
