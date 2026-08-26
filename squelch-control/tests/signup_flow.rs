@@ -270,6 +270,42 @@ async fn spawn_warden(rec: Shared) -> String {
             ),
         )
         .route(
+            "/v1/tenants/{label}/credentials/replace",
+            put(
+                |AxumState(rec): AxumState<Shared>,
+                 axum::extract::Path(label): axum::extract::Path<String>,
+                 headers: HeaderMap,
+                 body: String| async move {
+                    let parsed: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
+                    let mut r = rec.lock().unwrap();
+                    r.warden_bearers.push(bearer_of(&headers));
+                    let account_email = str_field(&parsed, "account_email");
+                    // UNLIKE the signup route, a PROVISIONED tenant is the whole
+                    // point. What is refused is a mailbox that does not own it.
+                    let owned = matches!(
+                        r.tenants.get(&label),
+                        Some(t) if t.account_email == account_email
+                    );
+                    if !r.tenants.contains_key(&label) {
+                        return json_status(StatusCode::NOT_FOUND, "unknown");
+                    }
+                    if !owned {
+                        return json_status(StatusCode::CONFLICT, "not_owner");
+                    }
+                    r.credential_puts.push((label.clone(), parsed));
+                    (
+                        StatusCode::OK,
+                        Json(json!({
+                            "pair_code": "ABCD-EFGH",
+                            "pair_url": format!("https://{label}.passband.test"),
+                            "deep_link": "passband://pair?url=x&code=ABCD-EFGH",
+                        })),
+                    )
+                        .into_response()
+                },
+            ),
+        )
+        .route(
             "/v1/tenants/{label}/recipient",
             post(
                 |AxumState(rec): AxumState<Shared>,
@@ -2053,14 +2089,8 @@ async fn the_activation_poller_stamps_once_and_quiesces() {
 /// THE HAPPY PATH: a second grant for a mailbox that already has a tenant
 /// installs a fresh sealed credential over the dead one, and provisions nothing.
 ///
-/// IGNORED, AND THE REASON IS THE POINT: the warden refuses
-/// `PUT /v1/tenants/{label}/credentials` for an ACTIVE tenant with a 409, so
-/// there is no way to replace a live tenant's credential yet. The mock encodes
-/// that faithfully and this test fails on it. Everything up to the install
-/// works — the grant, the reverse lookup, the recipient, the seal — which is
-/// why the test is kept: it is the executable statement of what the warden
-/// still has to grow, and it should be un-ignored by the change that grows it.
-#[ignore = "blocked: the warden 409s a credential replace on an active tenant"]
+/// It goes through the REPLACE route, not signup's: that one answers 409 for an
+/// active tenant, which is every tenant worth reconnecting.
 #[tokio::test]
 async fn a_reconnect_installs_a_fresh_credential_over_the_dead_one() {
     let h = Harness::new().await;
@@ -2073,26 +2103,27 @@ async fn a_reconnect_installs_a_fresh_credential_over_the_dead_one() {
     let (status, body) = h.run_reconnect().await;
     assert_eq!(status, StatusCode::OK, "{body}");
 
-    let r = h.rec.lock().unwrap();
-    assert_eq!(
-        r.credential_puts.len(),
-        installs_after_signup + 1,
-        "the reconnect must install a credential"
-    );
-    let (label, put) = r.credential_puts.last().unwrap();
-    assert_eq!(label, "ada");
-    // A REAL SEALED BLOB, not an echo of anything: age armor, and openable by
-    // the identity the warden minted for this tenant and nobody else.
-    let ciphertext = str_field(put, "cred_read_ciphertext");
-    assert!(
-        ciphertext.starts_with("-----BEGIN AGE ENCRYPTED FILE-----"),
-        "expected age armor, got {ciphertext:.40}"
-    );
-
-    // NOTHING WAS PROVISIONED. No second tenant, and no invite spent: the
-    // mailbox was paid for once and re-consenting must not cost another.
-    assert_eq!(r.tenants.len(), tenants_after_signup);
-    drop(r);
+    {
+        let r = h.rec.lock().unwrap();
+        assert_eq!(
+            r.credential_puts.len(),
+            installs_after_signup + 1,
+            "the reconnect must install a credential"
+        );
+        let (label, put) = r.credential_puts.last().unwrap();
+        assert_eq!(label, "ada");
+        // A REAL SEALED BLOB, not an echo of anything: age armor, openable by
+        // the identity the warden minted for this tenant and nobody else.
+        let ciphertext = str_field(put, "cred_read_ciphertext");
+        assert!(
+            ciphertext.starts_with("-----BEGIN AGE ENCRYPTED FILE-----"),
+            "expected age armor, got {ciphertext:.40}"
+        );
+        // NOTHING WAS PROVISIONED: no second tenant.
+        assert_eq!(r.tenants.len(), tenants_after_signup);
+    }
+    // And no invite spent: the mailbox was paid for once, and re-consenting
+    // must not cost another. Read after the guard is gone, never across it.
     assert_eq!(
         h.invite_row().await,
         invite_before,
@@ -2135,4 +2166,43 @@ async fn a_reconnect_asks_google_for_a_replacement_refresh_token() {
     for want in ["gmail.readonly", "gmail.modify", "gmail.send"] {
         assert!(scope.contains(want), "scope {scope} is missing {want}");
     }
+}
+
+/// THE CUSTODY CHECK, from the cluster's side. If the store and the warden ever
+/// disagree about who owns a mailbox, the credential does NOT get installed.
+///
+/// The store's mapping is not the only thing standing between a Google account
+/// and somebody else's mailbox: the warden matches the same address against the
+/// tenant's own identity Secret and refuses on its own. This drives that second
+/// check by making the two records disagree, which is the shape a compromised
+/// or buggy control plane would have.
+#[tokio::test]
+async fn a_reconnect_is_refused_when_the_cluster_disagrees_about_the_owner() {
+    let h = Harness::new().await;
+    h.complete_signup("ada").await;
+    let installs_after_signup = h.rec.lock().unwrap().credential_puts.len();
+
+    // The cluster now believes a different mailbox owns `ada`, while the
+    // control store still maps this Google account to it.
+    h.rec
+        .lock()
+        .unwrap()
+        .tenants
+        .get_mut("ada")
+        .unwrap()
+        .account_email = "someone-else@example.com".to_string();
+
+    let (status, _) = h.run_reconnect().await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_GATEWAY,
+        "a custody disagreement must not read as a user error"
+    );
+
+    let r = h.rec.lock().unwrap();
+    assert_eq!(
+        r.credential_puts.len(),
+        installs_after_signup,
+        "no credential may be installed when the two records disagree"
+    );
 }

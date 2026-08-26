@@ -194,6 +194,13 @@ pub enum WardenError {
 
 /// `POST /v1/tenants/{label}/recipient` request body. The mailbox is presented
 /// so the warden can check custody from its own record; nothing is created.
+/// `PUT /v1/tenants/{label}/credentials/replace` request body.
+#[derive(Debug, Serialize)]
+struct ReplaceCredentialsRequest<'a> {
+    account_email: &'a str,
+    cred_read_ciphertext: &'a str,
+}
+
 #[derive(Debug, Serialize)]
 struct RecipientRequest<'a> {
     account_email: &'a str,
@@ -459,6 +466,20 @@ pub trait Warden: Send + Sync {
         cred_read_ciphertext: &str,
     ) -> Result<Pairing, WardenError>;
 
+    /// REPLACE a live tenant's credential after its owner re-consented.
+    ///
+    /// [`Warden::put_credentials`] answers 409 for an ACTIVE tenant, which is
+    /// correct for signup and useless for a re-consent, so this is its own
+    /// route with its own guard. `account_email` is matched on the warden's
+    /// side against the tenant's identity Secret, so a 409 here means the
+    /// cluster does not agree that this mailbox owns this tenant.
+    async fn replace_credentials(
+        &self,
+        label: &str,
+        account_email: &str,
+        cred_read_ciphertext: &str,
+    ) -> Result<Pairing, WardenError>;
+
     /// Install or rotate the tenant's LLM-gateway virtual keys — triage
     /// (`api_key`) and assistant — in one call. `None` skips a slot rather
     /// than clearing it, so a half-failed mint installs the half that exists;
@@ -623,6 +644,50 @@ impl Warden for HttpWarden {
             // The cluster says a different mailbox owns this tenant.
             409 => Err(WardenError::LabelTaken),
             422 => Err(WardenError::LabelRefused),
+            _ => Err(WardenError::Failed),
+        }
+    }
+
+    async fn replace_credentials(
+        &self,
+        label: &str,
+        account_email: &str,
+        cred_read_ciphertext: &str,
+    ) -> Result<Pairing, WardenError> {
+        crate::labels::validate(label).map_err(|_| WardenError::LabelRefused)?;
+        // The same guard the signup route carries, for the same reason: this is
+        // the line that fails loudly if a refactor ever hands it a plaintext
+        // token instead of ciphertext.
+        if !cred_read_ciphertext.starts_with(crate::seal::ARMOR_HEADER) {
+            return Err(WardenError::NotCiphertext);
+        }
+
+        let resp = self
+            .http
+            .put(self.url(&format!("/v1/tenants/{label}/credentials/replace")))
+            .bearer_auth(&self.token)
+            .json(&ReplaceCredentialsRequest {
+                account_email,
+                cred_read_ciphertext,
+            })
+            .send()
+            .await
+            .map_err(|e| transport_error(e, label))?;
+
+        match resp.status().as_u16() {
+            200 => {
+                let body = read_capped(resp, label).await?;
+                let pairing: Pairing =
+                    serde_json::from_slice(&body).map_err(|_| WardenError::BadPairing)?;
+                validate_pairing(&pairing)?;
+                Ok(pairing)
+            }
+            401 | 403 => Err(WardenError::Unauthorized),
+            404 => Err(WardenError::NotFound),
+            // The cluster says this mailbox does not own this tenant, or the
+            // account is cancelled. Both are the same refusal on purpose.
+            409 => Err(WardenError::LabelTaken),
+            422 => Err(WardenError::NotCiphertext),
             _ => Err(WardenError::Failed),
         }
     }

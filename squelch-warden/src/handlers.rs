@@ -147,6 +147,14 @@ struct CreateTenant {
 }
 
 #[derive(Debug, Deserialize)]
+struct ReplaceCredentials {
+    /// The mailbox claiming this tenant, matched against its identity Secret.
+    account_email: String,
+    /// Age-armored ciphertext, exactly as on the signup route.
+    cred_read_ciphertext: String,
+}
+
+#[derive(Debug, Deserialize)]
 struct RecipientRequest {
     /// The mailbox claiming this tenant. Matched against the Secret, so this
     /// route cannot enumerate recipients or aim a credential elsewhere.
@@ -256,6 +264,32 @@ pub async fn create_tenant(State(state): State<WardenState>, body: Bytes) -> Res
             }),
         )
             .into_response(),
+        Err(e) => e.into_response(),
+    }
+}
+
+/// `PUT /v1/tenants/{label}/credentials/replace` - swap a LIVE tenant's
+/// credential for one its owner just re-consented to.
+///
+/// Its own route rather than a relaxation of `PUT .../credentials`, whose 409
+/// for an active tenant is load bearing. The mailbox in the body is the key: it
+/// is matched against the tenant's identity Secret, so this cannot install a
+/// credential into a mailbox the caller has not proved it owns.
+pub async fn replace_credentials(
+    State(state): State<WardenState>,
+    Path(label): Path<String>,
+    body: Bytes,
+) -> Response {
+    let req: ReplaceCredentials = match parse_json(&body) {
+        Ok(req) => req,
+        Err(detail) => return malformed(detail),
+    };
+    match state
+        .warden()
+        .replace_credentials(&label, &req.account_email, &req.cred_read_ciphertext)
+        .await
+    {
+        Ok(pairing) => (StatusCode::OK, Json(PairResponse::from(pairing))).into_response(),
         Err(e) => e.into_response(),
     }
 }

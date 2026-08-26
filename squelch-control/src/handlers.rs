@@ -1595,9 +1595,22 @@ async fn reconnect_install(state: &ControlState, code: String, pkce_verifier: St
     };
     drop(grant.token);
 
-    // INSTALL. Until this call lands nothing has changed: the tenant is still
-    // running on its dead credential, which is the right thing to fail back to.
-    if let Err(e) = state.warden().put_credentials(&label, &ciphertext).await {
+    // INSTALL, on the REPLACE route: the signup route answers 409 for a live
+    // tenant, which is every tenant worth reconnecting. Until this call lands
+    // nothing has changed — the tenant is still running on its dead credential,
+    // which is the right thing to fail back to.
+    //
+    // THE POD RESTARTS. The credential's hash rides on the Deployment's pod
+    // template, so a new credential is a new template and Kubernetes recreates
+    // the pod; the warden waits for the rollout before answering. That is a
+    // brief interruption, and it is the correct trade here: the mailbox this
+    // runs against is one whose sync is already dead, so the pod being replaced
+    // is not doing anything worth protecting.
+    if let Err(e) = state
+        .warden()
+        .replace_credentials(&label, &grant.account_email, &ciphertext)
+        .await
+    {
         tracing::error!(error = %e, label = %label, "reconnect: installing the credential failed");
         return reconnect_unavailable();
     }
