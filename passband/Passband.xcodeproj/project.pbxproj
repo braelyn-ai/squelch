@@ -223,6 +223,7 @@
 		D6C1F985EFED5530B73C27B8 /* Motion.swift in Sources */ = {isa = PBXBuildFile; fileRef = 30406C6A67318CD0CE71C1FF /* Motion.swift */; };
 		D71AFB170CE49A2A793EA34F /* FrameMeasurer.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7C0E91220FC27E7EC297FB40 /* FrameMeasurer.swift */; };
 		D83D2EEAF55EE8AC5B9EBEAE /* Concurrency.swift in Sources */ = {isa = PBXBuildFile; fileRef = E1C033DDA02DD344F437F943 /* Concurrency.swift */; };
+		D8A8B48374E30D8B95BAE9D2 /* ShareWaitlistPanel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 33EF8FAB871B43DBF883FDEE /* ShareWaitlistPanel.swift */; };
 		D8F41B5F6FA8F83DAA537CB5 /* Prefs.swift in Sources */ = {isa = PBXBuildFile; fileRef = 163BEF63DE1359294AD2ADD8 /* Prefs.swift */; };
 		D8FAA331307EB4021EF60BE1 /* Pairing.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5512C13F456F49B6DF7B182B /* Pairing.swift */; };
 		D912E3C77E849D839A27A115 /* Platform.swift in Sources */ = {isa = PBXBuildFile; fileRef = 37AEAA24984488DA00EBD6C4 /* Platform.swift */; };
@@ -250,6 +251,7 @@
 		EC7F67DBCCFA67E4FFC1A4C5 /* Glass.swift in Sources */ = {isa = PBXBuildFile; fileRef = 50EA4F5B8A98576A0355A528 /* Glass.swift */; };
 		EDA32122902CA1F3C0A3B33A /* TourController.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5283FAB3FFAED5F77BF41F71 /* TourController.swift */; };
 		EE3332829811091CAA50A0C0 /* JSONValue.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8860DE0FE5AA0366C7BE9922 /* JSONValue.swift */; };
+		EF1FC5FD79182124986111E3 /* ShareWaitlistPanel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 33EF8FAB871B43DBF883FDEE /* ShareWaitlistPanel.swift */; };
 		EF23C4EDACBC4D1216F580D5 /* RulesView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EE9B2C6A8850905B874A1ED /* RulesView.swift */; };
 		F19396496FB9FFA6061B7E1A /* Raster.swift in Sources */ = {isa = PBXBuildFile; fileRef = D4382469FC056D0CD54B22F3 /* Raster.swift */; };
 		F203E4786137371093270AB6 /* MinimapGeometry.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EF8CFFF47055FF070BD9E8F /* MinimapGeometry.swift */; };
@@ -312,6 +314,7 @@
 		30406C6A67318CD0CE71C1FF /* Motion.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Motion.swift; sourceTree = "<group>"; };
 		30CE0F7FB80B319544FD62FA /* Quotes.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Quotes.swift; sourceTree = "<group>"; };
 		327BC236C39F192198AFEF7D /* RecipientField.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RecipientField.swift; sourceTree = "<group>"; };
+		33EF8FAB871B43DBF883FDEE /* ShareWaitlistPanel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ShareWaitlistPanel.swift; sourceTree = "<group>"; };
 		3484EC544E0909F3D7A88E26 /* ProcessMode.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProcessMode.swift; sourceTree = "<group>"; };
 		356A38CCAAFCC056126A2978 /* MobileRecordsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MobileRecordsView.swift; sourceTree = "<group>"; };
 		35991F651C60388C6D9BBEDF /* ComposeSubmit.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ComposeSubmit.swift; sourceTree = "<group>"; };
@@ -495,6 +498,7 @@
 				3BE1E84810E523707C4E2CC5 /* SettingsView.swift */,
 				F35D517CCBF21D1292E154AB /* ShareNudgeModal.swift */,
 				D8F60C8D4A9145D5DD96DC2A /* SharePanel.swift */,
+				33EF8FAB871B43DBF883FDEE /* ShareWaitlistPanel.swift */,
 				BB2FD6FC0F4BAE985E3E8E70 /* SidebarRail.swift */,
 				992EA99CCF93A2EA929D6E3B /* SidePanel.swift */,
 				2B0750416DB37BFF3B78457B /* SitrepView.swift */,
@@ -947,6 +951,7 @@
 				E13A65A578EFB91C938B0060 /* ShareNudge.swift in Sources */,
 				2D20C5ABC5B7093CA8CCC508 /* ShareNudgeModal.swift in Sources */,
 				8344C251CDFE9A73A78B574B /* SharePanel.swift in Sources */,
+				D8A8B48374E30D8B95BAE9D2 /* ShareWaitlistPanel.swift in Sources */,
 				120F38E19705221A8EAA5ECF /* SidePanel.swift in Sources */,
 				DE7473541B0436222CDBFC6D /* SidebarRail.swift in Sources */,
 				FB0306D6A270C6C086EF253F /* SitrepPoller.swift in Sources */,
@@ -1079,6 +1084,7 @@
 				50E69A11AB542FBC85149FDE /* ShareNudge.swift in Sources */,
 				F3892526DCB5A77DCE1C4A2F /* ShareNudgeModal.swift in Sources */,
 				C1D1665A922C1E5430CAFF76 /* SharePanel.swift in Sources */,
+				EF1FC5FD79182124986111E3 /* ShareWaitlistPanel.swift in Sources */,
 				41FB0841236D3A9D6928F28C /* SidePanel.swift in Sources */,
 				811AE61DFEA4A6D99E9AFE40 /* SitrepPoller.swift in Sources */,
 				DBAF51D466CF5A747261E363 /* SitrepView.swift in Sources */,

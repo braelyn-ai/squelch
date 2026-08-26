@@ -52,8 +52,16 @@ struct RootView: View {
         // SHARE PASSBAND, hung here for the same reason Add Account is: it is
         // raised from Settings and from the two-week nudge, and neither knows
         // which page is on screen.
+        // WHICH share screen depends on whether there is anything to hand out.
+        // `SharePanel` mints a real invite code, and a code is useless until
+        // Google's review clears (`ShareGate`), so until then the sheet is the
+        // waitlist pointer instead.
         .sheet(isPresented: $store.shareSheetOpen) {
-            SharePanel()
+            if ShareGate.invitesEnabled {
+                SharePanel()
+            } else {
+                ShareWaitlistPanel()
+            }
         }
         // THE TWO-WEEK ASK. Over the shell rather than inside a page, because
         // it is about the app and not about whatever surface it lands on. It

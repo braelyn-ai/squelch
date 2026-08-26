@@ -916,6 +916,73 @@ this browser; rotating the admin token ends it everywhere.</p>"#,
     )
 }
 
+/// The one question the operator answers before any invite leaves the building.
+///
+/// A DOCUMENT AND NOT A `confirm()`, because the CSP at the top of this file is
+/// `default-src 'none'` with no `script-src` at all, and every page here is
+/// tested for having no `<script>` in it. An interruption that cannot be script
+/// has to be a page, so this is one: the address it concerns, the question, and
+/// the two ways out.
+///
+/// WHY THE QUESTION IS WORTH A WHOLE PAGE. The OAuth client is not verified yet
+/// (`docs/VERIFICATION.md`), so Google refuses consent to any account that is
+/// not on the project's test-user list. An invite mailed to somebody who is not
+/// on that list is an invite to a wall: the code is spent, the row reads
+/// "invited", and the first anyone hears of it is the person writing back to say
+/// Google would not let them in. Asking costs a click. Not asking costs a
+/// signup and a re-mint, and the board cannot tell the two apart afterwards.
+///
+/// NOTHING HAS HAPPENED YET when this renders. Every caller checks for the
+/// confirmation BEFORE it approves, mints, revokes, or mails, so cancelling here
+/// is genuinely a no-op rather than a half-finished approval.
+pub fn admin_confirm(
+    action: &str,
+    hidden: &[(&str, &str)],
+    who: &str,
+    confirm_label: &str,
+) -> Response {
+    let fields: String = hidden
+        .iter()
+        .map(|(name, value)| {
+            format!(
+                r#"<input type="hidden" name="{}" value="{}">"#,
+                escape_html(name),
+                escape_html(value),
+            )
+        })
+        .collect();
+    console(
+        StatusCode::OK,
+        "One thing first",
+        &format!(
+            r#"<h1>One thing first</h1>
+<p class="stop"><strong>Have you added this person to the Google
+test user list?</strong></p>
+<p>{who}</p>
+<p class="hint">Passband's OAuth client is not verified yet, so Google will not
+let an account finish consent unless that account is on the project's test-user
+list. Mailing an invite to somebody who is not on it sends them to a wall, and
+the code is spent by the time they tell you. Add them in the Google Cloud
+console first, then come back and press this.</p>
+<form method="post" action="{action}">{fields}<input type="hidden" name="{CONFIRM_FIELD}" value="yes">
+<button type="submit">{confirm_label}</button>
+</form>
+<p class="hint"><a href="/admin">Cancel and go back.</a> Nothing has been
+approved, minted, or mailed.</p>"#,
+            who = escape_html(who),
+            action = escape_html(action),
+            confirm_label = escape_html(confirm_label),
+            fields = fields,
+            CONFIRM_FIELD = CONFIRM_FIELD,
+        ),
+    )
+}
+
+/// The hidden field that says the operator answered the question on
+/// [`admin_confirm`]. Lives here so the page that writes it and the handlers
+/// that read it cannot drift to two different spellings.
+pub const CONFIRM_FIELD: &str = "confirmed";
+
 /// The "who" cell: the address this person is known by, and — when the Google
 /// account that actually signed up is a DIFFERENT address — a muted second line
 /// naming it.

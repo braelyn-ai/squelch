@@ -289,6 +289,20 @@ pub async fn invite(
         return dashboard(&state, Some(INVALID_ADDRESS)).await;
     }
 
+    // After the address is known to be one, so the confirmation page never
+    // quotes a typo back as though it were somebody. Before the row is created,
+    // so cancelling does not leave an approved row for a person nobody meant to
+    // approve. The address rides the form rather than a row id because at this
+    // point there is no row to name.
+    if !confirmed(&body) {
+        return pages::admin_confirm(
+            "/admin/invite",
+            &[("email", &email)],
+            &email,
+            "Yes, mint and email the invite",
+        );
+    }
+
     let id = match state.store().invite_directly(&email, Utc::now()).await {
         Ok(Some(id)) => id,
         // Already on the approved half. Not an error worth a red banner, but
@@ -334,6 +348,28 @@ pub async fn approve(
         return dashboard(&state, Some(NO_SUCH_ROW)).await;
     };
 
+    // THE ASK COMES BEFORE THE APPROVAL, not between it and the mail. A row that
+    // left `pending` and then waited on a second click would sit on the board as
+    // approved-with-nobody-told, which is the exact state the red "email not
+    // sent" flag exists to shout about, and this would be manufacturing it on
+    // purpose. Cancelling here leaves the row waiting, untouched.
+    if !confirmed(&body) {
+        let id_field = id.to_string();
+        return match state.store().user_entry(id).await {
+            Ok(Some(row)) => pages::admin_confirm(
+                "/admin/approve",
+                &[("id", &id_field)],
+                &row.email,
+                "Yes, approve and email the invite",
+            ),
+            Ok(None) => dashboard(&state, Some(NO_SUCH_ROW)).await,
+            Err(e) => {
+                tracing::error!(id, error = %e, "reading a user row failed");
+                dashboard(&state, Some(STORE_TROUBLE)).await
+            }
+        };
+    }
+
     match state.store().approve_user(id, Utc::now()).await {
         Ok(true) => {}
         Ok(false) => return dashboard(&state, Some(ALREADY_APPROVED)).await,
@@ -377,6 +413,22 @@ pub async fn send(State(state): State<ControlState>, headers: HeaderMap, body: B
     };
     if row.status != USER_APPROVED {
         return dashboard(&state, Some(NOT_APPROVED)).await;
+    }
+
+    // Asked here too, and for the same reason it is asked on approval: the
+    // repair path and the lost-email path both end in a fresh code landing in
+    // somebody's mailbox, and the wall Google puts in front of an account that
+    // is not on the test-user list does not care which button minted the code.
+    // Before the revoke below, so a cancelled confirmation does not leave the
+    // row holding nothing.
+    if !confirmed(&body) {
+        let id_field = id.to_string();
+        return pages::admin_confirm(
+            "/admin/send",
+            &[("id", &id_field)],
+            &row.email,
+            "Yes, send the invite",
+        );
     }
 
     if let Some(old) = row.invite_id {
@@ -641,6 +693,17 @@ fn back_to_dashboard() -> Response {
 /// refusal, not a lookup.
 fn row_id(body: &Bytes) -> Option<i64> {
     field(body, "id").parse().ok()
+}
+
+/// Whether this POST is the one that comes back from [`pages::admin_confirm`]
+/// with the test-user question answered.
+///
+/// A MISSING FIELD IS AN UNANSWERED QUESTION, which is the direction that costs
+/// a click rather than a signup: an operator who has genuinely added the person
+/// presses one more button, and a stale bookmark or a replayed form that never
+/// saw the page gets asked instead of acted on.
+fn confirmed(body: &Bytes) -> bool {
+    field(body, pages::CONFIRM_FIELD) == "yes"
 }
 
 #[cfg(test)]

@@ -240,11 +240,22 @@ private struct MobileShell: View {
         // never set into the void. A full-height sheet for the same reason the
         // composer is one: it autofocuses a field, and the keyboard takes the
         // bottom half of a phone.
+        // Gated on `ShareGate` exactly like the Mac's, so the two platforms
+        // never disagree about whether an invite code can be handed out.
+        // The pointer sheet is short, so it gets `.medium` rather than the
+        // composer's full height.
         .sheet(isPresented: shareOpen) {
-            SharePanel()
-                .presentationDetents([.large])
-                .presentationDragIndicator(.visible)
-                .presentationBackground(Palette.canvas)
+            if ShareGate.invitesEnabled {
+                SharePanel()
+                    .presentationDetents([.large])
+                    .presentationDragIndicator(.visible)
+                    .presentationBackground(Palette.canvas)
+            } else {
+                ShareWaitlistPanel()
+                    .presentationDetents([.medium])
+                    .presentationDragIndicator(.visible)
+                    .presentationBackground(Palette.canvas)
+            }
         }
         // THE TWO-WEEK ASK, over the shell on both platforms.
         .overlay { ShareNudgeModal() }
