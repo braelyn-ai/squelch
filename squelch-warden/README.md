@@ -304,7 +304,7 @@ holds even for a tenant reconciled by hand.
 | `SQUELCH_WARDEN_STORAGE_SIZE` | `10Gi` | Per-tenant volume. |
 | `SQUELCH_WARDEN_CPU_REQUEST` | `100m` | Tenant daemon container. |
 | `SQUELCH_WARDEN_CPU_LIMIT` | `1000m` | Tenant daemon container. |
-| `SQUELCH_WARDEN_MEMORY_REQUEST` | `256Mi` | Tenant daemon container. |
+| `SQUELCH_WARDEN_MEMORY_REQUEST` | `384Mi` | Tenant daemon container. What a daemon that has embedded anything actually rests at; the constant in `config.rs` carries the measurements and why a low one gets a neighbour OOM-killed. |
 | `SQUELCH_WARDEN_MEMORY_LIMIT` | `1Gi` | Tenant daemon container. Past it, OOM-killed and restarted. |
 | `SQUELCH_WARDEN_EPHEMERAL_REQUEST` | `256Mi` | `/tmp` plus logs. The mailbox is a PV and does not count. |
 | `SQUELCH_WARDEN_EPHEMERAL_LIMIT` | `1Gi` | What stops a tenant filling the node's root filesystem. |

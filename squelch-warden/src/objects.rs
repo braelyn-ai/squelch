@@ -2153,7 +2153,7 @@ mod tests {
         );
         assert_eq!(
             daemon.requests.clone().unwrap()["memory"],
-            Quantity("256Mi".into())
+            Quantity("384Mi".into())
         );
         assert_eq!(
             daemon.requests.unwrap()["ephemeral-storage"],
