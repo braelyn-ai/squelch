@@ -309,6 +309,7 @@ struct MainShell: View {
         case .auth: RoutedHost(view: .auth) { AuthView() }
         case .rules: RoutedHost(view: .rules) { RulesView() }
         case .audit: RoutedHost(view: .audit) { AuditView() }
+        case .groups: RoutedHost(view: .groups) { GroupsView() }
         case .usage: UsageView()
         case .settings: SettingsView()
         case .process: RoutedHost(view: .process) { ProcessView() }

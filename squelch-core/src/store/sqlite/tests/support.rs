@@ -212,6 +212,16 @@ impl TriagedBuilder {
         TriagedMessage {
             message: self.msg(),
             recipients: vec![],
+            // DERIVED from `to_addrs` rather than set separately, so a test that
+            // says who a sent message went to gets the normalized index for free
+            // and cannot describe a message whose two recipient views disagree —
+            // which is exactly the state the ingest path makes impossible.
+            recipient_addrs: self
+                .msg
+                .to_addrs
+                .as_deref()
+                .map(crate::sync::ingest::parse_stored_recipients)
+                .unwrap_or_default(),
             sensitivity: self.sensitivity,
             sealed_kind: self.sealed_kind,
             importance: self.importance,

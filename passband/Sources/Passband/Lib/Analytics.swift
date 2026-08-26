@@ -94,6 +94,7 @@ enum Analytics {
         "account_added",
         "tour_completed", "tour_skipped", "whats_new_shown",
         "invite_sent", "invite_nudge_accepted", "invite_nudge_dismissed",
+        "group_created", "group_updated", "group_deleted",
     ]
 
     /// The counter events that ride at `minimal`: anonymous counts and
@@ -117,6 +118,11 @@ enum Analytics {
         // many did not, and whether the one-time ask was taken up. No address
         // is anywhere near this, at any level.
         "invite_sent", "invite_nudge_accepted", "invite_nudge_dismissed",
+        // Send groups carry a mode and a member COUNT. Whether people organize
+        // their correspondents into audiences at all, and which shape they
+        // reach for, is the "does the product work" question for this feature;
+        // who is in one is not measured anywhere, at any level.
+        "group_created", "group_updated", "group_deleted",
     ]
 
     /// The closed set of STRING property values allowed off the machine.
@@ -127,7 +133,10 @@ enum Analytics {
             // compose_send / compose_opened
             "new", "reply", "forward", "sent", "guard_blocked", "forbidden", "failure",
             // undo_fired kinds
-            "archive", "done", "label", "ruleDelete", "remind",
+            "archive", "done", "label", "ruleDelete", "groupDelete", "remind",
+            // group_* modes — how an audience is addressed. "individual" is the
+            // only one that is not also a header name.
+            "to", "bcc", "individual",
             // triage_corrected axes and wire values — the daemon's closed
             // TriageAxis::allowed vocabulary, mirrored in TriageTargets.
             "tier", "category", "sensitivity",

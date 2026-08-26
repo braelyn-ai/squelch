@@ -15,6 +15,7 @@ pub mod device_tokens;
 mod drafts;
 mod events;
 mod feedback;
+pub mod groups;
 mod messages;
 mod migrate;
 mod rules;
@@ -46,9 +47,10 @@ use crate::store::{
 use crate::types::{
     AccountId, AttachmentInfo, AttentionStatus, AttentionUpdate, AuditEntry, BandCounts, Banking,
     CalendarUpdate, ClientAttachment, ClientMessage, ClientThreadView, Deadline, Disposition,
-    Event, EventKind, NewMessage, OpenRate, Receipt, RetriageProgress, SanitizedMessage, SearchHit,
-    SenderRule, Sensitivity, ShredCandidate, StoreStats, ThreadView, Tier, TriageAxis,
-    TriageFeedback, UnsubscribeRecord, Update,
+    Event, EventKind, GroupHistoryEntry, GroupMember, GroupMode, NewMessage, OpenRate, Receipt,
+    RetriageProgress, SanitizedMessage, SearchHit, SendGroup, SenderRule, Sensitivity,
+    ShredCandidate, StoreStats, ThreadView, Tier, TriageAxis, TriageFeedback, UnsubscribeRecord,
+    Update,
 };
 
 /// `app_settings` key recording when this account's open ledger started, so the

@@ -39,6 +39,9 @@ struct ActionLayer: View {
             if let request = store.ruleEditor {
                 RuleEditor(request: request) { store.closeRuleEditor() }
             }
+            if let request = store.groupEditor {
+                GroupEditor(request: request) { store.closeGroupEditor() }
+            }
             if store.processModeOpen { ProcessMode { store.processModeOpen = false } }
             if !store.authQueue.isEmpty { AuthCodeModal() }
             if let target = store.triageFix {
