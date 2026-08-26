@@ -12,17 +12,19 @@
 #
 # WHY A DROP-IN AND NOT `kubelet-arg:` IN config.yaml. k3s v1.32+ ships its own
 # defaults at 00-k3s-defaults.conf in this same directory and merges what it
-# finds here on top, per key. Two things follow, and both of them matter:
+# finds here on top, PER KEY. That is what `evictionHard` below needs: it adds
+# memory.available to k3s's disk thresholds instead of replacing them. The
+# `--eviction-hard` flag is a whole-map flag, so setting it to memory.available
+# alone silently drops k3s's imagefs/nodefs thresholds and nobody notices until
+# the disk fills.
 #
-#   - `evictionHard` below ADDS memory.available to k3s's disk thresholds
-#     instead of replacing them. The `--eviction-hard` flag is a whole-map
-#     flag: setting it to memory.available alone silently drops k3s's
-#     imagefs/nodefs thresholds, and nobody notices until the disk fills.
-#   - A `kubelet-arg:` list in /etc/rancher/k3s/config.yaml is DISCARDED
-#     ENTIRELY if the k3s systemd unit passes any --kubelet-arg of its own,
-#     which this box's does (the UserNamespacesSupport feature gate, from
-#     SETUP.md §2). For repeatable flags the command line does not merge with
-#     the config file, it replaces it. See SETUP.md §2b.
+# That is the whole case, and it is the only part of it that has been checked.
+# THE FLAG ROUTE WAS NOT TESTED. k3s builds one kubelet command line as
+# [config-file args][CLI args] and pkg/configfilearg's doc comment says the
+# non-config flags "override, or if a slice append to, the config file values",
+# so a kubelet-arg: list in config.yaml probably APPENDS to the --kubelet-arg
+# this box's unit already passes rather than being discarded by it. Probably is
+# not verified, and the drop-in is the route with a documented merge.
 #
 # Ordering is lexical, so 10- lands after k3s's 00- and before anything a
 # future k3s adds at 50-. Keep the numeric prefix.
@@ -33,27 +35,58 @@ apiVersion: kubelet.config.k8s.io/v1beta1
 kind: KubeletConfiguration
 
 # What the NODE costs, subtracted from what the scheduler may spend on pods.
-# Measured on carrier, 2026-08-26: k3s-server 803 MB, its embedded containerd
-# ~120 MB, systemd-journald 129 MB (capped by journald-squelch.conf in this
-# directory), litestream 67 MB, sshd and the rest of the OS ~100 MB. That is
-# ~1220 MB, and 1200Mi is the round number under it that assumes you also did
-# the journald cap and turned off the system docker/containerd pair.
+#
+# THE ARITHMETIC, so the next person can re-derive it instead of trusting it.
+# Measured on carrier, 2026-08-26, four tenants running:
+#
+#   k3s-server (API server, scheduler, controllers, kubelet)     803 MB
+#   k3s's embedded containerd                                   ~120 MB
+#   litestream                                                    67 MB
+#   systemd-journald, ANONYMOUS only                             ~30 MB
+#   sshd, systemd, the rest of the OS                           ~100 MB
+#   ------------------------------------------------------------------
+#                                                              ~1120 MB  (~1068 MiB)
+#
+# journald's full RSS that day was 129 MB, but it mmaps the journal files it
+# serves, so most of that is page cache the kernel drops under pressure rather
+# than memory anyone holds. Counting it in full would be counting the same
+# reclaimable pages twice. The system dockerd/containerd pair (~150 MB) is not
+# in the list because SETUP.md §2b(c) turns it off. IF YOU KEEP IT, ADD 150Mi.
+#
+# Then the memory no process's RSS shows: slab, page tables, kernel stacks,
+# socket buffers. On this box `free -m` reported 743 MiB available of 3814,
+# and the host RSS above plus the tenant pods' ~1.1 GB account for about 2.5 GB
+# of the ~3.1 GB in use. The remaining ~600 MiB is kernel, most of it
+# reclaimable. ~130 MiB is the conservative allowance for the part that is not.
+#
+#   1068 MiB + 130 MiB = ~1200Mi.
+#
+# evictionHard's 200Mi below comes out of allocatable as well, so 1400Mi is
+# withheld in total and the second 200 is the margin if that allowance is
+# optimistic. Allocatable lands at 3814 - 1200 - 200 = ~2414Mi.
 #
 # One bucket rather than a kubeReserved/systemReserved split: allocatable
 # subtracts both the same way, neither is enforced as its own cgroup unless
 # you ask for it, and one number is easier to keep true than two.
 #
 # RAISE THIS if you add anything to the host: another agent, a build, a shell
-# that stays open with a compile in it.
+# that stays open with a compile in it. LOWER IT if the verify in §2b shows the
+# host resting well under it, because a reserve larger than the host needs is
+# the one that stops evictions from ever firing.
 systemReserved:
   memory: 1200Mi
 
 # Subtracted from allocatable as well, and the kubelet starts evicting pods
-# when the node gets this close to the edge. An eviction is a pod the kubelet
-# chose, in an order it publishes, with an event explaining itself. The kernel
-# OOM killer is none of those things: it picks the largest RSS on the box,
-# which here is always a tenant daemon and never the thing that grew. 200Mi is
-# the price of being the one who chooses.
+# when the NODE gets this close to the edge. An eviction is a pod the kubelet
+# chose, by QoS class and priority, in an order it publishes, with an event
+# explaining itself. The kernel OOM killer is a badness score.
+#
+# memory.available is a whole-node number, not a kubepods.slice one. If the
+# host rests well under its reservation, pods can fill kubepods.slice to its
+# own memory.max while the node still has room, this threshold never trips, and
+# nothing is evicted: the failure is then a memcg OOM inside kubepods, which is
+# quieter than the global one it replaced. §2b's verify reads
+# kubepods.slice/memory.events for exactly that.
 #
 # Map keys merge with k3s's defaults, so imagefs.available and nodefs.available
 # survive. Do not restate them here.
@@ -62,18 +95,19 @@ evictionHard:
 
 # --- swap. Both lines are inert until a swap device exists. ---
 #
-# The kubelet refuses to start on a node with swap on unless it is told not to.
-# This is that. With no swap device present it changes nothing.
+# A RESTATEMENT, not a change: k3s already sets failSwapOn: false in its own
+# 00-k3s-defaults.conf in this directory. It is here so this file reads as the
+# whole swap decision rather than half of one, and so that a k3s that stops
+# defaulting it does not take the setting with it.
 failSwapOn: false
 
 # LimitedSwap rations swap by request: a Burstable container may use, at most,
-# (its memory request / node total memory) x total swap. Guaranteed pods
-# (request == limit) and BestEffort pods get NONE, which is the trap in
+# (its memory request / node total memory) x total swap. At a 384Mi request on
+# a 3814 MiB box with 2 GB of zram that is about 206 MB per tenant. Guaranteed
+# pods (request == limit) and BestEffort pods get NONE, which is the trap in
 # "tidying up" a tenant's spec so its request equals its limit.
 #
-# If the kubelet refuses to start after installing this file, comment these
-# two lines out and restart again: that isolates the swap half from the
-# reservation half, which is worth doing before you start reading feature
-# gates.
+# NodeSwap went GA in Kubernetes 1.34 and carrier runs 1.36, so there is no
+# feature gate to turn on for this.
 memorySwap:
   swapBehavior: LimitedSwap

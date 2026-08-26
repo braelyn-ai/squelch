@@ -246,15 +246,27 @@ The box is also running the things that make it a box. Measured on carrier on
 |---|---|
 | `k3s-server` (API server, scheduler, controllers, kubelet, one binary) | 803 MB |
 | k3s's embedded `containerd` | ~120 MB |
-| `systemd-journald` (725 MB of journal on disk, no `SystemMaxUse`) | 129 MB |
+| `systemd-journald` (725 MB of journal on disk, no `SystemMaxUse`) | 129 MB, of which ~30 MB is anonymous |
 | `litestream` | 67 MB |
 | sshd, systemd, the rest of the OS | ~100 MB |
 | a system `dockerd`/`containerd` pair nothing in the cluster uses | ~150 MB |
 
-About 1.4 GB before a single tenant starts, on a machine that believes it has
-3.72 GiB to hand out. That gap is not a warning, it is an ambush, and it fired
-on 2026-08-19. At 21:13 and again at 21:20 the kernel killed a tenant's
-`squelchd`:
+1369 MB as measured. 1219 without the docker pair, which (c) below turns off.
+About 1120 if you also count journald honestly: it mmaps the journal files it
+serves, so most of that 129 MB is page cache the kernel drops under pressure
+rather than memory anybody holds, and counting it in full is counting
+reclaimable pages twice.
+
+There is also more of this box than any RSS column shows. `free -m` the same
+afternoon reported 743 MiB available of 3814. The host processes above plus the
+four tenant pods' ~1.1 GB account for roughly 2.5 GB of the ~3.1 GB in use; the
+rest is kernel, which is to say slab, page tables, kernel stacks and socket
+buffers. Most of that is reclaimable. The part that is not still has to come out
+of somebody's budget, and there is exactly one budget on this box that can hold
+it: the one that is set to zero.
+
+That gap is not a warning, it is an ambush, and it fired on 2026-08-19. At 21:13
+and again at 21:20 the kernel killed a tenant's `squelchd`:
 
 ```sh
 journalctl -k | grep -i 'out of memory'
@@ -280,21 +292,84 @@ retype.
 
 `systemReserved` is subtracted from the node's capacity before the scheduler
 ever sees it, and the hard eviction threshold is subtracted with it. Set both
-and allocatable becomes what is really spendable: 3814 minus 1200 minus 200,
-about 2.4 GiB. Three things change at once and only the first is the expected
-one:
+and allocatable becomes what is really spendable: 3814 minus 1200 minus 200, or
+about 2414Mi.
+
+**Where 1200Mi comes from**, because a reservation nobody can re-derive is a
+reservation nobody will maintain:
+
+- **~1068 MiB of host process RSS.** The table above with journald counted at
+  its anonymous size and the docker pair gone, so ~1120 MB, so ~1068 MiB. If you
+  decide to keep the docker pair, add 150Mi here and take a tenant off the count
+  below.
+- **~130 MiB for the kernel.** The slab, page tables, kernel stacks and socket
+  buffers that no process's RSS shows. It is the conservative end of the ~600
+  MiB the box could not attribute above, on the assumption that most of that is
+  reclaimable and this is the part that is not.
+
+1068 plus 130 is 1198, so **1200Mi**. `evictionHard`'s 200Mi comes out of
+allocatable as well, which makes 1400Mi withheld in total, and the second 200 is
+the margin if that kernel allowance turns out to be optimistic. The verify at
+the end of this subsection is how you find out whether it was, and it is worth
+actually running: a reserve that is too big has its own failure mode, below.
+
+Three things change, and only the first is the one you asked for:
 
 - **The scheduler stops overselling.** A tenant that does not fit is refused,
   and a refused tenant is a provision that fails as `500 not_ready` (§7's
   failure mode; `kubectl -n tenants describe replicaset` gives the real reason,
   `Insufficient memory`). That is a bad afternoon for one signup instead of a
   kill for two strangers.
-- **`kubepods.slice/memory.max` drops to allocatable**, because the kubelet
-  enforces the pods cgroup by default. Pods collectively now hit a cgroup limit
-  before the machine hits a global one, and a cgroup OOM kills inside the cgroup
-  that grew. The victim becomes the culprit.
-- **The kubelet gets 200Mi of room to evict in**, in an order it publishes, with
-  an event that says why. An eviction is a choice. The OOM killer is not.
+- **The host stops being an OOM candidate.** `kubepods.slice/memory.max` drops
+  to allocatable, because the kubelet enforces the pods cgroup by default, so
+  pods collectively hit a cgroup limit before the machine hits a global one.
+  Do not read more into that than it says. A memcg OOM in `kubepods.slice`
+  chooses its victim exactly the way the global one did: `kubepods.slice` is a
+  shared parent for every pod on the box, the kernel walks the subtree, and it
+  picks by badness, which is still largest RSS and still probably the wrong
+  tenant. What changes is who is *eligible*. `sshd`, `k3s-server`, `containerd`
+  and `journald` live outside that cgroup, so they stop being candidates at all,
+  and losing the API server or your way into the box stops being one of the
+  possible outcomes of a tenant that grows. The kill also arrives as a memcg
+  event naming `oom_memcg=/kubepods.slice` rather than a `global_oom`, which is
+  the difference between a triage that takes a minute and one that takes an
+  afternoon.
+- **The kubelet gets a chance to choose first.** At 200Mi of `memory.available`
+  it evicts, by QoS class and pod priority, in an order it publishes, with an
+  event that says why. An eviction is a choice. A badness score is not.
+
+**That third one only wins the race if the host actually spends its reserve.**
+`memory.available` is a whole-node number: the kubelet computes it from the
+node's memory, not from `kubepods.slice`. If the host rests well under 1200Mi,
+which is precisely what (b) and (c) are for, then pods can fill
+`kubepods.slice` to its own `memory.max` while the node still has several
+hundred megabytes free, the threshold never trips, and nothing is evicted. What
+happens instead is a memcg OOM inside `kubepods`, which is *quieter* than the
+global kill it replaced: no eviction event, no node condition, just a container
+that restarted. That is the honest shape of this trade, it is still a better
+trade than a global kill, and it is why the verify below reads
+`kubepods.slice/memory.events` rather than only the eviction log.
+
+**Pre-flight, before you restart anything.** On kubelet start every pod
+re-enters admission, and a pod whose requests no longer fit the shrunken
+allocatable is not left alone: it is rejected, with phase `Failed` and reason
+`OutOfmemory`, which on a tenant means a mailbox that stops. Check that what is
+running fits under the allocatable you are about to create:
+
+```sh
+# What is promised. Sum the memory column against the new allocatable.
+kubectl get pods -A \
+  -o custom-columns='NS:.metadata.namespace,POD:.metadata.name,MEM:.spec.containers[*].resources.requests.memory'
+kubectl describe node carrier | grep -A3 'Allocated resources'
+
+# What is actually held right now by everything in the pods cgroup.
+cat /sys/fs/cgroup/kubepods.slice/memory.current
+```
+
+If either number is above the new allocatable, do not proceed: lower
+`systemReserved`, or remove a tenant first. On carrier today neither is close.
+Four tenants at a 384Mi request is 1536Mi promised against 2414Mi of new
+allocatable, and the pods cgroup is holding about 1.1 GB.
 
 ```sh
 install -d -m 0755 /var/lib/rancher/k3s/agent/etc/kubelet.conf.d
@@ -303,55 +378,72 @@ install -m 0644 deploy/hosted/node/kubelet.yaml \
 systemctl restart k3s
 ```
 
-**A kubelet drop-in, and not a `kubelet-arg:` list in `config.yaml`.** k3s
-v1.32+ writes its own kubelet defaults to `00-k3s-defaults.conf` in that
-directory and merges what it finds alongside them per key, which is what lets
-`evictionHard` add a memory threshold without dropping k3s's disk ones (the
-`--eviction-hard` flag is a whole-map flag: set it to `memory.available` alone
-and `imagefs.available` leaves with it). The flag route has a second problem on
-this box specifically. For repeatable flags, k3s's command line does not merge
-with the config file, it replaces it, and this unit passes a `--kubelet-arg` of
-its own:
+**A kubelet drop-in, and not a `kubelet-arg:` list in `config.yaml`.** k3s v1.32+
+writes its own kubelet defaults to `00-k3s-defaults.conf` in that directory and
+merges what it finds alongside them per key. That is what lets `evictionHard`
+add a memory threshold without dropping k3s's disk ones: `--eviction-hard` is a
+whole-map flag, so setting it to `memory.available` alone takes
+`imagefs.available` and `nodefs.available` with it, and nobody notices until the
+disk fills.
 
-```sh
-grep kubelet-arg /etc/systemd/system/k3s.service
-```
-
-Every entry a `kubelet-arg:` list added to `config.yaml` would be discarded in
-silence in favour of that one, which looks exactly like a setting that did not
-take. `deploy/hosted/node/k3s-config.yaml` is the whole `config.yaml` this box
-ends up with; it carries the flag route commented out for anyone on k3s older
-than v1.32, where neither the drop-in directory nor a kubelet config file
-exists.
+That reason is sufficient on its own, which is just as well, because it is the
+only one that has been checked. **The flag route was not tested here.** k3s
+builds one kubelet command line as [config-file args][CLI args], and
+`pkg/configfilearg`'s own doc comment says the non-config flags "override, or if
+a slice append to, the config file values", so a `kubelet-arg:` list in
+`config.yaml` most likely *appends* to the `--kubelet-arg` this box's unit
+already passes (the `UserNamespacesSupport` gate from §2) rather than losing to
+it. Most likely is not verified. The drop-in is the route with a documented
+per-key merge, so it is the route this section takes, and
+`deploy/hosted/node/k3s-config.yaml` is the whole `config.yaml` this box ends up
+with.
 
 **What `systemctl restart k3s` restarts:** the k3s server process and its
 embedded containerd. Not the tenants. Each container's
 `containerd-shim-runc-v2` is a separate process, it survives, and containerd
 re-attaches to it on the way back up. `kubectl` fails for ten to thirty seconds
 while the API server returns, and a signup that lands in that window fails and
-gets retried. The change evicts nothing either: if the tenants already running
-requested more than the new allocatable, they keep running and the node simply
-reads as overcommitted until one goes away.
+gets retried. Running pods that still fit are left alone, which is a sentence
+the pre-flight above is what makes true rather than hopeful.
 
-Verify all three of the things it changed, not just the one you asked for:
+Verify the config, then verify the box:
 
 ```sh
 kubectl describe node carrier | grep -A6 Allocatable
-cat /sys/fs/cgroup/kubepods.slice/memory.max
+cat /sys/fs/cgroup/kubepods.slice/memory.max        # now allocatable, not 3.72 GiB
 kubectl get --raw /api/v1/nodes/carrier/proxy/configz \
   | jq '.kubeletconfig | {systemReserved, evictionHard}'
 ```
 
 `configz` is the only one of those that reports what the kubelet actually
 parsed, as opposed to what you meant. Read it after every change in this
-section.
+section. Then come back a day later and read the machine, which is the only
+thing that can tell you whether 1200Mi was the right guess:
+
+```sh
+free -m                                             # is the host really using ~1.2 GB?
+cat /sys/fs/cgroup/kubepods.slice/memory.current    # against memory.max above
+cat /sys/fs/cgroup/kubepods.slice/memory.events     # oom_kill > 0 is the quiet failure
+```
+
+`memory.current` pressed up against `memory.max` while `free -m` still shows
+hundreds of megabytes available is the case described further up: the reserve is
+larger than the host needs, eviction will never fire, and the next failure is an
+`oom_kill` in `memory.events` that nothing else announces. The fix then is a
+*smaller* `systemReserved`, not a larger one.
 
 ### b. Cap the journal
 
 Uncapped, `systemd-journald` grows the journal to 10% of the filesystem and
-keeps it there: 725 MB on this box. That is a memory measure and not a disk
-measure because journald mmaps the files it serves, so its 129 MB of RSS tracks
-the size of what it is holding. Cap the archive and the process shrinks with it.
+keeps it there: 725 MB on this box, and 129 MB of journald RSS to serve it,
+because journald mmaps the files it is holding open.
+
+This is the smallest of the four measures and it is worth being clear about
+that. Mapped file pages are page cache: the kernel drops them under pressure, so
+most of that 129 MB was never memory held against the box, which is why (a)
+counts journald at its ~30 MB of anonymous memory instead. Cap it anyway. The
+process does shrink, 725 MB of logs on an 80 GB root disk is not free either,
+and a smaller archive is a faster `journalctl` at 3am.
 
 ```sh
 install -d -m 0755 /etc/systemd/journald.conf.d
@@ -379,14 +471,19 @@ install, holding ~150 MB for nobody.
 
 ```sh
 docker ps -a            # anything listed here is a reason to STOP
+docker images           # so is anything here, and this is the likelier hit
 systemctl is-enabled docker containerd
 crictl ps               # k3s's runtime: this is where the tenant containers are
 ```
 
-The reason to check rather than assume: `PRODUCTION.md`'s open items note that
-the warden image on this node is still hand-built. If it was hand-built *here*,
-docker is the thing that built it, and disabling it trades 150 MB for a build
-host. If `docker ps -a` is empty and no unit on the box depends on it:
+`docker images` is the check that matters, and it is the one that is easy to
+skip. `PRODUCTION.md`'s open items note that the warden image on this node is
+still hand-built; if it was hand-built *here*, what that left behind is a cached
+image and a layer store, not a running container, so `docker ps -a` is empty and
+`docker images` is not. Disabling the daemon does not delete any of it, but it
+does take away the thing that can rebuild from it, and finding that out during
+the next rebuild is worse than finding it out now. If both are empty and no unit
+on the box depends on it:
 
 ```sh
 systemctl disable --now docker.socket docker containerd
@@ -417,27 +514,43 @@ been busy and now is not compress beautifully; the model weights do not, and
 they are the larger half. Size the expectation to that, not to the average
 someone quotes for zram.
 
-Two preconditions, both of which this box already meets and neither of which is
-worth assuming. Per-container swap ceilings are written to the cgroup, so this
-wants cgroup v2; and `swapBehavior` is gated by the kubelet's `NodeSwap` gate,
-whose state travels with the kubelet version rather than with anything visible
-from the pod side.
+One precondition worth checking, because per-container swap ceilings are written
+to the cgroup:
 
 ```sh
 stat -fc %T /sys/fs/cgroup/     # cgroup2fs. Per-container swap needs cgroup v2.
-kubectl get node carrier -o jsonpath='{.status.nodeInfo.kubeletVersion}'; echo
 ```
+
+There is no feature gate to check. The kubelet's `NodeSwap` gate went GA in
+Kubernetes 1.34 and carrier runs k3s v1.36.3+k3s1, which is Kubernetes 1.36.
 
 The device:
 
 ```sh
 apt-get install -y systemd-zram-generator
 install -m 0644 deploy/hosted/node/zram-generator.conf /etc/systemd/zram-generator.conf
-systemctl daemon-reload
-systemctl start systemd-zram-setup@zram0.service
+systemctl daemon-reload         # runs the generator, which writes the device units
+systemctl start /dev/zram0      # equivalently: systemctl start dev-zram0.swap
 swapon --show                   # /dev/zram0, 2G, prio 100
 zramctl                         # algorithm zstd, and the live compression ratio
 ```
+
+**Start the swap unit, not the setup service.** `systemd-zram-setup@zram0.service`
+is a `Type=oneshot` that creates the device and runs `mkswap` on it. The
+`swapon` is not in it: it is in the generated `dev-zram0.swap` unit, which
+`Requires=` and `After=`s the setup service and orders itself
+`Before=swap.target`. `Requires` points downward, so starting the setup service
+by hand pulls in nothing above it and leaves a formatted device that is not
+swap. Starting `/dev/zram0` pulls the setup service in as its dependency and
+then swaps it on, which is why the upstream README's instructions are
+`systemctl daemon-reload` and `systemctl start /dev/zram0` and nothing else.
+`swapon --show` is what tells the two outcomes apart: on the wrong one it prints
+nothing at all while `zramctl` cheerfully shows the device, which reads exactly
+like a working install.
+
+A reboot needs none of this. The generator is invoked by systemd early in boot,
+writes the same units, and `swap.target` starts them. The manual step exists
+only so that you do not have to reboot the box to find out whether it worked.
 
 (On a distro that does not package the generator, `zram-tools` builds the same
 device from `/etc/default/zramswap`. The device is what matters, not which
@@ -462,27 +575,28 @@ amortise a seek that does not exist here: on zram that is seven decompressions
 nobody asked for.
 
 The kubelet half is already in the drop-in from (a), inert until this point:
-`failSwapOn: false` (without it the kubelet refuses to start on a node with swap
-on) and `memorySwap: {swapBehavior: LimitedSwap}`. It needs the restart to pick
-up the device:
+`memorySwap: {swapBehavior: LimitedSwap}`, plus a `failSwapOn: false` that
+restates what k3s already sets for you in `00-k3s-defaults.conf`, so the drop-in
+reads as the whole swap decision rather than half of one. It needs the restart
+to pick up the device:
 
 ```sh
 systemctl restart k3s
 kubectl get --raw /api/v1/nodes/carrier/proxy/configz \
   | jq '.kubeletconfig | {failSwapOn, memorySwap}'
 
-# Ground truth: LimitedSwap writes a ceiling per container. A kubelet that
-# refused to start says so in `systemctl status k3s`; a kubelet that parsed the
-# setting and then declined to act on it says nothing at all, and this is where
-# that shows up as zeroes.
+# Ground truth: LimitedSwap writes a ceiling per container. configz reports what
+# the kubelet parsed; this is what it did with it. Zeroes here, with a device in
+# `swapon --show`, are a kubelet that read the setting and declined to act on
+# it, which is the failure that appears in no log.
 grep -h . /sys/fs/cgroup/kubepods.slice/kubepods-burstable.slice/*/*/memory.swap.max
 ```
 
 **LimitedSwap rations swap by request rather than sharing it out.** A Burstable
 container may use at most (its memory request / node total memory) x total swap,
-so at a `SQUELCH_WARDEN_MEMORY_REQUEST` of 256Mi, on this box, with 2 GB of
-zram, that is about 140 MB per tenant. Raising the request raises the ration in
-step, which is one more reason the request is the number that matters (§7).
+so at a `SQUELCH_WARDEN_MEMORY_REQUEST` of 384Mi, on this 3814 MiB box, with 2 GB
+of zram, that is about 206 MB per tenant. Raising the request raises the ration
+in step, which is one more reason the request is the number that matters (§7).
 Guaranteed pods (request equal to limit) and BestEffort pods get none at all,
 which is the trap waiting for whoever "tidies up" a tenant's spec by setting its
 request equal to its limit: it would opt that tenant out of the net without
@@ -501,14 +615,36 @@ swap is a box that needs the daemon-side fix, not more zram.
 
 An idle tenant daemon holds 250 to 300 MB, most of it cold ONNX heap it will not
 touch again until the next message it embeds. Four of those is most of this box.
-Reserving the node's own memory does not make a tenant smaller. It makes the box
-tell the truth about how many tenants it can hold, which on this hardware is
-single digits and always was: the ceiling is allocatable divided by
-`SQUELCH_WARDEN_MEMORY_REQUEST`, and (a) is what makes the scheduler enforce it
-instead of discovering it. The daemon-side work (releasing the model when idle,
-and not holding two copies of it) is what raises that number. This section only
-guarantees that until then the failure is a signup that is refused rather than a
-mailbox that stops.
+Reserving the node's own memory does not make a tenant smaller. What it does is
+make the box tell the truth about how many tenants it can hold, and on this
+hardware the truth is **five**:
+
+```
+  2414Mi  allocatable          (3814 total - 1200 systemReserved - 200 evictionHard)
+-  400Mi  pods that are not tenants
+= 2014Mi  / 384Mi per tenant   = 5   (SQUELCH_WARDEN_MEMORY_REQUEST, §7)
+```
+
+That 400Mi is everything the scheduler has already promised to something that is
+not a mailbox: prometheus-agent 128Mi, kube-state-metrics 48Mi, node-exporter
+24Mi, the warden 32Mi, the fleet roller's job 32Mi while a roll is running, and
+about 140Mi of k3s's own coredns and metrics-server. Leave the roller out and it
+is ~370Mi, which is still five. cert-manager sets no memory requests at all, so
+the scheduler reserves nothing for it, which is a different problem and not this
+one. **Divide allocatable by the tenant request and you get six, and six is
+wrong**: that arithmetic hands the monitoring stack's memory to a tenant twice.
+
+Two gates enforce the five, and they are not the same gate. The ResourceQuota on
+`tenants` (§7: 1920Mi, five times the 384Mi request) is the API server refusing
+to create the pod, and it is the readable failure. The scheduler is the second
+gate, and until this section is applied it is the broken one: it believes in
+3.72 GiB and would place a sixth tenant that the quota had already decided
+against. Apply (a) and the two agree, which is the whole point of applying it.
+
+The sixth tenant is a resize (RAM only, `PRODUCTION.md`) or the daemon-side work
+landing first: releasing the model when idle, and not holding two copies of it.
+That is what raises the number. This section only guarantees that until then the
+failure is a signup that is refused rather than a mailbox that stops.
 
 ## 3. cert-manager and the wildcard certificate
 
@@ -757,7 +893,10 @@ kubectl apply -f deploy/hosted/70-tenant-limits.yaml
 
 A LimitRange and a ResourceQuota on `tenants`. **Size them to your box before
 you apply them**; the shipped numbers assume the 2 vCPU / 4 GB floor above and
-are deliberately conservative.
+are deliberately conservative. Your box here means what §2b left spendable once
+the node's own memory is reserved, not the RAM on the invoice: this quota is the
+API server's gate and the node's allocatable is the scheduler's, and the two
+agree on the same tenant count only after §2b is applied.
 
 The warden already puts requests and limits on both containers of every tenant
 pod (`SQUELCH_WARDEN_CPU_REQUEST` and friends in `15-warden-config.yaml`,

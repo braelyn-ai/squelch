@@ -20,28 +20,20 @@ default-local-storage-path: /mnt/tenant-data
 #
 # systemReserved, evictionHard and the swap settings live in a kubelet drop-in
 # at /var/lib/rancher/k3s/agent/etc/kubelet.conf.d/10-squelch.conf
-# (deploy/hosted/node/kubelet.yaml). Two reasons, either one sufficient:
+# (deploy/hosted/node/kubelet.yaml), because the drop-in MERGES with k3s's own
+# 00-k3s-defaults.conf PER KEY. That is what lets evictionHard add a memory
+# threshold without dropping k3s's imagefs/nodefs ones. The equivalent
+# --eviction-hard flag replaces the whole map, and the disk thresholds leave
+# with it.
 #
-#   1. The drop-in MERGES with k3s's own 00-k3s-defaults.conf per key, so
-#      evictionHard adds a memory threshold without dropping k3s's disk ones.
-#      The equivalent --eviction-hard flag replaces the whole map.
-#   2. A `kubelet-arg:` list in THIS file is discarded entirely when the k3s
-#      systemd unit passes any --kubelet-arg of its own. For repeatable flags
-#      the command line replaces the config file's list rather than merging
-#      with it, and this box's unit passes the UserNamespacesSupport feature
-#      gate that way (SETUP.md §2). The settings would be silently ignored.
+# A `kubelet-arg:` list here would probably have worked too, and was not tried:
+# k3s builds one kubelet command line as [config-file args][CLI args], and
+# pkg/configfilearg's doc comment says the non-config flags "override, or if a
+# slice append to, the config file values", so a list here most likely appends
+# to the --kubelet-arg this box's unit already passes (the UserNamespacesSupport
+# feature gate, SETUP.md §2) rather than losing to it. Untested is untested.
+# The per-key merge above is the reason the drop-in wins on its own.
 #
-# Check before you believe otherwise:
+# What the unit passes, if you want to see it:
 #
 #   grep kubelet-arg /etc/systemd/system/k3s.service
-#
-# If you are on k3s older than v1.32, neither the drop-in directory nor
-# `kubelet-arg: ["config=..."]` exists. Then it has to be individual flags,
-# and every kubelet-arg the unit passes has to move into the list below with
-# them, or the unit wins and the list is dead:
-#
-#   kubelet-arg:
-#     - "feature-gates=UserNamespacesSupport=true"
-#     - "system-reserved=memory=1200Mi"
-#     - "eviction-hard=memory.available<200Mi,imagefs.available<5%,nodefs.available<5%"
-#     - "fail-swap-on=false"

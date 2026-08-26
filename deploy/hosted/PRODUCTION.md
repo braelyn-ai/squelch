@@ -19,30 +19,39 @@ Values are never in here. Names, namespaces and key names only.
 | Firewall | inbound 22, 80, 443 only |
 | Backups | ON — 7 daily snapshots, **root disk only** (see "Backups" below) |
 | SSH | `ssh carrier` (host alias in `~/.ssh/config`) |
-| Node memory | 3814 MiB total, and **all of it is offered to pods today**: no `system-reserved`, `kubepods.slice` `memory.max` = 3.72 GiB, while the host's own processes hold ~1.4 GB. `SETUP.md` §2b reserves 1200Mi (allocatable becomes ~2.4 GiB); **not applied here yet** |
-| Swap | none. §2b's 2 GB zram device is written (`deploy/hosted/node/`) and **not installed here yet** |
+| Node memory | 3814 MiB total, and **all of it is offered to pods today**: nothing is reserved, so `kubepods.slice` `memory.max` is the whole 3.72 GiB, while the host's own processes (k3s, its containerd, journald, litestream, sshd) hold ~1.2 GB that is outside every pod's budget. `SETUP.md` §2b reserves 1200Mi and evicts at 200Mi, which leaves ~2414Mi allocatable and room for five tenants. **Not applied here yet** |
+| Swap | none. §2b's 2 GB zram device is written (`deploy/hosted/node/`) and **not installed here yet**. With it, `LimitedSwap` rations about 206 MB per tenant at a 384Mi request |
 
 Shared vCPU on purpose: tenant daemons are idle between syncs, and dedicated
 (CCX) costs roughly triple for headroom this workload spends most of its life not
 using. Scale vertically by resizing **CPU and RAM only** — a Hetzner resize that
 grows the disk is a one-way door and blocks every later downsize.
 
-**If a tenant is OOM-killed, read the constraint before anything else.**
-`kubectl` will tell you a container restarted; only the kernel says which of the
-two kinds of out-of-memory it was.
+### If a tenant is OOM-killed, read the constraint first
+
+`kubectl` will tell you a container restarted. Only the kernel says which of the
+two kinds of out-of-memory that was, and they have different answers.
 
 ```sh
 ssh carrier "journalctl -k --since '-24h'" | grep -i 'out of memory'
 ```
 
-`constraint=CONSTRAINT_MEMCG` with an `oom_memcg=` is that container exceeding
-its own limit: the culprit is the victim, and the answer is its limit or its
-code. `constraint=CONSTRAINT_NONE` with `global_oom` is the node running out
-with nobody over their limit, and the kernel picks the largest RSS rather than
-whatever grew, so the tenant that died is unrelated to the tenant that caused
-it. That happened twice on 2026-08-19 (21:13 and 21:20) with four tenants on
-this box, and preventing it is what `SETUP.md` §2b is for. None of §2b is
-applied here yet.
+`constraint=CONSTRAINT_MEMCG` with an `oom_memcg=` naming one tenant's cgroup is
+that container over its own limit: the culprit is the victim, and the answer is
+its limit or its code. `constraint=CONSTRAINT_NONE` with `global_oom` is the box
+running out with nobody over their limit, and the kernel then picks by badness
+across everything on it, which means largest RSS, which means a tenant daemon
+unrelated to whatever actually grew. That is the shape of the 2026-08-19 kills;
+`SETUP.md` §2b is the arithmetic and the fix, and none of §2b is applied here
+yet.
+
+There is a third case that can only appear after §2b(a) is applied:
+`oom_memcg=/kubepods.slice`, the pods collectively over the node's allocatable.
+It picks its victim the same way, by largest RSS in the subtree, so it is no
+kinder to the tenant that dies; what it changes is that the host processes are
+no longer eligible and nothing outside the cluster is at risk. It also arrives
+with no eviction event and no node condition, so
+`/sys/fs/cgroup/kubepods.slice/memory.events` is where you count them.
 
 ## The volume
 
