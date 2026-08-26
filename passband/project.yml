@@ -52,7 +52,7 @@ targets:
         # keys to Info.plist, not here.
         INFOPLIST_FILE: Sources/Passband/Info.plist
         # Mirror of ./VERSION, which build.sh reads as the source of truth.
-        MARKETING_VERSION: "0.0.4"
+        MARKETING_VERSION: "0.0.5"
         CURRENT_PROJECT_VERSION: "1"
         COMBINE_HIDPI_IMAGES: YES
         ASSETCATALOG_COMPILER_APPICON_NAME: Passband
