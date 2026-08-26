@@ -164,3 +164,13 @@ run_suite sender-identity \
   Sources/Passband/Lib/AsyncMemo.swift \
   Sources/Passband/Lib/SenderIdentity.swift \
   Tests/SenderIdentityTests.swift
+
+# The keymap's two-pass dispatch, which is what makes `E` (done + next) a
+# different verb from `e` (done) instead of the same one shouted — and what
+# makes a declining guard spelled only "e" quietly lose the shifted key to an
+# exact binding in another set. That failure abandons a draft, so it is asserted
+# rather than remembered. KeyDispatch.swift is the whole suite: the registry and
+# the algorithm are pure, and only the NSEvent bridge below them is AppKit.
+run_suite key-dispatch \
+  Sources/Passband/Keys/KeyDispatch.swift \
+  Tests/KeyDispatchTests.swift

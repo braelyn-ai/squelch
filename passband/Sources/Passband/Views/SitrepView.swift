@@ -9,6 +9,23 @@ import SwiftUI
 /// How many ranked standing items show before the quiet "{n} more" expander.
 private let eyesVisible = 10
 
+/// THE FOR-YOUR-EYES WALK: the queue the reader is handed when an email is
+/// opened from this band, so `E` (done + next) can step through it without
+/// coming back here.
+///
+/// The FULL ranked list, not the visible slice — the cursor stops at the
+/// collapse cutoff because arrowing past it is how you ASK for the rest, but a
+/// walk that quietly ended at row ten would strand exactly the mail the band is
+/// hiding. And the same ranking `body` renders, so the order you see is the
+/// order you get.
+///
+/// Computed at KEY-PRESS AND CLICK TIME ONLY. It re-ranks the standing list,
+/// which is the cost `SitrepCursor` exists to keep out of the render path.
+@MainActor
+private func eyesWalk(_ store: AppStore, weight: Double) -> [AttentionUpdate] {
+    Ranking.rank(store.sitrep.standing, weight: weight)
+}
+
 /// The sitrep's hover + keyboard cursor, in an `@Observable` box rather than
 /// `SitrepView`'s `@State`.
 ///
@@ -370,15 +387,15 @@ struct SitrepView: View {
             },
             KeyBinding("Enter", "open email") {
                 guard eyesActionable, let u = reachable[safe: cursor.index] else { return }
-                store.openThread(u.thread_id)
+                store.openThread(u.thread_id, queue: eyesWalk(store, weight: prefs.rankWeight))
             },
             // Same guard as every other verb here — inert unless a row is
-            // actually highlighted. Reply opens the email and composes inside it;
-            // no queue, exactly like Enter above (this dashboard is a set of
-            // records, not a walk).
+            // actually highlighted. Reply opens the email and composes inside it,
+            // and hands over the same walk Enter does, so `E` keeps working from
+            // inside the reader once the reply is away.
             KeyBinding("r", "reply") {
                 guard eyesActionable, let u = reachable[safe: cursor.index] else { return }
-                Actions.reply(u)
+                Actions.reply(u, queue: eyesWalk(store, weight: prefs.rankWeight))
             },
             KeyBinding("v", "fix triage") {
                 guard eyesActionable, let u = reachable[safe: cursor.index] else { return }
@@ -566,6 +583,9 @@ private struct DashHero: View {
 
 private struct ObligationRow: View {
     @Environment(AppStore.self) private var store
+    /// READ AT CLICK TIME ONLY, never in `body` — an Observable property read
+    /// during a render pass would subscribe all 10 rows to the rank slider.
+    @Environment(Prefs.self) private var prefs
     let update: AttentionUpdate
     let index: Int
     let cursor: SitrepCursor
@@ -589,9 +609,11 @@ private struct ObligationRow: View {
         let overdue = chip?.overdue ?? false
 
         // Click anywhere on the row opens the email; done is keyboard-only (e/d).
+        // The walk rides along with the click too — how you opened an email must
+        // not decide whether `E` inside it has anywhere to go.
         Button {
             cursor.index = index
-            store.openThread(update.thread_id)
+            store.openThread(update.thread_id, queue: eyesWalk(store, weight: prefs.rankWeight))
         } label: {
             HStack(spacing: 9) {
                 Avatar(sender: update.senderString, size: 22)

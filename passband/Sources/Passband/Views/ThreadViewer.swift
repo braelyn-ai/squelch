@@ -1107,11 +1107,25 @@ struct ThreadViewer: View {
                 guard let m = messages[safe: index] else { return }
                 store.openSearch(seed: "from:\(m.from_addr)")
             },
-            KeyBinding("e", "done + next") { Task { await doneAndNext() } },
-            KeyBinding("d", "done + next") { Task { await doneAndNext() } },
+            // THE PAIR: `e`/`d` finish this email and leave, `E`/`D` finish it
+            // and open the next one in the queue. One letter, one verb, on every
+            // surface — the shifted twin is the SAME verb with the walk attached,
+            // not a different one, which is why it is a case away rather than a
+            // key away.
+            //
+            // Plain done CLOSES even when there is a queue behind it. Finishing
+            // an email is not a commitment to read the next one, and a reader
+            // that hauls in more mail on the key you press to be rid of the mail
+            // in front of you is the app arguing with you.
+            KeyBinding("e", "done") { Task { await doneAndClose() } },
+            KeyBinding("d", "done") { Task { await doneAndClose() } },
+            KeyBinding("E", "done + next") { Task { await doneAndNext() } },
+            KeyBinding("D", "done + next") { Task { await doneAndNext() } },
             // Plain `h`, the same key as every other surface — it took "prev
-            // email"'s key (see the queue block above), because a verb cannot
-            // be the app's one shifted letter.
+            // email"'s key (see the queue block above) rather than moving to
+            // `H`, which would have made remind a verb you can ONLY reach
+            // shifted. `E`/`D` above are a different thing: the shift is an
+            // extra clause on a key that still means the same verb unshifted.
             KeyBinding("h", "remind + next") {
                 guard let thread, let m = remindable else { return }
                 store.openRemind(
@@ -1354,9 +1368,53 @@ struct ThreadViewer: View {
         store.openThread(next.thread_id, queue: queue)
     }
 
-    /// e/d — "done + next": mark the current thread's update done (keeping its
+    /// e/d — "done": resolve the email in front of you and leave, whatever is
+    /// or is not queued behind it. The same departure animation as done + next,
+    /// because it is the same verb — the walk is the only difference.
+    private func doneAndClose() async {
+        let liftedAt = liftOff()
+        await resolveOpenThread()
+        await flightOut(since: liftedAt)
+        // Same outlived-its-reader guard as the walk: if this finished after the
+        // reader moved to another thread, closing would close THAT one.
+        guard store.threadId == threadId else { return }
+        store.closeThread()
+    }
+
+    /// The resolve both verbs share, undo-first through `Actions.done` whenever
+    /// there is a row to hand it — the queue's own entry, which is the update
+    /// the surface underneath is still showing.
+    ///
+    /// A reader with no queue behind it (search, a right-rail record, a push
+    /// notification) has no row, so it resolves the newest message directly.
+    /// There is no undo chip on that path: undo restores a row to a band, and
+    /// this one never came from one.
+    private func resolveOpenThread() async {
+        if let row = store.threadQueue.first(where: { $0.thread_id == threadId }) {
+            await Actions.done(row)
+            return
+        }
+        guard let newest else { return }
+        do {
+            try await APIClient.shared.setStatus(newest.id, .done)
+            // Same unpin as Actions.done — this path resolves the message
+            // without going through it.
+            await ImageStore.shared.release(messageId: newest.id)
+            FrameHeights.shared.clear(messageId: newest.id)
+            // And the same optimistic drop: the surface underneath is still
+            // mounted, so without this the reader closes back onto a row for
+            // mail that is already done.
+            store.noteResolved(newest.id)
+            store.pushToast("done", .info)
+        } catch {
+            store.pushToast(errText(error, "done failed"), .error)
+        }
+    }
+
+    /// E/D — "done + next": mark the current thread's update done (keeping its
     /// 5s undo), then advance to the NEXT queued update in place; if none
-    /// remain, close the viewer.
+    /// remain — or if this reader never had a queue behind it — close the
+    /// viewer, which is exactly what plain `e` does.
     ///
     /// AND IT IS A MOTION, not a swap. The email you finished flies up and out,
     /// and then the next one comes in from below — the difference between "that
@@ -1373,35 +1431,28 @@ struct ThreadViewer: View {
     /// 220ms is ever waited on.
     private func doneAndNext() async {
         let queue = store.threadQueue
-        guard let cur = queue.firstIndex(where: { $0.thread_id == threadId }) else {
-            // Not opened from a queue (search, a right-rail record): `e` still
-            // means done — resolve the newest message directly and close. It
-            // still leaves the same way; there is simply nothing behind it.
-            let liftedAt = liftOff()
-            if let newest {
-                do {
-                    try await APIClient.shared.setStatus(newest.id, .done)
-                    // Same unpin as Actions.done — this path resolves the
-                    // message without going through it.
-                    await ImageStore.shared.release(messageId: newest.id)
-                    FrameHeights.shared.clear(messageId: newest.id)
-                    // And the same optimistic drop: the surface underneath is
-                    // still mounted, so without this the reader closes back
-                    // onto a row for mail that is already done.
-                    store.noteResolved(newest.id)
-                    store.pushToast("done", .info)
-                } catch {
-                    store.pushToast(errText(error, "done failed"), .error)
-                }
+        let cur = queue.firstIndex(where: { $0.thread_id == threadId })
+        // THE NEXT DIFFERENT EMAIL, not merely the next row. Every band listing
+        // is one row per THREAD — the store partitions them that way, and
+        // resolving one resolves the whole thread — so on those queues this
+        // reads exactly like `cur + 1`. The REMINDER SCHEDULE is the exception
+        // the store spells out: it lists one row per REMINDER, so two siblings
+        // of one thread can both be on it, and stepping onto the second would
+        // re-open the email just finished. `cur` would then find that same row
+        // again, and the walk would never move for as long as the key is held.
+        //
+        // Already-resolved rows are skipped for the same reason: a queue is a
+        // snapshot taken when the reader opened, and mail dealt with since (the
+        // sibling the store just resolved, a row done from a list underneath) is
+        // not something to walk a reader onto.
+        let next = cur.flatMap { c in
+            queue[(c + 1)...].first {
+                $0.thread_id != threadId && !store.resolvedIds.contains($0.id)
             }
-            await flightOut(since: liftedAt)
-            store.closeThread()
-            return
         }
 
-        let next = queue[safe: cur + 1]
         let liftedAt = liftOff()
-        await Actions.done(queue[cur])
+        await resolveOpenThread()
         await flightOut(since: liftedAt)
 
         // The reader can be closed while the email is still leaving — Esc, or
@@ -1409,9 +1460,10 @@ struct ThreadViewer: View {
         // reader must not haul the next thread back onto a page nobody is on.
         guard store.threadId == threadId else { return }
 
-        guard let next else {
-            // Nothing behind it: the queue is finished, and the reader leaves
-            // with the email rather than snapping back to show an empty one.
+        guard let cur, let next else {
+            // Nothing behind it — an empty queue, or the end of one: the reader
+            // leaves with the email rather than snapping back to show an empty
+            // one.
             store.closeThread()
             return
         }
