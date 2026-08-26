@@ -36,6 +36,15 @@ enum ComposeSubmit {
                 // Empty = "derive it": on a reply the daemon reads the recipient
                 // off the parent message.
                 to: c.to.isEmpty ? nil : c.to,
+                // THE ONE FIELD WHERE `""` AND ABSENT DIFFER, and the flag is
+                // what tells them apart: a composer whose fields state the
+                // audience sends its copy list whatever it holds, emptied
+                // included, while one still waiting on the daemon's derivation
+                // sends nothing and lets the daemon derive. Asserting an empty
+                // Cc we never had would narrow a reply-all to one person.
+                cc: c.recipientsStated ? c.cc : nil,
+                // Never derived, so this is simply what the sender typed.
+                bcc: c.bcc.isEmpty ? nil : c.bcc,
                 // nil, never "": the daemon reads Some("") as an explicit blank
                 // subject and would send the reply untitled.
                 subject: c.subject.isEmpty ? nil : c.subject,
@@ -76,6 +85,11 @@ enum ComposeSubmit {
                 "outcome": outcome,
                 "override": override,
                 "tracked": c.includeTracker,
+                // Whether the send used the copy lists at all — booleans, so
+                // nothing about WHO is anywhere near this (see Analytics'
+                // closed string vocabulary).
+                "copied": !c.cc.isEmpty,
+                "blind": !c.bcc.isEmpty,
             ])
     }
 }

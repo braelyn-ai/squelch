@@ -827,6 +827,16 @@ struct SendBody: Codable, Sendable {
     /// your own is the ordinary case.
     var forward_of_message_id: Int?
     var to: String?
+    /// PRESENT — `""` INCLUDED — means this client is stating the whole copy
+    /// list and the daemon does not consult the parent's. OMITTED means derive
+    /// it, which is what a composer that has not yet learned the derived set
+    /// must send: asserting an empty Cc it never had would silently narrow a
+    /// reply-all to one person. See `ComposeState.recipientsStated`.
+    var cc: String?
+    /// Blind copies. Nothing derives these — no header of the parent records
+    /// who was blind-copied on it — so absent and `""` mean the same thing and
+    /// this is simply omitted when empty.
+    var bcc: String?
     /// Omitted (not "") on a reply: the daemon derives `Re: <parent subject>`
     /// only when the field is absent — `Some("")` is an explicit empty subject.
     var subject: String?
@@ -941,6 +951,12 @@ struct DraftView: Codable, Sendable, Identifiable, Hashable {
     /// The message this answers. nil = the account's single new-message draft.
     var reply_to_message_id: Int?
     var to: String
+    /// Always present from a daemon that has them, `""` when empty. Optional
+    /// here for exactly one reason: an OLDER daemon sends neither field, and a
+    /// decode that failed over it would lose the whole draft rather than the two
+    /// lists it could not carry.
+    var cc: String?
+    var bcc: String?
     var subject: String
     var body: String
     var created_at: String
@@ -953,6 +969,11 @@ struct DraftView: Codable, Sendable, Identifiable, Hashable {
 struct DraftBody: Codable, Sendable {
     var reply_to_message_id: Int?
     var to: String
+    /// Sent unconditionally, `""` and all: unlike the SEND route, absence has
+    /// no second meaning here — nothing is ever derived into a draft — and a
+    /// composer that cleared its Bcc has to be able to say so.
+    var cc: String
+    var bcc: String
     var subject: String
     var body: String
 }

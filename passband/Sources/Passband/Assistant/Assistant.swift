@@ -219,6 +219,12 @@ struct PendingAction: Identifiable, Sendable {
     // send_email only, and the reason "edit in composer" can exist at all.
     var replyToMessageId: Int?
     var to: String?
+    /// The copy lists the model asked for, if any. On the card for the same
+    /// reason `to` is: approving a send means seeing everyone it reaches, and
+    /// a blind copy the confirmation did not mention is a recipient the user
+    /// authorized without knowing.
+    var cc: String?
+    var bcc: String?
     var subject: String?
     var body: String?
     var state: State = .pending

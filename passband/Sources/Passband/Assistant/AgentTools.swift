@@ -644,6 +644,7 @@ enum AgentTools {
         }
         let draft = try await APIClient.shared.putDraft(
             replyToMessageId: replyTo, to: string(input, "to") ?? "",
+            cc: string(input, "cc") ?? "", bcc: string(input, "bcc") ?? "",
             subject: string(input, "subject") ?? "", body: body)
         return ok(
             row(["draft_id": draft.id, "reply_to_message_id": draft.reply_to_message_id]),
@@ -707,6 +708,8 @@ enum AgentTools {
         }
         let replyTo = int(input, "reply_to_message_id")
         let to = string(input, "to")
+        let cc = string(input, "cc")
+        let bcc = string(input, "bcc")
         let subject = string(input, "subject")
         guard replyTo != nil || to != nil else {
             return failure(
@@ -731,7 +734,7 @@ enum AgentTools {
         let action = PendingAction(
             id: UUID(), tool: .sendEmail, verb: "Send",
             verifiedSender: verified?.sender, verifiedSubject: verified?.subject,
-            replyToMessageId: replyTo, to: to, subject: subject, body: body)
+            replyToMessageId: replyTo, to: to, cc: cc, bcc: bcc, subject: subject, body: body)
         return await confirmed(action, gate) {
             // No override_guard, ever, from here: the outbound guard's whole job
             // is to stop a secret leaving, and a model that just wrote the body
@@ -739,7 +742,11 @@ enum AgentTools {
             // comes back to the model verbatim (the kinds are already redacted
             // server-side) so it can rewrite and ask again.
             let result = try await APIClient.shared.actionSend(
-                body: body, replyToMessageId: replyTo, to: to, subject: subject)
+                body: body, replyToMessageId: replyTo, to: to,
+                // Omitted unless the model asked for one, which keeps a plain
+                // reply deriving its copy list from the parent exactly as it
+                // did before this tool learned the field existed.
+                cc: cc, bcc: bcc, subject: subject)
             return (
                 json(
                     row([
@@ -1099,6 +1106,13 @@ enum AgentTools {
                         description:
                             "The message this answers. Omit for a new-message draft."),
                     "to": .init(type: "string", description: "Recipient, for a new message."),
+                    "cc": .init(
+                        type: "string", description: "Comma-separated addresses to copy."),
+                    "bcc": .init(
+                        type: "string",
+                        description:
+                            "Comma-separated addresses to blind-copy. Only what the user asked "
+                            + "for."),
                     "subject": .init(type: "string", description: "Subject, for a new message."),
                     "body": .init(type: "string", description: "The draft body, in markdown."),
                 ],
@@ -1170,6 +1184,17 @@ enum AgentTools {
                             "Required when replying: the thread_id that message came back with."),
                     "to": .init(
                         type: "string", description: "Recipient address, for a new message."),
+                    "cc": .init(
+                        type: "string",
+                        description:
+                            "Comma-separated addresses to copy. Omit on a reply unless the user "
+                            + "named them: omitting keeps the parent's own copy list, and "
+                            + "passing this replaces it."),
+                    "bcc": .init(
+                        type: "string",
+                        description:
+                            "Comma-separated addresses to blind-copy. Only ever what the user "
+                            + "asked for; nothing derives a blind copy."),
                     "subject": .init(
                         type: "string", description: "Subject, for a new message."),
                     "body": .init(

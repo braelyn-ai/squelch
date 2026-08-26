@@ -1,20 +1,28 @@
-// The composer's "to" field: committed recipients render as PILLS in the send
-// line, with a live text fragment after them. A pill is minted by accepting a
-// suggestion, typing a comma, or typing a space after a complete address —
-// space WITHOUT an "@" stays literal, because "alice j" is a display-name
-// search, not an address. Backspace on an empty fragment is two-stage: first
-// press highlights the last pill, second deletes it. Clicking a pill selects
-// it the same way.
+// ONE RECIPIENT HEADER — to, cc or bcc — as a row of PILLS with a live text
+// fragment after them. A pill is minted by accepting a suggestion, typing a
+// comma, or typing a space after a complete address — space WITHOUT an "@"
+// stays literal, because "alice j" is a display-name search, not an address.
+// Backspace on an empty fragment is two-stage: first press highlights the last
+// pill, second deletes it. Clicking a pill selects it the same way.
+//
+// A SELECTED PILL OPENS THE MOVE BAR: `→ cc`, `→ bcc`, `remove`. That bar is
+// the feature, not decoration — moving somebody to Bcc is a thing people do
+// halfway through addressing a message, and a composer that can only add and
+// delete makes them retype an address they already got right. The same verbs
+// hang off a right-click (long-press on a phone) for people who look there
+// first. Both go through `Recipients.move`, which takes the address out of
+// every OTHER field on the way: an address left in To while the sender believes
+// it went out blind is the one outcome worth writing a whole type to prevent.
 //
 // Autocomplete rides the fragment: every keystroke asks the daemon for
 // Sent-derived contacts — people the user has actually written to — and the
 // suggestion list opens under the field.
 //
-// STATE CONTRACT: `text` (ComposeState.to, the wire string) stays the single
-// source of truth — pills and fragment are a PARSE of it, and every mutation
-// writes back through the same binding, so DraftSaver's autosave hook and the
-// send ceremony never learn pills exist. An external write (a draft restore)
-// re-parses.
+// STATE CONTRACT: the bound `Recipients` stays the single source of truth —
+// pills and fragment are a PARSE of this field's slice of it, and every
+// mutation writes back through the same binding, so DraftSaver's autosave hook
+// and the send ceremony never learn pills exist. An external write (a draft
+// restore, or a MOVE performed by one of the sibling fields) re-parses.
 //
 // The keymaps register into the pane's "modal" context: the suggestion set
 // (arrows / Enter / Tab / Esc) mounts ONLY while a list is showing — within a
@@ -25,9 +33,18 @@
 import SwiftUI
 
 struct RecipientField<F: Hashable>: View {
-    @Binding var text: String
+    /// ALL THREE HEADERS, not just this one's string: a move writes two fields
+    /// at once, and the rule that an address lands in exactly one of them can
+    /// only be enforced by something holding all three.
+    @Binding var recipients: Recipients
+    /// Which header this field edits.
+    let slot: RecipientSlot
     var focus: FocusState<F?>.Binding
     let field: F
+    /// Drawn under the pills instead of a placeholder when the field is empty
+    /// and unfocused — the reply composer uses it to say what the daemon
+    /// derived. nil for the ordinary case.
+    var placeholder: String?
 
     /// Committed recipients — the pills.
     @State private var pills: [String] = []
@@ -39,11 +56,20 @@ struct RecipientField<F: Hashable>: View {
     @State private var hits: [ContactHit] = []
     @State private var index = 0
 
+    /// This field's own slice of the bound value.
+    private var text: String { recipients[slot] }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
             VStack(alignment: .leading, spacing: 5) {
-                FieldLabel("to")
+                FieldLabel(slot.label)
                 pillRow.fieldWell()
+            }
+
+            // The verbs for the pill under the caret. Only with one selected,
+            // so an ordinary addressing pass never sees them.
+            if let selectedPill, let addr = pills[safe: selectedPill] {
+                moveBar(addr)
             }
 
             if !hits.isEmpty {
@@ -53,13 +79,14 @@ struct RecipientField<F: Hashable>: View {
         .keyBindings(.modal, fieldBindings)
         .task(id: searchFragment) { await refresh() }
         .onAppear { parse(text) }
-        // External writes only (a draft restore): our own writes round-trip to
+        // External writes only — a draft restore, or a sibling field moving an
+        // address into (or out of) this one. Our own writes round-trip to
         // exactly `composed`, and re-parsing those would fight the caret.
         .onChange(of: text) { _, now in
             if now != composed { parse(now) }
         }
-        // A click elsewhere defocuses the field; a stale list or a half-armed
-        // backspace must not linger.
+        // A click elsewhere defocuses the field; a stale list, a half-armed
+        // backspace or an open move bar must not linger.
         .onChange(of: focus.wrappedValue) { _, now in
             if now != field {
                 hits = []
@@ -73,12 +100,17 @@ struct RecipientField<F: Hashable>: View {
     private var pillRow: some View {
         FlowLine(spacing: 5) {
             ForEach(Array(pills.enumerated()), id: \.offset) { i, addr in
-                RecipientPill(addr: addr, selected: i == selectedPill) {
-                    selectedPill = (selectedPill == i) ? nil : i
-                    focus.wrappedValue = field
-                }
+                RecipientPill(
+                    addr: addr, selected: i == selectedPill,
+                    onTap: {
+                        selectedPill = (selectedPill == i) ? nil : i
+                        focus.wrappedValue = field
+                    },
+                    onMove: { move(addr, to: $0) },
+                    onRemove: { remove(addr) },
+                    slot: slot)
             }
-            TextField(pills.isEmpty ? "recipient@example.com" : "", text: $fragment)
+            TextField(pills.isEmpty ? (placeholder ?? "recipient@example.com") : "", text: $fragment)
                 .textFieldStyle(.plain)
                 .focused(focus, equals: field)
                 .frame(minWidth: 120)
@@ -89,6 +121,27 @@ struct RecipientField<F: Hashable>: View {
                 // unchanged value never re-fires onChange.
                 .onChange(of: fragment) { _, raw in fragmentTyped(raw) }
         }
+    }
+
+    /// The selected pill's verbs, in the field's own micro voice. The two
+    /// destinations are the OTHER two headers — moving a Cc to Cc is not an
+    /// offer worth making.
+    private func moveBar(_ addr: String) -> some View {
+        HStack(spacing: 6) {
+            ForEach(RecipientSlot.allCases.filter { $0 != slot }, id: \.self) { destination in
+                Button("→ \(destination.label)") { move(addr, to: destination) }
+                    .buttonStyle(.plain)
+                    .font(Typo.micro)
+                    .foregroundStyle(Palette.accent)
+            }
+            Text("·").font(Typo.micro).foregroundStyle(Palette.inkFaintest)
+            Button("remove") { remove(addr) }
+                .buttonStyle(.plain)
+                .font(Typo.micro)
+                .foregroundStyle(Palette.danger)
+            Spacer(minLength: 0)
+        }
+        .padding(.leading, 2)
     }
 
     /// Every keystroke and paste lands here. Commas ALWAYS commit the token
@@ -112,33 +165,72 @@ struct RecipientField<F: Hashable>: View {
     private func commit(_ token: String) {
         let addr = token.trimmed
         guard !addr.isEmpty, !pills.contains(addr) else { return }
+        // NOT into a field they are already in, even a different one: somebody
+        // typed into To who is currently blind-copied must not be quietly
+        // promoted into the header everyone reads. `Recipients.add` refuses,
+        // and the pill is dropped rather than shown somewhere it is not.
+        guard recipients.slot(of: addr) == nil else { return }
         pills.append(addr)
     }
 
-    /// Write the parse back to the wire string. The fragment rides along raw,
-    /// so mid-typing the wire string is what a plain text field would hold.
+    /// Write the parse back to this field's slice. The fragment rides along raw,
+    /// so mid-typing the stored string is what a plain text field would hold.
     private func sync() {
-        var parts = pills
-        if !fragment.trimmed.isEmpty { parts.append(fragment.trimmed) }
-        let next = parts.joined(separator: ", ")
-        if text != next { text = next }
+        let next = composed
+        guard recipients[slot] != next else { return }
+        var updated = recipients
+        updated[slot] = next
+        write(updated)
     }
 
     private var composed: String {
         var parts = pills
         if !fragment.trimmed.isEmpty { parts.append(fragment.trimmed) }
-        return parts.joined(separator: ", ")
+        return Recipients.join(parts)
     }
 
     /// An external value: complete tokens become pills, a trailing partial
     /// (no comma after it) stays editable as the fragment.
     private func parse(_ value: String) {
-        var tokens = value.split(separator: ",", omittingEmptySubsequences: false)
-            .map { String($0).trimmed }
+        var tokens = Recipients.split(value)
+        // A value ending in a separator has no partial: everything committed.
         let trailingPartial = !value.trimmed.hasSuffix(",") ? tokens.popLast() ?? "" : ""
-        pills = tokens.filter { !$0.isEmpty }
+        pills = tokens
         fragment = trailingPartial
         selectedPill = nil
+    }
+
+    // MARK: - moves
+
+    /// Hand one addressee to another header. `Recipients.move` is what makes
+    /// this safe: the address comes OUT of this field (and any other holding
+    /// it) before it goes in anywhere, so it is never in two headers at once.
+    private func move(_ addr: String, to destination: RecipientSlot) {
+        var updated = recipients
+        updated.move(addr, to: destination)
+        selectedPill = nil
+        write(updated)
+        // The caret stays here: moving somebody out is usually the middle of
+        // sorting the audience, not the end of it.
+        focus.wrappedValue = field
+    }
+
+    private func remove(_ addr: String) {
+        var updated = recipients
+        updated.remove(addr)
+        selectedPill = nil
+        write(updated)
+        focus.wrappedValue = field
+    }
+
+    /// The single write path. A move touches TWO fields, so the sibling's
+    /// `onChange` re-parses off the same value this one does.
+    private func write(_ updated: Recipients) {
+        recipients = updated
+        // Our own field may have changed underneath the parse (a move out of
+        // it), and `onChange` only fires for a value that differs from what we
+        // composed. Re-parse eagerly rather than rely on that race.
+        if updated[slot] != composed { parse(updated[slot]) }
     }
 
     // MARK: - suggestions
@@ -219,9 +311,8 @@ struct RecipientField<F: Hashable>: View {
                 guard focus.wrappedValue == field, fragment.isEmpty, !pills.isEmpty
                 else { return false }
                 if let selected = selectedPill {
-                    pills.remove(at: selected)
-                    selectedPill = nil
-                    sync()
+                    guard let addr = pills[safe: selected] else { return false }
+                    remove(addr)
                 } else {
                     selectedPill = pills.count - 1
                 }
@@ -262,8 +353,10 @@ struct RecipientField<F: Hashable>: View {
         guard !Task.isCancelled else { return }
         let found = (try? await APIClient.shared.contacts(searchFragment)) ?? []
         guard !Task.isCancelled else { return }
-        // Every already-committed pill is a done deal, not a suggestion.
-        hits = found.filter { !pills.contains($0.addr) }
+        // Anyone already addressed — in ANY of the three headers — is a done
+        // deal rather than a suggestion. Offering somebody who is currently
+        // blind-copied would be offering to un-blind them by accident.
+        hits = found.filter { recipients.slot(of: $0.addr) == nil }
         index = 0
     }
 
@@ -284,6 +377,10 @@ private struct RecipientPill: View {
     let addr: String
     let selected: Bool
     let onTap: () -> Void
+    let onMove: (RecipientSlot) -> Void
+    let onRemove: () -> Void
+    /// Where this pill currently lives, so the menu offers the other two.
+    let slot: RecipientSlot
 
     var body: some View {
         Button(action: onTap) {
@@ -305,6 +402,17 @@ private struct RecipientPill: View {
                 selected ? Palette.accent : Palette.accent.opacity(0.25),
                 lineWidth: selected ? 1.25 : 0.75)
         )
+        // The same verbs the move bar offers, where a right-click (long-press on
+        // a phone) goes looking for them. Two doors to one act, because moving a
+        // recipient is the kind of thing people expect from a context menu and
+        // the kind of thing that has to be findable without knowing that.
+        .contextMenu {
+            ForEach(RecipientSlot.allCases.filter { $0 != slot }, id: \.self) { destination in
+                Button("Move to \(destination.label.uppercased())") { onMove(destination) }
+            }
+            Divider()
+            Button("Remove", role: .destructive, action: onRemove)
+        }
     }
 }
 

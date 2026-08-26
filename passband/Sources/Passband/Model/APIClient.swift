@@ -540,7 +540,8 @@ actor APIClient {
     /// the daemon derives `Re: <parent subject>`; pass "" only to mean it.
     @discardableResult
     func actionSend(
-        body: String, replyToMessageId: Int? = nil, to: String? = nil, subject: String? = nil,
+        body: String, replyToMessageId: Int? = nil, to: String? = nil, cc: String? = nil,
+        bcc: String? = nil, subject: String? = nil,
         overrideGuard: Bool = false, draftId: Int? = nil, includeTracker: Bool = false,
         replyAll: Bool = false, forwardOfMessageId: Int? = nil
     ) async throws -> SendResult {
@@ -552,7 +553,16 @@ actor APIClient {
                 // never set beside `reply_to_message_id`: the daemon refuses a
                 // send that claims to be both an answer and a forward.
                 forward_of_message_id: forwardOfMessageId,
-                to: to, subject: subject, body: body,
+                to: to,
+                // NOT collapsed to nil when empty, unlike everything else here:
+                // `""` is this client saying "nobody, and I mean it", while
+                // absent hands the copy list back to the daemon's derivation.
+                // The caller decides which it means; see `ComposeSubmit`.
+                cc: cc,
+                // Nothing derives a blind copy, so empty and absent are the
+                // same thing and the caller may pass either.
+                bcc: bcc?.isEmpty == true ? nil : bcc,
+                subject: subject, body: body,
                 // Both composers write markdown; the daemon renders the HTML
                 // half from this same source after the guard has scanned it.
                 body_format: "markdown",
@@ -652,13 +662,15 @@ actor APIClient {
     /// draft, so a second PUT edits the same row rather than making another. A
     /// sealed or unknown parent is a 404 and stores nothing.
     @discardableResult
-    func putDraft(replyToMessageId: Int?, to: String, subject: String, body: String) async throws
-        -> DraftView
-    {
+    func putDraft(
+        replyToMessageId: Int?, to: String, cc: String = "", bcc: String = "", subject: String,
+        body: String
+    ) async throws -> DraftView {
         try await put(
             "/client/drafts",
             body: DraftBody(
-                reply_to_message_id: replyToMessageId, to: to, subject: subject, body: body))
+                reply_to_message_id: replyToMessageId, to: to, cc: cc, bcc: bcc, subject: subject,
+                body: body))
     }
 
     /// Discard one draft. Another account's id and an unknown id are the same 404.

@@ -33,7 +33,7 @@ struct ComposePane: View {
     @Environment(AppStore.self) private var store
     @FocusState private var focusedField: FocusTarget?
 
-    private enum FocusTarget { case to, subject }
+    private enum FocusTarget: Hashable { case recipient(RecipientSlot), subject }
 
     private var compose: ComposeState? { store.compose }
     private var inReview: Bool { compose?.phase == .review }
@@ -73,7 +73,7 @@ struct ComposePane: View {
             #endif
             .keyContext(.modal)
             .keyBindings(.modal, bindings)
-            .onAppear { if !inReview { focusedField = .to } }
+            .onAppear { if !inReview { focusedField = .recipient(.to) } }
         }
     }
 
@@ -245,7 +245,16 @@ struct ComposePane: View {
 
     private func editPane(_ compose: ComposeState) -> some View {
         VStack(alignment: .leading, spacing: 12) {
-            RecipientField(text: bind(\.to), focus: $focusedField, field: FocusTarget.to)
+            // ALL THREE, ALWAYS. A Cc behind a disclosure is a Cc people forget
+            // exists, and a Bcc behind one is worse: the field whose whole job
+            // is to be invisible in the sent mail should not also be invisible
+            // in the composer. The pane is half a window wide; it can afford
+            // three one-line wells.
+            ForEach(RecipientSlot.allCases, id: \.self) { slot in
+                RecipientField(
+                    recipients: recipientsBinding, slot: slot, focus: $focusedField,
+                    field: FocusTarget.recipient(slot))
+            }
             Field(label: "subject") {
                 // Left blank on a reply the daemon titles from the parent; the
                 // placeholder says so, because an empty field otherwise reads as
@@ -333,6 +342,15 @@ struct ComposePane: View {
     private func reviewPane(_ compose: ComposeState) -> some View {
         VStack(alignment: .leading, spacing: 10) {
             ComposeSummaryRow("to", compose.to.isEmpty ? "(none)" : compose.to)
+            // Only when there is one, and BOTH when there are — review's whole
+            // job is stating what goes out, and a blind copy is the part of
+            // that the sent mail will not show anybody, including the sender.
+            if !compose.cc.trimmed.isEmpty {
+                ComposeSummaryRow("cc", compose.cc)
+            }
+            if !compose.bcc.trimmed.isEmpty {
+                ComposeSummaryRow("bcc", compose.bcc)
+            }
             ComposeSummaryRow("subject", reviewSubject(compose))
             // Review states what is about to go out, and an invisible pixel in
             // it is part of that. Only when armed: a row saying "no" on every
@@ -477,6 +495,20 @@ struct ComposePane: View {
     }
 
     // MARK: - state helpers
+
+    /// The three recipient fields as one binding. Writes go through
+    /// `stateRecipients`, which records that this composer's fields ARE the
+    /// audience — see `ComposeState.recipientsStated`. Autosaves like every
+    /// other field: a Bcc typed and then abandoned has to come back.
+    private var recipientsBinding: Binding<Recipients> {
+        Binding(
+            get: { store.compose?.recipients ?? Recipients() },
+            set: { value in
+                guard store.compose?.recipients != value else { return }
+                patch { $0.stateRecipients(value) }
+                DraftSaver.shared.noteChange(.compose)
+            })
+    }
 
     private func bind(_ keyPath: WritableKeyPath<ComposeState, String>) -> Binding<String> {
         Binding(
