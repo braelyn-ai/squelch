@@ -830,6 +830,11 @@ CREATE TABLE IF NOT EXISTS drafts (
     account_id          INTEGER NOT NULL,
     reply_to_message_id INTEGER,          -- NULL = the new-message draft
     to_addr             TEXT NOT NULL DEFAULT '',
+    -- BLIND recipients, comma-joined, exactly as `to_addr` holds the visible
+    -- ones. A draft that could not hold these would silently lose the whole
+    -- audience of a bcc send across a close-and-reopen, which is the one thing
+    -- a draft exists to prevent.
+    bcc_addr            TEXT NOT NULL DEFAULT '',
     subject             TEXT NOT NULL DEFAULT '',
     body                TEXT NOT NULL DEFAULT '',
     created_at          TEXT NOT NULL,

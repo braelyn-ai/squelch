@@ -401,6 +401,9 @@ pub struct Draft {
     /// The message this replies to; `None` is the new-message draft.
     pub reply_to_message_id: Option<i64>,
     pub to_addr: String,
+    /// Blind recipients, comma-joined. `""` when there are none, which is every
+    /// draft written before the column existed.
+    pub bcc_addr: String,
     pub subject: String,
     pub body: String,
     /// First save of this draft; an edit keeps it.

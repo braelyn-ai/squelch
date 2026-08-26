@@ -436,6 +436,11 @@ pub struct GroupHistoryEntry {
     /// Recipients a fan-out failed to reach. Always 0 for a derived row and for
     /// a single-message send, which either went or did not.
     pub failed: i64,
+    /// Recipients a fan-out has not got to YET. Non-zero means this send is
+    /// still in flight, which is what lets the history row be its own progress
+    /// indicator: a plain re-read watches `reached` climb. Always 0 for a
+    /// derived row.
+    pub pending: i64,
     pub opens: i64,
 }
 

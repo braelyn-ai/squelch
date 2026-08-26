@@ -23,7 +23,9 @@ use squelch_core::store::{
 use squelch_core::sync::{decode_raw_b64url, parse_internal_date};
 use squelch_core::triage::llm::Usage;
 use squelch_core::triage::rule_infer;
-use squelch_core::types::{AccountId, AttentionStatus, Disposition, ShredStats, Tier, TriageAxis};
+use squelch_core::types::{
+    AccountId, AttentionStatus, Disposition, GroupMode, ShredStats, Tier, TriageAxis,
+};
 use std::collections::HashMap;
 use std::time::Duration;
 
@@ -33,6 +35,7 @@ use crate::gmail_write::{
     build_forward_rfc822, build_references, build_reply_rfc822, cc_excluding,
     derive_reply_recipients, forward_subject, parse_forwarded_original, reply_subject,
 };
+use crate::group_send;
 use crate::guard;
 use crate::state::ApiState;
 
@@ -1312,6 +1315,9 @@ struct DraftView {
     id: i64,
     reply_to_message_id: Option<i64>,
     to: String,
+    /// Blind recipients, spelled the way the send endpoint spells them. Always
+    /// present, `""` when there are none, so a client need not branch on absence.
+    bcc: String,
     subject: String,
     body: String,
     created_at: DateTime<Utc>,
@@ -1324,6 +1330,7 @@ impl From<Draft> for DraftView {
             id: d.id,
             reply_to_message_id: d.reply_to_message_id,
             to: d.to_addr,
+            bcc: d.bcc_addr,
             subject: d.subject,
             body: d.body,
             created_at: d.created_at,
@@ -1409,6 +1416,10 @@ pub struct DraftBody {
     /// so a missing (or null) field stores "" rather than 400ing.
     #[serde(default)]
     to: Option<String>,
+    /// Blind recipients. Absent stores `""` like every other field here — a
+    /// half-composed draft is the normal case.
+    #[serde(default)]
+    bcc: Option<String>,
     #[serde(default)]
     subject: Option<String>,
     #[serde(default)]
@@ -1431,11 +1442,12 @@ pub async fn put_draft(
     }
     let reply_to = body.reply_to_message_id;
     let to = body.to.unwrap_or_default();
+    let bcc = body.bcc.unwrap_or_default();
     let subject = body.subject.unwrap_or_default();
     let text = body.body.unwrap_or_default();
 
     let draft = store_call(&state, move |store, account_id| {
-        store.upsert_draft(account_id, reply_to, &to, &subject, &text, Utc::now())
+        store.upsert_draft(account_id, reply_to, &to, &bcc, &subject, &text, Utc::now())
     })
     .await?;
     Ok((no_store(), Json(DraftView::from(draft))))
@@ -2397,6 +2409,18 @@ pub struct SendBody {
     /// client writes the sender there for exactly this case.
     #[serde(default)]
     bcc: Option<String>,
+    /// ADDRESS A SEND GROUP. What it does depends on the group's own mode, which
+    /// is a property of the audience rather than of this message:
+    ///
+    /// * `to` / `bcc` — the composer has ALREADY expanded the membership into
+    ///   `to`/`bcc`, so this is attribution only: the send goes out as one
+    ///   message and is recorded against the group afterwards.
+    /// * `individual` — the daemon fans out, one message per member, and the
+    ///   response is a `202` naming the batch rather than a sent message.
+    ///
+    /// Another account's id and an unknown id are the same 404.
+    #[serde(default)]
+    group_id: Option<i64>,
     /// Explicit subject (overrides the reply-derived subject).
     #[serde(default)]
     subject: Option<String>,
@@ -2437,7 +2461,7 @@ pub struct SendBody {
 /// AUDIT (contract, docs/SECURITY.md §5): action `send.echo`, detail
 /// `skipped:no_id` | `skipped:sealed` | `failed:fetch` | `failed:ingest` |
 /// `ok:<local id>`.
-async fn echo_sent(
+pub(crate) async fn echo_sent(
     state: &ApiState,
     client: &GmailWriteClient,
     target: Option<String>,
@@ -2778,10 +2802,40 @@ pub async fn action_send(
         ));
     }
 
+    // AN UNRESOLVED GROUP TOKEN NEVER REACHES THE WIRE. Checked before the guard
+    // so it costs nothing, and checked at all because the quiet failure is the
+    // dangerous one: `parse_addr_list` would drop `#preseed investors` as
+    // unemittable and send to everyone else on the line, silently missing the
+    // audience the user believed they had addressed.
+    for list in [body.to.as_deref(), body.bcc.as_deref()]
+        .into_iter()
+        .flatten()
+    {
+        if let Err(e) = group_send::reject_unresolved_tokens(list) {
+            audit_action(&state, "send", target, "rejected:unresolved_group").await;
+            return Err(e);
+        }
+    }
+
+    // A GROUP IS AN AUDIENCE, and a reply or a forward already has one. Blasting
+    // a list into someone else's thread is not a thing this composer can express
+    // and not a thing the daemon should invent a meaning for.
+    if body.group_id.is_some()
+        && (body.reply_to_message_id.is_some() || body.forward_of_message_id.is_some())
+    {
+        audit_action(&state, "send", target, "rejected:group_on_reply").await;
+        return Err(ApiError::bad_request(
+            "a group is addressed by a new message, not by a reply or a forward",
+        ));
+    }
+
     // OUTBOUND GUARD: report only REDACTED kinds, never the matched text. Scanned
     // here, before any Gmail spend. A FORWARD'S VERDICT WAITS — most of what it
     // sends is the original, which has not been read yet — so its kinds are
     // unioned in and judged once, in `forward_send`.
+    //
+    // ONE VERDICT FOR A FAN-OUT TOO: it is one composition, so it is asked about
+    // once here and never again per recipient.
     let matches = guard::scan_kinds(&body.body);
     if body.forward_of_message_id.is_none()
         && let Some(err) =
@@ -2800,6 +2854,19 @@ pub async fn action_send(
 
     if let Some(original_id) = body.forward_of_message_id {
         return forward_send(&state, &body, &client, target, original_id, matches).await;
+    }
+
+    // A GROUP SEND resolves its audience here, once, after the guard has cleared
+    // and the write credential is known good — so a fan-out that is going to be
+    // refused is refused before any of it has gone.
+    let audience = match body.group_id {
+        Some(group_id) => Some(group_send::resolve(&state, group_id).await?),
+        None => None,
+    };
+    if let Some(audience) = &audience
+        && audience.mode == GroupMode::Individual
+    {
+        return fan_out_send(&state, &body, audience).await;
     }
 
     let (parent, thread_id) = match body.reply_to_message_id {
@@ -2934,6 +3001,9 @@ pub async fn action_send(
     )
     .await;
 
+    // Kept back for the group-send record, which is written after `subject` has
+    // moved into the MIME parts.
+    let subject_for_record = subject.clone();
     let parts = ReplyParts {
         to,
         cc: Some(cc).filter(|s| !s.trim().is_empty()),
@@ -2970,7 +3040,7 @@ pub async fn action_send(
     } else {
         "ok".to_string()
     };
-    finish_send(
+    let result = finish_send(
         &state,
         &client,
         &raw,
@@ -2982,7 +3052,82 @@ pub async fn action_send(
         body.draft_id,
         target,
     )
-    .await
+    .await;
+
+    // ATTRIBUTION, once the mail is away. A `to`/`bcc` group went out as one
+    // message that the composer addressed itself, so all the daemon adds is the
+    // record that this was that group — which is what makes the history entry
+    // exact ("12 of 12, sent as bcc") instead of inferred from its recipients.
+    if let (Some(audience), Ok(sent)) = (&audience, &result) {
+        let echo = sent
+            .0
+            .get("echo_message_id")
+            .and_then(serde_json::Value::as_i64);
+        group_send::record_single(&state, audience, subject_for_record, echo).await;
+    }
+    result
+}
+
+/// A fan-out: one message per member, run as a job because twelve serial sends
+/// plus twelve echoes do not fit inside the composer's POST budget.
+///
+/// Answers `202` with the batch id. The composer closes on it and the Groups
+/// page watches `reached` climb on its ordinary history read — the pending
+/// recipients ARE the progress bar, so nothing else has to be plumbed.
+async fn fan_out_send(
+    state: &ApiState,
+    body: &SendBody,
+    audience: &group_send::GroupAudience,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let target = Some(audience.group_id.to_string());
+    let subject = body
+        .subject
+        .clone()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_default();
+
+    // The tracker is minted ONCE for the batch; see `FanOut::pixel_url` for why
+    // it is not per recipient.
+    let tracker = mint_tracker(state, body.include_tracker.unwrap_or(false), target.clone()).await;
+
+    let plan = group_send::FanOut {
+        audience: group_send::GroupAudience {
+            group_id: audience.group_id,
+            mode: audience.mode,
+            addrs: audience.addrs.clone(),
+        },
+        subject,
+        body: body.body.clone(),
+        body_html: match body.body_format.as_deref() {
+            Some("markdown") => Some(crate::markdown::render_email_html(&body.body)),
+            _ => None,
+        },
+        pixel_url: tracker.as_ref().map(|(_, url)| url.clone()),
+    };
+    let recipients = plan.audience.addrs.len();
+
+    let group_send_id = match group_send::start(state, plan).await {
+        Ok(id) => id,
+        Err(e) => {
+            if let Some((token, _)) = &tracker {
+                discard_tracker(state, token, target.clone()).await;
+            }
+            audit_action(state, "send", target, "failed:fan_out_start").await;
+            return Err(e);
+        }
+    };
+
+    // The composition is away as far as the composer is concerned, so its draft
+    // goes with it — the same contract every other successful send has.
+    if let Some(draft_id) = body.draft_id {
+        discard_sent_draft(state, draft_id).await;
+    }
+
+    Ok(Json(json!({
+        "status": "sending",
+        "group_send_id": group_send_id,
+        "recipients": recipients,
+    })))
 }
 
 /// The largest original a forward will carry, in DECODED RFC822 bytes.

@@ -374,6 +374,29 @@ pub(super) fn migrate(conn: &Connection) -> Result<()> {
         clear_stale_no_extractor_markers(conn)?;
     }
 
+    // Blind recipients on a local draft. Pre-existing rows had none, and '' is
+    // the honest reading, which is also the column default: no backfill.
+    add_column_if_missing(conn, "drafts", "bcc_addr", "TEXT NOT NULL DEFAULT ''")?;
+
+    // STRANDED FAN-OUTS. A group send settles its recipients from a background
+    // task, and no task survives the process. So any recipient still 'pending'
+    // when the store opens belongs to a batch that died — a restart, a crash, a
+    // kill mid-send — and leaving it would make a months-old send read as one
+    // still in progress.
+    //
+    // Failing it is the honest reading and the safe one: the mail either went or
+    // did not, we cannot tell which from here, and a recipient recorded as
+    // unreached is a prompt to check rather than a silent claim of delivery. Safe
+    // to run unconditionally because nothing is in flight at open.
+    if tables_exist(conn, &["group_send_recipients"])? {
+        conn.execute(
+            "UPDATE group_send_recipients
+             SET status = 'failed', error = 'the daemon restarted mid-send'
+             WHERE status = 'pending'",
+            [],
+        )?;
+    }
+
     // ---- ONE-SHOT: the normalized sent-recipient index ---------------------
     //
     // `message_recipients` arrives empty on an existing DB while `to_addrs` has

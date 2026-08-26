@@ -2,7 +2,7 @@
 
 use super::super::*;
 use super::support::*;
-use crate::store::sqlite::groups::{GroupSendRecipient, NewGroupMember};
+use crate::store::sqlite::groups::{GroupSendRecipient, GroupSendStatus, NewGroupMember};
 use crate::types::{GroupMode, SealedKind};
 
 fn t(days: i64) -> DateTime<Utc> {
@@ -381,19 +381,19 @@ fn a_recorded_send_is_not_also_counted_as_derived() {
                 GroupSendRecipient {
                     addr: "ann@fund.com".into(),
                     message_id: Some(msg),
-                    sent: true,
+                    status: GroupSendStatus::Sent,
                     error: None,
                 },
                 GroupSendRecipient {
                     addr: "bo@fund.com".into(),
                     message_id: Some(msg),
-                    sent: true,
+                    status: GroupSendStatus::Sent,
                     error: None,
                 },
                 GroupSendRecipient {
                     addr: "cy@fund.com".into(),
                     message_id: Some(msg),
-                    sent: true,
+                    status: GroupSendStatus::Sent,
                     error: None,
                 },
             ],
@@ -437,19 +437,19 @@ fn a_partly_failed_fan_out_reports_both_halves() {
                 GroupSendRecipient {
                     addr: "ann@fund.com".into(),
                     message_id: Some(ann_copy),
-                    sent: true,
+                    status: GroupSendStatus::Sent,
                     error: None,
                 },
                 GroupSendRecipient {
                     addr: "bo@fund.com".into(),
                     message_id: None,
-                    sent: false,
+                    status: GroupSendStatus::Failed,
                     error: Some("gmail rejected the recipient".into()),
                 },
                 GroupSendRecipient {
                     addr: "cy@fund.com".into(),
                     message_id: None,
-                    sent: false,
+                    status: GroupSendStatus::Failed,
                     error: Some("gmail rejected the recipient".into()),
                 },
             ],
@@ -481,19 +481,19 @@ fn a_recorded_denominator_survives_the_group_changing() {
                 GroupSendRecipient {
                     addr: "ann@fund.com".into(),
                     message_id: None,
-                    sent: true,
+                    status: GroupSendStatus::Sent,
                     error: None,
                 },
                 GroupSendRecipient {
                     addr: "bo@fund.com".into(),
                     message_id: None,
-                    sent: true,
+                    status: GroupSendStatus::Sent,
                     error: None,
                 },
                 GroupSendRecipient {
                     addr: "cy@fund.com".into(),
                     message_id: None,
-                    sent: true,
+                    status: GroupSendStatus::Sent,
                     error: None,
                 },
             ],
@@ -538,7 +538,7 @@ fn recorded_sends_outlive_the_group() {
             &[GroupSendRecipient {
                 addr: "ann@fund.com".into(),
                 message_id: None,
-                sent: true,
+                status: GroupSendStatus::Sent,
                 error: None,
             }],
         )
@@ -572,7 +572,7 @@ fn last_sent_at_reports_the_most_recent_recorded_send() {
                 &[GroupSendRecipient {
                     addr: "ann@fund.com".into(),
                     message_id: None,
-                    sent: true,
+                    status: GroupSendStatus::Sent,
                     error: None,
                 }],
             )

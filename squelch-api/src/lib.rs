@@ -12,6 +12,7 @@ mod devices;
 mod error;
 mod events;
 pub mod gmail_write;
+mod group_send;
 mod groups;
 pub mod guard;
 mod handlers;

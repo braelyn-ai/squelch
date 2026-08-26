@@ -52,14 +52,36 @@ pub struct NewGroupMember {
     pub display_name: Option<String>,
 }
 
+/// Where one recipient of a group send has got to.
+///
+/// `Pending` is what makes the history row double as the progress indicator: a
+/// fan-out writes every recipient pending up front, then settles them one at a
+/// time, so "3 of 12" climbs on a plain re-read and no separate progress channel
+/// has to exist.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GroupSendStatus {
+    Pending,
+    Sent,
+    Failed,
+}
+
+impl GroupSendStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Sent => "sent",
+            Self::Failed => "failed",
+        }
+    }
+}
+
 /// One recipient of a recorded group send, as the send path reports it.
 #[derive(Debug, Clone)]
 pub struct GroupSendRecipient {
     pub addr: String,
     /// The local id of this recipient's echoed copy, when one landed.
     pub message_id: Option<i64>,
-    /// `false` records a recipient the send never reached.
-    pub sent: bool,
+    pub status: GroupSendStatus,
     /// Redacted reason, for a failed recipient only.
     pub error: Option<String>,
 }
@@ -498,7 +520,7 @@ impl SqliteStore {
                     account_id,
                     normalize_addr(&r.addr),
                     r.message_id,
-                    if r.sent { "sent" } else { "failed" },
+                    r.status.as_str(),
                     r.error,
                 ],
             )?;
@@ -507,24 +529,56 @@ impl SqliteStore {
         Ok(id)
     }
 
-    /// Point one recipient of a recorded send at its echoed local copy. The echo
-    /// lands after the send returns, so this is a second write rather than part
-    /// of [`Self::record_group_send`]. BEST-EFFORT at the call site: the mail is
-    /// already away.
-    pub fn set_group_send_message(
+    /// Settle one recipient of a recorded send: its outcome, and the local id of
+    /// its echoed copy when one landed.
+    ///
+    /// A second write rather than part of [`Self::record_group_send`] because a
+    /// fan-out records the whole audience as pending BEFORE it sends anything —
+    /// a batch that crashed mid-flight must leave a record of who it had not
+    /// reached yet, not a record of nobody.
+    ///
+    /// `message_id` is only ever written FORWARD: `COALESCE(?5, message_id)`, so
+    /// the later echo-linking call does not blank the id an earlier one set.
+    pub fn set_group_send_result(
         &self,
         account_id: AccountId,
         group_send_id: i64,
         addr: &str,
-        message_id: i64,
+        status: GroupSendStatus,
+        message_id: Option<i64>,
+        error: Option<&str>,
     ) -> Result<bool> {
         let conn = self.lock()?;
         let n = conn.execute(
-            "UPDATE group_send_recipients SET message_id = ?4
+            "UPDATE group_send_recipients
+             SET status = ?4, message_id = COALESCE(?5, message_id), error = ?6
              WHERE account_id = ?1 AND group_send_id = ?2 AND addr = ?3",
-            params![account_id, group_send_id, normalize_addr(addr), message_id],
+            params![
+                account_id,
+                group_send_id,
+                normalize_addr(addr),
+                status.as_str(),
+                message_id,
+                error,
+            ],
         )?;
         Ok(n > 0)
+    }
+
+    /// Mark every still-pending recipient of a send failed.
+    ///
+    /// The crash guard: a fan-out that dies mid-flight (the daemon restarts, the
+    /// task is dropped) would otherwise leave its remainder pending forever, and
+    /// the history would read as a send still in progress months later. Called on
+    /// the way out of the job, and on open for anything a previous run stranded.
+    pub fn fail_pending_group_sends(&self, account_id: AccountId, reason: &str) -> Result<usize> {
+        let conn = self.lock()?;
+        let n = conn.execute(
+            "UPDATE group_send_recipients SET status = 'failed', error = ?2
+             WHERE account_id = ?1 AND status = 'pending'",
+            params![account_id, reason],
+        )?;
+        Ok(n)
     }
 
     // --- history -------------------------------------------------------------
@@ -590,6 +644,8 @@ impl SqliteStore {
                      WHERE r.group_send_id = gs.id AND r.status = 'sent'),
                     (SELECT COUNT(*) FROM group_send_recipients r
                      WHERE r.group_send_id = gs.id AND r.status = 'failed'),
+                    (SELECT COUNT(*) FROM group_send_recipients r
+                     WHERE r.group_send_id = gs.id AND r.status = 'pending'),
                     (SELECT MIN(r.message_id) FROM group_send_recipients r
                      WHERE r.group_send_id = gs.id AND r.message_id IS NOT NULL),
                     (SELECT COUNT(*) FROM group_send_recipients r
@@ -612,14 +668,17 @@ impl SqliteStore {
                     r.get::<_, i64>(4)?,
                     r.get::<_, i64>(5)?,
                     r.get::<_, i64>(6)?,
-                    r.get::<_, Option<i64>>(7)?,
-                    r.get::<_, i64>(8)?,
+                    r.get::<_, i64>(7)?,
+                    r.get::<_, Option<i64>>(8)?,
+                    r.get::<_, i64>(9)?,
                 ))
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
 
         let mut out = Vec::with_capacity(rows.len());
-        for (id, subject, mode, sent_at, snapshot, reached, failed, message_id, opens) in rows {
+        for (id, subject, mode, sent_at, snapshot, reached, failed, pending, message_id, opens) in
+            rows
+        {
             // The snippet is the echoed message's, when there is one to read.
             let (thread_id, snippet) = match message_id {
                 Some(mid) => conn
@@ -645,6 +704,7 @@ impl SqliteStore {
                 reached,
                 group_size: snapshot,
                 failed,
+                pending,
                 opens,
             });
         }
@@ -710,6 +770,9 @@ impl SqliteStore {
                     reached: r.get(5)?,
                     group_size,
                     failed: 0,
+                    // Derived rows describe mail that already went; there is
+                    // nothing in flight to be pending about.
+                    pending: 0,
                     opens: r.get(6)?,
                 })
             })?
