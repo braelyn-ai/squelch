@@ -1253,6 +1253,8 @@ would happily stream over the real history.
   section says so instead of offering a URL that 404s.
 - **Google verification + CASA Tier 2** — the restricted-scope cap is 100 users.
   This gates user 101 and has the longest lead time of anything on this list.
+  The submission, its blockers, and the assessment scope are
+  `docs/VERIFICATION.md`.
 - **Public Suffix List entry for `passband.email`** — a PR to `publicsuffix/list`
   (private section, plus a `_psl` TXT record) makes browsers treat every tenant
   subdomain as its own registrable domain: no cross-tenant cookies, per-tenant

@@ -1501,6 +1501,27 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
         BudgetGate::Proceed
     }
 
+    /// Give back the charge for a call that was rejected at CONFIG level.
+    ///
+    /// The charge-before-call rule above is a retry-storm guard and it stays.
+    /// What it must not do is let a broken config spend the day's cap on 4xxs
+    /// that cost nothing: those are rejected in ~0ms, spend no tokens, and are
+    /// identical for every queued row, so a handful of cycles can exhaust a
+    /// 500-call budget. Since the pass also STOPS on a config failure and
+    /// leaves its rows queued, the un-refunded charge outlives the outage — the
+    /// budget key is the UTC day, so a gateway fixed at noon stays capped until
+    /// midnight UTC. Refunding here is what makes "the outage is over" and "the
+    /// fleet is triaging again" the same moment.
+    ///
+    /// Best-effort by design: a refund that fails must never turn a config
+    /// failure into a second, louder failure. The worst case is the behaviour
+    /// this method exists to fix, which is where we already were.
+    fn refund_budget(&self, key: &str, day: &str, label: &str) {
+        if let Err(e) = self.store.stage2_refund_budget(self.account_id, key, day) {
+            eprintln!("squelch: {label} budget refund failed ({e}); the cap keeps the charge");
+        }
+    }
+
     /// Plan and store a message's scheduled re-evaluations from a verdict that
     /// just landed. Failures are logged and swallowed: a missing revisit is a
     /// row that ages badly, never a reason to fail the verdict that produced it.
@@ -1746,6 +1767,7 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
                          re-evaluations stay scheduled"
                     );
                     self.metrics.record_llm_config_failure();
+                    self.refund_budget(REVISIT_BUDGET_KEY, &day, "revisit");
                     break;
                 }
                 Ok(stage1_llm::ClassifyOutcome::Refused)
@@ -1938,6 +1960,7 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
                         row.message_id
                     );
                     self.metrics.record_llm_config_failure();
+                    self.refund_budget(STAGE1_GLOBAL_BUDGET_KEY, &day, "stage-1 global");
                     break;
                 }
                 Ok(stage1_llm::ClassifyOutcome::Refused)
@@ -2140,6 +2163,7 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
                                  key/endpoint/model is wrong for the gateway; rows stay queued"
                             );
                             self.metrics.record_llm_config_failure();
+                            self.refund_budget(STAGE1_GLOBAL_BUDGET_KEY, &day, "extract");
                             auth_failed = true;
                             break;
                         }
@@ -2204,6 +2228,7 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
                                  key/endpoint/model is wrong for the gateway; rows stay queued"
                             );
                             self.metrics.record_llm_config_failure();
+                            self.refund_budget(STAGE1_GLOBAL_BUDGET_KEY, &day, "extract");
                             auth_failed = true;
                             break;
                         }
@@ -2319,6 +2344,7 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
                          key/endpoint/model is wrong for the gateway; rows stay queued"
                     );
                     self.metrics.record_llm_config_failure();
+                    self.refund_budget(STAGE1_GLOBAL_BUDGET_KEY, &day, "ship-extract");
                     break;
                 }
                 Ok(shipments::ExtractOutcome::Refused)
@@ -2609,6 +2635,16 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
                         );
                         self.metrics.record_llm_config_failure();
                         self.metrics.record_stage2(Stage2Verdict::Retryable);
+                        // ALL THREE budgets this row charged before the call,
+                        // in the same order they were taken. Refunding only the
+                        // global one would leave the thread and sender caps
+                        // silently eroded by an outage, which is the same bug
+                        // one scope down: a thread cap is small, so a handful
+                        // of config failures could park one conversation for
+                        // the rest of the day.
+                        self.refund_budget(GLOBAL_BUDGET_KEY, &day, "stage-2 global");
+                        self.refund_budget(&row.thread_id, &day, "stage-2 thread");
+                        self.refund_budget(&sender_key, &day, "stage-2 sender");
                         break;
                     }
                     // Row-level permanent failure (truncation/parse): mark the

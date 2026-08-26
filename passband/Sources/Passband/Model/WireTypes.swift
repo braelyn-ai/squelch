@@ -354,6 +354,13 @@ struct Shipment: Codable, Sendable, Identifiable, Hashable {
     /// Rate limits and transport errors never count, which is what makes a
     /// nonzero value evidence about the NUMBER rather than about the network.
     var poll_failures: Int?
+
+    /// The item name as a LABEL: emoji dropped, whitespace collapsed. The
+    /// daemon lifts this out of a subject line and its strip leaves pictographs
+    /// standing, so "🚚 Your order from X" reaches us with the truck attached.
+    /// Empty when nothing survives (a name that was only decoration), which is
+    /// each caller's cue to use its own fallback.
+    var displayItem: String { item_name.withoutEmoji }
 }
 
 /// What `POST /client/shipments/poll` answers. `kicked` is false, with an empty
@@ -1001,6 +1008,18 @@ struct TriageDebug: Codable, Sendable, Hashable {
     /// Optional so a client pointed at a daemon older than the field still
     /// decodes the page rather than failing the whole read.
     var thread_id: String?
+}
+
+/// What `GET /client/retriage` answers: how far the live dev re-triage has got.
+/// `total == 0` means no run is in flight. A daemon too old to serve the route
+/// 404s, which is NOT zero — the modal has to say "no counter" rather than
+/// "finished". See `RetriageRun`.
+struct RetriageProgress: Codable, Sendable, Hashable {
+    var total: Int
+    var done: Int
+    /// The oldest live stamp: when the counted run began. Absent exactly when
+    /// `total` is 0.
+    var started_at: String?
 }
 
 struct ShredStats: Codable, Sendable, Hashable {

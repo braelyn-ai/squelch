@@ -146,6 +146,21 @@ struct CreateTenant {
     account_email: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct ReplaceCredentials {
+    /// The mailbox claiming this tenant, matched against its identity Secret.
+    account_email: String,
+    /// Age-armored ciphertext, exactly as on the signup route.
+    cred_read_ciphertext: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct RecipientRequest {
+    /// The mailbox claiming this tenant. Matched against the Secret, so this
+    /// route cannot enumerate recipients or aim a credential elsewhere.
+    account_email: String,
+}
+
 #[derive(Debug, Serialize)]
 struct CreateTenantResponse {
     /// `age1...`. Public by construction: it is the half of the pair that
@@ -244,6 +259,64 @@ pub async fn create_tenant(State(state): State<WardenState>, body: Bytes) -> Res
     {
         Ok(created) => (
             StatusCode::CREATED,
+            Json(CreateTenantResponse {
+                recipient: created.recipient,
+            }),
+        )
+            .into_response(),
+        Err(e) => e.into_response(),
+    }
+}
+
+/// `PUT /v1/tenants/{label}/credentials/replace` - swap a LIVE tenant's
+/// credential for one its owner just re-consented to.
+///
+/// Its own route rather than a relaxation of `PUT .../credentials`, whose 409
+/// for an active tenant is load bearing. The mailbox in the body is the key: it
+/// is matched against the tenant's identity Secret, so this cannot install a
+/// credential into a mailbox the caller has not proved it owns.
+pub async fn replace_credentials(
+    State(state): State<WardenState>,
+    Path(label): Path<String>,
+    body: Bytes,
+) -> Response {
+    let req: ReplaceCredentials = match parse_json(&body) {
+        Ok(req) => req,
+        Err(detail) => return malformed(detail),
+    };
+    match state
+        .warden()
+        .replace_credentials(&label, &req.account_email, &req.cred_read_ciphertext)
+        .await
+    {
+        Ok(pairing) => (StatusCode::OK, Json(PairResponse::from(pairing))).into_response(),
+        Err(e) => e.into_response(),
+    }
+}
+
+/// `POST /v1/tenants/{label}/recipient` - the age recipient of a tenant that
+/// already exists, so the control plane can seal a REPLACEMENT credential.
+///
+/// A POST rather than a GET, and with a body rather than a query string, for
+/// two reasons: the mailbox has to be presented for the ownership check, and a
+/// query string reaches the edge's access log where a mailbox does not belong.
+/// Nothing is created or mutated; the verb is carrying a body, not a change.
+pub async fn get_recipient(
+    State(state): State<WardenState>,
+    Path(label): Path<String>,
+    body: Bytes,
+) -> Response {
+    let req: RecipientRequest = match parse_json(&body) {
+        Ok(req) => req,
+        Err(detail) => return malformed(detail),
+    };
+    match state
+        .warden()
+        .recipient_for(&label, &req.account_email)
+        .await
+    {
+        Ok(created) => (
+            StatusCode::OK,
             Json(CreateTenantResponse {
                 recipient: created.recipient,
             }),

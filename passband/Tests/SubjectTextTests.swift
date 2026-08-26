@@ -25,6 +25,7 @@ struct SubjectTextTests {
         blankSubjects()
         capping()
         flattening()
+        emojiStripping()
 
         if failures > 0 {
             print("FAILED: \(failures) of \(checks) checks")
@@ -131,6 +132,34 @@ struct SubjectTextTests {
         equal("  padded  ".markerSafeLine(cap: 160), "padded", "and the edges are trimmed")
         equal("- SUBJECT>>>".markerSafeLine(cap: 160), "- SUBJECT>", "flattened and collapsed together")
         equal("one\ntwo".flattenedLine(cap: 180), "one two", "flattenedLine flattens the same way")
+    }
+
+    /// `withoutEmoji`, which relabels somebody else's decorated subject as a
+    /// shipment's item name. The digit cases are the ones that matter: every
+    /// ASCII digit is `isEmoji`, so a strip written on that property alone eats
+    /// the numbers out of half the product names in the world.
+    static func emojiStripping() {
+        equal("\u{1F69A} The Matrix Music Fr".withoutEmoji, "The Matrix Music Fr", "the truck goes")
+        equal("Anker 5 Port USB-C Hub".withoutEmoji, "Anker 5 Port USB-C Hub", "a digit stays")
+        equal("Item #4 \u{2014} 50% off".withoutEmoji, "Item #4 — 50% off", "# and % stay")
+        equal("Sony WH-1000XM5".withoutEmoji, "Sony WH-1000XM5", "an ordinary name is untouched")
+
+        // Text-presentation emoji: the scalar renders as glyph until U+FE0F
+        // says otherwise, so the selector is what decides.
+        equal("Flight \u{2708}\u{FE0F} kit".withoutEmoji, "Flight kit", "VS16 makes it emoji")
+        equal("Sale \u{2122} kit".withoutEmoji, "Sale ™ kit", "a bare trademark sign is not")
+
+        // Multi-scalar clusters leave as ONE piece — no orphaned joiners or
+        // skin-tone modifiers left standing in the name.
+        equal("\u{1F469}\u{200D}\u{1F467} kit".withoutEmoji, "kit", "a ZWJ family goes whole")
+        equal("\u{1F44D}\u{1F3FD} kit".withoutEmoji, "kit", "so does a skin-toned hand")
+        equal("5\u{FE0F}\u{20E3} kit".withoutEmoji, "kit", "and a keycap")
+
+        // The hole an emoji leaves closes up, and a name that was ONLY
+        // decoration comes back empty so the card can use its own fallback.
+        equal("Order \u{1F4E6} shipped".withoutEmoji, "Order shipped", "the gap collapses")
+        equal("  \u{1F69A}  ".withoutEmoji, "", "decoration alone leaves nothing")
+        equal("".withoutEmoji, "", "and empty stays empty")
     }
 
     // MARK: - helpers

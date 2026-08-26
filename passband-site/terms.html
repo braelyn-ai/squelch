@@ -36,12 +36,13 @@
   <body>
     <nav><a href="/">← Passband</a></nav>
     <h1>Terms of Service</h1>
-    <p class="meta">Effective August 7, 2026</p>
+    <p class="meta">Effective August 25, 2026</p>
 
     <p>
-      These terms cover your use of the Passband app, the squelchd daemon,
-      and the small supporting services we operate (push notification relay
-      and optional read-receipt collection, together the "Services"). By
+      These terms cover your use of the Passband apps, the squelchd daemon,
+      and the services we operate: hosted Passband accounts, the push
+      notification relay, optional read-receipt collection, and the language
+      model gateway that serves hosted accounts (together, the "Services"). By
       using them you agree to these terms.
     </p>
 
@@ -50,8 +51,8 @@
       Passband and squelchd are open source software, licensed under the
       <a href="https://github.com/braelyn-ai/squelch/blob/main/LICENSE">MIT
       License</a>. That license, not these terms, governs your use of the
-      code itself. You run the software on your own hardware and are
-      responsible for your own deployment, backups, and security.
+      code itself. If you self-host, you run the software on your own hardware
+      and are responsible for your own deployment, backups, and security.
     </p>
 
     <h2>Your accounts</h2>
@@ -60,6 +61,27 @@
       responsible for complying with Google's terms, and for any API keys
       you supply to third-party model providers. You can revoke Passband's
       access to your Google account at any time at
+      <a href="https://myaccount.google.com/permissions">myaccount.google.com/permissions</a>.
+    </p>
+
+    <h2>Hosted accounts</h2>
+    <p>
+      A hosted account means we run squelchd for you and store your synced mail
+      and your Google refresh token on our infrastructure. What we hold and who
+      it reaches is set out in the <a href="/privacy">Privacy Policy</a>; read
+      it before you sign up, because the answer is materially different from
+      self-hosting.
+    </p>
+    <p>
+      Hosted accounts are currently offered free of charge and by invitation,
+      as a preview. Do not treat a hosted account as a backup of your mailbox:
+      Gmail remains the system of record, and we make no durability guarantee.
+      You may ask us to delete your account at any time, and we will destroy its
+      database, encryption key, and stored credential. We may suspend or
+      terminate an account for a violation of these terms, for abuse that
+      threatens the service, or on reasonable notice if we discontinue the
+      hosted tier; you can revoke our access to your mailbox yourself at any
+      time at
       <a href="https://myaccount.google.com/permissions">myaccount.google.com/permissions</a>.
     </p>
 
@@ -73,10 +95,10 @@
 
     <h2>The Services</h2>
     <p>
-      The relay and related infrastructure are provided free of charge and
-      on a best-effort basis. We may change, limit, or discontinue them at
-      any time. The self-hosted software keeps working without them, minus
-      push notifications and read receipts.
+      The Services are provided free of charge and on a best-effort basis. We
+      may change, limit, or discontinue them at any time. The self-hosted
+      software keeps working without them, minus push notifications and read
+      receipts.
     </p>
 
     <h2>Privacy</h2>

@@ -46,9 +46,9 @@ use crate::store::{
 use crate::types::{
     AccountId, AttachmentInfo, AttentionStatus, AttentionUpdate, AuditEntry, BandCounts, Banking,
     CalendarUpdate, ClientAttachment, ClientMessage, ClientThreadView, Deadline, Disposition,
-    Event, EventKind, NewMessage, OpenRate, Receipt, SanitizedMessage, SearchHit, SenderRule,
-    Sensitivity, ShredCandidate, StoreStats, ThreadView, Tier, TriageAxis, TriageFeedback,
-    UnsubscribeRecord, Update,
+    Event, EventKind, NewMessage, OpenRate, Receipt, RetriageProgress, SanitizedMessage, SearchHit,
+    SenderRule, Sensitivity, ShredCandidate, StoreStats, ThreadView, Tier, TriageAxis,
+    TriageFeedback, UnsubscribeRecord, Update,
 };
 
 /// `app_settings` key recording when this account's open ledger started, so the
@@ -628,6 +628,10 @@ impl Store for SqliteStore {
         self.retriage_reset(account_id, message_id, days)
     }
 
+    fn retriage_progress(&self, account_id: AccountId) -> Result<RetriageProgress> {
+        self.retriage_progress(account_id)
+    }
+
     fn extract_mark_processed(
         &self,
         account_id: AccountId,
@@ -1132,6 +1136,15 @@ impl Store for SqliteStore {
         day: &str,
     ) -> Result<u32> {
         self.stage2_increment_budget(account_id, thread_id, day)
+    }
+
+    fn stage2_refund_budget(
+        &self,
+        account_id: AccountId,
+        thread_id: &str,
+        day: &str,
+    ) -> Result<()> {
+        self.stage2_refund_budget(account_id, thread_id, day)
     }
 
     fn stage2_apply(&self, applied: &Stage2Applied) -> Result<bool> {

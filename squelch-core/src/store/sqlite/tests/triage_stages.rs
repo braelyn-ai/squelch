@@ -496,6 +496,101 @@ fn a_re_triaged_row_carries_the_stamp_that_overrides_the_stale_skip() {
     );
 }
 
+/// The progress counter the blocking modal reads. The client cannot dismiss that
+/// modal until `done == total`, so a counter that reaches its total early is
+/// worse than none: it uncovers the app mid-run.
+///
+/// The escalation hop is the whole case. A row Stage-1 has finished AND flagged
+/// for Stage-2 is still queued work, and a naive "stage1_model_used IS NOT NULL"
+/// reading calls it done.
+#[test]
+fn retriage_progress_counts_an_escalated_row_as_unfinished_until_stage2_has_it() {
+    let (store, acct) = store();
+
+    let a = triaged_row(acct, "g-a", "t-a", None, false, Sensitivity::Normal).ingest(&store);
+    let b = triaged_row(acct, "g-b", "t-b", None, false, Sensitivity::Normal).ingest(&store);
+    // Nobody has asked about anything yet.
+    let p = store.retriage_progress(acct).unwrap();
+    assert_eq!((p.total, p.done), (0, 0), "no stamps, no run");
+    assert!(p.started_at.is_none());
+
+    assert_eq!(store.retriage_reset(acct, None, 7).unwrap(), 2);
+    let p = store.retriage_progress(acct).unwrap();
+    assert_eq!((p.total, p.done), (2, 0), "both rows are back in the queue");
+    assert!(p.started_at.is_some(), "a live run knows when it began");
+
+    // `a` finishes outright; `b` is escalated and Stage-2 has not run.
+    {
+        let conn = store.lock().unwrap();
+        conn.execute(
+            "UPDATE triage SET stage1_model_used='claude-x', needs_stage2=0 WHERE message_id=?1",
+            rusqlite::params![a],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE triage SET stage1_model_used='claude-x', needs_stage2=1, model_used=NULL
+             WHERE message_id=?1",
+            rusqlite::params![b],
+        )
+        .unwrap();
+    }
+    let p = store.retriage_progress(acct).unwrap();
+    assert_eq!(
+        (p.total, p.done),
+        (2, 1),
+        "an escalated row is not done just because Stage-1 stamped it"
+    );
+    assert_eq!(store.stage2_queue(acct, 10).unwrap().len(), 1);
+
+    // Stage-2 lands, and only now is the run complete.
+    {
+        let conn = store.lock().unwrap();
+        conn.execute(
+            "UPDATE triage SET model_used='claude-x' WHERE message_id=?1",
+            rusqlite::params![b],
+        )
+        .unwrap();
+    }
+    let p = store.retriage_progress(acct).unwrap();
+    assert_eq!(
+        (p.total, p.done),
+        (2, 2),
+        "the run finishes when the queues empty"
+    );
+}
+
+/// The run is the LIVE window, the same one the passes force on. A stamp older
+/// than [`crate::triage::RETRIAGE_FORCE_WINDOW`] is a run that is over — the
+/// passes have stopped honouring it — so counting it would wedge the modal on a
+/// yesterday that can never finish.
+#[test]
+fn retriage_progress_forgets_a_run_whose_stamps_have_aged_out() {
+    let (store, acct) = store();
+    let id = triaged_row(acct, "g-old", "t-old", None, false, Sensitivity::Normal).ingest(&store);
+    store.retriage_reset(acct, Some(id), 7).unwrap();
+    assert_eq!(store.retriage_progress(acct).unwrap().total, 1);
+
+    let stale = (Utc::now() - crate::triage::RETRIAGE_FORCE_WINDOW - chrono::Duration::minutes(1))
+        .to_rfc3339();
+    {
+        let conn = store.lock().unwrap();
+        conn.execute(
+            "UPDATE triage SET retriage_at=?2 WHERE message_id=?1",
+            rusqlite::params![id, stale],
+        )
+        .unwrap();
+    }
+    assert!(!crate::triage::retriage_forced(
+        Some(Utc::now() - crate::triage::RETRIAGE_FORCE_WINDOW - chrono::Duration::minutes(1)),
+        Utc::now()
+    ));
+    assert_eq!(
+        store.retriage_progress(acct).unwrap().total,
+        0,
+        "an expired stamp is not a run in flight"
+    );
+}
+
 /// A row nobody asked about keeps a NULL stamp, so the age cutoff still decides
 /// for it. Without this the fix would read as "re-triage forces everything".
 #[test]
@@ -2273,4 +2368,104 @@ fn an_escalated_row_carries_its_reason_and_the_senders_record() {
     let q = store.stage2_queue(acct, 10).unwrap();
     let row = q.iter().find(|r| r.message_id == second).unwrap();
     assert_eq!(row.sender_history.total, 1);
+}
+
+/// A refund gives back exactly one charge, and never digs below zero.
+///
+/// The floor is the interesting half. The budget key is the UTC day, so a call
+/// charged at 23:59:59 and refunded two seconds later refunds against the NEXT
+/// day's row, which holds nothing. Without the floor that row would go
+/// negative and hand the new day a free call on top of its own cap.
+#[test]
+fn a_config_failure_refund_gives_back_one_charge_and_floors_at_zero() {
+    let (store, acct) = store();
+    let day = "2026-08-25";
+
+    store
+        .stage2_increment_budget(acct, "__stage1_global__", day)
+        .unwrap();
+    store
+        .stage2_increment_budget(acct, "__stage1_global__", day)
+        .unwrap();
+    assert_eq!(
+        store
+            .stage2_budget_used(acct, "__stage1_global__", day)
+            .unwrap(),
+        2
+    );
+
+    store
+        .stage2_refund_budget(acct, "__stage1_global__", day)
+        .unwrap();
+    assert_eq!(
+        store
+            .stage2_budget_used(acct, "__stage1_global__", day)
+            .unwrap(),
+        1
+    );
+
+    // Refunding past zero is a no-op, not a negative balance.
+    store
+        .stage2_refund_budget(acct, "__stage1_global__", day)
+        .unwrap();
+    store
+        .stage2_refund_budget(acct, "__stage1_global__", day)
+        .unwrap();
+    assert_eq!(
+        store
+            .stage2_budget_used(acct, "__stage1_global__", day)
+            .unwrap(),
+        0
+    );
+
+    // A refund against a day that was never charged creates nothing.
+    store
+        .stage2_refund_budget(acct, "__stage1_global__", "2026-08-26")
+        .unwrap();
+    assert_eq!(
+        store
+            .stage2_budget_used(acct, "__stage1_global__", "2026-08-26")
+            .unwrap(),
+        0
+    );
+
+    // Scopes stay independent: refunding one key leaves the others alone.
+    store.stage2_increment_budget(acct, "t-abc", day).unwrap();
+    store
+        .stage2_refund_budget(acct, "__stage1_global__", day)
+        .unwrap();
+    assert_eq!(store.stage2_budget_used(acct, "t-abc", day).unwrap(), 1);
+}
+
+/// THE OUTAGE THIS EXISTS FOR, in miniature: a run of config-level failures
+/// must not leave the cap spent once the config is fixed.
+///
+/// On 2026-08-25 a gateway misconfiguration charged 498 of a 500-call daily cap
+/// in about half an hour. Because the budget key is the UTC day and the charge
+/// stood, the tenant stayed capped for 22 hours after the gateway was repaired.
+#[test]
+fn a_run_of_config_failures_leaves_the_cap_intact() {
+    let (store, acct) = store();
+    let day = "2026-08-25";
+    let cap = 500u32;
+
+    // Every attempt charges before the call (the retry-storm guard), and every
+    // one comes back a config-level 4xx, so every one is refunded.
+    for _ in 0..498 {
+        store
+            .stage2_increment_budget(acct, "__stage1_global__", day)
+            .unwrap();
+        store
+            .stage2_refund_budget(acct, "__stage1_global__", day)
+            .unwrap();
+    }
+
+    let used = store
+        .stage2_budget_used(acct, "__stage1_global__", day)
+        .unwrap();
+    assert_eq!(used, 0, "config failures must not spend the day's cap");
+    assert!(
+        used < cap,
+        "the fleet can still triage once the config is fixed"
+    );
 }

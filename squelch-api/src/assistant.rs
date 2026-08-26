@@ -82,6 +82,33 @@ impl AssistantRelay {
     }
 }
 
+/// Qualify the request's `model` with its provider, returning `None` when the
+/// body needs no change and the ORIGINAL BYTES should go out untouched.
+///
+/// This is the one place the relay looks inside the body, and it is the same
+/// argument that pins `anthropic-version` above: the daemon, not the app,
+/// decides the dialect the gateway sees. The app cannot make this call itself
+/// because one setting drives both transports — through this relay a bare id
+/// is a 400 "could not auto resolve a provider", and through BYOK straight to
+/// Anthropic the qualified id is the one that is invalid. Only the daemon knows
+/// which endpoint is downstream, and it already gates the virtual-key header on
+/// exactly that question.
+///
+/// EVERYTHING ELSE IS LEFT ALONE. An unparseable body, a missing or non-string
+/// `model`, or an id that already names a provider all return `None` so the
+/// original bytes are forwarded verbatim and the gateway's own error reaches
+/// the app unedited. Re-serialization happens only when there is a change to
+/// make, so the common case once apps send qualified ids costs a parse and no
+/// copy. The conversation itself is never read, logged, or inspected here —
+/// only the one top-level field.
+fn qualify_model_for_gateway(body: &Bytes) -> Option<Bytes> {
+    let mut parsed: serde_json::Value = serde_json::from_slice(body).ok()?;
+    let model = parsed.get("model")?.as_str()?;
+    let qualified = squelch_core::triage::llm::qualify_gateway_model(model)?;
+    *parsed.get_mut("model")? = serde_json::Value::String(qualified);
+    Some(Bytes::from(serde_json::to_vec(&parsed).ok()?))
+}
+
 /// POST /client/assistant/messages — forward the raw body to the gateway and
 /// stream the answer back byte-for-byte. No re-framing: the app's SSE parser
 /// depends on exact framing, so the response body is the upstream body. A
@@ -123,9 +150,14 @@ pub(crate) async fn assistant_messages(State(state): State<ApiState>, body: Byte
     // gateway-only by construction (`resolve_assistant` returns None without a
     // base URL), but the condition is kept so ONE rule decides who gets a
     // virtual key, here and on the triage wire.
-    if squelch_core::triage::llm::is_gateway_url(&relay.url) {
+    // ...and, for the same reason and behind the same gate, the model id is
+    // qualified with its provider. See [`qualify_model_for_gateway`].
+    let body = if squelch_core::triage::llm::is_gateway_url(&relay.url) {
         req = req.header("x-bf-vk", relay.api_key.as_str());
-    }
+        qualify_model_for_gateway(&body).unwrap_or(body)
+    } else {
+        body
+    };
     let upstream = tokio::time::timeout(HEADERS_TIMEOUT, req.body(body).send()).await;
 
     let upstream = match upstream {
@@ -182,4 +214,65 @@ pub(crate) async fn assistant_messages(State(state): State<ApiState>, body: Byte
     builder
         .body(Body::from_stream(stream))
         .expect("status and whitelisted headers mirrored from a parsed response are valid")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rewrite(body: &str) -> Option<String> {
+        qualify_model_for_gateway(&Bytes::from(body.to_string()))
+            .map(|b| String::from_utf8(b.to_vec()).unwrap())
+    }
+
+    /// The bug this exists for: the app sends a bare id, the gateway cannot
+    /// resolve a provider from it, and the turn 400s before the virtual key is
+    /// ever consulted.
+    #[test]
+    fn a_bare_model_gets_its_provider() {
+        let out = rewrite(r#"{"model":"claude-opus-5","max_tokens":16}"#).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["model"], "anthropic/claude-opus-5");
+        // Everything else survives the round trip untouched.
+        assert_eq!(v["max_tokens"], 16);
+    }
+
+    /// An id that already names a provider is left alone AND the original
+    /// bytes are forwarded: `None` means "do not re-serialize".
+    #[test]
+    fn an_already_qualified_model_is_not_touched() {
+        assert!(rewrite(r#"{"model":"anthropic/claude-opus-5"}"#).is_none());
+        // Another provider's spelling is the caller's choice, not ours to fix.
+        assert!(rewrite(r#"{"model":"openai/gpt-5"}"#).is_none());
+    }
+
+    /// Nothing about a malformed or surprising body becomes this function's
+    /// problem: it declines, the original bytes go out, and the gateway's own
+    /// error reaches the app unedited.
+    #[test]
+    fn anything_unexpected_is_forwarded_verbatim() {
+        assert!(rewrite("not json at all").is_none());
+        assert!(rewrite(r#"{"messages":[]}"#).is_none(), "no model field");
+        assert!(
+            rewrite(r#"{"model":123}"#).is_none(),
+            "model is not a string"
+        );
+        assert!(rewrite(r#"{"model":""}"#).is_none(), "empty model");
+        assert!(rewrite("[1,2,3]").is_none(), "not an object");
+    }
+
+    /// The conversation rides through unchanged. This is the property that
+    /// makes looking inside the body acceptable at all: one top-level field is
+    /// read, and the user's own words are neither inspected nor reordered.
+    #[test]
+    fn the_conversation_survives_the_rewrite() {
+        let body = r#"{"model":"claude-haiku-4-5","stream":true,"messages":[{"role":"user","content":"what did Ada send me?"}],"system":[{"type":"text","text":"be brief"}]}"#;
+        let out = rewrite(body).unwrap();
+        let before: serde_json::Value = serde_json::from_str(body).unwrap();
+        let after: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(after["model"], "anthropic/claude-haiku-4-5");
+        for k in ["stream", "messages", "system"] {
+            assert_eq!(before[k], after[k], "{k} changed");
+        }
+    }
 }

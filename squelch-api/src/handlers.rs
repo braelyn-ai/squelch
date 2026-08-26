@@ -417,6 +417,25 @@ pub async fn retriage(
     Ok(Json(json!({ "reset": reset })))
 }
 
+// --- GET /client/retriage (developer tool) -----------------------------------
+
+/// HOW FAR THE LIVE RE-TRIAGE HAS GOT. Read-only, and safe to poll on a short
+/// interval — one indexed aggregate, no model call and no mailbox round trip.
+///
+/// A re-triage takes minutes and the client blocks the app over it, so the
+/// counters have to be true or the modal is a liar that cannot be dismissed:
+/// `done` is derived from the QUEUE PREDICATES themselves rather than from a
+/// marker, which is what keeps an escalated row counted as unfinished until
+/// Stage-2 has actually had it.
+pub async fn retriage_progress(
+    State(state): State<ApiState>,
+) -> Result<impl IntoResponse, ApiError> {
+    query(&state, move |store, account_id| {
+        store.retriage_progress(account_id)
+    })
+    .await
+}
+
 // --- GET /client/triage-debug/{message_id} (developer tool) ------------------
 
 /// DEV INSPECTOR: the full triage state of one non-sealed message. Read-only;

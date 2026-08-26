@@ -673,6 +673,11 @@ actor APIClient {
     struct RetriageMessageBody: Codable, Sendable { var message_id: Int }
     struct RetriageDaysBody: Codable, Sendable { var days: Int }
 
+    /// How far the live re-triage has got. 404 on a daemon too old to report it.
+    func retriageProgress() async throws -> RetriageProgress {
+        try await get("/client/retriage")
+    }
+
     @discardableResult
     func retriage(_ scope: RetriageScope) async throws -> RetriageResult {
         switch scope {

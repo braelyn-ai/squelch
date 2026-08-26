@@ -49,11 +49,18 @@ struct ActionLayer: View {
             }
             if store.askBarOpen { AskBar { store.askBarOpen = false } }
             if store.shortcutsOpen { ShortcutsOverlay { store.shortcutsOpen = false } }
-            // LAST, so it stacks above every other overlay in this layer. It is
-            // shown at most once per version, at a moment nothing else has been
-            // raised yet, and a modal that can end up UNDER something has to be
-            // dismissed twice to be read once.
+            // Above everything else in this layer, because it is shown at most
+            // once per version at a moment nothing else has been raised yet, and
+            // a modal that can end up UNDER something has to be dismissed twice
+            // to be read once.
             if store.whatsNew.active { WhatsNewCard() }
+            // LAST, and it outranks even the card above: that one is a greeting
+            // the user can dismiss, this one is the app being unavailable while
+            // a re-triage rewrites what every other overlay here is about.
+            // Anything already open when it starts stays open UNDER it and is
+            // there again when the run ends — closing them would be this modal
+            // reaching outside itself to tidy up state it does not own.
+            if let run = store.retriage { RetriageModal(run: run) }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomLeading)
         .keyBindings(.list, [
