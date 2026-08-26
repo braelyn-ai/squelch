@@ -292,6 +292,12 @@ async fn spawn_warden(rec: Shared) -> String {
                     if !owned {
                         return json_status(StatusCode::CONFLICT, "not_owner");
                     }
+                    // THE STATUS GUARD the real warden carries: a PENDING
+                    // tenant is a signup stopped between its two calls, and
+                    // installing here would finish it with no invite spent.
+                    if !r.tenants[&label].provisioned {
+                        return json_status(StatusCode::CONFLICT, "not_serving");
+                    }
                     r.credential_puts.push((label.clone(), parsed));
                     (
                         StatusCode::OK,
@@ -2204,5 +2210,39 @@ async fn a_reconnect_is_refused_when_the_cluster_disagrees_about_the_owner() {
         r.credential_puts.len(),
         installs_after_signup,
         "no credential may be installed when the two records disagree"
+    );
+}
+
+/// A PENDING tenant may not be finished through the reconnect link.
+///
+/// Signup is two warden calls, and a tenant that stopped between them exists
+/// with an identity and no workload. Installing a credential into that is
+/// completing a signup: a provisioned mailbox with no invite spent, reached
+/// through a public link. The control store's `active_tenant_for_email` already
+/// refuses to name a non-active tenant, so this drives the case where the store
+/// says yes anyway, which is what the warden's own status guard is for.
+#[tokio::test]
+async fn a_reconnect_cannot_finish_a_half_done_signup() {
+    let h = Harness::new().await;
+    h.complete_signup("ada").await;
+
+    // Put the cluster back into the shape a stopped-mid-signup tenant has:
+    // identity present, nothing serving.
+    h.rec
+        .lock()
+        .unwrap()
+        .tenants
+        .get_mut("ada")
+        .unwrap()
+        .provisioned = false;
+    let installs_before = h.rec.lock().unwrap().credential_puts.len();
+
+    let (status, _) = h.run_reconnect().await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+
+    assert_eq!(
+        h.rec.lock().unwrap().credential_puts.len(),
+        installs_before,
+        "a pending tenant must not be provisioned through reconnect"
     );
 }

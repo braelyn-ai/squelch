@@ -1520,8 +1520,15 @@ async fn reconnect_install(state: &ControlState, code: String, pkce_verifier: St
     let grant = match oauth::exchange_code(&endpoints(state), code, pkce_verifier).await {
         Ok(g) => g,
         Err(oauth::OAuthError::Scope) => {
+            // NOT `partial_consent_problem`: that page says "your invite code
+            // has not been used", which is true of a signup and meaningless to
+            // somebody reconnecting a mailbox they have had for weeks.
             tracing::info!("reconnect consent granted only part of the scope set");
-            return partial_consent_problem();
+            return pages::console_problem(
+                StatusCode::OK,
+                "Passband needs all three Gmail permissions",
+                "Nothing changed and your mailbox is still disconnected. Passband needs all                  three: reading your mail to triage it, changing it to archive and label, and                  sending so you can reply from the app. Start again and leave every box checked                  on Google's screen.",
+            );
         }
         Err(e) => {
             // PRIVACY: the error type only. Never the code, the token, or

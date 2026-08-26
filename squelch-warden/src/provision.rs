@@ -683,7 +683,20 @@ impl Warden {
             _ => return Err(WardenError::Conflict),
         }
 
+        // AND THE STATUS, which is the half the control plane's own check is not
+        // independent of. Its store only maps a mailbox to an ACTIVE tenant, so
+        // today nothing pending reaches here — but that is ONE gate, and this
+        // route exists to be the second one. A PENDING tenant is a signup that
+        // stopped between its two calls, and installing a credential into it
+        // would finish that signup: a mailbox provisioned with no invite spent,
+        // through a public link. STOPPED is deliberately down and must not be
+        // brought back up by re-consenting. FAILED is admitted with Active on
+        // purpose: a tenant whose pod is not serving is often one whose
+        // credential is exactly what died.
         let status = self.status_of(&name).await?;
+        if !matches!(status, TenantStatus::Active | TenantStatus::Failed) {
+            return Err(WardenError::Conflict);
+        }
         self.install_credentials(&name, &ciphertext, status, false)
             .await
     }
