@@ -4,6 +4,7 @@
 //! its `Connection` in a `Mutex`; async callers wrap calls in
 //! `tokio::task::spawn_blocking`.
 
+pub mod recency;
 pub mod search_query;
 pub mod sqlite;
 
@@ -1380,6 +1381,11 @@ pub trait Store: Send + Sync {
     fn resolve_sender(&self, account_id: AccountId, sender_addr: &str) -> Result<usize>;
 
     /// FTS5 keyword search over non-sealed messages. `limit`/`offset` paginate.
+    ///
+    /// Ranked by relevance TILTED TOWARD RECENT MAIL ([`recency`]) — the same
+    /// curve the semantic and hybrid legs blend in, so one query does not mean
+    /// two different things depending on which mode served it.
+    ///
     /// SECURITY: sealed rows are excluded in SQL, exactly like `ranked_updates`.
     fn search(
         &self,

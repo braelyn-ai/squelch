@@ -639,3 +639,313 @@ fn embed_e2e_real_model_ranks_relevant_first() {
         "decoy present but lower"
     );
 }
+
+// ---- RECENCY -----------------------------------------------------------
+//
+// Mail is not a document corpus: the thread the reader wants is
+// overwhelmingly the one that moved recently. Every RANKED leg blends the
+// `store::recency` curve into its score. These pin the three things that can
+// go wrong — the tilt not happening, the tilt becoming a re-sort, and a
+// `Date:` header the sender invented steering the ranking.
+
+use crate::store::recency;
+use chrono::Duration;
+
+/// Two messages that match a query IDENTICALLY, so nothing but the date can
+/// separate them. Used by the fusion legs, where a relevance tie is settled by
+/// whichever order the two indexes happened to return.
+const SAME_SUBJECT: &str = "quarterly contract";
+const SAME_BODY: &str = "The signed quarterly contract with the vendor is attached.";
+
+fn seed_equal_pair(
+    store: &SqliteStore,
+    acct: AccountId,
+    first_age_days: i64,
+    second_age_days: i64,
+) -> (i64, i64) {
+    let now = Utc::now();
+    let a = triaged(acct, "g-a", "t-a")
+        .subject(SAME_SUBJECT)
+        .body(SAME_BODY)
+        .received_at(now - Duration::days(first_age_days))
+        .seed(store);
+    let b = triaged(acct, "g-b", "t-b")
+        .subject(SAME_SUBJECT)
+        .body(SAME_BODY)
+        .received_at(now - Duration::days(second_age_days))
+        .seed(store);
+    (a, b)
+}
+
+/// A pair whose bm25 scores differ by roughly 1.8x: a short message that IS
+/// about a contract, and a newsletter that mentions one in passing.
+///
+/// The gap is deliberately modest. Wide enough that no tiebreak decides these
+/// tests — the keyword leg breaks ties by date, so an EQUAL pair would rank
+/// fresher-first with the recency blend torn out entirely and prove nothing —
+/// and narrow enough that the tilt can still overturn it.
+const STRONGER_SUBJECT: &str = "contract";
+const STRONGER_BODY: &str = "The signed contract with the vendor is attached for your records.";
+const WEAKER_SUBJECT: &str = "weekly digest";
+const WEAKER_BODY: &str = "A stray mention of a contract sits far down this roundup of \
+    newsletter items, among gardening tips, local events, recipes, and a reader letter \
+    about compost.";
+
+#[test]
+fn keyword_ranking_lifts_a_fresher_weaker_match_over_an_older_stronger_one() {
+    let (store, acct) = store();
+    let now = Utc::now();
+
+    let stronger_but_old = triaged(acct, "g-old", "t-old")
+        .subject(STRONGER_SUBJECT)
+        .body(STRONGER_BODY)
+        .received_at(now - Duration::days(500))
+        .seed(&store);
+    let weaker_but_fresh = triaged(acct, "g-new", "t-new")
+        .subject(WEAKER_SUBJECT)
+        .body(WEAKER_BODY)
+        .received_at(now)
+        .seed(&store);
+
+    let order: Vec<i64> = store
+        .search(acct, "contract", 10, 0)
+        .unwrap()
+        .iter()
+        .map(|h| h.id)
+        .collect();
+    assert_eq!(
+        order,
+        vec![weaker_but_fresh, stronger_but_old],
+        "bm25 alone would put the older message first; recency overturns a \
+         gap this size"
+    );
+}
+
+#[test]
+fn keyword_ranking_still_lets_a_clearly_better_old_match_win() {
+    // Recency is a TILT, not a re-sort. The floor caps how much relevance it
+    // can overturn (~1/FLOOR), so a strong three-month-old match still beats a
+    // stray mention that happens to have landed today.
+    let (store, acct) = store();
+    let now = Utc::now();
+
+    let strong_and_old = triaged(acct, "g-old", "t-old")
+        .subject("contract")
+        .body("contract")
+        .received_at(now - Duration::days(90))
+        .seed(&store);
+
+    let weak_and_fresh = triaged(acct, "g-new", "t-new")
+        .subject("weekly digest")
+        .body(
+            "Somewhere far down this long roundup of unrelated newsletter items there is \
+             one stray mention of a contract, buried among gardening tips, local events, \
+             recipes, and a reader letter about compost that goes on for quite a while \
+             yet, with still more filler after that to keep the document long, and then a \
+             further paragraph of entirely unrelated prose about the spring planting \
+             calendar, the community hall fundraiser, and the usual roundup of \
+             neighbourhood notices nobody reads.",
+        )
+        .received_at(now)
+        .seed(&store);
+
+    let hits = store.search(acct, "contract", 10, 0).unwrap();
+    let order: Vec<i64> = hits.iter().map(|h| h.id).collect();
+    assert_eq!(
+        order,
+        vec![strong_and_old, weak_and_fresh],
+        "a much better old match outranks a weak fresh one"
+    );
+}
+
+#[test]
+fn a_future_dated_header_cannot_buy_more_than_being_new() {
+    // `received_at` is a `Date:` header an untrusted sender wrote, so the curve
+    // clamps age at zero. Run the SAME pair twice — the weaker match landing
+    // now, then the weaker match dated 400 days in the future — and the answer
+    // has to be identical: an impossible date ranks as new, no better and no
+    // worse.
+    //
+    // The impossible date sits on the WEAKER match on purpose, so the assertion
+    // turns on the boost rather than on bm25. Un-clamped, that row's boost goes
+    // NEGATIVE (it divides by zero one half-life out) and sinks below the
+    // genuinely old message, flipping the order.
+    for offset_days in [0i64, 400] {
+        let (store, acct) = store();
+        let now = Utc::now();
+
+        let impossible = triaged(acct, "g-future", "t-future")
+            .subject(WEAKER_SUBJECT)
+            .body(WEAKER_BODY)
+            .received_at(now + Duration::days(offset_days))
+            .seed(&store);
+        let genuinely_old = triaged(acct, "g-old", "t-old")
+            .subject(STRONGER_SUBJECT)
+            .body(STRONGER_BODY)
+            .received_at(now - Duration::days(400))
+            .seed(&store);
+
+        let order: Vec<i64> = store
+            .search(acct, "contract", 10, 0)
+            .unwrap()
+            .iter()
+            .map(|h| h.id)
+            .collect();
+        assert_eq!(
+            order,
+            vec![impossible, genuinely_old],
+            "a Date: header {offset_days} days out ranks exactly as new"
+        );
+    }
+}
+
+#[test]
+fn the_blend_survives_an_operator_carrying_its_own_parameters() {
+    // The keyword leg binds the clock with an anonymous `?` that sits BETWEEN
+    // the filter's parameters and LIMIT/OFFSET, relying on SQLite numbering
+    // anonymous parameters in the order they appear in the SQL TEXT. Get that
+    // wrong with a filter in play and `julianday` reads a LIKE pattern, answers
+    // NULL, and every row silently COALESCEs to the same floor — a ranking that
+    // still returns the right mail in the wrong order.
+    let (store, acct) = store();
+    let now = Utc::now();
+
+    let stronger_but_old = triaged(acct, "g-old", "t-old")
+        .from("jane@example.com")
+        .subject(STRONGER_SUBJECT)
+        .body(STRONGER_BODY)
+        .received_at(now - Duration::days(500))
+        .seed(&store);
+    let weaker_but_fresh = triaged(acct, "g-new", "t-new")
+        .from("jane@example.com")
+        .subject(WEAKER_SUBJECT)
+        .body(WEAKER_BODY)
+        .received_at(now)
+        .seed(&store);
+
+    let (text, filter) = parse_search_query("contract from:jane");
+    let order: Vec<i64> = store
+        .search_filtered(acct, &text, &filter, 10, 0)
+        .unwrap()
+        .iter()
+        .map(|h| h.id)
+        .collect();
+    assert_eq!(
+        order,
+        vec![weaker_but_fresh, stronger_but_old],
+        "the recency blend still ranks with a from: filter bound ahead of it"
+    );
+}
+
+#[test]
+fn the_recency_curve_is_the_same_in_rust_and_in_sql() {
+    // The curve exists TWICE — as Rust for the fusion legs, as SQL text for the
+    // keyword leg, both generated from one set of constants. This is the only
+    // thing standing between that arrangement and a silent drift.
+    let (store, _acct) = store();
+    let conn = store.lock().unwrap();
+    let sql = format!("SELECT {}", recency::boost_sql("?1", "?2"));
+    let now = Utc::now();
+
+    for days in [0i64, 1, 7, 30, 90, 365, 3650, -1, -30, -400] {
+        let at = now - Duration::days(days);
+        let from_sql: f64 = conn
+            .query_row(&sql, params![at.to_rfc3339(), now.to_rfc3339()], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        let from_rust = recency::boost(at, now);
+        assert!(
+            (from_sql - from_rust).abs() < 1e-9,
+            "{days}d: sql {from_sql} vs rust {from_rust}"
+        );
+    }
+
+    // `julianday` answers NULL on text it cannot read; the COALESCE catches it
+    // so the row ranks as ancient instead of sorting as NULL.
+    let unreadable: f64 = conn
+        .query_row(&sql, params!["not a timestamp", now.to_rfc3339()], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(unreadable, recency::FLOOR);
+}
+
+#[test]
+fn hybrid_ranking_puts_the_fresher_of_two_equal_matches_first() {
+    // Both legs tie on identical text, so RRF alone would settle this by
+    // whatever order the two indexes happened to return. The recency vote is
+    // what makes it an answer instead of an accident — again seeded both ways
+    // round.
+    for (first, second) in [(500, 0), (0, 500)] {
+        let embedder = Arc::new(StubEmbedder::new(VEC_DIMS));
+        let (store, acct) = store_with_embedder(embedder.clone());
+        let (a, b) = seed_equal_pair(&store, acct, first, second);
+        let fresher = if first == 0 { a } else { b };
+        for m in store.messages_missing_vectors(acct, 10).unwrap() {
+            embed_and_store(&store, &*embedder, acct, m.message_id, &m.subject, &m.body);
+        }
+
+        let hits = store
+            .hybrid_search(acct, "quarterly contract", &SearchFilter::default(), 10)
+            .unwrap()
+            .0;
+        assert_eq!(hits.len(), 2);
+        assert_eq!(
+            hits[0].id, fresher,
+            "the fused order breaks a relevance tie toward the fresher message \
+             (seeded {first}d then {second}d)"
+        );
+    }
+}
+
+#[test]
+fn semantic_ranking_lifts_the_fresher_within_the_knn_window() {
+    // The nearest vector hit is the OLD one; the fresher message is a rank
+    // behind it. RRF's head is flat by design, so one rank of distance does not
+    // survive two years of age — and swapping the dates puts the nearest hit
+    // back on top, which is what separates "recency moved it" from "the order
+    // was always that".
+    const QUERY: &str = "signed vendor contract";
+    for near_age_days in [500i64, 0] {
+        let embedder = Arc::new(StubEmbedder::new(VEC_DIMS));
+        let (store, acct) = store_with_embedder(embedder.clone());
+        let now = Utc::now();
+
+        // Exactly the query terms: the closest vector in the index.
+        let nearest = triaged(acct, "g-near", "t-near")
+            .subject("signed vendor contract")
+            .body("signed vendor contract")
+            .received_at(now - Duration::days(near_age_days))
+            .seed(&store);
+        // The same terms diluted with unrelated ones: close, but a rank behind.
+        let further = triaged(acct, "g-far", "t-far")
+            .subject("signed vendor contract")
+            .body("signed vendor contract lunch tomorrow gardening compost calendar")
+            .received_at(now - Duration::days(500 - near_age_days))
+            .seed(&store);
+
+        for m in store.messages_missing_vectors(acct, 10).unwrap() {
+            embed_and_store(&store, &*embedder, acct, m.message_id, &m.subject, &m.body);
+        }
+
+        // The raw KNN primitive stays pure relevance: nearest first, always.
+        let knn = store.semantic_search(acct, QUERY, 10).unwrap();
+        assert_eq!(
+            knn[0].0, nearest,
+            "semantic_search is nearest-by-meaning and nothing else"
+        );
+
+        // The search SURFACE blends recency in.
+        let hits = store
+            .semantic_search_hits(acct, QUERY, &SearchFilter::default(), 10)
+            .unwrap()
+            .0;
+        let fresher = if near_age_days == 0 { nearest } else { further };
+        assert_eq!(
+            hits[0].id, fresher,
+            "mode=semantic ranks the fresher of two near-equal hits first \
+             (nearest is {near_age_days}d old)"
+        );
+    }
+}

@@ -413,17 +413,23 @@ impl SquelchServer {
     /// bodies. `get_thread` remains the escalation to read full content: pass a
     /// result's `thread_id` to it.
     ///
+    /// RECENCY IS PART OF THE RANK. The fused order tilts toward mail that
+    /// landed recently, so `relevance: 1` means "best answer", not "most
+    /// textually similar" — an agent looking for the OLD instance of something
+    /// should say so in the query rather than reading down the list.
+    ///
     /// SEALED: auth/verification mail is never embedded and is excluded in SQL by
     /// both the keyword and semantic legs, so it can never appear here. A
     /// defense-in-depth re-check drops any hit whose thread overlaps a sealed
     /// thread before serialization, mirroring `get_inbox_updates`.
     #[tool(
         name = "search_mail",
-        description = "Search the mailbox (hybrid keyword + semantic recall). \
-                       Returns SUMMARIES ONLY (sender, one-line subject, \
-                       received_at, thread_id, relevance) — never message bodies. \
-                       To read a result, pass its `thread_id` to get_thread. \
-                       Auth/verification emails are structurally absent."
+        description = "Search the mailbox (hybrid keyword + semantic recall, \
+                       ranked with a tilt toward recent mail). Returns SUMMARIES \
+                       ONLY (sender, one-line subject, received_at, thread_id, \
+                       relevance) — never message bodies. To read a result, pass \
+                       its `thread_id` to get_thread. Auth/verification emails \
+                       are structurally absent."
     )]
     async fn search_mail(
         &self,
