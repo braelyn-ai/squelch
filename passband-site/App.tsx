@@ -874,6 +874,13 @@ export function App() {
         ) : (
           masthead
         )}
+        {/* Held for the next pass at this page, when the tagline stops
+            swearing at the problem and starts letting the reader off the
+            hook for it:
+        <p style={styles.tagline}>
+          inbox 0 every day was never a realistic goal. you're just human
+        </p>
+        */}
         <p style={styles.tagline}>fuck email. lets make it bearable</p>
         {joining ? (
           <Waitlist />
