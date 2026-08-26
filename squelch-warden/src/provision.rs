@@ -229,7 +229,7 @@ pub struct Rolled {
     /// on the strength of a cluster that has just gone quiet. This one is a fact
     /// about one tenant that no retry changes, and stopping on it would park
     /// every tenant after it in [`Warden::fleet`] order behind a run that halts
-    /// at the same label every fifteen minutes, forever.
+    /// at the same label on every tick, forever.
     ///
     /// The pod is probably still up - the daemon installed its credential onto
     /// its own volume long ago - so this is not [`Rolled::stranded`]. It is a
@@ -2388,7 +2388,7 @@ impl Warden {
     /// [`Warden::torn_down_before_the_marker`]'s question, it costs one GET on
     /// this path alone, and getting it wrong here is not a miscount - the
     /// summary would name a closed account as a mailbox that is down, exit 1
-    /// over it every fifteen minutes, and send an operator to
+    /// over it on every tick, and send an operator to
     /// `squelch-control reconcile <label>`, which is the call that would put it
     /// back on the internet.
     async fn workloadless(&self, name: &TenantName) -> Result<Step, WardenError> {

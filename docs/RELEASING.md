@@ -155,7 +155,7 @@ warden is not a controller: it writes a tenant's objects at provision time and
 never revisits them, so a new `SQUELCH_WARDEN_IMAGE` changes what the next
 signup gets and nothing about the tenants already running. What closes the gap
 is the roller — the CronJob in `90-warden-roller.yaml`, which runs the warden's
-own binary as `squelch-warden roll` every 15 minutes under the warden's
+own binary as `squelch-warden roll` every 5 minutes under the warden's
 ServiceAccount. Each run reads the whole fleet, converges ONE drifted tenant onto
 today's render, waits for that rollout to finish, and exits. Each tenant blips
 for one pod restart; the fleet is never down; no mail is lost, because Gmail is
@@ -168,14 +168,14 @@ Five things about it that will surprise you anyway:
   (`still behind, one per run: N more`). The gap between ticks is the safety
   model, not a scheduling accident: a finished rollout only means the API server
   saw a ready replica, and squelchd binds its socket before it finishes starting,
-  so what actually clears a render is fifteen minutes of a real daemon serving
+  so what actually clears a render is five minutes of a real daemon serving
   real mail followed by a read pass that refuses to roll anything if that mailbox
   is carrying today's render and not up. **Every tick but the last exits 3 and
   marks its Job failed**, which is by design and is why an alert on failed Jobs
   alone is the wrong alert — see PRODUCTION.md.
 
 - **The serving warden does not see a ConfigMap change until it restarts.**
-  `envFrom` is read at pod start. The roller is a fresh pod every 15 minutes and
+  `envFrom` is read at pod start. The roller is a fresh pod every 5 minutes and
   picks the new pin up on its own; the warden keeps rendering the old one into
   new signups and into every `llm mint` until
   `kubectl -n warden rollout restart deploy/squelch-warden`. Apply and restart
@@ -420,9 +420,9 @@ roll the carrier promptly.
    and `20-warden.yaml` is repointed at a tag the registry actually holds
    (PRODUCTION.md, registry-gap note).
 5. Nothing alerts when a roll does not converge. The roller walks the fleet
-   every 15 minutes and halts on the first tenant that does not come back, which
+   every 5 minutes and halts on the first tenant that does not come back, which
    is the right behavior and is invisible: it shows up as a failed Job in ns
-   `warden` and nowhere else, with 24 runs of history — six hours at this
+   `warden` and nowhere else, with 72 runs of history — six hours at this
    schedule — before the evidence rotates away. kube-state-metrics is already
    scraped off carrier, so the alert is
    `kube_job_status_failed{namespace="warden"} > 0`; it wants writing.

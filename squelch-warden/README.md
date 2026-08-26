@@ -557,7 +557,7 @@ verdicts it reached, and `checked` is a sum of verdicts.
 **One read failure does not halt it**, and it is the one that would never stop:
 a workload whose `<label>-credential` Secret is gone can never be rendered by any
 run, so stopping there would park every tenant after it in fleet order behind a
-run that fails at the same label every fifteen minutes. That one is named for a
+run that fails at the same label on every tick, forever. That one is named for a
 person and the walk goes on.
 
 The exit code is the whole interface for whatever scheduled it, and anything
@@ -587,7 +587,7 @@ never restarted does not have.
 
 A run that halts on the SAME label every tick is a render the cluster refuses
 rather than a flaky tenant — the apply was rejected, so nothing was written, so
-that tenant is still drifted and first in the queue again fifteen minutes later.
+that tenant is still drifted and first in the queue again on the next tick.
 Under one-per-tick pacing that is a fleet STALL and not just a noisy tenant: the
 run spends its single attempt on the same label every time, and nothing behind it
 in fleet order moves. A `still behind` count that does not fall across runs is

@@ -7,8 +7,8 @@
 # and one ConfigMap behind two `envFrom`s is how they agree by construction
 # rather than by an operator remembering to diff two files.
 #
-# Two env blocks that disagree take turns rewriting the same tenant every
-# quarter hour, each half behaving correctly and neither one visibly wrong: the
+# Two env blocks that disagree take turns rewriting the same tenant every five
+# minutes, each half behaving correctly and neither one visibly wrong: the
 # roller applies its render, the next signup or `llm mint` writes the other
 # back, pods restart forever, and both drift reports say the fleet is behind.
 #
@@ -31,8 +31,8 @@
 #    starts. The roller picks up a change on its next tick because every run is a
 #    fresh pod; the serving pod does not, and goes on rendering the old values
 #    into new signups until `kubectl -n warden rollout restart
-#    deploy/squelch-warden`. Do both in the same minute: 15 minutes is the whole
-#    window in which the two disagree.
+#    deploy/squelch-warden`. Do both in the same minute: five minutes is the
+#    whole window in which the two disagree.
 # 3. **Quote every value.** `data` is `map[string]string`, and YAML reads a bare
 #    `on` as a boolean, at which point kubectl refuses the whole file with
 #    `cannot unmarshal bool into Go value of type string`. Loud, and only

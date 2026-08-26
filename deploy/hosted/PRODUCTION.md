@@ -598,10 +598,10 @@ Three steps, and only the middle one is a decision.
    when a pod starts: the roller gets the new value on its next tick because
    every run is a fresh pod, and the serving pod goes on rendering the OLD image
    into new signups and into every `llm mint` until it is restarted. Both
-   commands, same minute — fifteen minutes is the whole window in which the two
+   commands, same minute — five minutes is the whole window in which the two
    disagree.
 3. **The roller converges the fleet.** The CronJob in `90-warden-roller.yaml`
-   runs `squelch-warden roll` every 15 minutes, on the warden's image, under the
+   runs `squelch-warden roll` every 5 minutes, on the warden's image, under the
    warden's own ServiceAccount, with the warden's own environment — the same
    ConfigMap, through the same `envFrom`. It reads every tenant in the cluster,
    converges ONE whose live Deployment no longer matches today's render, waits
@@ -632,7 +632,7 @@ One tenant is down at a time, and only while its replacement comes up. That
 guarantee comes from the SCHEDULE and not from a health check inside the run: a
 finished rollout only means the API server saw a ready replica, and by default a
 tenant's probe is a TCP accept on a socket squelchd binds before it finishes
-starting. So the run converges one mailbox and leaves, fifteen minutes of real
+starting. So the run converges one mailbox and leaves, five minutes of real
 traffic happen, and the next tick's read pass refuses to roll anything at all if
 that mailbox is carrying today's render and not serving it.
 
@@ -667,7 +667,7 @@ The six shapes of a 1, and what each wants:
   cannot build the render to compare or apply. The run deliberately does NOT
   halt on it: that state never resolves on its own, and stopping there would
   park every tenant after it in alphabetical order behind a run that fails at
-  the same label every fifteen minutes. The pod is probably still serving (the
+  the same label every five minutes. The pod is probably still serving (the
   daemon copied its credential onto its own volume long ago), so this is not
   urgent in the way a DOWN tenant is — but nothing will ever roll that mailbox
   again until a person puts the Secret back, and there is no automated way to:
@@ -742,7 +742,7 @@ Three parts, each load-bearing:
   fleet is fixed - the same trap that had "Pods not ready" reading 3 over
   yesterday's corpses. The window costs nothing, because a frozen fleet
   RE-RAISES the casualty on every tick: the read pass halts before writing on
-  every run, so the signal renews itself every fifteen minutes for as long as
+  every run, so the signal renews itself every five minutes for as long as
   the problem is real, and goes cold within an hour of being fixed.
 
 That is the frozen fleet: nothing converged, and nothing will until a person
@@ -777,7 +777,7 @@ kubectl delete ns roll-exit-probe
 ```
 
 The split matters more than it looks, because codes 1, 2 and 3 can all be
-**permanent**. A stranded mailbox raises 1 every fifteen minutes until somebody
+**permanent**. A stranded mailbox raises 1 every five minutes until somebody
 reconciles it; an unreadable label raises 2 forever; a stalled queue raises 3
 forever. Each of those is a state an operator can reasonably look at, decide to
 live with for a week, and stop reading. If the casualty shared a code with any
@@ -852,8 +852,8 @@ kubectl -n warden patch cronjob squelch-warden-roll -p '{"spec":{"suspend":false
 
 **A run that halts on the SAME label every tick is a render the cluster refuses,
 not a flaky tenant.** A rejected apply writes nothing, so that tenant is still
-drifted, so it is first in the queue again fifteen minutes later and rejected
-again — ~96 failed Jobs a day and not one tenant converged in any of them. Unlike
+drifted, so it is first in the queue again five minutes later and rejected
+again — ~288 failed Jobs a day and not one tenant converged in any of them. Unlike
 a casualty, this one never moves on its own.
 
 A reconcile applies a tenant's PVC, NetworkPolicy and Service before its
@@ -867,8 +867,8 @@ and `render_rejected` for a render the dry run refused before anything was
 applied). Suspend, put back whatever changed in `15-warden-config.yaml`, restart
 the warden, unsuspend. `squelch-control reconcile <label>` on that one tenant
 reproduces the refusal with the API server's own message when the reason word is
-not enough. `failedJobsHistoryLimit: 24` is what keeps six hours of that evidence
-readable instead of an hour of it.
+not enough. `failedJobsHistoryLimit: 72` is what keeps six hours of that evidence
+readable instead of half an hour of it.
 
 **A run that stops before applying anything is the halt doing its job across
 runs.** The roller reads every tenant before it writes to any of them, and a
@@ -1217,10 +1217,10 @@ would happily stream over the real history.
   has the job (see "Images"), but this node still runs the hand-built image. The
   item closes when `20-warden.yaml` points at a tag GHCR actually holds.
 - **Nothing alerts on a roll that did not converge.** The converging half is
-  covered: the roller (see "Rolling the daemon image") walks the fleet every 15
+  covered: the roller (see "Rolling the daemon image") walks the fleet every 5
   minutes and fixes what it can. What is missing is anybody finding out when it
   cannot. A halt or a foreign-drift skip is a failed Job in ns `warden` and
-  nothing else — no email, no dashboard panel, and `failedJobsHistoryLimit: 24`
+  nothing else — no email, no dashboard panel, and `failedJobsHistoryLimit: 72`
   runs, six hours at this schedule, before the evidence rotates away.
   kube-state-metrics is already scraped off this box, so the alert is
   `kube_job_status_failed{namespace="warden"} > 0` plus a panel; it wants
