@@ -1341,7 +1341,8 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
                 break;
             }
             let n = missing.len();
-            // Flatten each message the SAME way ingest and query do.
+            // Flatten each message the SAME way ingest does. (Query text takes a
+            // different road: search embeds the query as typed, uncut.)
             let store = self.store.clone();
             let embedder = embedder.clone();
             let result = tokio::task::spawn_blocking(move || -> Result<()> {

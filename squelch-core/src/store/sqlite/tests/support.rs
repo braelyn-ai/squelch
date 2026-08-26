@@ -1,7 +1,7 @@
 //! Fixtures shared by the store test modules.
 
 use super::super::*;
-use crate::embed::{Embedder, message_embed_text};
+use crate::embed::{DEFAULT_EMBED_MAX_CHARS, Embedder, message_embed_text};
 use crate::triage::{CalendarInfo, CalendarKind, DeadlineHit, ReceiptInfo};
 use crate::types::{FieldReasons, SealedKind, Sensitivity, Tier};
 use chrono::TimeZone;
@@ -545,7 +545,7 @@ pub(super) fn embed_and_store(
     subject: &str,
     body: &str,
 ) {
-    let text = message_embed_text(subject, body, 2000);
+    let text = message_embed_text(subject, body, DEFAULT_EMBED_MAX_CHARS);
     let v = embedder.embed(&text).unwrap();
     store.upsert_message_vector(acct, message_id, &v).unwrap();
 }

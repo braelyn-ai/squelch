@@ -40,11 +40,16 @@ pub struct EmbedSettings {
     /// Directory the ONNX weights download to on first run.
     pub cache_dir: PathBuf,
     /// Tokens the model reads per text; longer input is truncated at the
-    /// tokenizer. Sets fastembed's `max_length` (its default is 512).
+    /// tokenizer. Sets fastembed's `max_length` (its default is 512). Build
+    /// this through [`crate::config::EmbedConfig::settings`], which clamps the
+    /// value: a small `max_tokens` is not "unlimited", it is broken (see there).
     pub max_tokens: usize,
 }
 
-/// Flatten a message into the canonical text used at both ingest and query time.
+/// Flatten a message into the canonical text embedded AT INGEST (and by the
+/// backfill, which reuses this). Query text does NOT come through here:
+/// `semantic_search` and `hybrid_search` embed the raw query, so `max_chars`
+/// never applies to it and the tokenizer cut is all a long query gets.
 pub fn message_embed_text(subject: &str, body: &str, max_chars: usize) -> String {
     let mut s = String::with_capacity(subject.len() + body.len() + 2);
     s.push_str(subject.trim());
@@ -55,17 +60,35 @@ pub fn message_embed_text(subject: &str, body: &str, max_chars: usize) -> String
     truncate_chars(&s, max_chars)
 }
 
-/// Default number of characters of `subject + body` fed to the embedder.
-/// Paired with [`DEFAULT_EMBED_MAX_TOKENS`]: roughly tokens x 4, so the
-/// character cut and the tokenizer cut land in about the same place.
+/// Default number of characters of `subject + body` fed to the embedder at
+/// ingest. Paired with [`DEFAULT_EMBED_MAX_TOKENS`]: roughly tokens x 4 for
+/// English, so the character cut and the tokenizer cut land in about the same
+/// place. The pairing is an ingest-only story; queries take no character cut.
 pub const DEFAULT_EMBED_MAX_CHARS: usize = 1000;
 
 /// Default token budget per text (fastembed `max_length`). 256, not the model's
 /// 512 ceiling: attention scratch is quadratic in sequence length and a batch
-/// pads to its longest member, so halving this cuts a batch-8 pass from +324 MB
-/// to +123 MB (batch-1: +44 MB to +13 MB). Recall lives in the subject and the
-/// first ~1000 characters; long newsletters lose their tails.
+/// pads to its longest member, so at a `backfill_batch` of 8 an fp32 pass of
+/// 512-token texts adds +324 MB against +123 MB at 256 (at batch 1, +44 MB
+/// against +13 MB); at a larger batch the same ratio applies to a far larger
+/// base. Recall lives in the subject and the first ~1000 characters; long
+/// newsletters lose their tails.
+///
+/// Lowering this leaves the corpus permanently MIXED. There is no re-embed
+/// path: `messages_missing_vectors` only finds messages with NO vector, so mail
+/// embedded at 512 keeps its old vector until `message_vecs` is reset. The
+/// model is CLS-pooled, so the skew between the two reads is modest; it is
+/// accepted and unmeasured, pending a `squelch-eval` recall pass.
 pub const DEFAULT_EMBED_MAX_TOKENS: usize = 256;
+
+/// Floor [`crate::config::EmbedConfig::settings`] clamps `max_tokens` up to.
+/// Keeps 0, 1 and 2 out of the tokenizer, where they do the opposite of what a
+/// small budget looks like it should do; the clamp's own doc has the mechanism.
+pub const EMBED_MAX_TOKENS_FLOOR: usize = 8;
+
+/// Ceiling [`crate::config::EmbedConfig::settings`] clamps `max_tokens` down
+/// to: the pinned model's position budget, past which there is nothing to read.
+pub const EMBED_MAX_TOKENS_CEILING: usize = 512;
 
 /// Deterministic, download-free [`Embedder`] for tests: a bag-of-words hash, so
 /// "planted doc ranks above decoy" is reproducible offline. Not for production —
