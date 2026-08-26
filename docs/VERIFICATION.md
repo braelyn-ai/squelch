@@ -15,7 +15,7 @@ hosted), therefore one verification and one security assessment.
 |---|---|---|
 | **1. Brand verification** | Automated + human check of app name, logo, home page, privacy policy, domain ownership. 2-3 business days. | Everything below |
 | **2. Restricted scope verification** | Scope declarations, justifications, permitted application type, demo video. Human review. | Consent above 100 users |
-| **3. CASA Tier 2** | Independent security assessment by an App Defense Alliance authorized lab: DAST scan against production plus a self-assessment questionnaire. ~$540-1,000, and the long pole. Repeats **every 12 months**. | Final approval |
+| **3. CASA Tier 2** | Independent security assessment by an App Defense Alliance authorized lab. The long pole, and the only gate with a bill attached. Repeats **every 12 months**. | Final approval |
 
 Total realistic lead time from a clean submission: **4-12 weeks**.
 
@@ -196,6 +196,28 @@ Up to three. Use:
 Engage an App Defense Alliance authorized lab once scope verification is under
 way; the assessment and Google's review can overlap, and the LOA date starts the
 12-month clock, so do not start it early for nothing.
+
+### What it costs: get quotes, do not trust a number
+
+**Do not budget this off a blog post, including the numbers below.** The cheap
+figures in circulation (TAC Security's ~$540 entry price is the one everybody
+quotes) are for the **self-scan** path, where the developer runs the AST tools
+and a lab only validates the output without touching code or infrastructure.
+The ADA's own Tier 2 page now carries a banner reading "The CASA self scanning
+process is deprecated," and its assurance-levels page describes both AL1 and AL2
+as *Lab Tested - Lab Verified*. The cheap tier is the one being retired, so
+pricing anchored to it is pricing the past.
+
+Reported lab quotes span roughly **$500 to $4,500**, with $900-$1,500 typical
+and some labs starting at $1,200+. TAC Security is the only lab Google labels a
+*preferred* partner, with pricing it negotiated for developers, so it is worth a
+quote even if it is not the one we take.
+
+Assume the **upper** half of that range, because labs price on complexity and
+Passband is not one web app. The scope below is five surfaces plus a
+multi-tenant cluster; a quote at the bottom of the range means the lab has
+misunderstood what it is assessing, which is a worse problem than a big invoice.
+Get three quotes against the scope table, in writing, before committing.
 
 **Assessment scope is everything that touches Gmail data**, which is more than
 the daemon:
