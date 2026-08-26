@@ -222,7 +222,19 @@ pub struct Config {
     pub user_namespaces: bool,
     /// Optional PVC holding a pre-seeded embedding-weights cache. When set,
     /// every tenant's init container copies from it instead of each tenant
-    /// downloading ~130 MB from Hugging Face on first boot.
+    /// downloading ~126 MB from Hugging Face on first boot.
+    ///
+    /// The copy is per model directory and skips what the tenant already has,
+    /// so it also fills in a model a tenant is missing rather than only ever
+    /// seeding an empty cache; see [`crate::objects::SEED_SCRIPT`]. Nothing a
+    /// tenant downloaded itself is ever overwritten, and a copy that fails
+    /// leaves the pod up: the daemon downloads what it does not find.
+    ///
+    /// NOTHING HERE CHECKS THAT THE PVC EXISTS. This name is rendered straight
+    /// into every tenant's pod spec, and a name that resolves to no claim
+    /// leaves each new tenant pod Pending on a volume that will never bind.
+    /// Seed the volume first; `deploy/hosted/SETUP.md` step 10 is the order,
+    /// and `deploy/hosted/PRODUCTION.md` has what the failure looks like.
     pub model_pvc: Option<String>,
     /// The node network, when the CNI drops kubelet probe traffic without one.
     ///

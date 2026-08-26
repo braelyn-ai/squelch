@@ -303,6 +303,61 @@ pub const BLOCKED_EGRESS_CIDRS: &[&str] = &[
 /// operator configured a model PVC (see `deploy/hosted/SETUP.md`). Copied
 /// rather than symlinked because the daemon's root filesystem is read-only and
 /// fastembed expects to own its cache directory.
+///
+/// PER MODEL DIRECTORY, not per cache. The obvious condition is "copy if the
+/// cache directory does not exist", and it has a hole the size of the whole
+/// feature: a tenant that booted once BEFORE the PVC was configured downloaded
+/// its own weights, so the cache directory exists, so it never takes anything
+/// from the PVC again, including a model it does not have. Every tenant
+/// provisioned before this volume existed is in exactly that state, and so is
+/// every tenant on the day the pinned model changes. Copying entry by entry and
+/// skipping the ones already present fixes both, keeps the tenant's own
+/// downloads untouched, and stays idempotent across restarts. `$m` is
+/// `/models/<model dir>`, so `${m#/models/}` is its name without needing
+/// `basename` in the image.
+///
+/// Per DIRECTORY is also what makes the copy safe. A model in fastembed's
+/// Hugging Face cache layout is mostly symlinks from `snapshots/` into
+/// `blobs/`, and whether `cp -r` recreates those or dereferences them differs
+/// between coreutils and BSD. Either is correct here, because the links are
+/// relative and point inside the directory being copied: preserved they still
+/// resolve, dereferenced the copy is just bigger. A per-file copy is what would
+/// break, which is why the loop iterates `/models/*` and not what is under it.
+///
+/// TEMP PATH THEN RENAME, because "skip what is already there" and "copy in
+/// place" combine into a trap. A `cp -r` straight to `$d` that dies partway
+/// (the node under memory pressure, the init container OOM-killed, a source
+/// file it cannot read) leaves a half-populated model directory, and every
+/// later boot sees `-e "$d"` and skips it. What that costs depends on how it
+/// died: hf-hub re-fetches what it cannot resolve, so a missing snapshot
+/// pointer or a dangling link only makes the tenant pay the download it was
+/// meant to skip. The one that does not heal is a TRUNCATED file at the right
+/// path, which looks fetched and fails at session load. Copying to
+/// `$d.seed-tmp` and renaming means `$d` only ever appears complete: rename is
+/// atomic, and both paths are on the tenant's own volume so it is a rename and
+/// not a cross-device copy. The `rm -rf "$t"` at the top of each iteration
+/// sweeps the leftovers of a run that died, so an interrupted seed costs disk
+/// once rather than accumulating.
+///
+/// A FAILED MODEL COPY IS NOT A FAILED POD. The weights half is best-effort by
+/// construction: the daemon can always download what it does not find, so the
+/// worst a failure here costs is the slow first boot this feature exists to
+/// avoid. Fatal, it would cost the fleet. `set -eu` plus one unreadable file on
+/// the shared volume (a PVC whose modes or ownership are wrong, which
+/// `deploy/hosted/SETUP.md` step 10 warns about) exits the init container 1 on
+/// EVERY tenant's next roll, and [`crate::provision`]'s roll reads a tenant
+/// that will not come up as a casualty and halts. So the copy is chained rather
+/// than trusted to `set -e`, and a failure sweeps its own temp directory and
+/// says so on stderr. The credentials half above stays strict: a daemon with no
+/// credentials file is not a daemon, and there is nothing for it to fall back
+/// to.
+///
+/// The limit, stated: this protects a directory THIS script wrote. A cache
+/// already half-populated under the model's real name (a download the daemon
+/// itself did not finish) is indistinguishable from a good one at `-e`, and the
+/// script leaves it alone. Repairing that is the operator's job, and the
+/// procedure is the reclaim step in `deploy/hosted/PRODUCTION.md`: delete the
+/// bad directory and let the next boot seed or re-download it.
 pub const SEED_SCRIPT: &str = "set -eu\n\
     want=$(sha256sum /etc/squelch/credential/credentials.json | cut -d ' ' -f 1)\n\
     have=''\n\
@@ -312,9 +367,19 @@ pub const SEED_SCRIPT: &str = "set -eu\n\
     \x20 chmod 600 /data/credentials.json\n\
     \x20 printf '%s\\n' \"$want\" > /data/.credentials.seed\n\
     fi\n\
-    if [ -d /models ] && [ ! -d /data/.local/share/squelch/models ]; then\n\
-    \x20 mkdir -p /data/.local/share/squelch\n\
-    \x20 cp -r /models /data/.local/share/squelch/models\n\
+    if [ -d /models ] && mkdir -p /data/.local/share/squelch/models; then\n\
+    \x20\x20for m in /models/*; do\n\
+    \x20\x20\x20\x20[ -e \"$m\" ] || continue\n\
+    \x20\x20\x20\x20d=/data/.local/share/squelch/models/${m#/models/}\n\
+    \x20\x20\x20\x20t=$d.seed-tmp\n\
+    \x20\x20\x20\x20rm -rf \"$t\"\n\
+    \x20\x20\x20\x20if [ ! -e \"$d\" ]; then\n\
+    \x20\x20\x20\x20\x20\x20cp -r \"$m\" \"$t\" && mv \"$t\" \"$d\" || {\n\
+    \x20\x20\x20\x20\x20\x20\x20\x20rm -rf \"$t\"\n\
+    \x20\x20\x20\x20\x20\x20\x20\x20echo \"squelch-seed: could not copy ${m#/models/}, the daemon will download it\" >&2\n\
+    \x20\x20\x20\x20\x20\x20}\n\
+    \x20\x20\x20\x20fi\n\
+    \x20\x20done\n\
     fi\n";
 
 /// The init container's bounds. Constants rather than config: it copies at most
@@ -2186,6 +2251,69 @@ mod tests {
         assert!(SEED_SCRIPT.contains("if [ \"$want\" != \"$have\" ]"));
         // The old no-clobber guard is what made rotation impossible.
         assert!(!SEED_SCRIPT.contains("if [ ! -f /data/credentials.json ]"));
+    }
+
+    /// The weights half seeds model by model. The whole-cache guard it replaced
+    /// could only ever fire on a tenant's very first boot, which meant a tenant
+    /// provisioned before the PVC existed, or one alive on the day the pinned
+    /// model changed, took nothing from it ever again and downloaded instead.
+    #[test]
+    fn the_seed_script_fills_in_a_missing_model_beside_the_ones_a_tenant_has() {
+        // The guard that made it first-boot-only.
+        assert!(!SEED_SCRIPT.contains("[ ! -d /data/.local/share/squelch/models ]"));
+        // Per entry, and skipping what is already there.
+        assert!(SEED_SCRIPT.contains("for m in /models/*; do"));
+        assert!(SEED_SCRIPT.contains("if [ ! -e \"$d\" ]; then"));
+        // `set -eu` still governs the credentials half above: an unset variable
+        // or a failed install there must stop the container.
+        assert!(SEED_SCRIPT.starts_with("set -eu\n"));
+    }
+
+    /// The destination appears complete or not at all. Copying in place would
+    /// pair with the "skip what exists" guard to make one interrupted `cp` a
+    /// permanent one: the half-copied directory is skipped by every later boot.
+    /// hf-hub re-fetches a dangling link, so most of those heal at the price of
+    /// the download; a truncated file at the right path does not.
+    #[test]
+    fn a_model_is_copied_to_a_temp_path_and_renamed_into_place() {
+        assert!(SEED_SCRIPT.contains("t=$d.seed-tmp"));
+        assert!(SEED_SCRIPT.contains("cp -r \"$m\" \"$t\""));
+        assert!(SEED_SCRIPT.contains("mv \"$t\" \"$d\""));
+        // Never the destination directly: that is the whole bug.
+        assert!(!SEED_SCRIPT.contains("cp -r \"$m\" \"$d\""));
+        // An interrupted run costs disk once, not once per restart.
+        assert!(SEED_SCRIPT.contains("rm -rf \"$t\""));
+        // And the sweep has to come BEFORE the copy, or it collects the temp
+        // directory the same iteration just built.
+        let sweep = SEED_SCRIPT.find("rm -rf \"$t\"").unwrap();
+        let copy = SEED_SCRIPT.find("cp -r \"$m\" \"$t\"").unwrap();
+        assert!(sweep < copy, "the sweep must precede the copy");
+    }
+
+    /// A model the init container cannot copy costs that tenant the download
+    /// this feature exists to avoid. Fatal, it would cost the FLEET: one source
+    /// file the container cannot read (a shared volume whose modes or ownership
+    /// are wrong) exits every tenant's init container 1 on its next roll, and
+    /// [`crate::provision`]'s roll reads a tenant that will not come up as a
+    /// casualty and halts. So the copy is chained, not left to `set -e`.
+    #[test]
+    fn a_failed_model_copy_does_not_fail_the_pod() {
+        // Chained, with the fallback branch that keeps the shell's status 0.
+        assert!(SEED_SCRIPT.contains("cp -r \"$m\" \"$t\" && mv \"$t\" \"$d\" || {"));
+        assert!(SEED_SCRIPT.contains("the daemon will download it"));
+        // The fallback sweeps its own wreckage, so a failure costs no disk.
+        let fallback = SEED_SCRIPT.find("|| {").unwrap();
+        let swept = SEED_SCRIPT[fallback..].find("rm -rf \"$t\"").unwrap();
+        let said = SEED_SCRIPT[fallback..].find("squelch-seed: could not copy").unwrap();
+        assert!(swept < said, "sweep the temp path before saying so");
+        // `mkdir -p` rides in the `if` condition for the same reason: a failure
+        // there is a verdict, not an exit.
+        assert!(SEED_SCRIPT
+            .contains("if [ -d /models ] && mkdir -p /data/.local/share/squelch/models; then"));
+        // The credentials half stays strict. A daemon with no credentials file
+        // is not a daemon, and it has nothing to fall back to.
+        assert!(SEED_SCRIPT
+            .contains(" cp /etc/squelch/credential/credentials.json /data/credentials.json\n"));
     }
 
     #[test]
