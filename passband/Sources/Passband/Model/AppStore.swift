@@ -2264,6 +2264,16 @@ final class AppStore {
     /// somebody through a Google consent screen for nothing.
     var gmailDisconnected: Bool { sitrep.stats?.gmail?.connected == false }
 
+    /// A mailbox catch-up in flight, as `(done, total)`.
+    ///
+    /// Nil is the normal state. When it is not nil, triage is blocked upstream
+    /// and anything waiting on a verdict is waiting on this — which is the one
+    /// thing a stalled-looking progress bar needs to be able to say.
+    var catchUp: (done: Int, total: Int)? {
+        guard let c = sitrep.stats?.catch_up, c.total > 0 else { return nil }
+        return (c.done, c.total)
+    }
+
     /// Where to re-consent, when the daemon offered a link.
     ///
     /// Hosted only. A self-host mailbox is repaired with `squelchd auth` at a

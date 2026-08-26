@@ -30,6 +30,7 @@ struct GmailHealthTests {
         selfHostIsToldWithoutALink()
         silenceIsNotGoodNews()
         bothStampShapesParse()
+        aCatchUpExplainsAStalledQueue()
 
         if failures > 0 {
             print("FAILED: \(failures) of \(checks) checks")
@@ -121,6 +122,30 @@ struct GmailHealthTests {
         expect(Fmt.date("2026-08-26T00:01:25Z") != nil, "and the Z spelling")
         expect(Fmt.date(nil) == nil, "nil in, nil out")
         expect(Fmt.date("not a date") == nil, "and garbage does not become a date")
+    }
+
+    /// A catch-up in flight is what a client shows instead of "not moving".
+    /// Absent is the normal state, so absence must decode to nil rather than to
+    /// a zeroed object that would read as a run stuck at 0 of 0.
+    static func aCatchUpExplainsAStalledQueue() {
+        guard let none = decode(stats(gmail: nil)) else {
+            return expect(false, "stats without a catch-up decode")
+        }
+        expect(none.catch_up == nil, "no catch-up decodes to nil, not to 0 of 0")
+
+        let json = """
+            {"tier_counts":{},"total":0,"sealed":0,\
+            "bands":{"standing":0,"new":0,"open":0},"catch_up":{"done":1240,"total":4500}}
+            """
+        guard let s = try? JSONDecoder().decode(StoreStats.self, from: Data(json.utf8)),
+            let c = s.catch_up
+        else {
+            return expect(false, "a catch-up in flight decodes")
+        }
+        expect(c.done == 1240 && c.total == 4500, "and carries both numbers")
+        // The numbers are the whole point: "not moving" and "1,240 of 4,500"
+        // are the same screen otherwise, and only one is worth waiting through.
+        expect(c.done < c.total, "a run in flight has somewhere left to go")
     }
 
     static func expect(_ cond: Bool, _ what: String) {
