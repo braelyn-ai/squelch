@@ -25,6 +25,21 @@ Shared vCPU on purpose: tenant daemons are idle between syncs, and dedicated
 using. Scale vertically by resizing **CPU and RAM only** — a Hetzner resize that
 grows the disk is a one-way door and blocks every later downsize.
 
+Memory is the axis that fills first, and there is no swap under it. A tenant
+daemon that has embedded anything keeps its ONNX session resident and rests at
+250-300 MB (on 2026-08-26 the four tenant pods were at 123, 293, 349 and 545 MB
+RSS), and on 2026-08-19 four of them ran this box out of memory globally: the
+kernel OOM-killed two squelchd processes, picking running mailboxes because a
+burstable pod is what it picks. The warden's memory request was 256Mi at the
+time and is 384Mi now (`15-warden-config.yaml`), which is what makes the
+scheduler refuse the signup that will not fit instead of letting the kernel pick
+a victim that is already serving. At that request, with roughly 1.2 GB of k3s,
+system and monitoring agent outside every pod's budget, this box holds about six
+tenants; the seventh is a resize (RAM only, above) or the daemon-side embedder
+unload landing first, whichever comes sooner. Existing tenants take a changed
+bound the way they take any pod-shape change: see "Shipping a tenant-shape
+change".
+
 ## The volume
 
 | | |

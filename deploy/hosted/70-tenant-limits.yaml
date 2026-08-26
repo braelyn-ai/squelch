@@ -37,7 +37,7 @@ spec:
         ephemeral-storage: 1Gi
       defaultRequest:
         cpu: 100m
-        memory: 256Mi
+        memory: 384Mi
         ephemeral-storage: 256Mi
       # The ceiling nothing in this namespace may exceed. One tenant is not
       # allowed to ask for the whole box.
@@ -64,20 +64,35 @@ metadata:
 spec:
   hard:
     # Requests are what the scheduler reserves, so this is the real capacity
-    # number: at the shipped 100m/256Mi per tenant, this is about 20 tenants.
+    # number, and it is sized to the NODE rather than to a tenant count you
+    # would like to have. k3s reserves nothing for itself by default, so the
+    # scheduler treats the whole box as allocatable when about 1.2 GB of it is
+    # k3s, the system and the monitoring agent; a quota above what is left over
+    # is a quota that never refuses anybody, and the kernel's OOM killer does
+    # the refusing instead, against a mailbox that is already serving. That is
+    # 2026-08-19 in one line: this said 5Gi on a 4 GB box, four tenants were
+    # enough, and two squelchd processes died.
+    #
+    # On the 4 GB floor about 2.5 GB is left for tenant pods, and at the shipped
+    # 100m/384Mi that is SIX tenants: 6 x 384Mi is 2304Mi and fits, 7 x 384Mi is
+    # 2688Mi and does not. CPU never binds first here - at 100m the same 2 vCPU
+    # carries twenty - so memory is the number to redo when you resize the box.
     requests.cpu: "2"
-    requests.memory: 5Gi
+    requests.memory: 2560Mi
     requests.ephemeral-storage: 5Gi
     # Limits may oversubscribe, because tenants are idle most of the time and a
-    # sync burst is short. Do not raise this ratio much past 4x on one node.
+    # sync burst is short. Do not raise this ratio much past 4x on one node,
+    # which is what 10Gi against 2560Mi of requests is.
     limits.cpu: "8"
-    limits.memory: 20Gi
+    limits.memory: 10Gi
     limits.ephemeral-storage: 20Gi
     # The mail. Local-path storage is the box's disk, and a claim that cannot
     # bind is a tenant that never comes up.
     requests.storage: 200Gi
     persistentvolumeclaims: "25"
     # A blunt ceiling on how much can exist here at all. One tenant is one pod,
-    # so this is also the tenant count.
+    # so this is a tenant count too, but it is not the one that binds: on the
+    # 4 GB floor `requests.memory` above refuses the seventh signup long before
+    # this refuses the twenty-sixth. Raise the memory line, not this one.
     pods: "25"
     count/secrets: "60"

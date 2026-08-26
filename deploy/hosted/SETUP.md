@@ -470,7 +470,7 @@ are deliberately conservative.
 
 The warden already puts requests and limits on both containers of every tenant
 pod (`SQUELCH_WARDEN_CPU_REQUEST` and friends in `15-warden-config.yaml`,
-defaulting to 100m/256Mi requested and 1000m/1Gi allowed, plus a 512Mi cap on
+defaulting to 100m/384Mi requested and 1000m/1Gi allowed, plus a 512Mi cap on
 the pod's `/tmp` and an ephemeral-storage bound so a runaway tenant cannot fill
 the node's root filesystem). This file is the layer under that: defaults for
 anything that lands in the namespace without bounds of its own, and an aggregate
@@ -478,9 +478,20 @@ ceiling.
 
 Sizing, in the order that matters:
 
-- **`requests.cpu` and `requests.memory` are your tenant count.** The scheduler
-  reserves requests, so at the shipped 100m/256Mi a 2-vCPU box carries about 20
-  tenants and no more, whatever the quota says about pods.
+- **`requests.memory` is your tenant count, and the box picks it, not you.** The
+  scheduler reserves requests, and k3s reserves nothing for itself, so the
+  scheduler treats the whole box as allocatable when about 1.2 GB of it is k3s,
+  the system and the monitoring agent. Size the quota to what is left: on the
+  4 GB floor that is about 2.5 GB, which at the shipped 384Mi is six tenants
+  and no more, whatever the quota says about pods. CPU is the smaller problem
+  (at 100m a 2-vCPU box carries twenty), and memory refuses long before it.
+- **The request itself has to be true.** It is a promise about a daemon's
+  resting size and the scheduler has nothing else to go on. A daemon that has
+  embedded anything keeps its ONNX session resident and rests at 250-300 MB,
+  and while this said 256Mi, four tenants ran a 4 GB box out of memory on
+  2026-08-19 and the kernel OOM-killed two of them: tenant pods are burstable,
+  so they are what it picks. At 384Mi the signup that would not fit is refused
+  instead (below), which is the failure you want and the one you can read.
 - **Limits may oversubscribe.** Tenants are idle most of the time and a sync
   burst is seconds long. 4x requests is comfortable on one node; much past that
   and a few simultaneous backfills evict each other.
@@ -494,7 +505,11 @@ Sizing, in the order that matters:
 
 A tenant refused by the quota looks like a provision that times out
 (`500 not_ready`), with the real reason in
-`kubectl -n tenants describe replicaset`.
+`kubectl -n tenants describe replicaset`. A quota looser than the node fails one
+layer further down and looks much the same: the pod is created, never scheduled,
+and `kubectl -n tenants describe pod` says `Insufficient memory`. Either way a
+signup is refused, which is the outcome you want; a quota sized to the node just
+gives the refusal a reason an operator can read at 3am.
 
 ## 8. The warden
 

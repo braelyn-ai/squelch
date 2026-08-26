@@ -68,7 +68,37 @@ pub const DEFAULT_CPU_REQUEST: &str = "100m";
 pub const DEFAULT_CPU_LIMIT: &str = "1000m";
 
 /// A tenant daemon's memory floor: SQLite plus the ONNX embedder's working set.
-pub const DEFAULT_MEMORY_REQUEST: &str = "256Mi";
+///
+/// A request is a promise about the p50, and the scheduler is the thing that
+/// believes it. This said 256Mi until somebody measured the promise: on the
+/// carrier box (3 vCPU, 3814 MiB, no swap) the four tenant pods were sitting at
+/// 123, 293, 349 and 545 MB RSS, because a daemon that has embedded anything
+/// keeps its ONNX session resident and rests at 250-300 MB. So the scheduler
+/// was reserving 256Mi per tenant while the kernel paid about 300, and on
+/// 2026-08-19 the node ran out of memory globally with FOUR tenants on it and
+/// OOM-killed two squelchd processes.
+///
+/// Which tenant dies in that is nobody's decision. A tenant pod is burstable
+/// (request below limit, `oom_score_adj` 933), so the kernel picks a RUNNING
+/// mailbox over anything the node keeps for itself, and the signup that
+/// overcommitted the box finished successfully minutes or days earlier. That is
+/// exactly the failure a request exists to prevent: with the request telling
+/// the truth, the tenant that will not fit fails to SCHEDULE, which surfaces at
+/// signup as the already-documented `500 not_ready` (`deploy/hosted/SETUP.md`
+/// §7, "A tenant refused by the quota looks like a provision that times out")
+/// rather than as a dead neighbour.
+///
+/// 384Mi is today's truth and a stopgap, not a target. The daemon-side work in
+/// flight - unloading the embedder when it goes idle, smaller embed batches -
+/// brings the real number down over the coming weeks, so revisit this off a
+/// week of `container_memory_working_set_bytes` at p50 and p99 rather than off
+/// a feeling. The limit stays at 1Gi: that one is the ceiling, this one is the
+/// promise, and they answer different questions.
+///
+/// Inert in production on its own. `deploy/hosted/15-warden-config.yaml`
+/// restates every bound as an env entry and an env entry outranks this
+/// constant, so a change here that is not made there ships nothing.
+pub const DEFAULT_MEMORY_REQUEST: &str = "384Mi";
 
 /// A tenant daemon's memory ceiling. Past this the container is OOM-killed and
 /// restarted, which is one tenant down rather than the node down.
@@ -988,7 +1018,7 @@ mod tests {
         assert_eq!(c.storage_size, "10Gi");
         assert_eq!(c.daemon_resources.cpu_request, "100m");
         assert_eq!(c.daemon_resources.cpu_limit, "1000m");
-        assert_eq!(c.daemon_resources.memory_request, "256Mi");
+        assert_eq!(c.daemon_resources.memory_request, "384Mi");
         assert_eq!(c.daemon_resources.memory_limit, "1Gi");
         assert_eq!(c.daemon_resources.ephemeral_request, "256Mi");
         assert_eq!(c.daemon_resources.ephemeral_limit, "1Gi");

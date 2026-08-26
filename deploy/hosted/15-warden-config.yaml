@@ -163,9 +163,24 @@ data:
   SQUELCH_WARDEN_CONSOLE_SSO_URL: "https://signup.passband.app"
   # Per-tenant-container bounds. The number of tenants a box carries is these
   # divided into it; size them with 70-tenant-limits.yaml, not separately.
+  #
+  # The memory request is a promise about a daemon's resting size and the
+  # scheduler believes it, so it has to be true. It said 256Mi while a daemon
+  # that has embedded anything rests at 250-300 MB (the ONNX session stays
+  # resident), and on 2026-08-19 the node ran out of memory with FOUR tenants
+  # on it; the kernel took two of them, because a burstable tenant pod is what
+  # it picks. 384Mi is what they measure at. With it, the tenant that will not
+  # fit is refused at signup instead of a running mailbox being killed for it.
+  # Revisit once the daemon unloads its embedder when idle; the constant in
+  # squelch-warden/src/config.rs carries the measurements.
+  #
+  # These land on the tenant DEPLOYMENT, which is the one object a drift report
+  # renders, so unlike the ingress and storage knobs above a change here does
+  # reach existing tenants: the roller converges them one per tick, each as an
+  # ordinary pod restart, once rule 2 has been followed.
   SQUELCH_WARDEN_CPU_REQUEST: "100m"
   SQUELCH_WARDEN_CPU_LIMIT: "1000m"
-  SQUELCH_WARDEN_MEMORY_REQUEST: "256Mi"
+  SQUELCH_WARDEN_MEMORY_REQUEST: "384Mi"
   SQUELCH_WARDEN_MEMORY_LIMIT: "1Gi"
   SQUELCH_WARDEN_EPHEMERAL_REQUEST: "256Mi"
   SQUELCH_WARDEN_EPHEMERAL_LIMIT: "1Gi"
