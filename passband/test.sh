@@ -148,6 +148,7 @@ run_suite remind-times \
 # guarding it are asserted rather than reasoned about. Pure string work;
 # WireTypes and Format ride along for the Tier and the capitalizer.
 run_suite sender-identity \
+  Sources/Passband/Model/SubjectText.swift \
   Sources/Passband/Model/WireTypes.swift \
   Sources/Passband/Lib/Format.swift \
   Sources/Passband/Lib/AsyncMemo.swift \

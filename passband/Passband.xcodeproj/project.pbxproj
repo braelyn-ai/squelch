@@ -205,11 +205,8 @@
 		C8B62E16CC9F5AE6DA3B774E /* RemindTimes.swift in Sources */ = {isa = PBXBuildFile; fileRef = CDDAB6C380027F87A19022BF /* RemindTimes.swift */; };
 		C8FCFA76D21B9E6DC3093D18 /* SwipeRow.swift in Sources */ = {isa = PBXBuildFile; fileRef = C465B24E00D0436CD5704294 /* SwipeRow.swift */; };
 		CDD154C0CEFB4D530E29DD34 /* Format.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5883BA424612265657845246 /* Format.swift */; };
-<<<<<<< HEAD
-		CF34A69E15DFE9980A622162 /* WhatsNewCard.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0AFCAEC0D83E0E01D0074CE7 /* WhatsNewCard.swift */; };
-=======
 		CF0065AF30C9FC626811FF50 /* RetriageModal.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA00E655EE0625FDF367DA22 /* RetriageModal.swift */; };
->>>>>>> 455bf9c (retriage: a blocking modal that counts the queues down)
+		CF34A69E15DFE9980A622162 /* WhatsNewCard.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0AFCAEC0D83E0E01D0074CE7 /* WhatsNewCard.swift */; };
 		D026185D5848A86409FAE120 /* Sessions.swift in Sources */ = {isa = PBXBuildFile; fileRef = DA80DD18A355200FB6274585 /* Sessions.swift */; };
 		D1722EF952905C3BCED61CD5 /* AuthCodeModal.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A47FA6986F50A4E81628452 /* AuthCodeModal.swift */; };
 		D4A4EA8324A57E2B01720266 /* ImageRepeats.swift in Sources */ = {isa = PBXBuildFile; fileRef = EFF2F03B0D68F54C0DC28777 /* ImageRepeats.swift */; };
@@ -486,11 +483,8 @@
 				361AB4D81F3740E2B072C5BA /* QuickLookPanel.swift */,
 				759702EBD03C1CECFD041E57 /* ReadReceipt.swift */,
 				327BC236C39F192198AFEF7D /* RecipientField.swift */,
-<<<<<<< HEAD
 				99CB7E94EB2C7C52575AF7A8 /* RemindPalette.swift */,
-=======
 				AA00E655EE0625FDF367DA22 /* RetriageModal.swift */,
->>>>>>> 455bf9c (retriage: a blocking modal that counts the queues down)
 				AE10D75BA4192F5F1B8977E9 /* RevealPanel.swift */,
 				4EE9B2C6A8850905B874A1ED /* RulesView.swift */,
 				EA2D959F49735AD9EDD13910 /* SentRow.swift */,
@@ -933,14 +927,11 @@
 				39808BC8E64BACBC8B8DCB4F /* ReadReceipt.swift in Sources */,
 				F3193F08328E9F5CC6BFCE27 /* RecipientField.swift in Sources */,
 				A19640E9DA24D6C6F85E215C /* RelayProxy.swift in Sources */,
-<<<<<<< HEAD
 				526581101F846DEC04813704 /* ReleaseNotes.swift in Sources */,
 				2E55F517D48F9CE4E5882C21 /* RemindPalette.swift in Sources */,
 				39B48BCF60CA5737C7088687 /* RemindTimes.swift in Sources */,
-=======
 				346B6C45B35972DC0A41FD9C /* RetriageModal.swift in Sources */,
 				D950DAEE748237F8D4002E11 /* RetriageRun.swift in Sources */,
->>>>>>> 455bf9c (retriage: a blocking modal that counts the queues down)
 				60753017D3F0F1ACA0080D4B /* RevealPanel.swift in Sources */,
 				647DD68EDE188660654C0D27 /* RootView.swift in Sources */,
 				EF23C4EDACBC4D1216F580D5 /* RulesView.swift in Sources */,
@@ -1068,14 +1059,11 @@
 				30B0B95981F83062CAD29D3F /* ReadReceipt.swift in Sources */,
 				6277F73C5576C9955C6B0656 /* RecipientField.swift in Sources */,
 				65404ACF0C3CD7B16721D3E8 /* RelayProxy.swift in Sources */,
-<<<<<<< HEAD
 				693321A39E2B0E50EC447924 /* ReleaseNotes.swift in Sources */,
 				C7AF257F381B402E8C1F1839 /* RemindPalette.swift in Sources */,
 				C8B62E16CC9F5AE6DA3B774E /* RemindTimes.swift in Sources */,
-=======
 				CF0065AF30C9FC626811FF50 /* RetriageModal.swift in Sources */,
 				8C7DC76677CBEE6FB72CE8F8 /* RetriageRun.swift in Sources */,
->>>>>>> 455bf9c (retriage: a blocking modal that counts the queues down)
 				7613233831674BFA6CE84C42 /* RevealPanel.swift in Sources */,
 				85057E3EAED4D8F071ECD75B /* RulesView.swift in Sources */,
 				4A6FA53C127DAD99FB5AF300 /* SenderIdentity.swift in Sources */,

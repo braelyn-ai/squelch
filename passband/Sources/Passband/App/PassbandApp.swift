@@ -234,6 +234,11 @@ struct PassbandCommands: Commands {
         CommandGroup(replacing: .help) {
             Button("Keyboard Shortcuts") { store.shortcutsOpen = true }
                 .keyboardShortcut("/", modifiers: [.command])
+                // Not harmful, just untidy: the overlay would open UNDERNEATH
+                // the re-triage modal and still be sitting there when the run
+                // ends. Theme and Check for Updates stay live — neither
+                // navigates, writes, nor leaves a surface behind.
+                .disabled(blocked)
         }
     }
 }
