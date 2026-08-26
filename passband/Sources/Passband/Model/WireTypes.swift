@@ -441,6 +441,127 @@ struct BankingRecord: Codable, Sendable, Identifiable, Hashable {
     var received_at: String
 }
 
+// MARK: - send groups
+
+/// How a group addresses its members. A property of the AUDIENCE, chosen when
+/// the group is made rather than per message: an investor list is
+/// individually-addressed every time or it is not one.
+enum GroupMode: String, Codable, Sendable, CaseIterable, Hashable {
+    /// One message, everyone in To. They see each other.
+    case to
+    /// One message, everyone in Bcc. They do not.
+    case bcc
+    /// One message PER member. Replies come back as private threads and read
+    /// receipts are per recipient.
+    case individual
+
+    var label: String {
+        switch self {
+        case .to: "To"
+        case .bcc: "Bcc"
+        case .individual: "Individually"
+        }
+    }
+
+    /// What picking this mode does to the composer, said in the one line the
+    /// picker has room for. No em dashes: user-facing copy.
+    var blurb: String {
+        switch self {
+        case .to: "everyone sees the whole list"
+        case .bcc: "nobody sees anyone else"
+        case .individual: "one separate email each"
+        }
+    }
+
+    var symbol: String {
+        switch self {
+        case .to: "person.2"
+        case .bcc: "eye.slash"
+        case .individual: "arrow.triangle.branch"
+        }
+    }
+}
+
+/// One mailbox in a group.
+struct GroupMember: Codable, Sendable, Hashable, Identifiable {
+    var addr: String
+    var display_name: String?
+
+    var id: String { addr }
+
+    /// What a pill or a member row shows: the name when the daemon has one,
+    /// the address otherwise.
+    var label: String {
+        guard let name = display_name, !name.isEmpty else { return addr }
+        return name
+    }
+}
+
+/// GET /client/groups. `members` is EMPTY on the list read and populated on the
+/// single-group read, so a sidebar listing is never a contacts dump.
+struct SendGroup: Codable, Sendable, Identifiable, Hashable {
+    var id: Int
+    var name: String
+    var slug: String
+    var mode: GroupMode
+    var note: String
+    var member_count: Int
+    var members: [GroupMember]?
+    var last_sent_at: String?
+    var created_at: String
+    var updated_at: String
+}
+
+struct GroupBody: Codable, Sendable {
+    var name: String
+    var mode: GroupMode
+    var note: String
+    var members: [GroupMember]
+}
+
+/// GET /client/groups/{id}/history — one entry, from either source. A RECORDED
+/// send names `group_send_id`; a DERIVED one (mail matched against the current
+/// membership, which is what lets a new group show the year that preceded it)
+/// names only the message.
+struct GroupHistoryEntry: Codable, Sendable, Identifiable, Hashable {
+    var group_send_id: Int?
+    var message_id: Int?
+    var thread_id: String?
+    var subject: String
+    var snippet: String
+    var sent_at: String
+    var mode: GroupMode
+    /// How many of the group this reached.
+    var reached: Int
+    /// The denominator: the snapshot taken at send time for a recorded entry,
+    /// the CURRENT membership for a derived one.
+    var group_size: Int
+    /// Recipients a fan-out never reached. Always 0 for a derived entry.
+    var failed: Int
+    var opens: Int
+
+    /// Stable across the two sources: a recorded entry is keyed by its send, a
+    /// derived one by its message. Both can be absent in principle, so the date
+    /// backs them up.
+    var id: String {
+        if let sendId = group_send_id { return "s\(sendId)" }
+        if let messageId = message_id { return "m\(messageId)" }
+        return "t\(sent_at)"
+    }
+
+    /// True when this went to every member it was measured against.
+    var reachedEveryone: Bool { group_size > 0 && reached >= group_size }
+}
+
+struct GroupHistoryPage: Codable, Sendable {
+    var items: [GroupHistoryEntry]
+    var next_offset: Int?
+}
+
+struct GroupLimits: Codable, Sendable {
+    var max_members: Int
+}
+
 // MARK: - rules
 
 struct SenderRule: Codable, Sendable, Identifiable, Hashable {

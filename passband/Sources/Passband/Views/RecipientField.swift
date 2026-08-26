@@ -28,6 +28,11 @@ struct RecipientField<F: Hashable>: View {
     @Binding var text: String
     var focus: FocusState<F?>.Binding
     let field: F
+    /// The caption over the well. Defaults to the composer's "to"; the group
+    /// editor reuses this whole field for its membership list and says so.
+    var label: String = "to"
+    /// Placeholder for the empty field, for the same reason.
+    var placeholder: String = "recipient@example.com"
 
     /// Committed recipients — the pills.
     @State private var pills: [String] = []
@@ -42,7 +47,7 @@ struct RecipientField<F: Hashable>: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
             VStack(alignment: .leading, spacing: 5) {
-                FieldLabel("to")
+                FieldLabel(label)
                 pillRow.fieldWell()
             }
 
@@ -78,7 +83,7 @@ struct RecipientField<F: Hashable>: View {
                     focus.wrappedValue = field
                 }
             }
-            TextField(pills.isEmpty ? "recipient@example.com" : "", text: $fragment)
+            TextField(pills.isEmpty ? placeholder : "", text: $fragment)
                 .textFieldStyle(.plain)
                 .focused(focus, equals: field)
                 .frame(minWidth: 120)
@@ -313,7 +318,10 @@ private struct RecipientPill: View {
 /// Minimal wrapping row for the send line: pills flow left to right and wrap,
 /// and the LAST subview — the text field — stretches to the end of its line so
 /// a click anywhere in the well lands the caret.
-private struct FlowLine: Layout {
+///
+/// Not private: the Groups page flows member chips through the same layout, and
+/// two wrapping rows that disagreed by a point would be visible side by side.
+struct FlowLine: Layout {
     var spacing: CGFloat = 5
 
     func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {

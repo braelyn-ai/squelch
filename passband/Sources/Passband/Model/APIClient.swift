@@ -414,6 +414,51 @@ actor APIClient {
 
     // MARK: - rules
 
+    // MARK: - send groups
+
+    /// Every group, for the Groups page. Counts only; membership rides on
+    /// [`group(_:)`].
+    func listGroups() async throws -> [SendGroup] { try await get("/client/groups") }
+
+    /// Composer autocomplete. An empty fragment is answered with nothing rather
+    /// than everything, so callers may pass what the user has typed as-is.
+    func searchGroups(_ q: String, limit: Int = 8) async throws -> [SendGroup] {
+        try await get("/client/groups", query: ["q": q, "limit": String(limit)])
+    }
+
+    /// One group WITH its membership.
+    func group(_ id: Int) async throws -> SendGroup { try await get("/client/groups/\(id)") }
+
+    @discardableResult
+    func createGroup(_ body: GroupBody) async throws -> SendGroup {
+        try await post("/client/groups", body: body)
+    }
+
+    /// `members` REPLACES the membership: the editor sends the list it is
+    /// showing, so a member dropped on screen is dropped on the daemon.
+    @discardableResult
+    func updateGroup(_ id: Int, _ body: GroupBody) async throws -> SendGroup {
+        try await put("/client/groups/\(id)", body: body)
+    }
+
+    /// The route answers `{"deleted": true}`; the body carries nothing a caller
+    /// needs, because a failed delete is a thrown status rather than a `false`.
+    func deleteGroup(_ id: Int) async throws { try await deleteNoContent("/client/groups/\(id)") }
+
+    /// What has already gone to this group: recorded sends and mail derived from
+    /// matching stored recipients against the membership, newest first.
+    func groupHistory(_ id: Int, limit: Int? = nil, offset: Int? = nil) async throws
+        -> GroupHistoryPage
+    {
+        try await get(
+            "/client/groups/\(id)/history",
+            query: ["limit": limit.map(String.init), "offset": offset.map(String.init)])
+    }
+
+    /// The membership cap, served rather than compiled in: the app and the
+    /// daemon ship on separate trains and a baked-in limit is one that disagrees.
+    func groupLimits() async throws -> GroupLimits { try await get("/client/groups/limits") }
+
     func listRules() async throws -> [SenderRule] { try await get("/client/rules") }
 
     @discardableResult

@@ -27,12 +27,18 @@ enum ShareOrigin: String, Sendable, Hashable {
 }
 
 enum MainView: String, Sendable, Hashable, CaseIterable {
-    case sitrep, emails, auth, rules, audit, usage, settings, process
+    case sitrep, emails, auth, rules, audit, groups, usage, settings, process
 
-    /// The TOP rail group — also the 1..5 number-key mapping. Usage/Settings are
-    /// excluded so that adding them never renumbers 1..5. `process` is off the
-    /// rail entirely: its one door is the all-mail header's peer-review chip.
-    static let mainViews: [MainView] = [.sitrep, .emails, .auth, .rules, .audit]
+    /// The TOP rail group — also the 1..N number-key mapping, taken from
+    /// POSITION in this array. Usage/Settings are excluded so that adding one
+    /// never renumbers the rest. `process` is off the rail entirely: its one door
+    /// is the all-mail header's peer-review chip.
+    ///
+    /// `groups` is APPENDED rather than inserted, which is the whole reason it
+    /// sits below Audit: anywhere earlier and every digit above it shifts, and
+    /// the keys people have in their fingers are worth more than alphabetical
+    /// tidiness.
+    static let mainViews: [MainView] = [.sitrep, .emails, .auth, .rules, .audit, .groups]
     /// The BOTTOM rail group, pinned below a divider.
     static let bottomViews: [MainView] = [.usage, .settings]
 
@@ -43,6 +49,7 @@ enum MainView: String, Sendable, Hashable, CaseIterable {
         case .auth: "Auth"
         case .rules: "Rules"
         case .audit: "Audit"
+        case .groups: "Groups"
         case .usage: "Usage"
         case .settings: "Settings"
         case .process: "Process"
@@ -56,6 +63,7 @@ enum MainView: String, Sendable, Hashable, CaseIterable {
         case .auth: "key"
         case .rules: "slider.horizontal.3"
         case .audit: "scroll"
+        case .groups: "person.2"
         case .usage: "waveform.path.ecg"
         case .settings: "gearshape"
         case .process: "checkmark.seal"
@@ -198,14 +206,15 @@ struct RefreshError: Equatable, Sendable {
 /// `remind` is its own kind rather than a flavour of `done`: the forward action
 /// resolves the thread AND schedules its return, so the inverse is two calls,
 /// and "undo_fired kind=done" would count a reminder as a completion.
-enum UndoKind: Sendable { case archive, done, label, ruleDelete, remind }
+enum UndoKind: Sendable { case archive, done, label, ruleDelete, groupDelete, remind }
 
 /// A queued undo. `revert` is the exact inverse call to fire on `u`/toast-click;
 /// the forward action has already gone out.
 struct PendingUndo: Identifiable, Sendable {
     let id = UUID()
     var kind: UndoKind
-    /// The message id for mail actions; the (now-deleted) rule id for ruleDelete.
+    /// The message id for mail actions; the (now-deleted) rule id for ruleDelete,
+    /// and the (now-deleted) group id for groupDelete.
     var messageId: Int
     var label: String
     var createdAt: Date = Date()
@@ -388,6 +397,19 @@ struct RuleEditorRequest: Identifiable, Sendable {
     var onSaved: (@MainActor @Sendable () -> Void)?
 }
 
+/// What the group editor was opened with. `group` nil is a create; present is an
+/// edit, and the editor opens on that group's own values.
+struct GroupEditorRequest: Identifiable, Sendable {
+    let id = UUID()
+    var group: SendGroup?
+    /// Seed a create with addresses the user already had in hand — the composer's
+    /// "save these people as a group" path. Ignored on an edit, which has its own
+    /// membership.
+    var seedMembers: [GroupMember] = []
+    /// Called after a successful save so the opener re-fetches its list.
+    var onSaved: (@MainActor @Sendable () -> Void)?
+}
+
 /// The open thread, reduced to what the ⌘K agent needs to be told about it:
 /// which email the person is looking at, and the id every thread-level verb in
 /// the reader already targets. A named struct rather than a tuple because it is
@@ -555,6 +577,7 @@ final class AppStore {
     var triageFix: TriageFixTarget?
     var remindTarget: RemindTarget?
     var ruleEditor: RuleEditorRequest?
+    var groupEditor: GroupEditorRequest?
     var processModeOpen = false
     var askBarOpen = false
     /// The ⌘K agent's conversation, HELD HERE rather than in AskBar: the modal
@@ -1128,6 +1151,7 @@ final class AppStore {
         triageFix = nil
         remindTarget = nil
         ruleEditor = nil
+        groupEditor = nil
         // Every revert closure targets the old account's daemon.
         undos = []
         authRings = []
@@ -1356,6 +1380,7 @@ final class AppStore {
     var modalOverlayOpen: Bool {
         askBarOpen || shortcutsOpen || processModeOpen
             || triageFix != nil || remindTarget != nil || ruleEditor != nil
+            || groupEditor != nil
             || !authQueue.isEmpty || retriage != nil
             || tour.wantsBlur || whatsNew.active
     }
@@ -2281,6 +2306,9 @@ final class AppStore {
 
     func openRuleEditor(_ request: RuleEditorRequest) { ruleEditor = request }
     func closeRuleEditor() { ruleEditor = nil }
+
+    func openGroupEditor(_ request: GroupEditorRequest) { groupEditor = request }
+    func closeGroupEditor() { groupEditor = nil }
 
     // MARK: - undo
 
