@@ -210,22 +210,32 @@ data:
   # model directory the tenant does not already have onto the tenant's own
   # volume; the daemon never sees the mount.
   #
-  # THE PVC HAS TO EXIST AND HAVE WEIGHTS IN IT BEFORE THIS IS SET. A name that
-  # resolves to no PVC leaves every tenant pod Pending on a volume that will
-  # never bind, which is a fleet-wide outage on the next roll, not a slow
-  # signup. Seed first, verify with `ls` in the seed pod, then set this.
+  # UNCOMMENT IT AFTER SETUP.md STEP 10 HAS CREATED AND SEEDED THE PVC, and not
+  # before. Nothing here checks: the warden renders this name straight into
+  # every tenant's pod spec, and a name that resolves to no claim leaves each
+  # NEW tenant pod Pending on a volume that will never bind. `kubectl -n tenants
+  # describe pod` says `persistentvolumeclaim "squelch-models" not found`, the
+  # signup that made it gets `500 not_ready`, and the next roll reads that
+  # tenant as a casualty and halts the fleet. The rollback is this line
+  # commented out again and a warden restart.
   #
-  # What it costs to leave unset, measured on this box in August 2026: every new
-  # tenant pulled ~126 MB of fp32 ONNX weights from Hugging Face on first boot
-  # (the tenant NetworkPolicy allows 443 egress for exactly this), slowly enough
-  # that the 30-day initial mail backfill outran the embedder and thousands of
-  # rows landed with no vectors. It is also the prerequisite for
+  # That is also why it ships commented. This file goes on in step 8, the first
+  # tenant in step 9, and the volume in step 10, and on a greenfield box the
+  # thing step 10 seeds FROM is the tenant step 9 produced.
+  #
+  # What it costs to leave commented, measured on this box in August 2026: every
+  # new tenant pulled ~126 MB of fp32 ONNX weights from Hugging Face on first
+  # boot (the tenant NetworkPolicy allows 443 egress for exactly this), slowly
+  # enough that the 30-day initial mail backfill outran the embedder and
+  # thousands of rows landed with no vectors. It is also the prerequisite for
   # SQUELCH_WARDEN_HTTP_READINESS above, which puts that download inside every
   # readiness wait the warden makes.
   #
   # This lands on the tenant's pod spec, so it IS drift the roller can see and
-  # every existing tenant takes one pod restart for it within a tick or two.
-  SQUELCH_WARDEN_MODEL_PVC: "squelch-models"
+  # every existing tenant takes one pod restart for it. The roller converges one
+  # tenant per run, so the fleet catches up at the CronJob's schedule times the
+  # number of tenants: four tenants on the */5 schedule is about twenty minutes.
+  # SQUELCH_WARDEN_MODEL_PVC: "squelch-models"
   # Uncomment if the squelchd image is private. This is the pull secret for
   # TENANT pods; the warden's own pod takes `imagePullSecrets` in
   # `20-warden.yaml`, and the roller's in `90-warden-roller.yaml`.

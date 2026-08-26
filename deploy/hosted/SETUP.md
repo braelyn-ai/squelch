@@ -721,8 +721,10 @@ you are building is:
 ├── blobs/                      # the real files, content-addressed
 ├── refs/main
 └── snapshots/<sha>/
-    ├── config.json
+    ├── config.json             # a SYMLINK into ../../blobs/
     ├── tokenizer.json
+    ├── tokenizer_config.json
+    ├── special_tokens_map.json
     └── onnx/model.onnx         # a SYMLINK into ../../../blobs/
 ```
 
@@ -760,8 +762,9 @@ recreate a symlink, dereference it, or refuse the entry outright has changed mor
 than once. Driving `tar` yourself is the same transfer with the behaviour
 written down: GNU tar stores a symlink as a symlink at both ends, so the tree
 lands byte-identical. If your tar does refuse, `tar -ch` on the sending side
-dereferences instead, which also works and costs ~63 MB of duplicated blobs on
-the volume; fastembed does not care which it gets.
+dereferences instead, which also works and costs a second full copy of the
+weights (~126 MB, since every blob arrives again under its snapshot name) on a
+2Gi volume; fastembed does not care which it gets.
 
 **From a laptop**, if there is no tenant to copy from yet. Run `squelchd` once
 against any mailbox, let it print `embedder ready`, then send the same stream:
@@ -804,32 +807,90 @@ Nothing references it afterwards, and leaving it running holds a
 
 ### Turn it on
 
-`SQUELCH_WARDEN_MODEL_PVC: "squelch-models"` is set in `15-warden-config.yaml`.
-Apply it and restart the warden:
+`SQUELCH_WARDEN_MODEL_PVC: "squelch-models"` ships COMMENTED OUT in
+`15-warden-config.yaml`, and this is the step that uncomments it. It has to be
+this way round: the warden renders that name straight into every tenant's pod
+spec and nothing checks the claim exists, so a knob set ahead of the volume
+leaves each new tenant pod Pending on a volume that will never bind. That is
+also why this step lives after step 9 rather than beside step 8: on a greenfield
+box the tenant you seed from is the one step 9 provisioned.
+
+Uncomment the line, apply, and restart the warden:
 
 ```sh
 kubectl apply -f deploy/hosted/15-warden-config.yaml
 kubectl -n warden rollout restart deploy/squelch-warden
+kubectl -n warden exec deploy/squelch-warden -- printenv SQUELCH_WARDEN_MODEL_PVC
+# squelch-models
 ```
 
 The mount is part of a tenant's pod spec, so the roller reads it as drift and
-every existing tenant takes one pod restart for it within a tick or two. That is
+every existing tenant takes one pod restart for it. The roller converges one
+tenant per run, so the fleet catches up at the CronJob schedule times the number
+of tenants: on the `*/5` schedule, four tenants is about twenty minutes. That is
 expected, and worth knowing before you watch the fleet cycle.
 
-Verify on the next tenant that signs up. Its init container copies from a local
-disk in a couple of seconds instead of pulling from Hugging Face, and its log
-should reach `embedder ready` with no download line before it:
+If a tenant pod goes Pending instead, that is this knob, and the message says so
+outright:
+
+```sh
+kubectl -n tenants describe pod <pod> | grep -A2 FailedScheduling
+# persistentvolumeclaim "squelch-models" not found
+```
+
+The rollback is the line commented out again and another warden restart.
+
+### Verify on the next tenant
+
+Once the new tenant's pod is Ready, look at the cache the init container built.
+That is the check, because it is the only end of this that is observable today:
+
+```sh
+kubectl -n tenants exec deploy/<label> -c squelchd -- \
+  ls /data/.local/share/squelch/models
+# models--Xenova--bge-small-en-v1.5      <- this, and nothing else
+```
+
+Exactly that one directory, and no `models--Qdrant--bge-small-en-v1.5-onnx-Q`
+beside it, is what the seeded volume looks like once it has been copied across.
+It is not on its own proof that the tenant never called Hugging Face: nothing
+records a tenant's egress per host, the NetworkPolicy allows 443 out and does
+not count it, so there is no metric to go and read. What makes it convincing is
+the pair, the directory being the one from the volume and the pod reaching Ready
+in seconds rather than the minutes a 126 MB download takes.
+
+**Do not use the download notice as the check.** `squelch: downloading embedding
+model ... (first run only)` is gated on a "does the cache look populated" test
+that returns true when ANY subdirectory of the cache holds anything, so a cache
+seeded with the WRONG model suppresses the line and hf-hub goes to the network
+underneath it. Absence of the line proves the directory is not empty and nothing
+more.
+
+Once the model pin lands (`squelch-core`'s `resolve_model`), the daemon prints
+what it actually loaded after the session is up, and that line is the stronger
+check because it names the build rather than the config string:
 
 ```sh
 kubectl -n tenants logs deploy/<label> -c squelchd | grep -E 'embedding model|embedder ready'
+# squelch: embedding model Xenova/bge-small-en-v1.5 (384-dim) loaded
 # squelchd: embedder ready — semantic + hybrid search now enabled
 ```
 
-A `squelch: downloading embedding model ... (first run only)` line above it means
-the seeded directory is not the model the daemon resolved. Compare the name the
-daemon logs at init against the directory in `/seed`; a mismatch there is the
-whole failure mode, and it is silent otherwise (the tenant works, it just pays
-the download).
+**A copy that fails does not take the pod down**, so a tenant with nothing in its
+cache is a log to read rather than a crash to find. The init container says so
+and exits 0:
+
+```sh
+kubectl -n tenants logs deploy/<label> -c seed
+# squelch-seed: could not copy models--Xenova--bge-small-en-v1.5, the daemon will download it
+```
+
+That is deliberate, and it is the difference between one slow tenant and a
+stopped fleet: the daemon can always fetch what it does not find, while an init
+container that exits 1 fails on EVERY tenant's next roll, and the roller reads a
+tenant that will not come up as a casualty and halts. The usual cause is the
+shared volume's ownership on the node, which is the `Permission denied` note
+under "Fill it once" above.
 
 Existing tenants keep whatever they already have. Their cache directory is
 already populated, and the init container only fills in entries that are missing,

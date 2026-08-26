@@ -2,6 +2,11 @@
 # starts with the weights already on its own volume: see "10. Embedding weights"
 # in SETUP.md for the seeding procedure.
 #
+# ORDER: this file, then the seed, then `SQUELCH_WARDEN_MODEL_PVC` uncommented in
+# `15-warden-config.yaml` and a warden restart. The knob names a claim and
+# nothing verifies it exists, so turning it on ahead of this file leaves every
+# new tenant pod Pending forever.
+#
 # Without this, every tenant downloads about 126 MB from Hugging Face the first
 # time it embeds anything. That is not fatal, but it is the same bytes over and
 # over, it happens inside the signup a person is watching, and it is slow enough
@@ -48,10 +53,17 @@ spec:
     runAsNonRoot: true
     runAsUser: 10001
     runAsGroup: 10001
-    # Same uid/gid a tenant daemon runs as, and the same reason: it is what
-    # makes the PersistentVolume writable without anything in the pod being
-    # root. Seed the volume as any other id and every tenant's init container
-    # reads files it does not own.
+    # The same uid/gid a tenant daemon runs as, so the weights land owned by the
+    # id that reads them: seed as any other id and every tenant's init container
+    # is reading files it does not own.
+    #
+    # `fsGroup` is NOT what makes the volume writable here. The kubelet does not
+    # manage ownership on host-path-backed volumes, which is what `local-path`
+    # hands out, so the group has no effect on the mounted directory and what
+    # actually lets uid 10001 write is the 0777 local-path creates it with. When
+    # that is wrong the extract fails `Permission denied` and the fix is a
+    # `chown` on the node, per SETUP.md step 10. The setting stays because it
+    # costs nothing and is correct on any storage class that does honour it.
     fsGroup: 10001
     fsGroupChangePolicy: OnRootMismatch
     seccompProfile:
@@ -64,21 +76,19 @@ spec:
       # fleet's tag is a copy that starts immediately instead of a pull.
       image: ghcr.io/braelyn-ai/squelchd:daemon-0.0.4
       command: ["/bin/sh", "-c", "sleep 3600"]
+      # /seed is the only writable path in this pod, and it is all it needs:
+      # the container sleeps, and `tar -x` streams into the volume without a
+      # temporary file anywhere. So no /tmp emptyDir, and the root filesystem
+      # stays read-only.
       volumeMounts:
         - name: models
           mountPath: /seed
-        # The root filesystem is read-only, and `tar -x` wants somewhere to put
-        # its temporaries. Same shape as a tenant pod's /tmp: an emptyDir with a
-        # sizeLimit, because one without is a hole with the node's free space at
-        # the bottom of it.
-        - name: tmp
-          mountPath: /tmp
       # Explicit, because a container with no bounds takes the LimitRange's
-      # defaults, and those are one TENANT's worth (100m / 256Mi requested,
-      # 1000m / 1Gi limit). A pod whose whole job is to sleep while tar writes
-      # to a volume should not reserve a tenant's share of a 2-vCPU box out of
-      # the namespace quota. Above the LimitRange's floor (10m / 16Mi) and well
-      # under its ceiling.
+      # defaults from `70-tenant-limits.yaml`, and those are one TENANT's worth
+      # of a 2-vCPU box: whatever a daemon is promised for its ONNX session,
+      # reserved out of the namespace quota by a pod whose whole job is to sleep
+      # while tar writes to a volume. Above the LimitRange's floor (10m / 16Mi)
+      # and well under its ceiling.
       resources:
         requests:
           cpu: 10m
@@ -98,6 +108,3 @@ spec:
     - name: models
       persistentVolumeClaim:
         claimName: squelch-models
-    - name: tmp
-      emptyDir:
-        sizeLimit: 256Mi
