@@ -585,7 +585,8 @@ actor APIClient {
     /// the daemon derives `Re: <parent subject>`; pass "" only to mean it.
     @discardableResult
     func actionSend(
-        body: String, replyToMessageId: Int? = nil, to: String? = nil, subject: String? = nil,
+        body: String, replyToMessageId: Int? = nil, to: String? = nil, bcc: String? = nil,
+        groupId: Int? = nil, subject: String? = nil,
         overrideGuard: Bool = false, draftId: Int? = nil, includeTracker: Bool = false,
         replyAll: Bool = false, forwardOfMessageId: Int? = nil
     ) async throws -> SendResult {
@@ -597,7 +598,11 @@ actor APIClient {
                 // never set beside `reply_to_message_id`: the daemon refuses a
                 // send that claims to be both an answer and a forward.
                 forward_of_message_id: forwardOfMessageId,
-                to: to, subject: subject, body: body,
+                to: to, bcc: bcc,
+                // Attribution for an expanded group; the whole audience for a
+                // fan-out, whose membership the daemon reads itself.
+                group_id: groupId,
+                subject: subject, body: body,
                 // Both composers write markdown; the daemon renders the HTML
                 // half from this same source after the guard has scanned it.
                 body_format: "markdown",
@@ -697,13 +702,14 @@ actor APIClient {
     /// draft, so a second PUT edits the same row rather than making another. A
     /// sealed or unknown parent is a 404 and stores nothing.
     @discardableResult
-    func putDraft(replyToMessageId: Int?, to: String, subject: String, body: String) async throws
-        -> DraftView
-    {
+    func putDraft(
+        replyToMessageId: Int?, to: String, bcc: String = "", subject: String, body: String
+    ) async throws -> DraftView {
         try await put(
             "/client/drafts",
             body: DraftBody(
-                reply_to_message_id: replyToMessageId, to: to, subject: subject, body: body))
+                reply_to_message_id: replyToMessageId, to: to, bcc: bcc, subject: subject,
+                body: body))
     }
 
     /// Discard one draft. Another account's id and an unknown id are the same 404.

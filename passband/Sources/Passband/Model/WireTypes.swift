@@ -975,6 +975,15 @@ struct SendBody: Codable, Sendable {
     /// your own is the ordinary case.
     var forward_of_message_id: Int?
     var to: String?
+    /// Blind recipients, comma-joined. Omitted when there are none. Filtered
+    /// server-side against `to` and `cc`, so a person on both lists is delivered
+    /// once rather than twice.
+    var bcc: String?
+    /// ADDRESS A SEND GROUP. What it does is the GROUP's mode, not this
+    /// message's: `to`/`bcc` groups are already expanded into the fields above,
+    /// so this is attribution; an `individual` group makes the daemon fan out and
+    /// answer with a batch id instead of a sent message.
+    var group_id: Int?
     /// Omitted (not "") on a reply: the daemon derives `Re: <parent subject>`
     /// only when the field is absent — `Some("")` is an explicit empty subject.
     var subject: String?
@@ -1066,7 +1075,13 @@ struct StatusResult: Codable, Sendable {
 }
 
 struct SendResult: Codable, Sendable {
+    /// `"sent"` for an ordinary send; `"sending"` for a fan-out, which has left
+    /// with a batch to watch rather than a message to open.
     var status: String
+    /// The `group_sends` row a fan-out started. Present only on `"sending"`.
+    var group_send_id: Int?
+    /// How many people that fan-out is going to.
+    var recipients: Int?
     /// The sent copy as it landed in the local store, and its thread — both null
     /// when the send succeeded but the echo has not been ingested yet.
     var echo_message_id: Int?
@@ -1089,6 +1104,9 @@ struct DraftView: Codable, Sendable, Identifiable, Hashable {
     /// The message this answers. nil = the account's single new-message draft.
     var reply_to_message_id: Int?
     var to: String
+    /// Blind recipients. Always present, `""` when there are none — a draft that
+    /// could not hold these would silently lose the audience of a bcc send.
+    var bcc: String
     var subject: String
     var body: String
     var created_at: String
@@ -1101,6 +1119,7 @@ struct DraftView: Codable, Sendable, Identifiable, Hashable {
 struct DraftBody: Codable, Sendable {
     var reply_to_message_id: Int?
     var to: String
+    var bcc: String
     var subject: String
     var body: String
 }

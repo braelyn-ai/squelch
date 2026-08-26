@@ -177,7 +177,8 @@ final class DraftSaver {
         // A body that is only the seeded signature counts as blank: saving it
         // would mint a draft of nothing, and every later `c` would restore it.
         let blank =
-            state.to.trimmed.isEmpty && state.subject.trimmed.isEmpty
+            state.to.trimmed.isEmpty && state.bcc.trimmed.isEmpty
+            && state.subject.trimmed.isEmpty
             && Prefs.shared.isBodyUntouched(state.body)
         if blank {
             // EMPTIED, not composed: a draft cleared back to nothing is discarded
@@ -190,7 +191,7 @@ final class DraftSaver {
         }
         do {
             let saved = try await APIClient.shared.putDraft(
-                replyToMessageId: state.replyToMessageId, to: state.to,
+                replyToMessageId: state.replyToMessageId, to: state.to, bcc: state.bcc,
                 subject: state.subject, body: state.body)
             adopt(saved.id, slot: slot, key: state.id)
         } catch {

@@ -289,6 +289,25 @@ struct ComposeState: Sendable, Equatable {
     /// nothing at all).
     var forwardOfMessageId: Int?
     var to: String = ""
+    /// BLIND recipients, comma-joined, in the same wire-string form as `to`.
+    /// Empty on every composer that has not been handed a bcc group or opened
+    /// the row by hand, so an ordinary send is unchanged.
+    var bcc: String = ""
+    /// The send group this composition is addressed to, once one has been
+    /// picked.
+    ///
+    /// For a `to`/`bcc` group this is ATTRIBUTION ONLY — the picker has already
+    /// expanded the membership into the fields above, and the daemon records
+    /// which group that was. For an `individual` group it is the whole audience:
+    /// `to` holds only the `#slug` token that keeps the pill alive across a draft
+    /// round-trip, and the daemon reads the membership itself.
+    var groupId: Int?
+    /// The picked group's mode and name, for what the composer has to SAY: the
+    /// pill's label, and the review pane's line about how many emails are about
+    /// to leave. Display state — the daemon re-reads both from `groupId`, so
+    /// nothing here can talk it into a different shape.
+    var groupMode: GroupMode?
+    var groupName: String?
     var subject: String = ""
     var body: String = ""
     /// The server-side draft this composer is autosaving into, once one exists.
@@ -2141,9 +2160,36 @@ final class AppStore {
             next.to.isEmpty, next.subject.isEmpty, Prefs.shared.isBodyUntouched(next.body)
         else { return }
         next.to = draft.to
+        next.bcc = draft.bcc
         next.subject = draft.subject
         next.body = draft.body
         next.draftId = draft.id
+        compose = next
+        await resolveDraftGroup()
+    }
+
+    /// Turn a restored draft's `#slug` token back into a group.
+    ///
+    /// The token is all the draft could keep — the drafts row has no group
+    /// column, and giving it one would put the audience in two places that can
+    /// disagree. So the composer re-resolves on restore, and a token that no
+    /// longer names anything (deleted, or renamed, which changes the slug) simply
+    /// does not resolve: the pill renders as a problem and the daemon refuses the
+    /// send. Both are correct. Guessing which audience someone meant is not a
+    /// thing to do with an irreversible action.
+    private func resolveDraftGroup() async {
+        let e = epoch
+        guard let slug = compose.map({ GroupToken.firstSlug(in: $0.to) }) ?? nil,
+            let group = await GroupToken.resolve(slug),
+            e == epoch,
+            var next = compose,
+            // Still the same composition: a restore that raced a keystroke must
+            // not stamp a group onto whatever is in the slot now.
+            GroupToken.firstSlug(in: next.to) == slug
+        else { return }
+        next.groupId = group.id
+        next.groupMode = group.mode
+        next.groupName = group.name
         compose = next
     }
 
