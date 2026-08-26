@@ -224,3 +224,10 @@ time() - squelchd_sync_last_success_timestamp_seconds > 900
 One tenant firing is usually a dead refresh token (its
 `squelchd_gmail_api_errors_total{kind="auth"}` will be climbing) and that tenant
 has to re-consent; every tenant firing at once is the box.
+
+A first backfill that ran without the embedder (the init never settled inside
+its three-minute ceiling) is `increase(squelchd_embedder_gate_timeouts_total[1h])
+> 0`. The mailbox is fine; it is the memory profile that is not, because the
+vector backfill pass then drains that mailbox in batches instead of ingest
+embedding it one message at a time. One is worth a look; a train of them is a
+wedged init retrying.
