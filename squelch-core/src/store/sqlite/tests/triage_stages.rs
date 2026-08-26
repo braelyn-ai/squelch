@@ -2274,3 +2274,103 @@ fn an_escalated_row_carries_its_reason_and_the_senders_record() {
     let row = q.iter().find(|r| r.message_id == second).unwrap();
     assert_eq!(row.sender_history.total, 1);
 }
+
+/// A refund gives back exactly one charge, and never digs below zero.
+///
+/// The floor is the interesting half. The budget key is the UTC day, so a call
+/// charged at 23:59:59 and refunded two seconds later refunds against the NEXT
+/// day's row, which holds nothing. Without the floor that row would go
+/// negative and hand the new day a free call on top of its own cap.
+#[test]
+fn a_config_failure_refund_gives_back_one_charge_and_floors_at_zero() {
+    let (store, acct) = store();
+    let day = "2026-08-25";
+
+    store
+        .stage2_increment_budget(acct, "__stage1_global__", day)
+        .unwrap();
+    store
+        .stage2_increment_budget(acct, "__stage1_global__", day)
+        .unwrap();
+    assert_eq!(
+        store
+            .stage2_budget_used(acct, "__stage1_global__", day)
+            .unwrap(),
+        2
+    );
+
+    store
+        .stage2_refund_budget(acct, "__stage1_global__", day)
+        .unwrap();
+    assert_eq!(
+        store
+            .stage2_budget_used(acct, "__stage1_global__", day)
+            .unwrap(),
+        1
+    );
+
+    // Refunding past zero is a no-op, not a negative balance.
+    store
+        .stage2_refund_budget(acct, "__stage1_global__", day)
+        .unwrap();
+    store
+        .stage2_refund_budget(acct, "__stage1_global__", day)
+        .unwrap();
+    assert_eq!(
+        store
+            .stage2_budget_used(acct, "__stage1_global__", day)
+            .unwrap(),
+        0
+    );
+
+    // A refund against a day that was never charged creates nothing.
+    store
+        .stage2_refund_budget(acct, "__stage1_global__", "2026-08-26")
+        .unwrap();
+    assert_eq!(
+        store
+            .stage2_budget_used(acct, "__stage1_global__", "2026-08-26")
+            .unwrap(),
+        0
+    );
+
+    // Scopes stay independent: refunding one key leaves the others alone.
+    store.stage2_increment_budget(acct, "t-abc", day).unwrap();
+    store
+        .stage2_refund_budget(acct, "__stage1_global__", day)
+        .unwrap();
+    assert_eq!(store.stage2_budget_used(acct, "t-abc", day).unwrap(), 1);
+}
+
+/// THE OUTAGE THIS EXISTS FOR, in miniature: a run of config-level failures
+/// must not leave the cap spent once the config is fixed.
+///
+/// On 2026-08-25 a gateway misconfiguration charged 498 of a 500-call daily cap
+/// in about half an hour. Because the budget key is the UTC day and the charge
+/// stood, the tenant stayed capped for 22 hours after the gateway was repaired.
+#[test]
+fn a_run_of_config_failures_leaves_the_cap_intact() {
+    let (store, acct) = store();
+    let day = "2026-08-25";
+    let cap = 500u32;
+
+    // Every attempt charges before the call (the retry-storm guard), and every
+    // one comes back a config-level 4xx, so every one is refunded.
+    for _ in 0..498 {
+        store
+            .stage2_increment_budget(acct, "__stage1_global__", day)
+            .unwrap();
+        store
+            .stage2_refund_budget(acct, "__stage1_global__", day)
+            .unwrap();
+    }
+
+    let used = store
+        .stage2_budget_used(acct, "__stage1_global__", day)
+        .unwrap();
+    assert_eq!(used, 0, "config failures must not spend the day's cap");
+    assert!(
+        used < cap,
+        "the fleet can still triage once the config is fixed"
+    );
+}
