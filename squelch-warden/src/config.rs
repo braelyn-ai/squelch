@@ -224,6 +224,17 @@ pub struct Config {
     /// every tenant's init container copies from it instead of each tenant
     /// downloading ~130 MB from Hugging Face on first boot.
     pub model_pvc: Option<String>,
+    /// Which embedding weights tenant daemons load, injected as
+    /// `SQUELCH_EMBED_MODEL`. Optional, and unset means the daemon's own pinned
+    /// default, which is the normal state.
+    ///
+    /// It exists because the daemon's env is a CLOSED list rendered here: a
+    /// var this file does not name cannot reach a tenant at all, so without
+    /// this knob moving the fleet's embedding model would mean cutting a new
+    /// image. A fastembed `model_code` or variant name, validated by the daemon
+    /// rather than here, since fastembed's table is the authority on what
+    /// resolves.
+    pub embed_model: Option<String>,
     /// The node network, when the CNI drops kubelet probe traffic without one.
     ///
     /// A readiness probe originates from the NODE, not from a pod, so it
@@ -318,6 +329,7 @@ impl std::fmt::Debug for Config {
             .field("pull_secret", &self.pull_secret)
             .field("user_namespaces", &self.user_namespaces)
             .field("model_pvc", &self.model_pvc)
+            .field("embed_model", &self.embed_model)
             .field("node_cidr", &self.node_cidr)
             .field("http_readiness", &self.http_readiness)
             .field("run_as", &self.run_as)
@@ -595,8 +607,8 @@ impl Config {
             None => None,
             Some(raw) => Some(canonical_llm_base_url(&raw)?),
         };
-        let llm_stage1_model = llm_value_var(get, "SQUELCH_WARDEN_LLM_STAGE1_MODEL")?;
-        let llm_stage2_model = llm_value_var(get, "SQUELCH_WARDEN_LLM_STAGE2_MODEL")?;
+        let llm_stage1_model = env_value_var(get, "SQUELCH_WARDEN_LLM_STAGE1_MODEL")?;
+        let llm_stage2_model = env_value_var(get, "SQUELCH_WARDEN_LLM_STAGE2_MODEL")?;
         let llm_stage1_daily_cap = llm_cap_var(get, "SQUELCH_WARDEN_LLM_STAGE1_DAILY_CAP")?;
         let llm_stage2_daily_cap = llm_cap_var(get, "SQUELCH_WARDEN_LLM_STAGE2_DAILY_CAP")?;
         // The four tuning vars mean nothing without a gateway: a model pin the
@@ -694,6 +706,7 @@ impl Config {
             pull_secret: optional_name_var(get, "SQUELCH_WARDEN_IMAGE_PULL_SECRET")?,
             user_namespaces,
             model_pvc: optional_name_var(get, "SQUELCH_WARDEN_MODEL_PVC")?,
+            embed_model: env_value_var(get, "SQUELCH_WARDEN_EMBED_MODEL")?,
             node_cidr,
             http_readiness,
             run_as,
@@ -898,10 +911,10 @@ fn canonical_llm_base_url(raw: &str) -> Result<String, ConfigError> {
     Ok(url.to_string())
 }
 
-/// An optional LLM tuning value (a model id): printable, no whitespace, no
-/// shell metacharacters, because it becomes an environment value in every
-/// tenant pod.
-fn llm_value_var(get: Lookup, name: &str) -> Result<Option<String>, ConfigError> {
+/// An optional free-form value (a model id, an embedding `model_code`):
+/// printable, no whitespace, no shell metacharacters, because it becomes an
+/// environment value in every tenant pod.
+fn env_value_var(get: Lookup, name: &str) -> Result<Option<String>, ConfigError> {
     match var(get, name) {
         None => Ok(None),
         Some(value) => {
@@ -1006,6 +1019,9 @@ mod tests {
         assert!(!c.http_readiness);
         assert!(c.node_cidr.is_none());
         assert!(c.model_pvc.is_none());
+        // Unset means the daemon's own pinned embedding model, which is what a
+        // fleet should be running unless somebody deliberately moved it.
+        assert!(c.embed_model.is_none());
         assert!(c.pull_secret.is_none());
         assert!(c.console_sso_url.is_none());
         // The LLM env feature is off unless the operator turns it on.
@@ -1274,6 +1290,28 @@ mod tests {
         vars.insert(
             "SQUELCH_WARDEN_LLM_STAGE1_MODEL".to_string(),
             "claude haiku".to_string(),
+        );
+        assert!(load(&vars).is_err());
+    }
+
+    /// The embedding pin, which is NOT part of the LLM block and needs no
+    /// gateway: it is a fastembed model name, not a call to anybody.
+    #[test]
+    fn the_embedding_model_is_optional_and_stands_alone() {
+        let mut vars = required();
+        vars.insert(
+            "SQUELCH_WARDEN_EMBED_MODEL".to_string(),
+            "Xenova/bge-small-en-v1.5".to_string(),
+        );
+        let c = load(&vars).unwrap();
+        assert_eq!(c.embed_model.as_deref(), Some("Xenova/bge-small-en-v1.5"));
+        // No gateway configured, and it is still accepted.
+        assert!(c.llm_base_url.is_none());
+
+        // A value with a space would break the env value it becomes.
+        vars.insert(
+            "SQUELCH_WARDEN_EMBED_MODEL".to_string(),
+            "bge small".to_string(),
         );
         assert!(load(&vars).is_err());
     }
