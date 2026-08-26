@@ -745,8 +745,13 @@ pub fn default_embed_cache_dir() -> PathBuf {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct EmbedConfig {
-    /// fastembed model name/alias. Default: BGE-small-en-v1.5 (384-dim, small,
-    /// English). Accepts the fastembed `model_code` or a friendly alias.
+    /// fastembed model, written as a full `model_code`. Default:
+    /// `"Xenova/bge-small-en-v1.5"` (BGE-small-en-v1.5, fp32, 384-dim, English).
+    /// The full code is the point: fastembed also ships
+    /// `Qdrant/bge-small-en-v1.5-onnx-Q`, the int8 build of the same family, and
+    /// the bare family name this used to default to picked between the two at
+    /// random per boot. Short aliases still parse and still mean the fp32 code;
+    /// anything that could name more than one model is refused at startup.
     pub model: String,
     /// Embedding dimensionality; must match `model` and the vec0 table width.
     pub dims: usize,
@@ -761,7 +766,7 @@ pub struct EmbedConfig {
 impl Default for EmbedConfig {
     fn default() -> Self {
         Self {
-            model: "bge-small-en-v1.5".to_string(),
+            model: crate::embed::DEFAULT_MODEL_CODE.to_string(),
             dims: 384,
             cache_dir: default_embed_cache_dir(),
             max_chars: crate::embed::DEFAULT_EMBED_MAX_CHARS,
