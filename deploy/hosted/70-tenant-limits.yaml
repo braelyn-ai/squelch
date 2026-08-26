@@ -30,7 +30,10 @@ spec:
   limits:
     - type: Container
       # What a container gets when it asks for nothing. Matches the warden's
-      # own defaults, so a tenant pod is unaffected by this file.
+      # own defaults, so a tenant pod is unaffected by this file. Anything else
+      # that lands here without resources of its own now costs a whole tenant
+      # slot out of the quota below - `60-models.yaml`'s seed pod is the one in
+      # this repo, and it should carry its own `resources`.
       default:
         cpu: 1000m
         memory: 1Gi
@@ -65,26 +68,45 @@ spec:
   hard:
     # Requests are what the scheduler reserves, so this is the real capacity
     # number, and it is sized to the NODE rather than to a tenant count you
-    # would like to have. k3s reserves nothing for itself by default, so the
-    # scheduler treats the whole box as allocatable when about 1.2 GB of it is
-    # k3s, the system and the monitoring agent; a quota above what is left over
-    # is a quota that never refuses anybody, and the kernel's OOM killer does
-    # the refusing instead, against a mailbox that is already serving. That is
+    # would like to have. A quota bigger than what the box can actually run is
+    # a quota that never refuses anybody, and the kernel's OOM killer does the
+    # refusing instead, against a mailbox that is already serving. That is
     # 2026-08-19 in one line: this said 5Gi on a 4 GB box, four tenants were
     # enough, and two squelchd processes died.
     #
-    # On the 4 GB floor about 2.5 GB is left for tenant pods, and at the shipped
-    # 100m/384Mi that is SIX tenants: 6 x 384Mi is 2304Mi and fits, 7 x 384Mi is
-    # 2688Mi and does not. CPU never binds first here - at 100m the same 2 vCPU
-    # carries twenty - so memory is the number to redo when you resize the box.
+    # The NODE budget, on the 4 GB floor (3814 MiB of it is real):
+    #
+    #     3814  the whole machine, all of which is offered to pods today
+    #    -1200  k3s, containerd, journald, litestream: outside every pod
+    #     -372  the pods that are not tenants - CoreDNS 70, metrics-server 70,
+    #           kube-state-metrics 48, node-exporter 24, the Prometheus agent
+    #           128, the warden itself 32
+    #    ~2242  about 2.2 GiB left for tenant pods
+    #
+    # At the shipped 100m/384Mi that is FIVE tenants: 5 x 384Mi is 1920Mi and
+    # fits, 6 x 384Mi is 2304Mi and does not. Five is the honest count until the
+    # daemon-side memory work (idle embedder unload, smaller embed batches) has
+    # landed AND been measured for a week; raise this off a week of
+    # container_memory_working_set_bytes, not off wanting a sixth tenant.
+    #
+    # And this quota is the ONLY refusal on this box today. k3s reserves nothing
+    # for itself by default, so the scheduler still believes all 3814 MiB is
+    # available to pods: the 1200 above is a fact about the machine, not
+    # something the scheduler knows, and left to itself it would admit a sixth
+    # tenant and a seventh. SETUP.md §2b (kubelet `systemReserved`, allocatable
+    # drops to ~2.4 GiB) is what makes the scheduler a second gate; it is
+    # written but not applied here, so do not size this line as if it were.
+    #
+    # CPU never binds first - at 100m the same 2 vCPU carries twenty - so memory
+    # is the number to redo when you resize the box.
     requests.cpu: "2"
-    requests.memory: 2560Mi
+    requests.memory: 1920Mi
     requests.ephemeral-storage: 5Gi
     # Limits may oversubscribe, because tenants are idle most of the time and a
     # sync burst is short. Do not raise this ratio much past 4x on one node,
-    # which is what 10Gi against 2560Mi of requests is.
+    # which is what 7680Mi against 1920Mi of requests is.
     limits.cpu: "8"
-    limits.memory: 10Gi
+    limits.memory: 7680Mi
     limits.ephemeral-storage: 20Gi
     # The mail. Local-path storage is the box's disk, and a claim that cannot
     # bind is a tenant that never comes up.
@@ -92,7 +114,7 @@ spec:
     persistentvolumeclaims: "25"
     # A blunt ceiling on how much can exist here at all. One tenant is one pod,
     # so this is a tenant count too, but it is not the one that binds: on the
-    # 4 GB floor `requests.memory` above refuses the seventh signup long before
+    # 4 GB floor `requests.memory` above refuses the sixth signup long before
     # this refuses the twenty-sixth. Raise the memory line, not this one.
     pods: "25"
     count/secrets: "60"

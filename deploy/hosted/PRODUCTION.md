@@ -25,21 +25,6 @@ Shared vCPU on purpose: tenant daemons are idle between syncs, and dedicated
 using. Scale vertically by resizing **CPU and RAM only** — a Hetzner resize that
 grows the disk is a one-way door and blocks every later downsize.
 
-Memory is the axis that fills first, and there is no swap under it. A tenant
-daemon that has embedded anything keeps its ONNX session resident and rests at
-250-300 MB (on 2026-08-26 the four tenant pods were at 123, 293, 349 and 545 MB
-RSS), and on 2026-08-19 four of them ran this box out of memory globally: the
-kernel OOM-killed two squelchd processes, picking running mailboxes because a
-burstable pod is what it picks. The warden's memory request was 256Mi at the
-time and is 384Mi now (`15-warden-config.yaml`), which is what makes the
-scheduler refuse the signup that will not fit instead of letting the kernel pick
-a victim that is already serving. At that request, with roughly 1.2 GB of k3s,
-system and monitoring agent outside every pod's budget, this box holds about six
-tenants; the seventh is a resize (RAM only, above) or the daemon-side embedder
-unload landing first, whichever comes sooner. Existing tenants take a changed
-bound the way they take any pod-shape change: see "Shipping a tenant-shape
-change".
-
 ## The volume
 
 | | |
@@ -71,6 +56,43 @@ in this cluster's datastore. Verify with `k3s secrets-encrypt status`.
 Namespaces: `warden` (the provisioner), `tenants` (everything per-tenant, Pod
 Security Admission at `restricted`), `cert-manager`. Manifests applied from
 `deploy/hosted/` in the numbered order.
+
+## How many tenants fit
+
+**Five, and memory is what decides it.** Not CPU, not the `pods: "25"` line in
+`70-tenant-limits.yaml`, and there is no swap under any of it.
+
+A tenant daemon that has embedded anything keeps its ONNX session resident. The
+four tenant pods here read 91, 317, 376 and 509 MiB on 2026-08-26, and 123, 293,
+349 and 545 MB on another pass the same day: roughly 300-500 MB at rest, moving
+while you watch. The warden requests **384Mi** per tenant
+(`15-warden-config.yaml`), which is about the p50 of that rather than a
+comfortable number, and `70-tenant-limits.yaml` holds the namespace to
+`requests.memory: 1920Mi`, which is five of them. The subtraction is written out
+in that file and in `SETUP.md` §7: 3814 MiB of machine, less about 1200 for k3s,
+containerd, journald and litestream, less about 372 for the pods that are not
+tenants, leaving about 2.2 GiB.
+
+**The quota is the only refusal on this box.** Nothing is reserved outside the
+pod budget today: k3s takes nothing for itself by default, so the scheduler
+still sees all 3814 MiB as allocatable and would admit a sixth tenant and a
+seventh onto a machine that cannot run them. A kubelet `systemReserved` is what
+would make the scheduler a second gate; it is written up as `SETUP.md` §2b (PR
+#151) and **not applied here**.
+
+What that combination costs when the numbers are wrong is 2026-08-19: the
+request was 256Mi and the quota was 5Gi on a 4 GB box, four tenants ran it out
+of memory globally, and the kernel OOM-killed two squelchd processes. It takes a
+running mailbox, because a tenant pod is burstable, while the signup that
+overcommitted the box succeeded days earlier and is nobody's suspect. With both
+numbers telling the truth the sixth signup is refused instead, as the documented
+`500 not_ready`, reason in `kubectl -n tenants describe replicaset`.
+
+A sixth tenant is a RAM resize (CPU and RAM only, see "The box") or the
+daemon-side embedder unload landing and being measured for a week, whichever
+comes sooner. Raise it off `container_memory_working_set_bytes`, not off wanting
+a sixth tenant. Existing tenants take a changed bound the way they take any
+pod-shape change: see "Shipping a tenant-shape change".
 
 ## Railway
 

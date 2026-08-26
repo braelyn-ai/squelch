@@ -71,12 +71,15 @@ pub const DEFAULT_CPU_LIMIT: &str = "1000m";
 ///
 /// A request is a promise about the p50, and the scheduler is the thing that
 /// believes it. This said 256Mi until somebody measured the promise: on the
-/// carrier box (3 vCPU, 3814 MiB, no swap) the four tenant pods were sitting at
-/// 123, 293, 349 and 545 MB RSS, because a daemon that has embedded anything
-/// keeps its ONNX session resident and rests at 250-300 MB. So the scheduler
-/// was reserving 256Mi per tenant while the kernel paid about 300, and on
-/// 2026-08-19 the node ran out of memory globally with FOUR tenants on it and
-/// OOM-killed two squelchd processes.
+/// carrier box (3 vCPU, 3814 MiB, no swap) the four tenant pods read 91, 317,
+/// 376 and 509 MiB on one pass and 123, 293, 349 and 545 MB on another the same
+/// day, because a daemon that has embedded anything keeps its ONNX session
+/// resident and rests at roughly 300-500 MB. 384Mi is about the p50 of that,
+/// which is a truthful number and not a comfortable one: half the fleet is
+/// above it on any given read. The scheduler was reserving 256Mi per tenant
+/// while the kernel paid three to five hundred, and on 2026-08-19 the node ran
+/// out of memory globally with FOUR tenants on it and OOM-killed two squelchd
+/// processes.
 ///
 /// Which tenant dies in that is nobody's decision. A tenant pod is burstable
 /// (request below limit, `oom_score_adj` 933), so the kernel picks a RUNNING

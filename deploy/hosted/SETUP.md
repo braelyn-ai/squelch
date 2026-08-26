@@ -478,20 +478,29 @@ ceiling.
 
 Sizing, in the order that matters:
 
-- **`requests.memory` is your tenant count, and the box picks it, not you.** The
-  scheduler reserves requests, and k3s reserves nothing for itself, so the
-  scheduler treats the whole box as allocatable when about 1.2 GB of it is k3s,
-  the system and the monitoring agent. Size the quota to what is left: on the
-  4 GB floor that is about 2.5 GB, which at the shipped 384Mi is six tenants
-  and no more, whatever the quota says about pods. CPU is the smaller problem
-  (at 100m a 2-vCPU box carries twenty), and memory refuses long before it.
+- **`requests.memory` is your tenant count, and the box picks it, not you.**
+  Subtract, do not wish. On the 4 GB floor (3814 MiB of it real): take off about
+  1200 MiB for k3s, containerd, journald and litestream, which live outside
+  every pod, and about 372 MiB for the pods that are not tenants (CoreDNS 70,
+  metrics-server 70, kube-state-metrics 48, node-exporter 24, the Prometheus
+  agent 128, the warden 32). That leaves about 2.2 GiB, which at the shipped
+  384Mi is **five** tenants and no more, whatever the quota says about pods. CPU
+  is the smaller problem (at 100m a 2-vCPU box carries twenty), and memory
+  refuses long before it.
+- **On a default k3s the quota is the only gate there is.** k3s reserves nothing
+  for itself, so the scheduler believes the whole machine is available to pods
+  and would admit a sixth tenant onto a box that cannot run one. The 1200 MiB
+  above is a fact about the machine, not something the scheduler knows. Making
+  it a second gate is a kubelet `systemReserved`, which is its own change (PR
+  #151 adds it here as §2b); until that is applied, this quota is the refusal.
 - **The request itself has to be true.** It is a promise about a daemon's
   resting size and the scheduler has nothing else to go on. A daemon that has
-  embedded anything keeps its ONNX session resident and rests at 250-300 MB,
-  and while this said 256Mi, four tenants ran a 4 GB box out of memory on
-  2026-08-19 and the kernel OOM-killed two of them: tenant pods are burstable,
-  so they are what it picks. At 384Mi the signup that would not fit is refused
-  instead (below), which is the failure you want and the one you can read.
+  embedded anything keeps its ONNX session resident and rests at roughly
+  300-500 MB, so 384Mi is about the p50 and not a comfortable number. While
+  this said 256Mi, four tenants ran a 4 GB box out of memory on 2026-08-19 and
+  the kernel OOM-killed two of them: tenant pods are burstable, so they are
+  what it picks. At 384Mi the signup that would not fit is refused instead
+  (below), which is the failure you want and the one you can read.
 - **Limits may oversubscribe.** Tenants are idle most of the time and a sync
   burst is seconds long. 4x requests is comfortable on one node; much past that
   and a few simultaneous backfills evict each other.

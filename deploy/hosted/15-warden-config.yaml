@@ -166,11 +166,15 @@ data:
   #
   # The memory request is a promise about a daemon's resting size and the
   # scheduler believes it, so it has to be true. It said 256Mi while a daemon
-  # that has embedded anything rests at 250-300 MB (the ONNX session stays
-  # resident), and on 2026-08-19 the node ran out of memory with FOUR tenants
-  # on it; the kernel took two of them, because a burstable tenant pod is what
-  # it picks. 384Mi is what they measure at. With it, the tenant that will not
-  # fit is refused at signup instead of a running mailbox being killed for it.
+  # that has embedded anything rests at roughly 300-500 MB (the ONNX session
+  # stays resident), and on 2026-08-19 the node ran out of memory with FOUR
+  # tenants on it; the kernel took two of them, because a burstable tenant pod
+  # is what it picks. 384Mi is about the p50 of what they measure at, not a
+  # comfortable number. With it, the tenant that will not fit is refused at
+  # signup instead of a running mailbox being killed for it, and on this box
+  # the thing doing the refusing is the quota in 70-tenant-limits.yaml, which
+  # is sized to five tenants at this request. Change one and redo the other.
+  #
   # Revisit once the daemon unloads its embedder when idle; the constant in
   # squelch-warden/src/config.rs carries the measurements.
   #
