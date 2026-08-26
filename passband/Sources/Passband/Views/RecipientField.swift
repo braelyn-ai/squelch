@@ -5,14 +5,23 @@
 // Backspace on an empty fragment is two-stage: first press highlights the last
 // pill, second deletes it. Clicking a pill selects it the same way.
 //
-// A SELECTED PILL OPENS THE MOVE BAR: `→ cc`, `→ bcc`, `remove`. That bar is
-// the feature, not decoration — moving somebody to Bcc is a thing people do
-// halfway through addressing a message, and a composer that can only add and
-// delete makes them retype an address they already got right. The same verbs
-// hang off a right-click (long-press on a phone) for people who look there
-// first. Both go through `Recipients.move`, which takes the address out of
-// every OTHER field on the way: an address left in To while the sender believes
-// it went out blind is the one outcome worth writing a whole type to prevent.
+// MOVING SOMEBODY BETWEEN FIELDS HAS THREE DOORS, because it is the thing
+// people actually do halfway through addressing a message and a composer that
+// can only add and delete makes them retype an address they already got right:
+//
+// - DRAG THE PILL onto another field. The direct one — the thing on screen is
+//   the person, and you put them where they go.
+// - Click the pill and take the MOVE BAR: `→ cc`, `→ bcc`, `remove`.
+// - Right-click it (long-press on a phone) for the same verbs in a menu.
+//
+// All three land on `Recipients.move`, which takes the address out of every
+// OTHER field on the way. An address left in To while the sender believes it
+// went out blind is the one outcome worth writing a whole type to prevent.
+//
+// The drop target takes plain text, so an address dragged out of a message
+// body — or out of another app — lands as a recipient too. Text carrying no
+// `@` is refused rather than pilled: `Recipients.key` returns "" for it, and
+// every caller reads that as "not an address".
 //
 // Autocomplete rides the fragment: every keystroke asks the daemon for
 // Sent-derived contacts — people the user has actually written to — and the
@@ -41,10 +50,14 @@ struct RecipientField<F: Hashable>: View {
     let slot: RecipientSlot
     var focus: FocusState<F?>.Binding
     let field: F
-    /// Drawn under the pills instead of a placeholder when the field is empty
-    /// and unfocused — the reply composer uses it to say what the daemon
-    /// derived. nil for the ordinary case.
+    /// Drawn in the well instead of the default when the field is empty — the
+    /// reply composer uses it to say why a bcc is blank. nil for the ordinary
+    /// case.
     var placeholder: String?
+    /// Something to hang on the right of the LABEL row. The `to` field carries
+    /// the cc/bcc toggles there, so they sit on the line that names the field
+    /// they unfold rather than floating loose above the stack.
+    var accessory: AnyView?
 
     /// Committed recipients — the pills.
     @State private var pills: [String] = []
@@ -55,15 +68,41 @@ struct RecipientField<F: Hashable>: View {
 
     @State private var hits: [ContactHit] = []
     @State private var index = 0
+    /// A drag is hovering this field's well.
+    @State private var dropTargeted = false
 
     /// This field's own slice of the bound value.
     private var text: String { recipients[slot] }
 
+    /// What an empty well says. ONLY `to` names an example address: three wells
+    /// all reading "recipient@example.com" reads as three fields waiting to be
+    /// filled, when two of them are ordinarily empty and correct that way. The
+    /// label above already says which header this is.
+    private var placeholderText: String {
+        if let placeholder { return placeholder }
+        return slot == .to ? "recipient@example.com" : ""
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
             VStack(alignment: .leading, spacing: 5) {
-                FieldLabel(slot.label)
-                pillRow.fieldWell()
+                HStack(spacing: 8) {
+                    FieldLabel(slot.label)
+                    Spacer(minLength: 0)
+                    accessory
+                }
+                pillRow
+                    .fieldWell()
+                    // The whole well is the target, not the pills in it: an
+                    // empty Bcc has nothing to aim at, and that is exactly the
+                    // field people drag TO.
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 9, style: .continuous)
+                            .strokeBorder(Palette.accent, lineWidth: dropTargeted ? 1.5 : 0)
+                    )
+                    .dropDestination(for: String.self) { items, _ in
+                        accept(dropped: items)
+                    } isTargeted: { dropTargeted = $0 }
             }
 
             // The verbs for the pill under the caret. Only with one selected,
@@ -110,7 +149,7 @@ struct RecipientField<F: Hashable>: View {
                     onRemove: { remove(addr) },
                     slot: slot)
             }
-            TextField(pills.isEmpty ? (placeholder ?? "recipient@example.com") : "", text: $fragment)
+            TextField(pills.isEmpty ? placeholderText : "", text: $fragment)
                 .textFieldStyle(.plain)
                 .focused(focus, equals: field)
                 .frame(minWidth: 120)
@@ -133,12 +172,14 @@ struct RecipientField<F: Hashable>: View {
                     .buttonStyle(.plain)
                     .font(Typo.micro)
                     .foregroundStyle(Palette.accent)
+                    .pointingHand()
             }
             Text("·").font(Typo.micro).foregroundStyle(Palette.inkFaintest)
             Button("remove") { remove(addr) }
                 .buttonStyle(.plain)
                 .font(Typo.micro)
                 .foregroundStyle(Palette.danger)
+                .pointingHand()
             Spacer(minLength: 0)
         }
         .padding(.leading, 2)
@@ -189,12 +230,26 @@ struct RecipientField<F: Hashable>: View {
         return Recipients.join(parts)
     }
 
-    /// An external value: complete tokens become pills, a trailing partial
-    /// (no comma after it) stays editable as the fragment.
+    /// An external value, turned back into pills and a live fragment.
+    ///
+    /// A COMPLETE ADDRESS IS A PILL HOWEVER IT ARRIVED — moved in from another
+    /// field, dropped from a drag, restored from a draft, seeded from the
+    /// daemon's derivation. Only a trailing token that is not yet an address
+    /// (no `@`) stays editable, because that one is somebody mid-keystroke.
+    ///
+    /// Testing for the trailing COMMA alone was the bug: nothing but typing
+    /// puts one there, so every address that arrived any other way landed as
+    /// raw text in the well and stayed text until the sender pressed space —
+    /// which made "move to cc" look like it had half-worked.
     private func parse(_ value: String) {
         var tokens = Recipients.split(value)
-        // A value ending in a separator has no partial: everything committed.
-        let trailingPartial = !value.trimmed.hasSuffix(",") ? tokens.popLast() ?? "" : ""
+        var trailingPartial = ""
+        if !value.trimmed.hasSuffix(","), let last = tokens.last,
+            Recipients.key(last).isEmpty
+        {
+            trailingPartial = last
+            tokens.removeLast()
+        }
         pills = tokens
         fragment = trailingPartial
         selectedPill = nil
@@ -213,6 +268,30 @@ struct RecipientField<F: Hashable>: View {
         // The caret stays here: moving somebody out is usually the middle of
         // sorting the audience, not the end of it.
         focus.wrappedValue = field
+    }
+
+    /// SOMETHING WAS DROPPED ON THIS FIELD. Usually a pill from one of the
+    /// other two; possibly an address dragged out of a message, or out of
+    /// another app entirely.
+    ///
+    /// Refused rather than pilled when the text names nobody — `Recipients.key`
+    /// is empty for anything without an `@`, so a sentence dragged off a page
+    /// does not become a recipient — and a no-op when the address is already in
+    /// THIS field, so a pill dropped back where it started keeps its place in
+    /// the list instead of jumping to the end.
+    private func accept(dropped items: [String]) -> Bool {
+        var updated = recipients
+        var moved = false
+        for token in items {
+            let addr = token.trimmed
+            guard !Recipients.key(addr).isEmpty, updated.slot(of: addr) != slot else { continue }
+            updated.move(addr, to: slot)
+            moved = true
+        }
+        guard moved else { return false }
+        selectedPill = nil
+        write(updated)
+        return true
     }
 
     private func remove(_ addr: String) {
@@ -402,10 +481,15 @@ private struct RecipientPill: View {
                 selected ? Palette.accent : Palette.accent.opacity(0.25),
                 lineWidth: selected ? 1.25 : 0.75)
         )
+        // THE PILL IS THE PERSON, so you can pick them up and put them in
+        // another field. Plain text on the way out, which also makes a pill
+        // draggable into anything that takes an address.
+        .draggable(addr)
+        .pointingHand()
         // The same verbs the move bar offers, where a right-click (long-press on
-        // a phone) goes looking for them. Two doors to one act, because moving a
-        // recipient is the kind of thing people expect from a context menu and
-        // the kind of thing that has to be findable without knowing that.
+        // a phone) goes looking for them. Three doors to one act, because moving
+        // a recipient is the kind of thing people reach for in three different
+        // ways and it has to be findable in all of them.
         .contextMenu {
             ForEach(RecipientSlot.allCases.filter { $0 != slot }, id: \.self) { destination in
                 Button("Move to \(destination.label.uppercased())") { onMove(destination) }
@@ -464,6 +548,86 @@ private struct FlowLine: Layout {
                 proposal: ProposedViewSize(width: size.width, height: size.height))
             x += size.width + spacing
             rowHeight = max(rowHeight, size.height)
+        }
+    }
+}
+
+// MARK: - the three fields together
+
+/// THE ADDRESS BLOCK: `to`, plus `cc` and `bcc` FOLDED AWAY behind their own
+/// labels on its line.
+///
+/// Folded because most mail has neither, and three wells for a message going to
+/// one person is three questions where there was one. The labels are the whole
+/// affordance — click "cc", the field unfolds with the caret already in it.
+///
+/// A FIELD HOLDING ADDRESSES IS NEVER FOLDED, whatever the toggle last said.
+/// That is not a nicety: a restored draft whose bcc hid itself would be exactly
+/// the invisible recipient this feature exists to make visible, and it would be
+/// invisible in the one direction that matters — the sender believing they are
+/// writing to fewer people than they are. So `shown` ORs in "has content", and
+/// clicking a full field's label focuses it instead of hiding it.
+struct RecipientFields<F: Hashable>: View {
+    @Binding var recipients: Recipients
+    var focus: FocusState<F?>.Binding
+    /// Maps a slot to the caller's own focus token — the two composers key
+    /// their `@FocusState` differently.
+    let field: (RecipientSlot) -> F
+    /// Per-slot placeholder override. The reply composer uses it on `bcc`.
+    var placeholder: (RecipientSlot) -> String? = { _ in nil }
+
+    /// Which optional fields the sender has unfolded this session.
+    @State private var revealed: Set<RecipientSlot> = []
+
+    /// The two that fold. `to` is not one of them: a message with no recipient
+    /// is not a message.
+    private static var optional: [RecipientSlot] { [.cc, .bcc] }
+
+    private func shown(_ slot: RecipientSlot) -> Bool {
+        slot == .to || revealed.contains(slot) || !recipients[slot].trimmed.isEmpty
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            ForEach(RecipientSlot.allCases.filter(shown), id: \.self) { slot in
+                RecipientField(
+                    recipients: $recipients, slot: slot, focus: focus, field: field(slot),
+                    placeholder: placeholder(slot),
+                    accessory: slot == .to ? AnyView(toggles) : nil)
+            }
+        }
+    }
+
+    /// The unfold labels, in the field block's own micro voice. Lit while their
+    /// field is up, so the row doubles as a statement of what this message
+    /// currently carries.
+    private var toggles: some View {
+        HStack(spacing: 8) {
+            ForEach(Self.optional, id: \.self) { slot in
+                Button(slot.label) { toggle(slot) }
+                    .buttonStyle(.plain)
+                    .font(Typo.micro)
+                    .foregroundStyle(shown(slot) ? Palette.accent : Palette.inkFaintest)
+                    // Two words in the micro voice look exactly like the label
+                    // beside them until the pointer says otherwise.
+                    .pointingHand()
+                    .accessibilityLabel(shown(slot) ? "hide \(slot.label)" : "add \(slot.label)")
+            }
+        }
+    }
+
+    private func toggle(_ slot: RecipientSlot) {
+        // A field with people in it does not fold away — it takes the caret, so
+        // the click still does something and what it does is visible.
+        guard recipients[slot].trimmed.isEmpty else {
+            focus.wrappedValue = field(slot)
+            return
+        }
+        if revealed.contains(slot) {
+            revealed.remove(slot)
+        } else {
+            revealed.insert(slot)
+            focus.wrappedValue = field(slot)
         }
     }
 }

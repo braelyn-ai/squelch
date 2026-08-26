@@ -245,16 +245,11 @@ struct ComposePane: View {
 
     private func editPane(_ compose: ComposeState) -> some View {
         VStack(alignment: .leading, spacing: 12) {
-            // ALL THREE, ALWAYS. A Cc behind a disclosure is a Cc people forget
-            // exists, and a Bcc behind one is worse: the field whose whole job
-            // is to be invisible in the sent mail should not also be invisible
-            // in the composer. The pane is half a window wide; it can afford
-            // three one-line wells.
-            ForEach(RecipientSlot.allCases, id: \.self) { slot in
-                RecipientField(
-                    recipients: recipientsBinding, slot: slot, focus: $focusedField,
-                    field: FocusTarget.recipient(slot))
-            }
+            // `to`, with cc and bcc folded behind their labels — and unfolded
+            // on their own whenever they hold anybody. See `RecipientFields`.
+            RecipientFields(
+                recipients: recipientsBinding, focus: $focusedField,
+                field: FocusTarget.recipient)
             Field(label: "subject") {
                 // Left blank on a reply the daemon titles from the parent; the
                 // placeholder says so, because an empty field otherwise reads as

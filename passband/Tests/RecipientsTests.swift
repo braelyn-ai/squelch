@@ -27,6 +27,7 @@ struct RecipientsTests {
         typingAnAddressIntoAFieldMovesThemThere()
         removingIsIdempotent()
         countsAndSlots()
+        aMovedAddressIsAFinishedRecipient()
 
         if failures > 0 {
             print("FAILED: \(failures) of \(checks) checks")
@@ -164,6 +165,25 @@ struct RecipientsTests {
         equal(r.all.count, 4, "four people in all")
         equal(r.slot(of: "C@Z.TEST"), RecipientSlot.cc, "found case-insensitively")
         equal(r.slot(of: "stranger@x.test"), nil, "a stranger is in no field")
+    }
+
+    /// The composer's field re-reads its whole list after every move, and it
+    /// has to be able to tell "a finished recipient" from "somebody
+    /// mid-keystroke" WITHOUT a trailing comma to go on — nothing but typing
+    /// ever puts one there. `key` is that test: an address has one, a fragment
+    /// does not.
+    static func aMovedAddressIsAFinishedRecipient() {
+        var r = Recipients(to: "alice@x.test, bob@x.test")
+        r.move("bob@x.test", to: .cc)
+        // No trailing comma, and there never will be — the field that renders
+        // this has to pill it anyway or the move reads as half-done.
+        equal(r.cc, "bob@x.test", "the value carries no separator")
+        equal(Recipients.key(Recipients.split(r.cc).last ?? "").isEmpty, false, "and it is an address")
+
+        // The other half of the same test: a real fragment has no key, which is
+        // what keeps it editable instead of being pilled out from under the
+        // caret.
+        equal(Recipients.key("bo").isEmpty, true, "a fragment is not finished")
     }
 
     // MARK: - assert

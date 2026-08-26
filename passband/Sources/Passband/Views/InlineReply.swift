@@ -243,6 +243,9 @@ struct InlineReply: View {
             }
             .buttonStyle(.plain)
             .disabled(inReview)
+            // A sentence in the micro voice reads as a caption until the
+            // pointer says it is a control.
+            .pointingHand()
             .accessibilityLabel(editingRecipients ? "hide recipients" : "edit recipients")
             Text("·").foregroundStyle(Palette.inkFaintest)
             Text(replySubject)
@@ -303,17 +306,12 @@ struct InlineReply: View {
     @ViewBuilder
     private func recipientEditor(_ compose: ComposeState) -> some View {
         if compose.recipientsStated {
-            VStack(alignment: .leading, spacing: 8) {
-                ForEach(RecipientSlot.allCases, id: \.self) { slot in
-                    RecipientField(
-                        recipients: recipientsBinding, slot: slot, focus: $focusedField,
-                        field: slot,
-                        // The one field with nothing to seed it says why it is
-                        // empty, rather than reading as a value that got lost.
-                        placeholder: slot == .bcc ? "nobody is blind-copied" : nil)
-                }
-            }
-            .padding(.bottom, 2)
+            RecipientFields(
+                recipients: recipientsBinding, focus: $focusedField, field: { $0 },
+                // The one field with nothing to seed it says why it is empty,
+                // rather than reading as a value that got lost.
+                placeholder: { $0 == .bcc ? "nobody is blind-copied" : nil })
+                .padding(.bottom, 2)
         } else {
             Text("deriving recipients…")
                 .font(Typo.micro)
