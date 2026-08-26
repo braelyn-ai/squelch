@@ -348,6 +348,97 @@ pub struct SenderRule {
     pub updated_at: DateTime<Utc>,
 }
 
+str_enum! {
+    /// HOW A SEND GROUP ADDRESSES ITS MEMBERS. A property of the AUDIENCE, not
+    /// of any one message: an investor list is individually-addressed every
+    /// time or it is not one, so this is chosen when the group is created and
+    /// the composer obeys it rather than asking again per send.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    pub enum GroupMode {
+        /// One message, every member in `To` — they see each other.
+        To => "to",
+        /// One message, every member in `Bcc` — they do not.
+        Bcc => "bcc",
+        /// One message PER member, sent separately. Replies come back as
+        /// private threads and read receipts are per-recipient.
+        Individual => "individual",
+    }
+    fallback = To;
+}
+
+/// One mailbox in a [`SendGroup`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GroupMember {
+    /// Lowercased bare address — the identity half of the membership key.
+    pub addr: String,
+    /// A convenience copy for rendering the list without joining `contacts`,
+    /// which stays the source of truth for who anyone is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+}
+
+/// A named audience the user can address as one. HUMAN DOOR ONLY.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SendGroup {
+    pub id: i64,
+    pub name: String,
+    /// Lowercased, whitespace-collapsed `name`. The uniqueness key, and what
+    /// composer autocomplete matches.
+    pub slug: String,
+    pub mode: GroupMode,
+    pub note: String,
+    pub member_count: i64,
+    /// EMPTY ON THE LIST READ, populated on the single-group read: a sidebar
+    /// listing every group's full membership is a contacts dump nobody asked
+    /// for.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub members: Vec<GroupMember>,
+    /// When this group was last addressed, recorded or derived. `None` for a
+    /// group that has never been written to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_sent_at: Option<DateTime<Utc>>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// ONE ENTRY IN A GROUP'S SEND HISTORY, from either of the two sources that feed
+/// it — a recorded [`crate::types::SendGroup`] send, or a message DERIVED by
+/// matching its stored recipients against the current membership.
+///
+/// The derived half is what makes the feature work on the day it ships: a group
+/// is created for people the user has already been emailing for a year, so a
+/// history that only knew about sends made through the group would open empty.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GroupHistoryEntry {
+    /// The recorded send this row is, or `None` when it was derived.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group_send_id: Option<i64>,
+    /// The message to open. For a fan-out this is the first recipient's copy —
+    /// the batch has no single message — and `None` when no echo ever landed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message_id: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread_id: Option<String>,
+    pub subject: String,
+    pub snippet: String,
+    pub sent_at: DateTime<Utc>,
+    pub mode: GroupMode,
+    /// How many of the group this reached. A derived row counts CURRENT members
+    /// the message named; a recorded row counts its own recipients.
+    pub reached: i64,
+    /// The denominator `reached` is out of: the snapshot taken at send time for
+    /// a recorded row, the current membership for a derived one. The two differ
+    /// on purpose — "9 of 12" about last quarter must keep meaning what it
+    /// meant, while a derived row can only ever speak about the group as it is
+    /// now.
+    pub group_size: i64,
+    /// Recipients a fan-out failed to reach. Always 0 for a derived row and for
+    /// a single-message send, which either went or did not.
+    pub failed: i64,
+    pub opens: i64,
+}
+
 /// An extracted bill/deadline. Bypasses the squelch threshold.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Deadline {

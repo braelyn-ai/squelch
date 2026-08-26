@@ -99,6 +99,15 @@ pub struct TriagedMessage {
     /// own address is filtered out at ingest). Contacts come exclusively from
     /// recipients of sent mail, never from inbound senders.
     pub recipients: Vec<String>,
+    /// Sent mail only: the FAITHFUL To/Cc address set, lowercased and deduped,
+    /// which becomes the `message_recipients` index.
+    ///
+    /// Deliberately not `recipients`, which is filtered for contact seeding (the
+    /// account's own address and robot addresses dropped). This one answers "who
+    /// did this go to" — the question `messages.to_addrs` answers in display
+    /// form — so send-group history can join against it and still see a mail
+    /// that went to `support@` or to the user themselves. Empty on received mail.
+    pub recipient_addrs: Vec<String>,
     pub sensitivity: Sensitivity,
     pub sealed_kind: Option<SealedKind>,
     pub importance: u8,

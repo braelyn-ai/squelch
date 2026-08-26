@@ -374,6 +374,20 @@ pub(super) fn migrate(conn: &Connection) -> Result<()> {
         clear_stale_no_extractor_markers(conn)?;
     }
 
+    // ---- ONE-SHOT: the normalized sent-recipient index ---------------------
+    //
+    // `message_recipients` arrives empty on an existing DB while `to_addrs` has
+    // been filling for months, so without this a send group opens on a mailbox
+    // that looks like it has never written to anyone. Derived history is the
+    // half of the feature that can speak about the past, and this is what gives
+    // it something to read.
+    //
+    // Self-triggering and idempotent: the candidate predicate is "sent, has
+    // recipients, has no index rows", so a completed pass matches nothing and an
+    // interrupted one resumes where it stopped. No done-flag and no `added_*`
+    // gate — a plain re-run is free.
+    backfill_message_recipients(conn)?;
+
     // Guarded on table existence — migration unit tests build partial schemas.
     if !tables_exist(conn, &["triage", "deadlines", "messages"])? {
         return Ok(());
@@ -570,6 +584,49 @@ fn clear_stale_no_extractor_markers(conn: &Connection) -> Result<()> {
                 "UPDATE triage SET extractor_model_used = NULL
                  WHERE extractor_model_used = 'skip-no-extractor' AND category = ?1",
                 params![category],
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// ONE-SHOT (and resumable): fill `message_recipients` from the `to_addrs`
+/// display strings already on disk.
+///
+/// Local and parse-only — no network, unlike the recipients sweep in the sync
+/// engine that produced `to_addrs` in the first place. Rows whose `to_addrs` is
+/// NULL are not candidates here: they are that sweep's queue, and it writes the
+/// index itself as it fills them.
+///
+/// An EMPTY `to_addrs` ("looked, and the headers named nobody") yields no rows
+/// and therefore stays a candidate forever. That is a handful of rows parsing to
+/// nothing on each open, which is cheaper than a done-flag per account for a
+/// table this seam scans once.
+fn backfill_message_recipients(conn: &Connection) -> Result<()> {
+    if !tables_exist(conn, &["messages", "message_recipients"])?
+        || !has_columns(conn, "messages", &["to_addrs", "is_sent"])?
+    {
+        return Ok(());
+    }
+    let rows: Vec<(i64, i64, String)> = conn
+        .prepare(
+            "SELECT m.id, m.account_id, m.to_addrs FROM messages m
+             WHERE m.is_sent = 1
+               AND m.to_addrs IS NOT NULL
+               AND m.to_addrs != ''
+               AND NOT EXISTS (
+                   SELECT 1 FROM message_recipients r
+                   WHERE r.account_id = m.account_id AND r.message_id = m.id)",
+        )?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+
+    for (message_id, account_id, to_addrs) in rows {
+        for addr in crate::sync::ingest::parse_stored_recipients(&to_addrs) {
+            conn.execute(
+                "INSERT OR IGNORE INTO message_recipients(account_id, message_id, addr)
+                 VALUES(?1,?2,?3)",
+                params![account_id, message_id, addr],
             )?;
         }
     }

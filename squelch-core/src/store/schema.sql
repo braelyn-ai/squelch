@@ -959,3 +959,132 @@ CREATE TABLE IF NOT EXISTS pairing_codes (
 
 -- The mint's supersede reads exactly "every code for my account".
 CREATE INDEX IF NOT EXISTS idx_pairing_codes_account ON pairing_codes(account_id);
+
+-- NORMALIZED SENT RECIPIENTS: one row per (sent message, bare address), written
+-- from the SAME faithful mailbox list `messages.to_addrs` is rendered from.
+--
+-- `to_addrs` is a DISPLAY string (`"Doe, Jane" <j@x>, bob@y`), so the only way to
+-- ask "who did I send this to" against it is a `LIKE '%addr%'` scan per address
+-- — which is what the send-group history would have had to do, per member, per
+-- query. This table makes that an indexed join instead.
+--
+-- FAITHFUL, NOT FILTERED — deliberately unlike `contacts`, which drops the
+-- account's own address and robot addresses to protect "people I know". This
+-- answers "who did this go to", so a note to self and a `support@` both belong.
+-- `addr` is lowercased and deduped per message; display names live in
+-- `to_addrs` and are no part of the key.
+--
+-- SENT MAIL ONLY. Received mail has no `to_addrs` and writes nothing here, so
+-- the table can never be read as an inbound-recipient index.
+CREATE TABLE IF NOT EXISTS message_recipients (
+    account_id INTEGER NOT NULL,
+    message_id INTEGER NOT NULL,   -- -> messages.id
+    addr       TEXT NOT NULL,      -- lowercased bare address, no display name
+    PRIMARY KEY(account_id, message_id, addr)
+);
+
+-- The group-history read is "every sent message naming any of these addresses",
+-- so the address is the leading column.
+CREATE INDEX IF NOT EXISTS idx_message_recipients_addr
+    ON message_recipients(account_id, addr);
+
+-- A NAMED AUDIENCE the user can address as one ("preseed investors" -> 12
+-- mailboxes). HUMAN-DOOR DATA ONLY: served by `/client/groups`, never visible on
+-- /mcp — who the user talks to as a bloc is not something the agent door was
+-- handed (two-door invariant).
+--
+-- NOT NAMED `groups`: `GROUPS` is a SQLite window-frame keyword, and while
+-- SQLite would accept it unquoted today, every query naming it is one grammar
+-- change away from a syntax error.
+--
+-- `mode` IS THE GROUP'S OWN PROPERTY, not the composer's, because it is a fact
+-- about the audience rather than about one message: an investor list is
+-- individually-addressed every time or it is not one.
+--   'to'         one message, every member in To — they see each other
+--   'bcc'        one message, every member in Bcc — they do not
+--   'individual' one message PER member, sent separately
+-- Unrecognized values read as 'to' (the visible, least surprising shape); see
+-- `GroupMode::parse`.
+--
+-- `slug` is the lowercased, whitespace-collapsed `name`: the uniqueness key, and
+-- what composer autocomplete matches, so "Preseed Investors" and
+-- "preseed investors" cannot both exist.
+CREATE TABLE IF NOT EXISTS send_groups (
+    id         INTEGER PRIMARY KEY,
+    account_id INTEGER NOT NULL,
+    name       TEXT NOT NULL,
+    slug       TEXT NOT NULL,
+    mode       TEXT NOT NULL DEFAULT 'to',
+    note       TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(account_id, slug)
+);
+
+-- MEMBERSHIP. `addr` is the lowercased bare address and half the primary key, so
+-- adding someone twice is a no-op rather than a duplicate recipient. The
+-- `display_name` is a convenience copy for rendering the member list without a
+-- join; `contacts` remains the source of truth for who anyone is.
+--
+-- ON DELETE CASCADE: `PRAGMA foreign_keys = ON` is set at the top of this file,
+-- so dropping a group takes its membership with it.
+CREATE TABLE IF NOT EXISTS group_members (
+    group_id     INTEGER NOT NULL REFERENCES send_groups(id) ON DELETE CASCADE,
+    account_id   INTEGER NOT NULL,
+    addr         TEXT NOT NULL,
+    display_name TEXT,
+    added_at     TEXT NOT NULL,
+    PRIMARY KEY(group_id, addr)
+);
+
+-- The member-side of the history join, and the composer's "expand this group".
+CREATE INDEX IF NOT EXISTS idx_group_members_addr
+    ON group_members(account_id, addr);
+
+-- ONE ROW PER GROUP SEND, whatever shape it took: a single To/Bcc message or a
+-- fan-out of N. This is the RECORDED half of a group's history; the derived half
+-- (`message_recipients` joined against `group_members`) is what makes a group
+-- created today show the year of mail that preceded it. A group send is recorded
+-- here AND matches the derived query, so the history read excludes any message a
+-- row here already claims.
+--
+-- `recipients` is a SNAPSHOT COUNT taken at send time. Membership is mutable, and
+-- "sent to 12" must not silently become "sent to 15" when three people join
+-- later.
+--
+-- `group_id` does NOT cascade-delete: deleting a group is a statement about who
+-- you will address next, not a licence to erase what you already sent. The rows
+-- outlive the group, and the history read tolerates a dangling id.
+CREATE TABLE IF NOT EXISTS group_sends (
+    id         INTEGER PRIMARY KEY,
+    account_id INTEGER NOT NULL,
+    group_id   INTEGER NOT NULL,
+    subject    TEXT NOT NULL,
+    mode       TEXT NOT NULL,
+    sent_at    TEXT NOT NULL,
+    recipients INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_group_sends_group
+    ON group_sends(account_id, group_id, sent_at);
+
+-- ONE ROW PER (GROUP SEND, RECIPIENT). For a To/Bcc send every row names the
+-- same `message_id`; for a fan-out each names its own, which is what makes read
+-- receipts per-recipient in that mode.
+--
+-- `message_id` is NULL until the echo of that send lands (and stays NULL when it
+-- never does — a sealed or failed echo), exactly like `send_trackers.message_id`.
+--
+-- `status` is 'sent' | 'failed'. A FAN-OUT CAN PARTIALLY FAIL, and that is a
+-- first-class state rather than an error: eleven investors got the update and one
+-- did not, and the one thing worse than that is not knowing which. `error` holds
+-- the redacted reason for the failed row.
+CREATE TABLE IF NOT EXISTS group_send_recipients (
+    group_send_id INTEGER NOT NULL REFERENCES group_sends(id) ON DELETE CASCADE,
+    account_id    INTEGER NOT NULL,
+    addr          TEXT NOT NULL,
+    message_id    INTEGER,
+    status        TEXT NOT NULL DEFAULT 'sent',
+    error         TEXT,
+    PRIMARY KEY(group_send_id, addr)
+);

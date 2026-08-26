@@ -12,6 +12,7 @@ mod devices;
 mod error;
 mod events;
 pub mod gmail_write;
+mod groups;
 pub mod guard;
 mod handlers;
 mod invite_mail;
@@ -142,6 +143,7 @@ fn client_router(state: ApiState) -> Router {
         // Recipient autocomplete over Sent-derived contacts. Human door only —
         // the agent door must never see who the user writes to.
         .route("/client/contacts", get(handlers::get_contacts))
+        .merge(groups::routes())
         .route("/client/sealed", get(handlers::list_sealed))
         .route(
             "/client/sealed/{message_id}/reveal",
