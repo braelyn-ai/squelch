@@ -311,7 +311,7 @@ holds even for a tenant reconciled by hand.
 | `SQUELCH_WARDEN_TMP_SIZE` | `512Mi` | `sizeLimit` on the pod's `/tmp` emptyDir. |
 | `SQUELCH_WARDEN_USER_NAMESPACES` | `on` | `hostUsers: false`. Turn off only if the cluster cannot do it. |
 | `SQUELCH_WARDEN_MODEL_PVC` | unset | Shared pre-seeded embedding weights; see SETUP.md step 10. |
-| `SQUELCH_WARDEN_EMBED_MODEL` | unset | Fleet-wide embedding model, passed on as `SQUELCH_EMBED_MODEL`. Unset means the daemon's own pin. |
+| `SQUELCH_WARDEN_EMBED_MODEL` | unset | Fleet-wide embedding model, passed on as `SQUELCH_EMBED_MODEL`. Unset means the daemon's own pin. Reseed `SQUELCH_WARDEN_MODEL_PVC` with the new weights BEFORE moving it: a model the volume does not hold is a cold download on every tenant, which is the readiness failure the warden warns about at boot. |
 | `SQUELCH_WARDEN_EMBED_IDLE_UNLOAD_SECS` | unset | Passed on as `SQUELCH_EMBED_IDLE_UNLOAD_SECS`: seconds before a tenant daemon drops its idle embedding session. Unset keeps the daemon's default; `0` never unloads. |
 | `SQUELCH_WARDEN_IMAGE_PULL_SECRET` | unset | For a private squelchd image. |
 | `SQUELCH_WARDEN_NODE_CIDR` | unset | Lets the node reach 8848 and 9464, when the CNI drops kubelet probes. |

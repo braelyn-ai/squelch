@@ -844,15 +844,28 @@ impl EmbedConfig {
     /// identical.
     /// The ceiling is the model's own position budget; asking for more only pays
     /// for padding.
+    ///
+    /// A clamp that fires says so on stderr, once, beside the line naming the
+    /// model: an operator who wrote a number and got a different one has to be
+    /// able to find that out from the log rather than from a memory graph.
     pub fn settings(&self) -> crate::embed::EmbedSettings {
+        let max_tokens = self.max_tokens.clamp(
+            crate::embed::EMBED_MAX_TOKENS_FLOOR,
+            crate::embed::EMBED_MAX_TOKENS_CEILING,
+        );
+        if max_tokens != self.max_tokens {
+            eprintln!(
+                "squelch: embed max_tokens {} is out of range, using {max_tokens} (allowed {}-{})",
+                self.max_tokens,
+                crate::embed::EMBED_MAX_TOKENS_FLOOR,
+                crate::embed::EMBED_MAX_TOKENS_CEILING,
+            );
+        }
         crate::embed::EmbedSettings {
             model_name: self.model.clone(),
             dims: self.dims,
             cache_dir: self.cache_dir.clone(),
-            max_tokens: self.max_tokens.clamp(
-                crate::embed::EMBED_MAX_TOKENS_FLOOR,
-                crate::embed::EMBED_MAX_TOKENS_CEILING,
-            ),
+            max_tokens,
         }
     }
 }
@@ -1240,16 +1253,21 @@ fn env_nonempty(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|s| !s.is_empty())
 }
 
-/// Overwrite `slot` from env var `name` when it is set, non-empty, and parses as
-/// `T`. EMPTY IS "UNSET": an exported-but-blank var must never clear a
-/// configured value. The value is used verbatim — no trimming — so a var whose
-/// whitespace matters keeps it.
+/// Overwrite `slot` from env var `name` when it is set, non-blank, and parses as
+/// `T`. TRIMMED, and BLANK IS "UNSET": an exported-but-empty var must never
+/// clear a configured value, and neither must one carrying nothing but spaces.
+/// The whitespace half is not pedantry — `SQUELCH_EMBED_MODEL="   "` used to set
+/// a pin that `resolve_model` then trims back to empty, which takes semantic
+/// recall off for that run. Same rule the warden's `var()` follows, so a value
+/// means the same thing whichever door it comes through.
 fn env_override<T: std::str::FromStr>(name: &str, slot: &mut T) {
-    if let Ok(v) = std::env::var(name)
-        && !v.is_empty()
-        && let Ok(parsed) = v.parse::<T>()
-    {
-        *slot = parsed;
+    if let Ok(v) = std::env::var(name) {
+        let v = v.trim();
+        if !v.is_empty()
+            && let Ok(parsed) = v.parse::<T>()
+        {
+            *slot = parsed;
+        }
     }
 }
 
@@ -2474,12 +2492,26 @@ backfill_days = 90
 
         // Exported but blank is "unset", the rule every env_override follows: it
         // must not clear the pin and leave the embedder resolving an empty name.
+        // WHITESPACE COUNTS AS BLANK, and it is the spelling that actually turns
+        // up: a quoted value in a unit file or a `-e VAR=" "` is easy to write
+        // and impossible to see, and `resolve_model` trims it back to empty and
+        // refuses, which takes semantic recall off for the run.
+        for blank in ["", "   ", "\n\t "] {
+            unsafe {
+                std::env::set_var("SQUELCH_EMBED_MODEL", blank);
+            }
+            let mut c = Config::default();
+            c.apply_env_overrides();
+            assert_eq!(c.embed.model, crate::embed::DEFAULT_MODEL_CODE, "{blank:?}");
+        }
+
+        // A value with slack around it still means the value.
         unsafe {
-            std::env::set_var("SQUELCH_EMBED_MODEL", "");
+            std::env::set_var("SQUELCH_EMBED_MODEL", "  BGESmallENV15Q\n");
         }
         let mut c = Config::default();
         c.apply_env_overrides();
-        assert_eq!(c.embed.model, crate::embed::DEFAULT_MODEL_CODE);
+        assert_eq!(c.embed.model, "BGESmallENV15Q");
         unsafe {
             std::env::remove_var("SQUELCH_EMBED_MODEL");
         }
