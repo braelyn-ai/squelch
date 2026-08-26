@@ -26,6 +26,7 @@
 		16E483911006F01000C2CEC8 /* ConnectView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4D6D7D083F3A7242DB7EB186 /* ConnectView.swift */; };
 		19AC9992744F5AE1DE0DF040 /* AuditView.swift in Sources */ = {isa = PBXBuildFile; fileRef = E6D39F14D1F28EEB5D9E86FE /* AuditView.swift */; };
 		1B728ED3AEA7FA2987C81319 /* ListRow.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4A52E20474A0D6F31073DA61 /* ListRow.swift */; };
+		1CE21E966B1C0068BBAE7178 /* ThreadArrivals.swift in Sources */ = {isa = PBXBuildFile; fileRef = CB8DC0D632309B6B97130426 /* ThreadArrivals.swift */; };
 		1D4DC0356DE1A699763FBFB0 /* UsageView.swift in Sources */ = {isa = PBXBuildFile; fileRef = E8D7384FAFC16891C369CFA8 /* UsageView.swift */; };
 		1E07DF0006E501D0B7C3228A /* Ranking.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7079893CCCC8806D2B5099D8 /* Ranking.swift */; };
 		217F91C35460C7286C88712C /* WebKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = BBC8D81B089AFD24BD4AC367 /* WebKit.framework */; };
@@ -147,6 +148,7 @@
 		8DD946F7BC6990641C19ACC1 /* ProcessView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 639F5C0DB9AE5A1AE8DF69A1 /* ProcessView.swift */; };
 		903D181BC549637A0AEEB564 /* EmailWebCore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3BFBFFBE499370A5F88E2540 /* EmailWebCore.swift */; };
 		911E2DC6E6549AECE86FFBAA /* Sounds in Resources */ = {isa = PBXBuildFile; fileRef = F538ABF63F676ADB2910AE59 /* Sounds */; };
+		913D465C949CCE810929D314 /* ThreadArrivals.swift in Sources */ = {isa = PBXBuildFile; fileRef = CB8DC0D632309B6B97130426 /* ThreadArrivals.swift */; };
 		918EB3663E912FF4F36229C2 /* EmailWebCore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3BFBFFBE499370A5F88E2540 /* EmailWebCore.swift */; };
 		91F318BC5570E8048D351984 /* StagedAttachment.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2CEB46442CC9ABC798040928 /* StagedAttachment.swift */; };
 		921ACE1D761AE0AD1F714980 /* MobileAuthView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9E5E8356451742599F7D7A2A /* MobileAuthView.swift */; };
@@ -400,6 +402,7 @@
 		C10C0C8780CCB9C6BAB2709C /* MailCSP.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MailCSP.swift; sourceTree = "<group>"; };
 		C465B24E00D0436CD5704294 /* SwipeRow.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SwipeRow.swift; sourceTree = "<group>"; };
 		C9CC93E238228B2BA4D4569A /* Passband.icon */ = {isa = PBXFileReference; lastKnownFileType = wrapper.icon; path = Passband.icon; sourceTree = "<group>"; };
+		CB8DC0D632309B6B97130426 /* ThreadArrivals.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ThreadArrivals.swift; sourceTree = "<group>"; };
 		CDDAB6C380027F87A19022BF /* RemindTimes.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RemindTimes.swift; sourceTree = "<group>"; };
 		CE462B9CE6C195F53B48B801 /* EventStream.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EventStream.swift; sourceTree = "<group>"; };
 		CE514B2862480E62EB8936A3 /* ImageFill.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ImageFill.swift; sourceTree = "<group>"; };
@@ -544,6 +547,7 @@
 				DEACCDDABDFBD619EB070CEB /* ShareNudge.swift */,
 				5B7D3E42C4E6495943239602 /* SitrepWindow.swift */,
 				2CEB46442CC9ABC798040928 /* StagedAttachment.swift */,
+				CB8DC0D632309B6B97130426 /* ThreadArrivals.swift */,
 				A5B25E3187C89277DBE8DEF3 /* ThreadStyle.swift */,
 				9C92A36DDD1B4FF9A1BD99B0 /* ThreadStyleLedger.swift */,
 				EEFA34554013DFB615774309 /* Trackers.swift */,
@@ -955,6 +959,7 @@
 				61E6D7AA7EB53F8AEE04063C /* SitrepZones.swift in Sources */,
 				91F318BC5570E8048D351984 /* StagedAttachment.swift in Sources */,
 				EA0F7FADC742BF00778433BF /* SubjectText.swift in Sources */,
+				913D465C949CCE810929D314 /* ThreadArrivals.swift in Sources */,
 				4C66C7F7C1AB185340BCC719 /* ThreadMinimap.swift in Sources */,
 				AB169C9A19D62418DBAD4C3D /* ThreadPrefetch.swift in Sources */,
 				2D0D09F90F44A946AC7286C3 /* ThreadStyle.swift in Sources */,
@@ -1087,6 +1092,7 @@
 				36AF6616DDF139B04CF8782F /* StagedAttachment.swift in Sources */,
 				C47E10D8934D830B5018DC8B /* SubjectText.swift in Sources */,
 				C8FCFA76D21B9E6DC3093D18 /* SwipeRow.swift in Sources */,
+				1CE21E966B1C0068BBAE7178 /* ThreadArrivals.swift in Sources */,
 				9B3E18E0184901FAE39CB499 /* ThreadMinimap.swift in Sources */,
 				40E611424100EA3551AB3477 /* ThreadPrefetch.swift in Sources */,
 				0D05989412C01C429266CDBA /* ThreadStyle.swift in Sources */,

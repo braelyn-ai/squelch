@@ -531,17 +531,24 @@ final class AppStore {
         else { return nil }
         return summary
     }
-    /// Bumped when a sync brings a message NEWER than the one the reader holds
-    /// into the thread on screen — see SitrepPoller.performPull. The viewer
-    /// watches it and refetches without moving the reading position.
+    /// Bumped when a message NEWER than the one the reader holds lands in the
+    /// thread on screen — from the live event feed the instant triage emits it,
+    /// or from the 10s poll behind it. The viewer watches it and refetches
+    /// without moving the reading position. See `noteThreadArrival`.
     ///
-    /// A token rather than the mail itself: the poller reads the attention
-    /// bands, which say a thread moved but not what it now contains, and the
-    /// viewer is the one place that knows how to adopt a thread. It is also why
-    /// nothing resets it — a counter only has to CHANGE, so a thread switch
-    /// under a live token is a viewer that simply never hears about the bump it
-    /// no longer cares about.
+    /// A token rather than the mail itself: neither reporter carries the
+    /// thread's new contents (the feed has one denormalized row, the poller
+    /// reads the attention bands, which say a thread moved and not what it now
+    /// holds), and the viewer is the one place that knows how to adopt a
+    /// thread. It is also why nothing resets it — a counter only has to CHANGE,
+    /// so a thread switch under a live token is a viewer that simply never
+    /// hears about the bump it no longer cares about.
     var openThreadRefreshToken = 0
+    /// WHAT THE HUMAN HAS ALREADY BEEN TOLD about the thread they are reading.
+    /// Private because `noteThreadArrival` is the only door: the refetch and
+    /// the announcement have different rules, and ThreadArrivals is where the
+    /// difference lives.
+    private var arrivals = ThreadArrivals()
     var compose: ComposeState?
     /// The reader's inline reply composer. Deliberately NOT part of
     /// `modalOverlayOpen`: it is a bar inside the reading surface, not an overlay
@@ -1117,6 +1124,9 @@ final class AppStore {
         // through `closeThread`/`closeCompose`: those flush drafts, and step
         // (4) already saved and settled everything there was to save.
         threadId = nil
+        // The ledger goes with it: what the other mailbox's reader had already
+        // been told about says nothing about this one's.
+        arrivals.reset(to: nil)
         threadQueue = []
         pendingReplyMessageId = nil
         compose = nil
@@ -1311,6 +1321,9 @@ final class AppStore {
         // mounted and may never re-adopt.
         if self.threadId != threadId { openThreadSummary = nil }
         self.threadId = threadId
+        // The arrivals ledger follows the thread, and declines to forget on a
+        // REOPEN of the same one — see ThreadArrivals.reset.
+        arrivals.reset(to: threadId)
         self.threadQueue = queue
         // An ordinary open puts the reader straight in the window — opening an
         // email is a jump. Only done+next passes an edge, and it walks the
@@ -1333,6 +1346,7 @@ final class AppStore {
 
     func closeThread() {
         threadId = nil
+        arrivals.reset(to: nil)
         threadQueue = []
         // The flight is deliberately left where it is: the last email of a queue
         // is mid-departure when this runs, and there is nothing left to put back
@@ -1341,6 +1355,49 @@ final class AppStore {
         DraftSaver.shared.flush(.inlineReply, inlineReply)
         inlineReply = nil
         pendingReplyMessageId = nil
+    }
+
+    // MARK: - live arrivals
+
+    /// A frame off the live event feed, offered to the thread on screen.
+    ///
+    /// THE ACCOUNT IS AN ARGUMENT and never read from here. One event stream
+    /// runs per account — including the ones nobody is looking at, which is the
+    /// entire reason they are held — and thread ids and message ids alike are
+    /// one daemon's SQLite ints. A background mailbox whose ids happened to
+    /// collide with the live thread's would otherwise pull a stranger's mail
+    /// into the email on screen.
+    func noteLiveEvent(_ event: Event, accountId: UUID) {
+        guard AccountManager.shared.activeId == accountId else { return }
+        // A read receipt is not new mail: nothing joined the thread, and
+        // `sender` on one of those rows is the user's own address. The reader
+        // keeps its receipts fresh on its own schedule.
+        guard event.kind != .opened else { return }
+        noteThreadArrival(
+            thread: event.thread_id, message: event.message_id, sender: event.sender)
+    }
+
+    /// NEW MAIL IN THE THREAD SOMEBODY IS READING — the one door, and both
+    /// reporters come through it: the event feed the moment triage emits, and
+    /// the 10s poll that is the only one to see an arrival the feed missed or
+    /// never carried.
+    ///
+    /// Two things follow and they are decided separately (see ThreadArrivals).
+    /// The REFETCH is a token bump the viewer answers by adopting a fresh copy
+    /// in place — that is what puts the reply into the thread under the
+    /// reader's eyes, without taking the page away from them. The ANNOUNCEMENT
+    /// is the toast, and it is the only thing that says so out loud: the system
+    /// banner is deliberately suppressed while the app is frontmost with a
+    /// window up (see Notifier.presentation), which is precisely the case a
+    /// person reading the thread is in.
+    func noteThreadArrival(thread: String, message: Int, sender: String) {
+        let verdict = arrivals.admit(
+            thread: thread, message: message, held: currentThreadSummary?.newestMessageId)
+        guard verdict.refetch else { return }
+        openThreadRefreshToken &+= 1
+        guard verdict.announce else { return }
+        let name = SenderID.displayName(sender)
+        pushToast(name.isEmpty ? "new message in this thread" : "new message from \(name)")
     }
 
     /// True while a modal owns the screen; the surfaces under it blur so the modal

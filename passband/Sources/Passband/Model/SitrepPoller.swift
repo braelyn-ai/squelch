@@ -129,15 +129,21 @@ final class SitrepPoller {
             // value difference, so writing an identical read model every 10s
             // re-lays out the whole dashboard for nothing.
             if next != store.sitrep { store.sitrep = next }
-            // A REPLY THAT LANDED IN THE THREAD ON SCREEN. The reader holds the
-            // copy it fetched when it opened, and this poll is the only thing in
-            // the app that hears about new mail — without this, an answer to the
-            // email somebody is sitting on shows up when they leave and come
-            // back. Deliberately NOT gated on `next` having changed: a refetch
-            // that failed leaves the summary where it was, so the next poll asks
-            // again, and the ask stops the moment the viewer adopts the newer id.
-            if let open = store.currentThreadSummary, brings(next, newMailTo: open) {
-                store.openThreadRefreshToken &+= 1
+            // A REPLY THAT LANDED IN THE THREAD ON SCREEN. The live event feed
+            // usually gets there first, and this is the backstop that has to
+            // hold anyway: the feed only carries mail triage judged worth a
+            // notification, and it is not carrying anything at all while the
+            // connection is down. Without one of the two, an answer to the email
+            // somebody is sitting on shows up when they leave and come back.
+            //
+            // Deliberately NOT gated on `next` having changed: a refetch that
+            // failed leaves the summary where it was, so the next poll asks
+            // again, and the ask stops the moment the viewer adopts the newer
+            // id. The store is what makes the ask idempotent and the TELLING
+            // once — see AppStore.noteThreadArrival.
+            if let open = store.currentThreadSummary, let row = newestArrival(in: next, for: open) {
+                store.noteThreadArrival(
+                    thread: row.thread_id, message: row.id, sender: row.senderString)
             }
             if store.refreshError != nil {
                 store.refreshError = nil
@@ -189,16 +195,31 @@ final class SitrepPoller {
         }
     }
 
-    /// Whether a freshly pulled read model holds a message in the open thread
-    /// that the reader has not got. Ids are the store's own row ids, so newer
-    /// really is greater — and the compare is what keeps this quiet: the same
-    /// rows sit in the bands for as long as they are unresolved, and only one
-    /// that outranks the summary's newest is news.
-    private func brings(_ data: SitrepData, newMailTo open: OpenThreadSummary) -> Bool {
-        func newer(_ rows: [AttentionUpdate]) -> Bool {
-            rows.contains { $0.thread_id == open.threadId && $0.id > open.newestMessageId }
-        }
-        return newer(data.standing) || newer(data.new) || newer(data.open)
+    /// The newest message in a freshly pulled read model that belongs to the
+    /// open thread and that the reader has not got. Ids are the store's own row
+    /// ids, so newer really is greater — and the compare is what keeps this
+    /// quiet: the same rows sit in the bands for as long as they are unresolved,
+    /// and only one that outranks the summary's newest is news.
+    ///
+    /// The NEWEST of them and not each one, because the row is only carried for
+    /// the sender's name on a toast: three replies landing between two polls is
+    /// one refetch that brings all three, and one line naming whoever spoke
+    /// last beats three lines stacked on top of each other.
+    ///
+    /// KNOWN LIMITATION, and it is why the event feed is the reporter that
+    /// matters: the bands collapse to ONE ROW PER THREAD, and the survivor is
+    /// picked by importance before recency (see the ROW_NUMBER in
+    /// store::sqlite::attention). So a new message that scores BELOW a sibling
+    /// already in the band never appears here at all, however recent it is —
+    /// this sees an arrival only when it is the most important thing its thread
+    /// has to offer, which for a live back-and-forth it usually is.
+    private func newestArrival(
+        in data: SitrepData, for open: OpenThreadSummary
+    ) -> AttentionUpdate? {
+        [data.standing, data.new, data.open]
+            .joined()
+            .filter { $0.thread_id == open.threadId && $0.id > open.newestMessageId }
+            .max { $0.id < $1.id }
     }
 
     /// Manual refresh: poke the daemon to poll Gmail now, then re-pull so fresh

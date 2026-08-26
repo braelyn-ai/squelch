@@ -88,6 +88,14 @@ struct ThreadViewer: View {
     /// issue competing `scrollTo`s at two targets, which is a column that
     /// judders rather than lands. See `settle`.
     @State private var settleTask: Task<Void, Never>?
+    /// HOW MUCH MAIL LANDED BELOW THE READER while they were reading, and it is
+    /// only ever non-zero for somebody who is NOT at the end of the thread:
+    /// `refreshInPlace` carries a reader who was parked on the newest onto the
+    /// message that just arrived, and there is nothing to point at when the
+    /// thing being pointed at is already in front of you. Everyone else keeps
+    /// their place, so the arrival is off screen below them and the pill is the
+    /// only thing that says it happened.
+    @State private var arrivals = 0
 
     enum ConfirmMode: Equatable { case ask, noLink }
 
@@ -609,6 +617,13 @@ struct ThreadViewer: View {
                     // hands off. It fires twice a gesture, not per tick.
                     .onScrollPhaseChange { _, phase in
                         handScrolling = phase != .idle
+                        // A WHEEL NEVER TOUCHES THE SELECTION, so somebody who
+                        // scrolled down to the arrival themselves would still be
+                        // looking at a pill telling them it is below. Asked of
+                        // the map, which is already tracking every card's frame,
+                        // and only when the hand comes off: mid-gesture the
+                        // answer changes every tick.
+                        if phase == .idle, parkedOnNewest { arrivals = 0 }
                     }
                 }
                 // A STEP animates, A JUMP DOES NOT. j/k moves to the neighbouring
@@ -618,6 +633,9 @@ struct ThreadViewer: View {
                 // instantiated is the one SwiftUI reliably declines to perform:
                 // it has nothing to animate from, so it does nothing at all.
                 .onChange(of: index) { was, now in
+                    // Reaching the end of the thread IS reading what arrived —
+                    // whether that took the pill, a press of `j`, or the rail.
+                    if now == newestIndex { arrivals = 0 }
                     if abs(now - was) == 1 {
                         withAnimation(Motion.scrollFollow) { proxy.scrollTo(now, anchor: .top) }
                     } else {
@@ -714,6 +732,13 @@ struct ThreadViewer: View {
                         on: target, proxy: proxy, tries: 24, every: .milliseconds(40), hold: 3,
                         under: index)
                 }
+                // NEW MAIL IS BELOW YOU, and this is the only thing in the
+                // window that says so: the arrival was folded into the stack
+                // without moving the reader, which is the right call and also a
+                // silent one. Bottom-centre, over the mail rather than beside
+                // it, because it is about the thread and not about any one
+                // message in it.
+                .overlay(alignment: .bottom) { arrivalPill }
                 // The style radio rides the mail's own top-right corner rather
                 // than the header row: it is a verdict about the mail below it,
                 // and the header is already a sentence of verbs.
@@ -724,6 +749,47 @@ struct ThreadViewer: View {
                 }
             }
         }
+    }
+
+    /// "2 new messages" with an arrow, over the foot of the column, for a
+    /// reader who is somewhere up in the history while the conversation carries
+    /// on below them. A press takes them to the end of it.
+    ///
+    /// It says the COUNT and not the sender, which the toast that fired at the
+    /// same moment already named: by the time somebody looks up from a
+    /// paragraph, the number of emails between them and the end is the thing
+    /// they cannot get any other way.
+    ///
+    /// Absent at zero rather than hidden — this is a floating target over a
+    /// scroll surface, and one that is merely transparent would go on eating
+    /// the wheel where it sits for the whole time nothing has arrived.
+    private var arrivalPill: some View {
+        ZStack {
+            if arrivals > 0 {
+                Button { index = newestIndex } label: {
+                    HStack(spacing: 6) {
+                        Image(systemName: "arrow.down")
+                            .font(.system(size: 10, weight: .bold))
+                        Text("\(arrivals) new message\(arrivals == 1 ? "" : "s")")
+                            .font(Typo.chip)
+                    }
+                    .foregroundStyle(Palette.accentInk)
+                    .padding(.horizontal, 13)
+                    .padding(.vertical, 7)
+                    .contentShape(Capsule())
+                }
+                .buttonStyle(.plain)
+                .glassCapsule(tint: Palette.accent.opacity(0.4))
+                .transition(.move(edge: .bottom).combined(with: .opacity))
+                .accessibilityLabel("jump to the newest message")
+            }
+        }
+        .padding(.bottom, 14)
+        // SCOPED TO THE PILL, and it has to be: `arrivals` changes in the same
+        // update that adopts the freshly fetched thread, so the same animation
+        // hung on the column would take a whole relayout of the mail with it —
+        // every card and every web frame, sliding, while somebody reads.
+        .animation(Motion.disclose, value: arrivals)
     }
 
     /// EMPTY ROOM UNDER THE LAST MESSAGE, and it is the whole reason the newest
@@ -1311,12 +1377,31 @@ struct ThreadViewer: View {
         // Anchor AFTER the await: a reader who moved while the fetch was in
         // flight is anchored where they are now, not where they were.
         let anchor = anchorId
+        let before = messages.count
         // Same overwrite as the post-send reload: the cached copy predates the
         // arrival, and reopening this thread must not serve it back.
         ThreadPrefetch.shared.note(threadId, view)
         adopt(view)
-        if let anchor, let found = messages.firstIndex(where: { $0.id == anchor }) {
-            index = found
+        let gained = max(0, messages.count - before)
+        // THE READER WHO STAYED WHERE THEY WERE has the arrival below them and
+        // out of the window, and the pill is the only thing that says so. It
+        // COUNTS rather than flags: a second reply landing while it is already
+        // up has to say two.
+        //
+        // Everyone else — parked on the newest, or anchored to a message this
+        // fetch no longer carries — is left where `adopt` put them, looking
+        // straight at the new mail, and a pill pointing at what somebody is
+        // already reading is noise.
+        let held = anchor.flatMap { id in messages.firstIndex { $0.id == id } }
+        if let held {
+            index = held
+            arrivals += gained
+        }
+        // Only when something actually arrived: a token bump whose refetch
+        // brought nothing (the daemon had not stored the message yet) is not a
+        // reading experience anybody had.
+        if gained > 0 {
+            Analytics.capture("thread_live_arrival", ["followed": held == nil])
         }
         await refreshOpens()
     }
@@ -1482,6 +1567,10 @@ struct ThreadViewer: View {
         map.forget()
         newestHeight = 0
         landed = false
+        // Another thread's arrivals are not this one's, and a REOPEN of the
+        // same thread re-fetches from the top — either way the pill is
+        // pointing at nothing by the time this runs.
+        arrivals = 0
         // Fresh prefetch hit → render it and skip the round-trip entirely (the
         // cache is at most 60s old; e/d/refresh paths repopulate it).
         if let cached = ThreadPrefetch.shared.cached(threadId) {
