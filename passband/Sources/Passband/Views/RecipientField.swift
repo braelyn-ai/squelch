@@ -165,11 +165,6 @@ struct RecipientField<F: Hashable>: View {
     private func commit(_ token: String) {
         let addr = token.trimmed
         guard !addr.isEmpty, !pills.contains(addr) else { return }
-        // NOT into a field they are already in, even a different one: somebody
-        // typed into To who is currently blind-copied must not be quietly
-        // promoted into the header everyone reads. `Recipients.add` refuses,
-        // and the pill is dropped rather than shown somewhere it is not.
-        guard recipients.slot(of: addr) == nil else { return }
         pills.append(addr)
     }
 
@@ -179,7 +174,12 @@ struct RecipientField<F: Hashable>: View {
         let next = composed
         guard recipients[slot] != next else { return }
         var updated = recipients
-        updated[slot] = next
+        // Through `set`, not a bare assignment: somebody TYPED into this field
+        // who is currently sitting in another one has just been moved here, and
+        // leaving the old copy behind is the exact shape this whole feature
+        // exists to make impossible — an address in To that the sender believes
+        // went out blind.
+        updated.set(slot, to: next)
         write(updated)
     }
 

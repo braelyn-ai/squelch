@@ -452,6 +452,24 @@ can filter". Keep the guards returning errors, the reveal audited-before-served 
 the audit log, and keep both seal paths scrubbing it — a draft outliving its parent's
 seal is a quotation of auth mail the user has already decided is auth.
 
+**The recipient headers a send states.** `to`, `cc` and `bcc` come from the caller
+and go into the outgoing message's headers, so `gmail_write::build_reply_rfc822` and
+`build_forward_rfc822` reject any of them carrying CR or LF **before** composing:
+a smuggled newline is how a recipient gets appended that the sender never approved,
+and in a `Bcc` that addition is invisible to everyone downstream by construction.
+An explicit `cc` is written **verbatim** rather than through `cc_excluding`, which
+parses to bare addresses — running a stated list through it would delete the display
+names the sender typed — so the CR/LF check is the whole of the sanitization and has
+to be, which is why it lives at the builder rather than at the handler.
+
+**A Bcc is recorded in exactly one place: the audit ledger.** Every other recipient
+is legible in the delivered mail; a blind copy is stripped by Gmail from the copies
+the visible recipients receive, so nothing outside this machine records that it
+happened. `handlers::action_send` therefore appends `:cc:<n>:bcc:<n>` to the send's
+audit detail. **Counts, never addresses** — the ledger's job is that a send of this
+shape happened, not who it named, and the same rule that keeps matched secret text
+out of an audit row keeps recipients out of one.
+
 ## 5. Outbound secret guard
 
 **Invariant.** A secret-looking outgoing body is blocked unless the caller

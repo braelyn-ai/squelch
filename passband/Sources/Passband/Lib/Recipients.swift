@@ -111,15 +111,22 @@ struct Recipients: Sendable, Equatable {
         }
     }
 
-    /// Add an addressee to one field, unless they are ALREADY somewhere. The
-    /// existing placement wins — an autocomplete hit must not silently promote
-    /// someone out of Bcc back into the header everyone can read.
-    mutating func add(_ token: String, to destination: RecipientSlot) {
-        let key = Self.key(token)
-        guard !key.isEmpty, slot(of: token) == nil else { return }
-        var addrs = tokens(destination)
-        addrs.append(token.trimmingCharacters(in: .whitespacesAndNewlines))
-        self[destination] = Self.join(addrs)
+    /// REPLACE ONE HEADER'S WHOLE LIST, and take everyone it now names out of
+    /// the other two. This is what a field's own editing writes through:
+    /// TYPING an address into To is as explicit a statement as dragging the
+    /// pill there, so the rule that a person sits in exactly one header has to
+    /// hold however they arrived — not only when they came through `move`.
+    ///
+    /// Half-typed fragments claim nobody: a token with no `@` has no key, and
+    /// `key` returning "" is what keeps two of them from matching each other or
+    /// evicting a real address somewhere else.
+    mutating func set(_ slot: RecipientSlot, to list: String) {
+        self[slot] = list
+        let claimed = Set(Self.split(list).map(Self.key).filter { !$0.isEmpty })
+        guard !claimed.isEmpty else { return }
+        for other in RecipientSlot.allCases where other != slot {
+            self[other] = Self.join(tokens(other).filter { !claimed.contains(Self.key($0)) })
+        }
     }
 
     // MARK: - list grammar

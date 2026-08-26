@@ -24,7 +24,7 @@ struct RecipientsTests {
         movingCarriesTheDisplayName()
         movingMatchesAcrossSpellings()
         movingSomebodyAlreadyThereIsANoOp()
-        addingNeverPromotesSomebodyOutOfBcc()
+        typingAnAddressIntoAFieldMovesThemThere()
         removingIsIdempotent()
         countsAndSlots()
 
@@ -119,17 +119,30 @@ struct RecipientsTests {
         equal(r.to, "alice@x.test", "and nobody else moved")
     }
 
-    static func addingNeverPromotesSomebodyOutOfBcc() {
-        // Autocomplete offering somebody who is already blind-copied must not
-        // quietly move them into the visible header. An explicit `move` is the
-        // only thing allowed to do that.
+    static func typingAnAddressIntoAFieldMovesThemThere() {
+        // A recipient field writes its whole list back through `set` on every
+        // keystroke. Somebody TYPED into To who was blind-copied has just been
+        // moved — typing the address out is as explicit as dragging the pill —
+        // and leaving the Bcc copy behind would put them in two headers, which
+        // is the failure this whole type exists to prevent.
         var r = Recipients(to: "alice@x.test", bcc: "bob@x.test")
-        r.add("bob@x.test", to: .to)
-        equal(r.to, "alice@x.test", "not added to To")
-        equal(r.bcc, "bob@x.test", "left where the sender put them")
+        r.set(.to, to: "alice@x.test, BOB@X.TEST")
+        equal(r.to, "alice@x.test, BOB@X.TEST", "the field says what was typed")
+        equal(r.bcc, "", "and they are no longer blind-copied")
 
-        r.add("carol@x.test", to: .cc)
-        equal(r.cc, "carol@x.test", "somebody new does land")
+        // A HALF-TYPED FRAGMENT CLAIMS NOBODY. The field's live text includes
+        // whatever is under the caret, so a `set` fires on every keystroke —
+        // and "bo" must not evict anyone anywhere.
+        var mid = Recipients(to: "alice@x.test", cc: "bob@x.test", bcc: "carol@x.test")
+        mid.set(.to, to: "alice@x.test, bo")
+        equal(mid.cc, "bob@x.test", "still copied")
+        equal(mid.bcc, "carol@x.test", "still blind-copied")
+
+        // Clearing a field takes nobody with it.
+        var cleared = Recipients(to: "alice@x.test", bcc: "bob@x.test")
+        cleared.set(.cc, to: "")
+        equal(cleared.to, "alice@x.test", "To untouched")
+        equal(cleared.bcc, "bob@x.test", "Bcc untouched")
     }
 
     static func removingIsIdempotent() {

@@ -2051,9 +2051,18 @@ final class AppStore {
         if next.body.isEmpty { next.body = Prefs.shared.signatureSeed }
         // A composer with NO PARENT addresses itself: there is nothing for the
         // daemon to derive an audience from, so its three fields are the whole
-        // answer from the first keystroke. A reply opened into this pane (the
-        // agent's hand-off) keeps deriving until somebody edits a field.
-        if next.replyToMessageId == nil { next.recipientsStated = true }
+        // answer from the first keystroke.
+        //
+        // A REPLY opened into this pane — the agent's hand-off — keeps deriving,
+        // UNLESS it arrived carrying a copy list. That case is the hand-off of a
+        // send the model addressed and the person read on the confirm card, and
+        // leaving it deriving would drop those addresses on the floor between
+        // the card and the composer.
+        if next.replyToMessageId == nil || !next.cc.isEmpty || !next.bcc.isEmpty {
+            next.recipientsStated = true
+        }
+        // Whatever it opened with is what "untouched" means for the autosave.
+        next.seededRecipients = next.recipients
         compose = next
         DraftSaver.shared.noteOpened(.compose)
         Analytics.capture("compose_opened", ["kind": next.analyticsKind])
