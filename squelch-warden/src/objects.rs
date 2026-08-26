@@ -1356,6 +1356,13 @@ fn daemon_env(config: &Config, name: &TenantName) -> Vec<EnvVar> {
         ));
     }
 
+    // The tenant daemon's idle-embedder window, present only when the operator
+    // pinned one. Unset, the daemon keeps its own default: this is a pod-shaped
+    // override, not a policy the warden holds an opinion about.
+    if let Some(secs) = config.embed_idle_unload_secs {
+        env.push(plain("SQUELCH_EMBED_IDLE_UNLOAD_SECS", &secs.to_string()));
+    }
+
     // The LLM gateway block, present only when the operator configured one.
     // With it absent the env above is byte-identical to what a warden without
     // the feature built, which is the env-contract tests' whole claim.
@@ -1684,6 +1691,12 @@ mod tests {
         // Unpinned, the daemon picks its own embedding model, and the var is
         // absent rather than empty.
         assert!(!plain.contains_key("SQUELCH_EMBED_MODEL"));
+        // Unset by default, so the daemon keeps its own idle-unload window.
+        assert!(
+            env.iter()
+                .all(|e| e.name != "SQUELCH_EMBED_IDLE_UNLOAD_SECS"),
+            "an unset embedder knob still reached the pod"
+        );
 
         // The address comes from the Secret, so it is encrypted at rest and is
         // not in the Deployment anyone can `kubectl get -o yaml`.
@@ -1790,6 +1803,32 @@ mod tests {
             env.iter().all(|e| e.name != "ANTHROPIC_API_KEY"),
             "the raw provider key reappeared in a gateway-configured pod"
         );
+    }
+
+    /// The daemon reads `SQUELCH_EMBED_IDLE_UNLOAD_SECS`, but a hosted tenant's
+    /// env is this CLOSED list, so the daemon knob is unreachable unless the
+    /// warden renders it. `0` is the off switch, and it has to survive the
+    /// render as `"0"` rather than being read as unset.
+    #[test]
+    fn the_embedder_idle_window_reaches_the_pod_when_the_operator_pins_one() {
+        let mut c = test_config();
+        c.embed_idle_unload_secs = Some(900);
+        let pod = tenant_deployment(&c).spec.unwrap().template.spec.unwrap();
+        let env = pod.containers[0].env.clone().unwrap();
+        let plain: BTreeMap<&str, &str> = env
+            .iter()
+            .filter_map(|e| Some((e.name.as_str(), e.value.as_deref()?)))
+            .collect();
+        assert_eq!(plain["SQUELCH_EMBED_IDLE_UNLOAD_SECS"], "900");
+
+        c.embed_idle_unload_secs = Some(0);
+        let pod = tenant_deployment(&c).spec.unwrap().template.spec.unwrap();
+        let env = pod.containers[0].env.clone().unwrap();
+        let zero = env
+            .iter()
+            .find(|e| e.name == "SQUELCH_EMBED_IDLE_UNLOAD_SECS")
+            .expect("the off switch is a value, not an absence");
+        assert_eq!(zero.value.as_deref(), Some("0"));
     }
 
     /// The tuning knobs, each landing under the daemon's real variable name.
@@ -2339,16 +2378,22 @@ mod tests {
         // The fallback sweeps its own wreckage, so a failure costs no disk.
         let fallback = SEED_SCRIPT.find("|| {").unwrap();
         let swept = SEED_SCRIPT[fallback..].find("rm -rf \"$t\"").unwrap();
-        let said = SEED_SCRIPT[fallback..].find("squelch-seed: could not copy").unwrap();
+        let said = SEED_SCRIPT[fallback..]
+            .find("squelch-seed: could not copy")
+            .unwrap();
         assert!(swept < said, "sweep the temp path before saying so");
         // `mkdir -p` rides in the `if` condition for the same reason: a failure
         // there is a verdict, not an exit.
-        assert!(SEED_SCRIPT
-            .contains("if [ -d /models ] && mkdir -p /data/.local/share/squelch/models; then"));
+        assert!(
+            SEED_SCRIPT
+                .contains("if [ -d /models ] && mkdir -p /data/.local/share/squelch/models; then")
+        );
         // The credentials half stays strict. A daemon with no credentials file
         // is not a daemon, and it has nothing to fall back to.
-        assert!(SEED_SCRIPT
-            .contains(" cp /etc/squelch/credential/credentials.json /data/credentials.json\n"));
+        assert!(
+            SEED_SCRIPT
+                .contains(" cp /etc/squelch/credential/credentials.json /data/credentials.json\n")
+        );
     }
 
     #[test]

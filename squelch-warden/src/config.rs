@@ -163,6 +163,12 @@ pub const MIN_PENDING_TTL_SECS: u64 = 600;
 /// shared bucket for every caller, so it is a refusal to boot instead.
 pub const MAX_TRUSTED_PROXY_HOPS: usize = 8;
 
+/// Ceiling on `SQUELCH_WARDEN_EMBED_IDLE_UNLOAD_SECS`. The knob is an idle
+/// window in seconds and 0 is its off switch, so a value past a month is a
+/// typo, not a policy; the daemon adds its reap interval to it, and a ceiling
+/// keeps that sum from ever being a question.
+pub const MAX_EMBED_IDLE_UNLOAD_SECS: u64 = 30 * 24 * 60 * 60;
+
 /// Shortest bearer token that may be configured.
 ///
 /// This is the credential for a service that can create workloads and read
@@ -350,6 +356,14 @@ pub struct Config {
     pub llm_stage1_daily_cap: Option<u32>,
     /// Per-tenant daily ceiling on stage-2 calls.
     pub llm_stage2_daily_cap: Option<u32>,
+    /// Seconds a tenant daemon holds its idle embedding session before dropping
+    /// it, passed on as `SQUELCH_EMBED_IDLE_UNLOAD_SECS`. Unset leaves the
+    /// daemon's own default, which is the only reason this exists as an option
+    /// rather than a number: the env a tenant pod gets is a CLOSED list built
+    /// here, so a knob the daemon reads is a knob a hosted tenant cannot reach
+    /// unless the warden renders it. `0` pins the session in memory, which is
+    /// the off switch if the reaper ever misbehaves in production.
+    pub embed_idle_unload_secs: Option<u64>,
 }
 
 impl std::fmt::Debug for Config {
@@ -387,6 +401,7 @@ impl std::fmt::Debug for Config {
             .field("llm_stage2_model", &self.llm_stage2_model)
             .field("llm_stage1_daily_cap", &self.llm_stage1_daily_cap)
             .field("llm_stage2_daily_cap", &self.llm_stage2_daily_cap)
+            .field("embed_idle_unload_secs", &self.embed_idle_unload_secs)
             .finish()
     }
 }
@@ -685,6 +700,23 @@ impl Config {
                 }
             }
         }
+        let embed_idle_unload_secs = match var(get, "SQUELCH_WARDEN_EMBED_IDLE_UNLOAD_SECS") {
+            None => None,
+            Some(value) => {
+                let secs = value.parse::<u64>().map_err(|e| {
+                    ConfigError::invalid(format!(
+                        "invalid SQUELCH_WARDEN_EMBED_IDLE_UNLOAD_SECS `{value}`: {e}"
+                    ))
+                })?;
+                if secs > MAX_EMBED_IDLE_UNLOAD_SECS {
+                    return Err(ConfigError::invalid(format!(
+                        "SQUELCH_WARDEN_EMBED_IDLE_UNLOAD_SECS `{secs}` exceeds {MAX_EMBED_IDLE_UNLOAD_SECS} (thirty days); 0 is the off switch, anything longer than a month is a typo"
+                    )));
+                }
+                Some(secs)
+            }
+        };
+
         // Tombstone for the shared-key bridge: the var no longer exists, and a
         // manifest that still sets it belongs to an operator who believes the
         // shared Secret still feeds new tenants. Same posture as the inert
@@ -764,6 +796,7 @@ impl Config {
             llm_stage2_model,
             llm_stage1_daily_cap,
             llm_stage2_daily_cap,
+            embed_idle_unload_secs,
         })
     }
 
@@ -1069,6 +1102,8 @@ mod tests {
         assert!(c.embed_model.is_none());
         assert!(c.pull_secret.is_none());
         assert!(c.console_sso_url.is_none());
+        // Unset means the tenant daemon keeps its own idle-unload default.
+        assert!(c.embed_idle_unload_secs.is_none());
         // The LLM env feature is off unless the operator turns it on.
         assert!(c.llm_base_url.is_none());
         assert!(c.llm_stage1_model.is_none());
@@ -1277,6 +1312,30 @@ mod tests {
 
     /// The whole LLM knob set, accepted together and validated together. The
     /// URL is normalized so two spellings of one gateway are one string.
+    /// The embedder window parses as a number, and `0` survives as `Some(0)`:
+    /// it is the off switch (never unload), not an absent setting.
+    #[test]
+    fn the_embedder_idle_window_parses_and_zero_is_a_value() {
+        let mut vars = required();
+        vars.insert(
+            "SQUELCH_WARDEN_EMBED_IDLE_UNLOAD_SECS".to_string(),
+            "900".to_string(),
+        );
+        assert_eq!(load(&vars).unwrap().embed_idle_unload_secs, Some(900));
+
+        vars.insert(
+            "SQUELCH_WARDEN_EMBED_IDLE_UNLOAD_SECS".to_string(),
+            "0".to_string(),
+        );
+        assert_eq!(load(&vars).unwrap().embed_idle_unload_secs, Some(0));
+
+        vars.insert(
+            "SQUELCH_WARDEN_EMBED_IDLE_UNLOAD_SECS".to_string(),
+            "ten minutes".to_string(),
+        );
+        assert!(load(&vars).is_err(), "a bad value is a refusal to boot");
+    }
+
     #[test]
     fn accepts_a_full_llm_configuration() {
         let mut vars = required();

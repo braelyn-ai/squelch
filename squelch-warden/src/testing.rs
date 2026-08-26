@@ -87,6 +87,7 @@ pub fn test_config() -> Config {
         llm_stage2_model: None,
         llm_stage1_daily_cap: None,
         llm_stage2_daily_cap: None,
+        embed_idle_unload_secs: None,
     }
 }
 

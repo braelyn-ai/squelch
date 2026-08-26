@@ -49,6 +49,13 @@ fastembed = { workspace = true }
 sqlite-vec = { workspace = true }
 zerocopy = { workspace = true }
 
+# One use: `malloc_trim` behind `mem::trim`, which is how a dropped embedding
+# session's heap actually leaves the process (see `mem.rs` for the measurements).
+# The call is a glibc entry point and exists nowhere else, so the dependency is
+# scoped to glibc targets rather than compiled in everywhere and ignored.
+[target.'cfg(all(target_os = "linux", target_env = "gnu"))'.dependencies]
+libc = { workspace = true }
+
 [dev-dependencies]
 # The APNs pusher's tests bind a MOCK RELAY on an ephemeral loopback port and
 # assert on the exact bytes that leave the daemon — "the relay is blind" is only

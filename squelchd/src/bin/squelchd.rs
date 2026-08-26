@@ -20,7 +20,8 @@ use squelch_core::credentials::{
     CredentialStore, FileCredentialStore, KeyringCredentialStore, load_token_backend,
     store_token_backend, store_tokens_backend, write_private,
 };
-use squelch_core::embed::{Embedder, FastEmbedder};
+use squelch_core::embed::{Embedder, LazyEmbedder, ReapOutcome};
+use squelch_core::metrics::SyncMetrics;
 use squelch_core::store::sqlite::device_tokens::PAIRING_TTL_SECS;
 use squelch_core::store::{SqliteStore, Store};
 use squelch_core::sync::{SyncEngine, wait_for_embedder_gate};
@@ -436,9 +437,18 @@ fn make_credential_store(
 
 /// Build the semantic-recall embedder. `None` on failure — search then degrades
 /// to keyword-only.
-fn build_embedder(config: &Config) -> Option<Arc<dyn Embedder>> {
-    match FastEmbedder::new(&config.embed.settings()) {
-        Ok(e) => Some(Arc::new(e) as Arc<dyn Embedder>),
+///
+/// The concrete [`LazyEmbedder`] rather than `Arc<dyn Embedder>`, because the
+/// reaper in [`spawn_embedder_reaper`] needs the unload method and the trait
+/// deliberately does not carry it: unloading is a property of THIS embedder, not
+/// of embedding. Attach sites coerce.
+fn build_embedder(config: &Config, metrics: Option<Arc<SyncMetrics>>) -> Option<Arc<LazyEmbedder>> {
+    let built = LazyEmbedder::new(&config.embed.settings()).map(|e| match metrics {
+        Some(m) => e.with_metrics(m),
+        None => e,
+    });
+    match built {
+        Ok(e) => Some(Arc::new(e)),
         Err(e) => {
             eprintln!(
                 "squelch: embedder unavailable ({e}); semantic recall disabled \
@@ -447,6 +457,121 @@ fn build_embedder(config: &Config) -> Option<Arc<dyn Embedder>> {
             None
         }
     }
+}
+
+/// How often the reaper looks. A minute is far below any sane idle window and
+/// costs one uncontended `try_lock` when there is nothing to do, so there is no
+/// reason to make it a knob.
+///
+/// It is also a FLOOR on `[embed] idle_unload_secs`: nothing is unloaded
+/// between ticks, so the effective window is the configured one rounded up to
+/// the next minute. The startup line below prints both numbers rather than
+/// leaving an operator who set 5 wondering why it took 65.
+const EMBEDDER_REAP_INTERVAL_SECS: u64 = 60;
+
+/// How many consecutive contended ticks before the reaper says so. An embed
+/// holding the lock is normal and happens all day; a whole hour of them is a
+/// session no reaper can ever reach, which is the memory this feature exists to
+/// give back sitting there anyway.
+const EMBEDDER_CONTENDED_TICKS_BEFORE_WARNING: u32 = 60;
+
+/// Drop the embedding session once it has gone `idle_secs` without a call. That
+/// session is 85-90% of a tenant daemon's memory (~250-300 MB against ~25-40 MB
+/// for everything else, SQLite included) and a mailbox is idle nearly all the
+/// time, so a daemon that holds it forever is a pod that is mostly ONNX arenas
+/// waiting for mail. Reloading costs ~200 ms off the cached weights, paid by
+/// whichever search or poll tick lands first.
+///
+/// `idle_secs == 0` means never unload: no task is spawned at all, and the
+/// daemon behaves exactly as it did before this existed.
+fn spawn_embedder_reaper(
+    embedder: Arc<LazyEmbedder>,
+    idle_secs: u64,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+) {
+    if idle_secs == 0 {
+        return;
+    }
+    let max_idle = std::time::Duration::from_secs(idle_secs);
+    let interval = std::time::Duration::from_secs(EMBEDDER_REAP_INTERVAL_SECS);
+    // Once, at startup, with the EFFECTIVE numbers: the configured window and
+    // the tick that rounds it up are two different values and an operator who
+    // reads only the first will misread every unload line that follows.
+    eprintln!(
+        "squelchd: embedder reaper armed: unloads after {idle_secs} s idle, \
+         checked every {EMBEDDER_REAP_INTERVAL_SECS} s (so the session goes at \
+         {idle_secs}-{} s past the last use)",
+        idle_secs + EMBEDDER_REAP_INTERVAL_SECS
+    );
+    tokio::spawn(async move {
+        let mut contended_run: u32 = 0;
+        loop {
+            tokio::select! {
+                _ = tokio::time::sleep(interval) => {}
+                // An Err is the SENDER being dropped, which is the daemon on its
+                // way out. It has to end the task rather than fall through: a
+                // dropped sender makes `changed()` return instantly forever, and
+                // this loop would spin a core until the process died.
+                res = shutdown.changed() => {
+                    if res.is_err() {
+                        return;
+                    }
+                }
+            }
+            if *shutdown.borrow() {
+                return;
+            }
+            // Dropping an ONNX session and trimming glibc's arenas are both
+            // millisecond-scale rather than instant, and this runs on the same
+            // runtime as the doors.
+            let e = embedder.clone();
+            let outcome = match tokio::task::spawn_blocking(move || e.reap_if_idle(max_idle)).await
+            {
+                Ok(outcome) => outcome,
+                Err(e) => {
+                    // A panic inside the reap (a session whose Drop blew up, say)
+                    // must not vanish into a Kept: it would repeat every tick
+                    // with the gauge pinned at 1 and nothing in the log. Say so
+                    // and leave the contention count alone.
+                    eprintln!(
+                        "squelchd: embedder reap task join error ({e}); trying again next tick"
+                    );
+                    continue;
+                }
+            };
+            match outcome {
+                ReapOutcome::Unloaded => {
+                    contended_run = 0;
+                    eprintln!(
+                        "squelchd: embedder unloaded after {idle_secs} s idle; \
+                         reloads on the next embed or search"
+                    );
+                }
+                ReapOutcome::Kept => contended_run = 0,
+                ReapOutcome::Contended => {
+                    contended_run += 1;
+                    // ONCE per run, not per tick: the whole point is a line an
+                    // operator can find, and a line every minute forever is a
+                    // line nobody reads. The task keeps going either way — a
+                    // reaper that gave up would be the leak it was built to
+                    // stop.
+                    // Every N ticks rather than once: permanent contention is
+                    // the case this exists for, and one line at minute 60 has
+                    // rotated out of the log by the time anyone looks.
+                    if contended_run.is_multiple_of(EMBEDDER_CONTENDED_TICKS_BEFORE_WARNING) {
+                        eprintln!(
+                            "squelchd: the embedder lock has been held on every \
+                             reap for {} minutes; the session is not being \
+                             unloaded and its memory is not coming back",
+                            EMBEDDER_CONTENDED_TICKS_BEFORE_WARNING as u64
+                                * EMBEDDER_REAP_INTERVAL_SECS
+                                / 60
+                        );
+                    }
+                }
+            }
+        }
+    });
 }
 
 /// Mirror the loaded `.env` into config.toml so other binaries and non-repo CWDs
@@ -1349,11 +1474,15 @@ fn run_daemon(config: Config) -> Result<(), squelch_core::CoreError> {
 
     // Attach the embedder to both the store (query-side) and the engine
     // (write-side); `None` keeps everything working without vector recall.
-    let embedder = build_embedder(&config);
+    // No metrics registry: this mode serves no scrape endpoint, so the
+    // loaded/unloaded gauge would have no reader.
+    let embedder = build_embedder(&config, None);
     if let Some(e) = &embedder {
-        store = store.with_embedder(e.clone())?;
+        store = store.with_embedder(e.clone() as Arc<dyn Embedder>)?;
     }
     let store = Arc::new(store);
+    // Read off config before the engine takes ownership of it below.
+    let idle_unload_secs = config.embed.idle_unload_secs;
 
     let creds = make_credential_store(
         config.credential_backend,
@@ -1375,7 +1504,8 @@ fn run_daemon(config: Config) -> Result<(), squelch_core::CoreError> {
 
         let mut engine = SyncEngine::new(store, creds, account_id, email, config);
         if let Some(e) = embedder {
-            engine = engine.with_embedder(e);
+            spawn_embedder_reaper(e.clone(), idle_unload_secs, shutdown_rx.clone());
+            engine = engine.with_embedder(e as Arc<dyn Embedder>);
         }
         engine.run(shutdown_rx).await
     })?;
@@ -2144,22 +2274,38 @@ fn cmd_serve(
             let store = store.clone();
             let config = config.clone();
             let readiness = readiness.clone();
+            let sync_metrics = sync_metrics.clone();
+            // Read off config here because the blocking closure below takes it.
+            let idle_unload_secs = config.embed.idle_unload_secs;
+            // Its own receiver, taken here rather than inside the task, for the
+            // same reason the metrics server takes one: it must not depend on
+            // where in this block the sync engine took the original.
+            let reaper_shutdown = shutdown_tx.subscribe();
             eprintln!(
                 "squelchd: initializing semantic-recall embedder in the background \
                  (first run downloads the model; the server is already serving, \
                  search is keyword-only until the embedder is ready)"
             );
             tokio::spawn(async move {
-                let built = tokio::task::spawn_blocking(move || build_embedder(&config)).await;
+                let built =
+                    tokio::task::spawn_blocking(move || build_embedder(&config, Some(sync_metrics)))
+                        .await;
                 match built {
-                    Ok(Some(embedder)) => match store.attach_embedder(embedder) {
-                        Ok(_) => eprintln!(
-                            "squelchd: embedder ready — semantic + hybrid search now enabled"
-                        ),
-                        Err(e) => eprintln!(
-                            "squelchd: embedder attach failed ({e}); search stays keyword-only"
-                        ),
-                    },
+                    Ok(Some(embedder)) => {
+                        match store.attach_embedder(embedder.clone() as Arc<dyn Embedder>) {
+                            Ok(_) => eprintln!(
+                                "squelchd: embedder ready — semantic + hybrid search now enabled"
+                            ),
+                            Err(e) => eprintln!(
+                                "squelchd: embedder attach failed ({e}); search stays keyword-only"
+                            ),
+                        }
+                        // Spawned even when the attach failed, and especially
+                        // then: an embedder nobody can reach still loaded a
+                        // session at construction, and this is what puts that
+                        // 250 MB down instead of holding it until restart.
+                        spawn_embedder_reaper(embedder, idle_unload_secs, reaper_shutdown);
+                    }
                     Ok(None) => { /* build_embedder already logged the reason */ }
                     Err(e) => eprintln!(
                         "squelchd: embedder init task join error ({e}); search stays keyword-only"

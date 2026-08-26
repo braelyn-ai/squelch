@@ -29,45 +29,83 @@ impl FastEmbedder {
     /// Errors on an unknown model name, or a reported dimension that disagrees with
     /// `settings.dims` — such a mismatch would silently corrupt the vec0 table.
     pub fn new(settings: &EmbedSettings) -> Result<Self> {
-        let ResolvedModel { model, code, dim } = resolve_model(&settings.model_name)?;
-        if dim != settings.dims {
-            return Err(CoreError::InvalidInput(format!(
-                "embedding model '{}' (resolved to {code}) has dim {dim}, \
-                 but config/schema expects {}",
-                settings.model_name, settings.dims
-            )));
-        }
-
-        // A stable, greppable line so operators know weights are being fetched.
-        // It names the resolved code, not the configured string: the config may
-        // hold an alias, and what an operator wants off the wire is the answer.
-        let already_cached = model_appears_cached(&settings.cache_dir, &code);
-        if !already_cached {
-            eprintln!(
-                "squelch: downloading embedding model '{code}' weights to {} (first run only)",
-                settings.cache_dir.display()
-            );
-        }
-
-        let opts = InitOptions::new(model)
-            .with_cache_dir(settings.cache_dir.clone())
-            .with_show_download_progress(!already_cached)
-            .with_max_length(settings.max_tokens);
-
-        let embedding = TextEmbedding::try_new(opts)
-            .map_err(|e| CoreError::Other(anyhow::anyhow!("fastembed init: {e}")))?;
-
-        // Printed AFTER init succeeds, so the line means "these weights are
-        // resident" rather than "these were asked for". This is the only place
-        // a pod's logs say which of fastembed's same-named builds it is running,
-        // and its absence is why a fleet running two different models went
-        // unnoticed until someone went looking at RSS. See [`resolve_model`].
-        eprintln!("squelch: embedding model {code} ({dim}-dim) loaded");
-
+        let (embedding, dims) = load_session(settings)?;
         Ok(Self {
             model: Mutex::new(embedding),
-            dims: settings.dims,
+            dims,
         })
+    }
+}
+
+/// Resolve `settings` to a model, check its dimension against `settings.dims`,
+/// and load the ONNX session, downloading weights on first run. THE one place a
+/// session is built, shared by [`FastEmbedder`] (loads once, holds it for the
+/// life of the process) and [`super::LazyEmbedder`] (loads, unloads when idle,
+/// loads again), so both validate and log the same way. Returns the session and
+/// the now-confirmed dimension.
+fn load_session(settings: &EmbedSettings) -> Result<(TextEmbedding, usize)> {
+    let ResolvedModel { model, code, dim } = resolve_model(&settings.model_name)?;
+    if dim != settings.dims {
+        return Err(CoreError::InvalidInput(format!(
+            "embedding model '{}' (resolved to {code}) has dim {dim}, \
+             but config/schema expects {}",
+            settings.model_name, settings.dims
+        )));
+    }
+
+    // A stable, greppable line so operators know weights are being fetched.
+    // It names the resolved code, not the configured string: the config may
+    // hold an alias, and what an operator wants off the wire is the answer.
+    let already_cached = model_appears_cached(&settings.cache_dir, &code);
+    if !already_cached {
+        eprintln!(
+            "squelch: downloading embedding model '{code}' weights to {} (first run only)",
+            settings.cache_dir.display()
+        );
+    }
+
+    let opts = InitOptions::new(model)
+        .with_cache_dir(settings.cache_dir.clone())
+        .with_show_download_progress(!already_cached)
+        .with_max_length(settings.max_tokens);
+
+    let embedding = TextEmbedding::try_new(opts)
+        .map_err(|e| CoreError::Other(anyhow::anyhow!("fastembed init: {e}")))?;
+
+    // Printed AFTER init succeeds, so the line means "these weights are
+    // resident" rather than "these were asked for". This is the only place
+    // a pod's logs say which of fastembed's same-named builds it is running,
+    // and its absence is why a fleet running two different models went
+    // unnoticed until someone went looking at RSS. See [`resolve_model`].
+    // Once per process, not per load: LazyEmbedder rebuilds the session after
+    // an idle unload and logs that reload itself, so the model line here would
+    // otherwise repeat every ten minutes and drown the one answer it exists to
+    // give (which of fastembed's same-named builds this pod runs).
+    static ANNOUNCED: std::sync::Once = std::sync::Once::new();
+    ANNOUNCED.call_once(|| eprintln!("squelch: embedding model {code} ({dim}-dim) loaded"));
+
+    Ok((embedding, dim))
+}
+
+/// [`load_session`] behind [`super::lazy::EmbedSession`], which is the shape
+/// [`super::LazyEmbedder`] loads through. Boxing here rather than there keeps
+/// every fastembed type inside this file: the lazy wrapper is pure lifecycle
+/// (load, stamp, drop) and can be tested against a fake session with no weights
+/// on disk.
+pub(super) fn load_boxed_session(
+    settings: &EmbedSettings,
+) -> Result<Box<dyn super::lazy::EmbedSession>> {
+    let (session, _dims) = load_session(settings)?;
+    Ok(Box::new(session))
+}
+
+/// The loaded half of [`super::LazyEmbedder`]. `TextEmbedding::embed` takes
+/// `&mut self`, which is why the trait does too and why every caller reaches it
+/// through a mutex.
+impl super::lazy::EmbedSession for TextEmbedding {
+    fn embed_batch(&mut self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+        self.embed(texts, None)
+            .map_err(|e| CoreError::Other(anyhow::anyhow!("fastembed embed: {e}")))
     }
 }
 
