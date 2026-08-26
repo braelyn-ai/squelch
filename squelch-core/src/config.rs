@@ -752,8 +752,17 @@ pub struct EmbedConfig {
     pub dims: usize,
     /// Where ONNX weights cache on disk. Default: [`default_embed_cache_dir`].
     pub cache_dir: PathBuf,
-    /// Characters of `subject + body` fed to the embedder per message.
+    /// Characters of `subject + body` fed to the embedder per message. Default
+    /// 1000. A pair with `max_tokens`: keep this near tokens x 4 so we neither
+    /// pad past what the model reads nor truncate twice at different places.
     pub max_chars: usize,
+    /// Tokens the model reads per text (fastembed `max_length`). Default 256,
+    /// not the model's 512 ceiling: attention scratch is quadratic in sequence
+    /// length and a batch pads to its longest member, so on the fp32 model a
+    /// batch-8 pass of 512-token texts adds +324 MB against +123 MB at 256
+    /// (batch-1: +44 MB against +13 MB). The subject and first ~1000 characters
+    /// are where recall lives; long newsletters lose their tails.
+    pub max_tokens: usize,
     /// Backfill batch size: how many missing-vector messages to embed per pass.
     pub backfill_batch: usize,
 }
@@ -765,6 +774,7 @@ impl Default for EmbedConfig {
             dims: 384,
             cache_dir: default_embed_cache_dir(),
             max_chars: crate::embed::DEFAULT_EMBED_MAX_CHARS,
+            max_tokens: crate::embed::DEFAULT_EMBED_MAX_TOKENS,
             backfill_batch: 64,
         }
     }
@@ -777,6 +787,7 @@ impl EmbedConfig {
             model_name: self.model.clone(),
             dims: self.dims,
             cache_dir: self.cache_dir.clone(),
+            max_tokens: self.max_tokens,
         }
     }
 }
@@ -1922,6 +1933,36 @@ mod tests {
         assert_eq!(c.sync.backfill_days, 30);
         assert_eq!(c.sync.poll_secs, 5);
         assert!(c.client_id.is_none());
+    }
+
+    #[test]
+    fn embed_defaults_are_sane() {
+        let c = EmbedConfig::default();
+        assert_eq!(c.model, "bge-small-en-v1.5");
+        assert_eq!(c.dims, 384);
+        assert_eq!(c.max_chars, 1000);
+        assert_eq!(c.max_tokens, 256);
+        assert_eq!(c.backfill_batch, 64);
+    }
+
+    /// `settings()` carries the token budget through to the embedder, and the
+    /// two truncation lengths are independently configurable.
+    #[test]
+    fn embed_settings_carry_max_tokens() {
+        assert_eq!(EmbedConfig::default().settings().max_tokens, 256);
+
+        let cfg: Config = toml::from_str("[embed]\nmax_tokens = 128\nmax_chars = 700\n").unwrap();
+        assert_eq!(cfg.embed.max_tokens, 128);
+        assert_eq!(cfg.embed.max_chars, 700);
+        let s = cfg.embed.settings();
+        assert_eq!(s.max_tokens, 128);
+        assert_eq!(s.model_name, "bge-small-en-v1.5");
+        assert_eq!(s.dims, 384);
+
+        // A config written before the field existed still parses to the default.
+        let cfg: Config = toml::from_str("[embed]\nmax_chars = 2000\n").unwrap();
+        assert_eq!(cfg.embed.max_chars, 2000);
+        assert_eq!(cfg.embed.max_tokens, 256);
     }
 
     #[test]

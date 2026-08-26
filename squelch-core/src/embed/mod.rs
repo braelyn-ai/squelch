@@ -39,6 +39,9 @@ pub struct EmbedSettings {
     pub dims: usize,
     /// Directory the ONNX weights download to on first run.
     pub cache_dir: PathBuf,
+    /// Tokens the model reads per text; longer input is truncated at the
+    /// tokenizer. Sets fastembed's `max_length` (its default is 512).
+    pub max_tokens: usize,
 }
 
 /// Flatten a message into the canonical text used at both ingest and query time.
@@ -53,7 +56,16 @@ pub fn message_embed_text(subject: &str, body: &str, max_chars: usize) -> String
 }
 
 /// Default number of characters of `subject + body` fed to the embedder.
-pub const DEFAULT_EMBED_MAX_CHARS: usize = 2000;
+/// Paired with [`DEFAULT_EMBED_MAX_TOKENS`]: roughly tokens x 4, so the
+/// character cut and the tokenizer cut land in about the same place.
+pub const DEFAULT_EMBED_MAX_CHARS: usize = 1000;
+
+/// Default token budget per text (fastembed `max_length`). 256, not the model's
+/// 512 ceiling: attention scratch is quadratic in sequence length and a batch
+/// pads to its longest member, so halving this cuts a batch-8 pass from +324 MB
+/// to +123 MB (batch-1: +44 MB to +13 MB). Recall lives in the subject and the
+/// first ~1000 characters; long newsletters lose their tails.
+pub const DEFAULT_EMBED_MAX_TOKENS: usize = 256;
 
 /// Deterministic, download-free [`Embedder`] for tests: a bag-of-words hash, so
 /// "planted doc ranks above decoy" is reproducible offline. Not for production —
@@ -105,5 +117,43 @@ impl Embedder for StubEmbedder {
 
     fn dims(&self) -> usize {
         self.dims
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn embed_text_joins_subject_and_body_and_trims() {
+        assert_eq!(
+            message_embed_text("  Re: invoice ", "\nattached\n", DEFAULT_EMBED_MAX_CHARS),
+            "Re: invoice\n\nattached"
+        );
+        // An empty body contributes no separator.
+        assert_eq!(message_embed_text("hi", "   ", 100), "hi");
+    }
+
+    #[test]
+    fn embed_text_truncates_at_the_default_char_budget() {
+        assert_eq!(DEFAULT_EMBED_MAX_CHARS, 1000);
+        let body = "x".repeat(5000);
+        let out = message_embed_text("subject", &body, DEFAULT_EMBED_MAX_CHARS);
+        assert_eq!(out.chars().count(), DEFAULT_EMBED_MAX_CHARS);
+        assert!(out.starts_with("subject\n\nxxx"));
+        // Under the budget, nothing is cut.
+        let short = message_embed_text("subject", "short body", DEFAULT_EMBED_MAX_CHARS);
+        assert_eq!(short, "subject\n\nshort body");
+    }
+
+    /// The two defaults are a pair: chars ~ tokens x 4, so the char cut and the
+    /// tokenizer cut land in about the same place.
+    #[test]
+    fn char_and_token_budgets_stay_paired() {
+        let c = crate::config::EmbedConfig::default();
+        assert_eq!(c.max_tokens, DEFAULT_EMBED_MAX_TOKENS);
+        assert_eq!(c.max_chars, DEFAULT_EMBED_MAX_CHARS);
+        assert!(c.max_chars <= c.max_tokens * 4);
+        assert!(c.max_chars >= c.max_tokens * 3);
     }
 }
