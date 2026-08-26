@@ -26,8 +26,8 @@ CREATE TABLE IF NOT EXISTS messages (
     -- storage is fine, serving is guarded.
     body_html   TEXT,
     is_sent     INTEGER NOT NULL DEFAULT 0,
-    -- DISPLAY RECIPIENTS of mail the user SENT: the To + Cc mailboxes as the
-    -- headers spelled them, comma-joined `Name <addr>` (bare addr with no
+    -- DISPLAY RECIPIENTS of mail the user SENT: the To + Cc + Bcc mailboxes as
+    -- the headers spelled them, comma-joined `Name <addr>` (bare addr with no
     -- display name). NULL on received mail — a message the user did not send
     -- has no "to" worth showing — and NULL on sent rows ingested before this
     -- column existed, which the one-shot recipients backfill fills in. Empty

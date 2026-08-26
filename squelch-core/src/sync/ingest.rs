@@ -936,6 +936,21 @@ pub fn ingest(
         if let Some(cc) = m.cc() {
             collect_mailboxes(cc, &mut mailboxes);
         }
+        // BCC, on SENT MAIL ONLY. Gmail strips this header on delivery and keeps
+        // it on the sender's own Sent copy, so this reads the blind copy list of
+        // a message the user themselves sent — never a stranger's.
+        //
+        // Not an optional nicety: a bcc-only send carries NO To beyond the
+        // sender, so without this its outbox row would render as mail addressed
+        // to nobody, and `message_recipients` would have nothing to attribute a
+        // bcc group send to.
+        //
+        // The `is_sent` guard above is what keeps this honest. On received mail
+        // a `Bcc` header is at best the sender's leak and at worst forged, and
+        // in neither case is it "who this went to".
+        if let Some(bcc) = m.bcc() {
+            collect_mailboxes(bcc, &mut mailboxes);
+        }
     }
     let to_addrs = format_recipients(&mailboxes);
     // THE FAITHFUL RECIPIENT SET, taken here because `recipients` below is about
@@ -1577,6 +1592,68 @@ mod tests {
         let f = raw(1, "g-recv", eml, /* is_sent */ false);
         let t = ingest(&f, &Stage1Config::default(), Utc::now(), |_| false);
         assert_eq!(t.message.to_addrs, None);
+    }
+
+    /// Gmail keeps the `Bcc` header on the SENDER'S own Sent copy, and that copy
+    /// is the only record of who a blind blast reached. Without reading it, a
+    /// bcc-only send lists in the outbox addressed to nobody.
+    #[test]
+    fn sent_mail_reads_its_own_bcc_and_received_mail_never_does() {
+        let eml = "From: Me <me@example.com>\r\n\
+                   To: Me <me@example.com>\r\n\
+                   Bcc: Ann <ann@fund.com>, bo@fund.com\r\n\
+                   Subject: Update #3\r\n\
+                   Date: Mon, 7 Jul 2026 10:00:00 +0000\r\n\
+                   \r\n\
+                   we closed the round\r\n";
+        let f = raw(1, "g-bcc", eml, /* is_sent */ true);
+        let t = ingest(&f, &Stage1Config::default(), Utc::now(), |_| false);
+        assert_eq!(
+            t.message.to_addrs.as_deref(),
+            Some("Me <me@example.com>, Ann <ann@fund.com>, bo@fund.com"),
+            "the outbox must show who a blind blast actually reached"
+        );
+        assert!(t.recipient_addrs.contains(&"ann@fund.com".to_string()));
+        assert!(t.recipient_addrs.contains(&"bo@fund.com".to_string()));
+
+        // On RECEIVED mail a `Bcc` header is at best the sender's leak and at
+        // worst forged, and in neither case is it "who this went to".
+        let f = raw(1, "g-bcc-in", eml, /* is_sent */ false);
+        let t = ingest(&f, &Stage1Config::default(), Utc::now(), |_| false);
+        assert_eq!(t.message.to_addrs, None);
+        assert!(t.recipient_addrs.is_empty());
+    }
+
+    /// The inverse of `format_recipients`, used by the backfill paths that only
+    /// ever see the rendered column.
+    #[test]
+    fn stored_recipients_parse_back_to_bare_addresses() {
+        assert_eq!(
+            parse_stored_recipients(
+                "Alice <ALICE@friends.com>, bob@friends.com, \"Doe, John\" <john@x.com>"
+            ),
+            vec!["alice@friends.com", "bob@friends.com", "john@x.com"],
+            "the split is quote-aware: a lastname-first name is ONE recipient"
+        );
+        assert!(parse_stored_recipients("").is_empty());
+        // Case-folded dedup, matching what the index stores.
+        assert_eq!(parse_stored_recipients("a@x.com, A@X.com"), vec!["a@x.com"]);
+    }
+
+    /// Round-trip: anything the ingest path renders, the backfill path reads
+    /// back identically. These two must not drift.
+    #[test]
+    fn format_and_parse_recipients_round_trip() {
+        let mailboxes = vec![
+            ("ALICE@friends.com".to_string(), Some("Alice".to_string())),
+            ("john@x.com".to_string(), Some("Doe, John".to_string())),
+            ("bare@x.com".to_string(), None),
+        ];
+        let rendered = format_recipients(&mailboxes).unwrap();
+        assert_eq!(
+            parse_stored_recipients(&rendered),
+            dedupe_lowercased(&mailboxes)
+        );
     }
 
     #[test]

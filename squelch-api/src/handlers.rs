@@ -29,9 +29,9 @@ use std::time::Duration;
 
 use crate::error::ApiError;
 use crate::gmail_write::{
-    ForwardParts, GmailWriteClient, ReplyParts, SentRef, WriteError, build_forward_rfc822,
-    build_references, build_reply_rfc822, cc_excluding, derive_reply_recipients, forward_subject,
-    parse_forwarded_original, reply_subject,
+    ForwardParts, GmailWriteClient, ReplyParts, SentRef, WriteError, addrs_excluding,
+    build_forward_rfc822, build_references, build_reply_rfc822, cc_excluding,
+    derive_reply_recipients, forward_subject, parse_forwarded_original, reply_subject,
 };
 use crate::guard;
 use crate::state::ApiState;
@@ -2386,6 +2386,17 @@ pub struct SendBody {
     /// is unchanged. See [`crate::gmail_write::derive_reply_recipients`].
     #[serde(default)]
     reply_all: bool,
+    /// BLIND copies, comma-joined, for a send whose audience must not see each
+    /// other. Never derived from anything (see [`crate::gmail_write::ReplyParts`]),
+    /// and filtered against `to`/`cc` before it composes so nobody is delivered
+    /// two copies of one message.
+    ///
+    /// A send carrying ONLY `bcc` is legitimate — it is the whole shape of a bcc
+    /// blast — and the `To` header then falls back to the account's own address
+    /// rather than the send being refused. RFC822 wants a `To`, and every mail
+    /// client writes the sender there for exactly this case.
+    #[serde(default)]
+    bcc: Option<String>,
     /// Explicit subject (overrides the reply-derived subject).
     #[serde(default)]
     subject: Option<String>,
@@ -2858,6 +2869,7 @@ pub async fn action_send(
     // the caller retyped the `to` would send to fewer people than they asked
     // for — always minus whoever the chosen `to` already covers.
     let derived_cc = derived.as_ref().map(|d| d.cc.clone()).unwrap_or_default();
+    let bcc_requested = body.bcc.clone().unwrap_or_default();
     let to = match body.to.clone().filter(|s| !s.trim().is_empty()) {
         Some(t) => t,
         None => match (&derived, &parent) {
@@ -2865,6 +2877,28 @@ pub async fn action_send(
             // stored From rather than composing a recipient-less reply.
             (Some(d), _) if !d.to.trim().is_empty() => d.to.clone(),
             (_, Some(p)) => p.from_addr.clone(),
+            // A BCC-ONLY SEND is not a send with no recipient: it is the shape
+            // of a blind blast, and the `To` it still needs is the sender. Read
+            // from the store rather than left blank — `build_reply_rfc822`
+            // refuses an empty `To`, and a mail addressed to nobody visible
+            // reads to a recipient's client as a header it cannot render.
+            (_, None) if !bcc_requested.trim().is_empty() => {
+                match store_call(&state, |store, account_id| store.account_email(account_id)).await
+                {
+                    Ok(own) if !own.trim().is_empty() => own,
+                    // The account row is what every other surface reads the
+                    // user's own address from, so this is near-impossible. It
+                    // still fails the send rather than composing something
+                    // half-addressed.
+                    _ => {
+                        audit_action(&state, "send", target, "rejected:no_recipient").await;
+                        return Err(ApiError::bad_request(
+                            "a bcc-only send needs this account's own address, \
+                             which could not be read",
+                        ));
+                    }
+                }
+            }
             (_, None) => {
                 audit_action(&state, "send", target, "rejected:no_recipient").await;
                 return Err(ApiError::bad_request(
@@ -2874,8 +2908,14 @@ pub async fn action_send(
         },
     };
     let cc = cc_excluding(&derived_cc, &to);
-    // For the audit line, counted before `cc` moves into the MIME parts.
+    // BLIND COPIES LAST, filtered against everyone already VISIBLE on the
+    // message. Someone in both `to` and `bcc` would otherwise receive two copies
+    // of one mail, and the second would look like a blind copy of a message they
+    // are openly on.
+    let bcc = addrs_excluding(&bcc_requested, &[&to, &cc]);
+    // For the audit line, counted before either moves into the MIME parts.
     let copied = cc.split(',').filter(|s| !s.trim().is_empty()).count();
+    let blind = bcc.split(',').filter(|s| !s.trim().is_empty()).count();
 
     let subject = body
         .subject
@@ -2897,6 +2937,7 @@ pub async fn action_send(
     let parts = ReplyParts {
         to,
         cc: Some(cc).filter(|s| !s.trim().is_empty()),
+        bcc: Some(bcc).filter(|s| !s.trim().is_empty()),
         subject,
         body: body.body.clone(),
         in_reply_to,
@@ -2918,9 +2959,13 @@ pub async fn action_send(
         }
     };
 
-    // A reply-all is the one send that reaches N people; the ledger says so,
-    // with the recipient count, instead of a plain "ok".
-    let outcome = if body.reply_all {
+    // A send that reaches N people says so in the ledger, with the COUNT and
+    // never the addresses. Two shapes do: a reply-all, and a blind copy list —
+    // the second matters more, because it is the one whose audience is invisible
+    // in the mail itself, so the ledger is the only place it is written down.
+    let outcome = if blind > 0 {
+        format!("ok:bcc:{blind}")
+    } else if body.reply_all {
         format!("ok:reply_all:{}", copied + 1)
     } else {
         "ok".to_string()

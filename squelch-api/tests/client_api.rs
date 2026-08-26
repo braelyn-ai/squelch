@@ -2908,6 +2908,153 @@ async fn an_ordinary_reply_still_carries_no_cc() {
     assert!(mime.contains("To: alice@example.com\r\n"), "{mime}");
 }
 
+/// A BCC-ONLY COLD SEND: the shape of a blind blast. It is not a send with no
+/// recipient, so it must not be refused — the `To` falls back to the sender.
+#[tokio::test]
+async fn a_bcc_only_send_addresses_the_sender_and_blind_copies_the_rest() {
+    let (base, handle) = mock_gmail_seq(vec![(200, "{}".to_string())]).await;
+    let Harness { app, .. } = app_with_writes(base, |_, _| {});
+
+    let resp = app
+        .oneshot(authed_json(
+            "POST",
+            "/client/actions/send",
+            serde_json::json!({
+                "bcc": "ann@fund.com, bo@fund.com",
+                "subject": "Update #3",
+                "body": "we closed the round",
+                "confirm": true
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let mime = sent_mime(&handle.await.unwrap()[0]);
+    assert!(
+        mime.contains("To: me@example.com\r\n"),
+        "the account's own address is the visible recipient: {mime}"
+    );
+    assert!(
+        mime.contains("Bcc: ann@fund.com, bo@fund.com\r\n"),
+        "{mime}"
+    );
+    assert!(!mime.contains("Cc:"), "a bcc send invents no Cc: {mime}");
+}
+
+/// Nobody visibly on the mail may also receive a blind copy of it — that is two
+/// deliveries of one message, the second apparently secret.
+#[tokio::test]
+async fn a_bcc_never_duplicates_someone_already_visible() {
+    let (base, handle) = mock_gmail_seq(vec![(200, "{}".to_string())]).await;
+    let Harness { app, .. } = app_with_writes(base, |_, _| {});
+
+    let resp = app
+        .oneshot(authed_json(
+            "POST",
+            "/client/actions/send",
+            serde_json::json!({
+                "to": "Ann <ann@fund.com>",
+                "bcc": "ANN@fund.com, cy@fund.com",
+                "subject": "Update #3",
+                "body": "we closed the round",
+                "confirm": true
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let mime = sent_mime(&handle.await.unwrap()[0]);
+    assert!(mime.contains("To: Ann <ann@fund.com>\r\n"), "{mime}");
+    assert!(
+        mime.contains("Bcc: cy@fund.com\r\n"),
+        "Ann was already visible, so her blind copy is dropped: {mime}"
+    );
+}
+
+/// A blind audience is invisible in the mail itself, so the ledger is the only
+/// place it is written down — as a COUNT, never as addresses.
+#[tokio::test]
+async fn a_bcc_send_audits_its_reach_without_naming_anyone() {
+    let (base, handle) = mock_gmail_seq(vec![(200, "{}".to_string())]).await;
+    let Harness { app, store, acct } = app_with_writes(base, |_, _| {});
+
+    let resp = app
+        .oneshot(authed_json(
+            "POST",
+            "/client/actions/send",
+            serde_json::json!({
+                "bcc": "ann@fund.com, bo@fund.com, cy@fund.com",
+                "subject": "Update #3",
+                "body": "we closed the round",
+                "confirm": true
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    handle.await.unwrap();
+
+    let entries = store.list_audit(acct, 20).unwrap();
+    assert!(
+        entries
+            .iter()
+            .any(|a| a.action == "send" && a.detail.as_deref() == Some("ok:bcc:3")),
+        "expected the reach in the ledger: {entries:?}"
+    );
+    let rendered = serde_json::to_string(&entries).unwrap();
+    assert!(
+        !rendered.contains("fund.com"),
+        "the ledger must not name a blind audience: {rendered}"
+    );
+}
+
+/// An empty `bcc` changes nothing: the send is byte-identical to what it was
+/// before the field existed.
+#[tokio::test]
+async fn an_empty_bcc_writes_no_header() {
+    let (base, handle) = mock_gmail_seq(vec![(200, "{}".to_string())]).await;
+    let Harness { app, .. } = app_with_writes(base, |_, _| {});
+
+    let resp = app
+        .oneshot(authed_json(
+            "POST",
+            "/client/actions/send",
+            serde_json::json!({
+                "to": "ann@fund.com",
+                "bcc": "   ",
+                "subject": "hi",
+                "body": "hello",
+                "confirm": true
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let mime = sent_mime(&handle.await.unwrap()[0]);
+    assert!(!mime.contains("Bcc:"), "{mime}");
+}
+
+/// A send with neither `to` nor `bcc` nor a parent is still refused: the bcc
+/// fallback is a fallback for a blind audience, not a way to compose mail
+/// addressed to nobody.
+#[tokio::test]
+async fn a_send_with_no_audience_at_all_is_still_refused() {
+    let (base, _handle) = mock_gmail_seq(vec![]).await;
+    let Harness { app, .. } = app_with_writes(base, |_, _| {});
+
+    let resp = app
+        .oneshot(authed_json(
+            "POST",
+            "/client/actions/send",
+            serde_json::json!({"subject": "hi", "body": "hello", "confirm": true}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
 #[tokio::test]
 async fn an_explicit_to_wins_but_keeps_the_derived_copies() {
     let (base, handle) =
