@@ -51,7 +51,8 @@ impl FastEmbedder {
 
         let opts = InitOptions::new(model)
             .with_cache_dir(settings.cache_dir.clone())
-            .with_show_download_progress(!already_cached);
+            .with_show_download_progress(!already_cached)
+            .with_max_length(settings.max_tokens);
 
         let embedding = TextEmbedding::try_new(opts)
             .map_err(|e| CoreError::Other(anyhow::anyhow!("fastembed init: {e}")))?;

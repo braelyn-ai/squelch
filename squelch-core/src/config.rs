@@ -757,8 +757,24 @@ pub struct EmbedConfig {
     pub dims: usize,
     /// Where ONNX weights cache on disk. Default: [`default_embed_cache_dir`].
     pub cache_dir: PathBuf,
-    /// Characters of `subject + body` fed to the embedder per message.
+    /// Characters of `subject + body` fed to the embedder per message. Default
+    /// 1000. A pair with `max_tokens` AT INGEST: keep this near tokens x 4 so we
+    /// neither pad past what the model reads nor truncate twice at different
+    /// places. The pairing covers ingest only. A query is embedded raw
+    /// (`semantic_search` / `hybrid_search` hand `embedder.embed` the query text
+    /// as typed), so nothing cuts a long query but `max_tokens`.
     pub max_chars: usize,
+    /// Tokens the model reads per text (fastembed `max_length`). Default 256,
+    /// not the model's 512 ceiling: attention scratch is quadratic in sequence
+    /// length and a batch pads to its longest member, so on the fp32 model, at
+    /// a `backfill_batch` of 8, a pass of 512-token texts adds +324 MB against
+    /// +123 MB at 256 (at batch 1, +44 MB against +13 MB); at a larger batch
+    /// the same ratio applies to a far larger base. The subject and first ~1000
+    /// characters are where recall lives; long newsletters lose their tails.
+    /// The chars-to-tokens ratio above is an English one, and the pinned model's
+    /// vocabulary is English-only, so this is not the knob where CJK recall is
+    /// decided. CLAMPED by [`EmbedConfig::settings`]; 0 is not "unlimited".
+    pub max_tokens: usize,
     /// Backfill batch size: how many missing-vector messages to embed per pass.
     pub backfill_batch: usize,
 }
@@ -770,6 +786,7 @@ impl Default for EmbedConfig {
             dims: 384,
             cache_dir: default_embed_cache_dir(),
             max_chars: crate::embed::DEFAULT_EMBED_MAX_CHARS,
+            max_tokens: crate::embed::DEFAULT_EMBED_MAX_TOKENS,
             backfill_batch: 64,
         }
     }
@@ -777,11 +794,29 @@ impl Default for EmbedConfig {
 
 impl EmbedConfig {
     /// Build the resolved [`crate::embed::EmbedSettings`] the embedder needs.
+    ///
+    /// `max_tokens` is CLAMPED here, to
+    /// [`EMBED_MAX_TOKENS_FLOOR`](crate::embed::EMBED_MAX_TOKENS_FLOOR) ..=
+    /// [`EMBED_MAX_TOKENS_CEILING`](crate::embed::EMBED_MAX_TOKENS_CEILING).
+    /// A small value is not a smaller budget and 0 is NOT "unlimited" the way it
+    /// reads elsewhere: fastembed passes `max_length` to tokenizers, which
+    /// truncates at `max_length - n_added_tokens`, and `n_added_tokens` is 2 for
+    /// this model's `[CLS]` and `[SEP]`. At 0 or 1 that subtraction wraps a
+    /// `usize` (release builds carry no overflow checks), truncation stops
+    /// happening at all, and the setting UNCAPS the memory it exists to cap. At
+    /// 2 every text truncates to zero content tokens and every vector comes out
+    /// identical.
+    /// The ceiling is the model's own position budget; asking for more only pays
+    /// for padding.
     pub fn settings(&self) -> crate::embed::EmbedSettings {
         crate::embed::EmbedSettings {
             model_name: self.model.clone(),
             dims: self.dims,
             cache_dir: self.cache_dir.clone(),
+            max_tokens: self.max_tokens.clamp(
+                crate::embed::EMBED_MAX_TOKENS_FLOOR,
+                crate::embed::EMBED_MAX_TOKENS_CEILING,
+            ),
         }
     }
 }
@@ -1932,6 +1967,66 @@ mod tests {
         assert_eq!(c.sync.backfill_days, 30);
         assert_eq!(c.sync.poll_secs, 5);
         assert!(c.client_id.is_none());
+    }
+
+    #[test]
+    fn embed_defaults_are_sane() {
+        // Only the two lengths this test owns. The model pin and the backfill
+        // batch size have their own tests where they are decided.
+        let c = EmbedConfig::default();
+        assert_eq!(c.dims, 384);
+        assert_eq!(c.max_chars, 1000);
+        assert_eq!(c.max_tokens, 256);
+    }
+
+    /// `settings()` carries the token budget through to the embedder, and the
+    /// two truncation lengths are independently configurable.
+    #[test]
+    fn embed_settings_carry_max_tokens() {
+        assert_eq!(EmbedConfig::default().settings().max_tokens, 256);
+
+        let cfg: Config = toml::from_str("[embed]\nmax_tokens = 128\nmax_chars = 700\n").unwrap();
+        assert_eq!(cfg.embed.max_tokens, 128);
+        assert_eq!(cfg.embed.max_chars, 700);
+        let s = cfg.embed.settings();
+        assert_eq!(s.max_tokens, 128);
+        assert_eq!(s.model_name, cfg.embed.model);
+        assert_eq!(s.dims, 384);
+
+        // A config written before the field existed still parses to the default.
+        let cfg: Config = toml::from_str("[embed]\nmax_chars = 2000\n").unwrap();
+        assert_eq!(cfg.embed.max_chars, 2000);
+        assert_eq!(cfg.embed.max_tokens, 256);
+    }
+
+    /// A hand-written `max_tokens` never reaches the tokenizer unclamped. The
+    /// small end is the point: 0 and 1 wrap `max_length - 2` and turn truncation
+    /// OFF, and 2 leaves no content tokens at all, so neither can be honoured as
+    /// written. See [`EmbedConfig::settings`].
+    #[test]
+    fn embed_settings_clamp_max_tokens() {
+        let resolved = |max_tokens: usize| {
+            EmbedConfig {
+                max_tokens,
+                ..EmbedConfig::default()
+            }
+            .settings()
+            .max_tokens
+        };
+
+        for n in [0, 1, 2] {
+            assert_eq!(
+                resolved(n),
+                crate::embed::EMBED_MAX_TOKENS_FLOOR,
+                "{n} tokens must clamp up, not disable truncation"
+            );
+        }
+        assert_eq!(resolved(4096), crate::embed::EMBED_MAX_TOKENS_CEILING);
+
+        // In range, passed through untouched, ends included.
+        assert_eq!(resolved(crate::embed::EMBED_MAX_TOKENS_FLOOR), 8);
+        assert_eq!(resolved(256), 256);
+        assert_eq!(resolved(crate::embed::EMBED_MAX_TOKENS_CEILING), 512);
     }
 
     #[test]
