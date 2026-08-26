@@ -5,23 +5,16 @@
 // Backspace on an empty fragment is two-stage: first press highlights the last
 // pill, second deletes it. Clicking a pill selects it the same way.
 //
-// MOVING SOMEBODY BETWEEN FIELDS HAS THREE DOORS, because it is the thing
-// people actually do halfway through addressing a message and a composer that
-// can only add and delete makes them retype an address they already got right:
+// MOVING SOMEBODY BETWEEN FIELDS HAS TWO DOORS, because it is the thing people
+// actually do halfway through addressing a message and a composer that can only
+// add and delete makes them retype an address they already got right:
 //
-// - DRAG THE PILL onto another field. The direct one — the thing on screen is
-//   the person, and you put them where they go.
 // - Click the pill and take the MOVE BAR: `→ cc`, `→ bcc`, `remove`.
 // - Right-click it (long-press on a phone) for the same verbs in a menu.
 //
-// All three land on `Recipients.move`, which takes the address out of every
-// OTHER field on the way. An address left in To while the sender believes it
-// went out blind is the one outcome worth writing a whole type to prevent.
-//
-// The drop target takes plain text, so an address dragged out of a message
-// body — or out of another app — lands as a recipient too. Text carrying no
-// `@` is refused rather than pilled: `Recipients.key` returns "" for it, and
-// every caller reads that as "not an address".
+// Both land on `Recipients.move`, which takes the address out of every OTHER
+// field on the way. An address left in To while the sender believes it went out
+// blind is the one outcome worth writing a whole type to prevent.
 //
 // Autocomplete rides the fragment: every keystroke asks the daemon for
 // Sent-derived contacts — people the user has actually written to — and the
@@ -68,8 +61,6 @@ struct RecipientField<F: Hashable>: View {
 
     @State private var hits: [ContactHit] = []
     @State private var index = 0
-    /// A drag is hovering this field's well.
-    @State private var dropTargeted = false
 
     /// This field's own slice of the bound value.
     private var text: String { recipients[slot] }
@@ -91,18 +82,7 @@ struct RecipientField<F: Hashable>: View {
                     Spacer(minLength: 0)
                     accessory
                 }
-                pillRow
-                    .fieldWell()
-                    // The whole well is the target, not the pills in it: an
-                    // empty Bcc has nothing to aim at, and that is exactly the
-                    // field people drag TO.
-                    .overlay(
-                        RoundedRectangle(cornerRadius: 9, style: .continuous)
-                            .strokeBorder(Palette.accent, lineWidth: dropTargeted ? 1.5 : 0)
-                    )
-                    .dropDestination(for: String.self) { items, _ in
-                        accept(dropped: items)
-                    } isTargeted: { dropTargeted = $0 }
+                pillRow.fieldWell()
             }
 
             // The verbs for the pill under the caret. Only with one selected,
@@ -268,30 +248,6 @@ struct RecipientField<F: Hashable>: View {
         // The caret stays here: moving somebody out is usually the middle of
         // sorting the audience, not the end of it.
         focus.wrappedValue = field
-    }
-
-    /// SOMETHING WAS DROPPED ON THIS FIELD. Usually a pill from one of the
-    /// other two; possibly an address dragged out of a message, or out of
-    /// another app entirely.
-    ///
-    /// Refused rather than pilled when the text names nobody — `Recipients.key`
-    /// is empty for anything without an `@`, so a sentence dragged off a page
-    /// does not become a recipient — and a no-op when the address is already in
-    /// THIS field, so a pill dropped back where it started keeps its place in
-    /// the list instead of jumping to the end.
-    private func accept(dropped items: [String]) -> Bool {
-        var updated = recipients
-        var moved = false
-        for token in items {
-            let addr = token.trimmed
-            guard !Recipients.key(addr).isEmpty, updated.slot(of: addr) != slot else { continue }
-            updated.move(addr, to: slot)
-            moved = true
-        }
-        guard moved else { return false }
-        selectedPill = nil
-        write(updated)
-        return true
     }
 
     private func remove(_ addr: String) {
@@ -461,6 +417,11 @@ private struct RecipientPill: View {
     /// Where this pill currently lives, so the menu offers the other two.
     let slot: RecipientSlot
 
+    /// A `Button`, and deliberately still one. It is also what keeps a click on
+    /// a pill from dragging the whole WINDOW: the app hides its titlebar and
+    /// moves by its background (see `Glass.WindowConfigurator`), so anything
+    /// AppKit reads as background is a window handle — and a bare SwiftUI shape
+    /// with a tap gesture is background. A Button is not.
     var body: some View {
         Button(action: onTap) {
             // Email-derived string: Text only, never markup.
@@ -481,15 +442,11 @@ private struct RecipientPill: View {
                 selected ? Palette.accent : Palette.accent.opacity(0.25),
                 lineWidth: selected ? 1.25 : 0.75)
         )
-        // THE PILL IS THE PERSON, so you can pick them up and put them in
-        // another field. Plain text on the way out, which also makes a pill
-        // draggable into anything that takes an address.
-        .draggable(addr)
         .pointingHand()
         // The same verbs the move bar offers, where a right-click (long-press on
-        // a phone) goes looking for them. Three doors to one act, because moving
-        // a recipient is the kind of thing people reach for in three different
-        // ways and it has to be findable in all of them.
+        // a phone) goes looking for them. Two doors to one act, because moving a
+        // recipient is the kind of thing people reach for both ways and it has
+        // to be findable in either.
         .contextMenu {
             ForEach(RecipientSlot.allCases.filter { $0 != slot }, id: \.self) { destination in
                 Button("Move to \(destination.label.uppercased())") { onMove(destination) }
