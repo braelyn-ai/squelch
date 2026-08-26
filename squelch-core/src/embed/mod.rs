@@ -11,8 +11,10 @@ use crate::error::{CoreError, Result};
 use crate::text::truncate_chars;
 
 mod fastembed_impl;
+mod lazy;
 
 pub use fastembed_impl::{DEFAULT_MODEL_CODE, FastEmbedder};
+pub use lazy::{LazyEmbedder, ReapOutcome};
 
 /// Turns text into a fixed-dimension embedding vector. CPU-bound; callers run it
 /// under `spawn_blocking` so ingest never stalls on it. `dims()` MUST match the

@@ -793,6 +793,25 @@ pub struct EmbedConfig {
     /// until the embedder has settled (see `SyncEngine::with_embedder_gate`),
     /// so the queue this drains is leftovers rather than the whole mailbox.
     pub backfill_batch: usize,
+    /// Seconds of no embedding or semantic search before the daemon DROPS the
+    /// ONNX session and hands the heap back. `0` disables it and keeps the
+    /// session loaded for the life of the process, which is what every release
+    /// before this one did.
+    ///
+    /// The session is 85-90% of a tenant daemon's memory: measured on a hosted
+    /// pod, loading it costs ~195 MB and a batch pass another ~324 MB, and
+    /// dropping it plus one `malloc_trim` takes the process from ~520 MB back to
+    /// ~40 MB. A mailbox is idle nearly all the time, so the default keeps that
+    /// memory for ten minutes past the last use and then gives it up. The bill
+    /// is ~200 ms on the next embed or search, spent reloading from the weights
+    /// already on disk.
+    ///
+    /// A FLOOR APPLIES. The daemon's reaper only looks every 60 seconds, so the
+    /// effective window is this value rounded up to the next tick: setting 5
+    /// gets an unload somewhere between 5 and 65 seconds after the last use,
+    /// not at 5. Anything at or above the ten-minute default is unaffected by
+    /// the rounding.
+    pub idle_unload_secs: u64,
 }
 
 impl Default for EmbedConfig {
@@ -804,6 +823,7 @@ impl Default for EmbedConfig {
             max_chars: crate::embed::DEFAULT_EMBED_MAX_CHARS,
             max_tokens: crate::embed::DEFAULT_EMBED_MAX_TOKENS,
             backfill_batch: 8,
+            idle_unload_secs: 600,
         }
     }
 }
@@ -1540,6 +1560,12 @@ impl Config {
         }
         env_override("SQUELCH_BACKFILL_DAYS", &mut self.sync.backfill_days);
         env_override("SQUELCH_POLL_SECS", &mut self.sync.poll_secs);
+        // A per-pod memory knob, so it has to be reachable without editing a
+        // config file inside a container image. 0 pins the session in memory.
+        env_override(
+            "SQUELCH_EMBED_IDLE_UNLOAD_SECS",
+            &mut self.embed.idle_unload_secs,
+        );
         env_override("SQUELCH_SQUELCH_LEVEL", &mut self.squelch_level);
         env_override(
             "SQUELCH_NOTIFY_MIN_IMPORTANCE",
@@ -2456,6 +2482,40 @@ backfill_days = 90
         assert_eq!(c.embed.model, crate::embed::DEFAULT_MODEL_CODE);
         unsafe {
             std::env::remove_var("SQUELCH_EMBED_MODEL");
+        }
+    }
+
+    /// The daemon half of the warden's `SQUELCH_WARDEN_EMBED_IDLE_UNLOAD_SECS`:
+    /// this is the variable the pod actually has to parse.
+    #[test]
+    fn env_overrides_the_embed_idle_unload() {
+        let _g = ENV_LOCK.lock().unwrap();
+        // SAFETY: guarded by ENV_LOCK so no other test reads env concurrently.
+        unsafe {
+            std::env::set_var("SQUELCH_EMBED_IDLE_UNLOAD_SECS", "0");
+        }
+        let mut c = Config::default();
+        c.apply_env_overrides();
+        assert_eq!(
+            c.embed.idle_unload_secs, 0,
+            "0 is the off switch, not unset"
+        );
+
+        unsafe {
+            std::env::set_var("SQUELCH_EMBED_IDLE_UNLOAD_SECS", "90");
+        }
+        let mut c = Config::default();
+        c.apply_env_overrides();
+        assert_eq!(c.embed.idle_unload_secs, 90);
+
+        unsafe {
+            std::env::set_var("SQUELCH_EMBED_IDLE_UNLOAD_SECS", "");
+        }
+        let mut c = Config::default();
+        c.apply_env_overrides();
+        assert_eq!(c.embed.idle_unload_secs, 600, "blank is unset, not zero");
+        unsafe {
+            std::env::remove_var("SQUELCH_EMBED_IDLE_UNLOAD_SECS");
         }
     }
 

@@ -774,7 +774,19 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
 
     /// First-run backfill: INBOX bodies over the window, then SENT headers to
     /// seed contacts, then persist the account's current historyId.
+    ///
+    /// The trim runs WHATEVER THE OUTCOME. A run that failed halfway through the
+    /// window still parsed and stored everything up to the failure, and that
+    /// peak is the highest watermark this process ever reaches; leaving it in
+    /// glibc's arenas because the last call errored would make a failed first
+    /// run the most expensive thing a pod ever does. See [`crate::mem`].
     async fn backfill(&self) -> Result<()> {
+        let out = self.backfill_inner().await;
+        crate::mem::trim_off_runtime().await;
+        out
+    }
+
+    async fn backfill_inner(&self) -> Result<()> {
         let since = self.backfill_since();
 
         // INBOX bodies.
@@ -1009,7 +1021,16 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
     /// expired-history 404 — exactly the cases where the history walk cannot
     /// account for the gap, so the sent half has to be re-listed too or mail the
     /// user wrote from another client during it is lost for good.
+    ///
+    /// Trimmed on the way out either way, for the reason [`Self::backfill`]
+    /// gives: a catch-up that dies mid-window has already paid the peak.
     async fn catch_up(&self) -> Result<()> {
+        let out = self.catch_up_inner().await;
+        crate::mem::trim_off_runtime().await;
+        out
+    }
+
+    async fn catch_up_inner(&self) -> Result<()> {
         let q = format!("newer_than:{}d", self.config.sync.backfill_days);
         let ids = self.list_message_ids(LABEL_INBOX, Some(&q)).await?;
         // A catch-up may carry genuinely new mail, so it is allowed to notify.
@@ -1558,6 +1579,13 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
 
         if total > 0 {
             eprintln!("squelch: vector backfill embedded {total} message(s) for semantic recall");
+            // A batch pass is the single largest transient this process makes:
+            // ONNX arenas plus every flattened body, hundreds of MB on a first
+            // run, and glibc keeps all of it unless asked. Worth doing with the
+            // session still loaded (+324 MB to +290 MB on the measured pass),
+            // and gated on `total > 0` so it is at most once per poll tick. See
+            // [`crate::mem`].
+            crate::mem::trim_off_runtime().await;
         }
     }
 

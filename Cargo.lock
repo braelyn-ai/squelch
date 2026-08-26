@@ -4898,6 +4898,7 @@ dependencies = [
  "fastembed",
  "getrandom 0.3.4",
  "keyring",
+ "libc",
  "mail-parser",
  "oauth2",
  "regex",

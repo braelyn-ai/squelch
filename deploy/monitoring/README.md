@@ -207,6 +207,14 @@ warden) and serves Prometheus text on container port `metrics`, named
 namespace by `app.kubernetes.io/name=squelchd` plus the port name, relabels
 `app.kubernetes.io/instance` to `tenant`, and caps each scrape at 500 samples.
 
+One series on that listener is worth naming, because it is the reader for
+**Tenant memory** rather than a health signal of its own:
+`squelchd_embedder_loaded` is 1 while the daemon's ONNX embedding session is
+resident and 0 while it is unloaded. That session is 85-90% of a tenant pod's
+RSS, so the **Embedder loaded** timeline is what turns a memory sawtooth from a
+mystery into cause and effect. A tenant pinned at 1 is a session the idle reaper
+never gets to put down.
+
 That listener has no authentication, so reaching it is a network question and
 the answer is one rule: the per-tenant NetworkPolicy admits the `monitoring`
 namespace's `app.kubernetes.io/name=prometheus-agent` pod to 9464 and nothing

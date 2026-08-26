@@ -1915,6 +1915,101 @@
    }
   },
   {
+   "type": "state-timeline",
+   "title": "Embedder loaded",
+   "id": 51,
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prometheus"
+   },
+   "description": "One band per tenant, and the reader for the memory graph above it. The ONNX embedding session is 85-90% of a tenant daemon's RSS, so a sawtooth in Tenant memory should line up band for band with this one: loaded while a poll tick or a search is working, unloaded once the idle window passes. A tenant that never leaves loaded is a daemon whose reaper is not getting the session down.",
+   "gridPos": {
+    "h": 8,
+    "w": 8,
+    "x": 0,
+    "y": 57
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prometheus"
+     },
+     "expr": "squelchd_embedder_loaded",
+     "refId": "A",
+     "range": true,
+     "instant": false,
+     "legendFormat": "{{tenant}}"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "color": {
+      "mode": "thresholds"
+     },
+     "unit": "short",
+     "min": 0,
+     "max": 1,
+     "decimals": 0,
+     "custom": {
+      "lineWidth": 0,
+      "fillOpacity": 80,
+      "spanNulls": false,
+      "insertNulls": false,
+      "hideFrom": {
+       "tooltip": false,
+       "viz": false,
+       "legend": false
+      }
+     },
+     "mappings": [
+      {
+       "type": "value",
+       "options": {
+        "0": {
+         "text": "unloaded",
+         "color": "green",
+         "index": 0
+        },
+        "1": {
+         "text": "loaded",
+         "color": "blue",
+         "index": 1
+        }
+       }
+      }
+     ],
+     "thresholds": {
+      "mode": "absolute",
+      "steps": [
+       {
+        "color": "green",
+        "value": null
+       }
+      ]
+     },
+     "noValue": "NO DATA"
+    },
+    "overrides": []
+   },
+   "options": {
+    "showValue": "never",
+    "alignValue": "left",
+    "mergeValues": true,
+    "rowHeight": 0.9,
+    "legend": {
+     "showLegend": false,
+     "displayMode": "list",
+     "placement": "bottom",
+     "calcs": []
+    },
+    "tooltip": {
+     "mode": "single",
+     "sort": "none"
+    }
+   }
+  },
+  {
    "type": "bargauge",
    "title": "Tenant PVC usage",
    "id": 28,
@@ -1925,8 +2020,8 @@
    "description": "Per-tenant mailbox volumes on the shared 50 GB block volume",
    "gridPos": {
     "h": 8,
-    "w": 12,
-    "x": 0,
+    "w": 8,
+    "x": 8,
     "y": 57
    },
    "targets": [
@@ -1994,8 +2089,8 @@
    "description": "Empty is healthy. A restarting tenant daemon is a tenant not getting mail triaged",
    "gridPos": {
     "h": 8,
-    "w": 12,
-    "x": 12,
+    "w": 8,
+    "x": 16,
     "y": 57
    },
    "targets": [

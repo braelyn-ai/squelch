@@ -255,6 +255,13 @@ pub struct SyncMetrics {
     /// Unix seconds of the last poll a carrier answered. 0 = never, for the same
     /// reason as the sync stamp below.
     carrier_poll_last_success_unix: AtomicI64,
+
+    /// 1 while the embedding session is resident, 0 while it is unloaded (or was
+    /// never built). A GAUGE, and the series that explains a pod's memory
+    /// sawtooth: the session is 85-90% of a tenant daemon's RSS, so a graph of
+    /// memory next to this one reads as cause and effect instead of a mystery.
+    /// Written by [`crate::embed::LazyEmbedder`] on each load and unload.
+    embedder_loaded: AtomicU64,
 }
 
 impl SyncMetrics {
@@ -395,6 +402,15 @@ impl SyncMetrics {
             self.carrier_poll_last_success_unix
                 .store(Utc::now().timestamp(), Ordering::Relaxed);
         }
+    }
+
+    /// The embedding session was just loaded (`true`) or dropped (`false`).
+    /// Idempotent: the reaper and the reload path both set an absolute state
+    /// rather than stepping a counter, so a missed edge cannot make the gauge
+    /// drift away from what is actually resident.
+    pub fn set_embedder_loaded(&self, loaded: bool) {
+        self.embedder_loaded
+            .store(u64::from(loaded), Ordering::Relaxed);
     }
 
     /// A poll advanced a shipment's status (`apply_carrier_track` said so).
@@ -777,6 +793,16 @@ pub fn render(metrics: &SyncMetrics, db: Option<&StoreSnapshot>) -> String {
          each one leaves a mailbox for the vector pass to embed in batches. Alert on any.",
         metrics.get(&metrics.embedder_gate_timeouts),
     );
+    // Always emitted, 0 included: a daemon whose embedder never built and one
+    // whose session is currently unloaded are the same shape here, and both are
+    // "not holding 250 MB right now", which is what the series is for. Absent
+    // would instead read as a scraper problem.
+    e.scalar(
+        "squelchd_embedder_loaded",
+        MetricKind::Gauge,
+        "1 while the embedding session is resident in memory, 0 while unloaded or never built.",
+        metrics.get(&metrics.embedder_loaded),
+    );
 
     // ALL 20 series are emitted, including carriers this daemon has no
     // credentials for: an absent series is indistinguishable from a scraper
@@ -1080,6 +1106,9 @@ mod tests {
         // Present at 0 for the same reason: a counter that only appears the
         // first time it moves reads as a scraper problem, not as an event.
         assert!(text.contains("squelchd_embedder_gate_timeouts_total 0\n"));
+        // The gauge too: "not holding a session" must render as 0, never as
+        // absence, or an unloaded fleet reads as a scraper problem.
+        assert!(text.contains("squelchd_embedder_loaded 0\n"));
         assert!(!text.contains("squelchd_db_size_bytes"));
         assert!(!text.contains("squelchd_store_messages"));
         assert!(!text.contains("squelchd_devices_paired"));

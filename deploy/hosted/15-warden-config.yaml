@@ -255,6 +255,10 @@ data:
   # tenant per run, so the fleet catches up at the CronJob's schedule times the
   # number of tenants: four tenants on the */5 schedule is about twenty minutes.
   # SQUELCH_WARDEN_MODEL_PVC: "squelch-models"
+  # How long a tenant daemon holds its idle ONNX embedding session before
+  # dropping it and handing the heap back. Unset, the daemon's own default (600)
+  # applies; this is the OFF SWITCH (0 = never unload) if the reaper misbehaves.
+  # SQUELCH_WARDEN_EMBED_IDLE_UNLOAD_SECS: "0"
   # Moves the whole fleet's embedding model without cutting a new daemon image;
   # unset means the daemon's own pin, which is Xenova/bge-small-en-v1.5.
   # SQUELCH_WARDEN_EMBED_MODEL: "Xenova/bge-small-en-v1.5"
