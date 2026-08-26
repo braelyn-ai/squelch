@@ -775,7 +775,23 @@ pub struct EmbedConfig {
     /// vocabulary is English-only, so this is not the knob where CJK recall is
     /// decided. CLAMPED by [`EmbedConfig::settings`]; 0 is not "unlimited".
     pub max_tokens: usize,
-    /// Backfill batch size: how many missing-vector messages to embed per pass.
+    /// Backfill batch size: how many missing-vector messages to embed per
+    /// `embed_batch` call. SMALL ON PURPOSE. The memory a batch takes is not
+    /// given back when the batch ends, so this number does not set a transient
+    /// peak, it sets a permanent RSS floor for the daemon. Measured at the
+    /// model's 512-token ceiling, the cap before `max_tokens` existed: a batch
+    /// of 64 costs +1.7 GB (int8) to +2.7 GB (fp32) of RSS that is never
+    /// released, against a hosted pod limit of 1 Gi; a batch of 8 costs +324 MB;
+    /// a batch of 1 costs +21-44 MB. At the shipped `max_tokens` of 256 the same
+    /// batch of 8 costs about +123 MB and a batch of 1 about +13 MB; the ratio
+    /// between batch sizes is the point and it does not move. 64 is what got two
+    /// tenant daemons OOM-killed on 2026-08-19.
+    ///
+    /// Throughput is not what this trades against, because the pass is only
+    /// ever draining what ingest could not embed at the time and ingest embeds
+    /// one message at a time. On a first run the daemon holds the backfill
+    /// until the embedder has settled (see `SyncEngine::with_embedder_gate`),
+    /// so the queue this drains is leftovers rather than the whole mailbox.
     pub backfill_batch: usize,
 }
 
@@ -787,7 +803,7 @@ impl Default for EmbedConfig {
             cache_dir: default_embed_cache_dir(),
             max_chars: crate::embed::DEFAULT_EMBED_MAX_CHARS,
             max_tokens: crate::embed::DEFAULT_EMBED_MAX_TOKENS,
-            backfill_batch: 64,
+            backfill_batch: 8,
         }
     }
 }

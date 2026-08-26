@@ -23,7 +23,7 @@ use squelch_core::credentials::{
 use squelch_core::embed::{Embedder, FastEmbedder};
 use squelch_core::store::sqlite::device_tokens::PAIRING_TTL_SECS;
 use squelch_core::store::{SqliteStore, Store};
-use squelch_core::sync::SyncEngine;
+use squelch_core::sync::{SyncEngine, wait_for_embedder_gate};
 use squelch_core::types::AccountId;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::PathBuf;
@@ -1542,10 +1542,29 @@ struct Readiness {
     flags: Arc<ReadinessFlags>,
 }
 
-#[derive(Default)]
 struct ReadinessFlags {
     sync_running: AtomicBool,
-    embedder_settled: AtomicBool,
+    /// A watch sender rather than an `AtomicBool` because two things now read
+    /// this bit: `/healthz`, and the sync engine, whose first backfill parks
+    /// until the embedder init has resolved (see
+    /// `SyncEngine::with_embedder_gate`). ONE bit for both, so settling the
+    /// probe always releases the backfill, and there is no second flag to forget
+    /// in a new arm of the init task. The reverse does not hold: the backfill
+    /// also releases ITSELF at `EMBEDDER_GATE_CEILING` (three minutes) with the
+    /// probe still 503, and that is the same 180 s as the warden's default ready
+    /// timeout, so a wedged init fails the signup at about the instant the
+    /// backfill starts without it. The ceiling's log line describes the
+    /// daemon, not the tenant's fate.
+    embedder_settled: tokio::sync::watch::Sender<bool>,
+}
+
+impl Default for ReadinessFlags {
+    fn default() -> Self {
+        Self {
+            sync_running: AtomicBool::new(false),
+            embedder_settled: tokio::sync::watch::channel(false).0,
+        }
+    }
 }
 
 /// Clears the sync flag when the sync task ends, HOWEVER it ends: a returned
@@ -1573,15 +1592,26 @@ impl Readiness {
     }
 
     /// Mark the background embedder init resolved, whichever way it resolved.
+    /// Every gate handed out by [`Readiness::embedder_gate`] opens in the same
+    /// motion, because it is the same bit.
     fn embedder_settled(&self) {
-        self.flags.embedder_settled.store(true, Ordering::Relaxed);
+        // `send_replace`, not `send`: the latter is an error when no receiver is
+        // alive, and a daemon whose sync task has already died still has a probe
+        // to answer.
+        self.flags.embedder_settled.send_replace(true);
+    }
+
+    /// A receiver on the embedder-settled bit, for the sync engine's first
+    /// backfill to wait on. Already true if the init resolved before the caller
+    /// asked, so a late subscriber never waits for something that has happened.
+    fn embedder_gate(&self) -> tokio::sync::watch::Receiver<bool> {
+        self.flags.embedder_settled.subscribe()
     }
 
     /// Both conditions, and nothing derived from either: the caller gets one
     /// bit because one bit is all `/healthz` may say.
     fn is_up(&self) -> bool {
-        self.flags.sync_running.load(Ordering::Relaxed)
-            && self.flags.embedder_settled.load(Ordering::Relaxed)
+        self.flags.sync_running.load(Ordering::Relaxed) && *self.flags.embedder_settled.borrow()
     }
 }
 
@@ -1940,7 +1970,12 @@ fn cmd_serve(
             make_credential_store(backend, account_id, email.clone(), creds_path, client);
 
         // No embedder override: the loop resolves it from the shared store each
-        // tick, so it picks up the background-attached one.
+        // tick, so it picks up the background-attached one. The gate is what
+        // keeps a brand-new tenant's FIRST backfill from racing that attach:
+        // without it the whole 30-day window ingests with no vector while the
+        // model is still downloading, and the vector pass then has to embed all
+        // of it in batches, which is the memory that OOM-killed tenant daemons.
+        // Only the first backfill waits; polling and catch-up never do.
         let sync_handle = {
             let store = store.clone();
             let email = email.clone();
@@ -1951,11 +1986,13 @@ fn cmd_serve(
             // Taken before the spawn and dropped by the task, so readiness
             // tracks the engine and not the intention to start one.
             let sync_running = readiness.sync_started();
+            let embedder_gate = readiness.embedder_gate();
             tokio::spawn(async move {
                 let _sync_running = sync_running;
                 SyncEngine::new(store, creds, account_id, email, config)
                     .with_refresh(refresh)
                     .with_metrics(sync_metrics)
+                    .with_embedder_gate(embedder_gate)
                     .run(shutdown_rx)
                     .await
             })
@@ -1969,12 +2006,22 @@ fn cmd_serve(
         // just retries on the next daemon start — each done flag is only set on
         // completion — and neither can block the sync loop, which runs in its own
         // task.
+        //
+        // The stagger is measured from when that burst can actually START, which
+        // is why this waits on the SAME embedder gate the first backfill does: on
+        // a cold model cache the backfill now begins minutes into the run, and a
+        // sweep that is one metadata GET per Sent message (the heaviest Gmail
+        // consumer here) landing on top of a 30-day raw backfill on one
+        // credential is how a tenant earns a 429 — which bubbles out of
+        // `run_once` and bounces the whole sync lifecycle through backoff.
         {
             let store = store.clone();
             let email = email.clone();
             let config = config.clone();
             let creds = sync_creds.clone();
+            let mut embedder_gate = readiness.embedder_gate();
             tokio::spawn(async move {
+                wait_for_embedder_gate(&mut embedder_gate).await;
                 tokio::time::sleep(std::time::Duration::from_secs(180)).await;
                 let engine = SyncEngine::new(store, creds, account_id, email, config);
                 if let Err(e) = engine.harvest_sent_contacts().await {
@@ -2121,6 +2168,9 @@ fn cmd_serve(
                 // Every arm above, including the ones that gave up: this is the
                 // last step of startup, and readiness waits on it having
                 // HAPPENED rather than on it having worked. See [`Readiness`].
+                // The sync engine's first backfill waits on this same call for
+                // the same reason: an init that failed is one to stop waiting
+                // for, not one to wait out.
                 readiness.embedder_settled();
             });
         }
@@ -3180,7 +3230,18 @@ mod tests {
         let sync_running = readiness.sync_started();
         assert_eq!(probe(app.clone()).await.0, StatusCode::SERVICE_UNAVAILABLE);
 
+        // The sync engine's gate is this same bit, which is the point of it
+        // being one bit: a gate taken before the settle opens with it, and one
+        // taken after is already open.
+        let gate_before = readiness.embedder_gate();
+        assert!(!*gate_before.borrow(), "shut until the init resolves");
         readiness.embedder_settled();
+        assert!(*gate_before.borrow(), "settling the probe opens the gate");
+        assert!(
+            *readiness.embedder_gate().borrow(),
+            "and a late one is open"
+        );
+
         let (status, body) = probe(app.clone()).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body, "ok");
