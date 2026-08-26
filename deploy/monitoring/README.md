@@ -53,8 +53,59 @@ plus `GF_SECURITY_ADMIN_PASSWORD`. All live in Railway variables and in the
 
 `deploy/hosted/80-monitoring.yaml`: node-exporter, kube-state-metrics, and a
 Prometheus in **agent mode** that scrapes node-exporter, kubelet, cadvisor,
-kube-state-metrics, Traefik and cert-manager, then pushes everything out.
-No inbound port; the firewall stays 22/80/443. Total footprint ~200 MB.
+kube-state-metrics, Traefik and cert-manager, then pushes what survives
+relabeling. No inbound port; the firewall stays 22/80/443. It is meant to be a
+small tenant of the box and has to be kept that way on purpose; see below.
+
+### cadvisor and kubelet are allow-listed by metric name
+
+Those two endpoints are the cardinality hogs, and the agent is what pays for
+them: it sat at 213 MiB against a 256Mi limit on a 3.8 GB box that has already
+global-OOM-killed tenant daemons. So they are not scraped whole. cadvisor keeps
+four families and drops the `id`, `name` and `image` labels; kubelet keeps
+`kubelet_volume_stats_*` and nothing else. Everything else the dashboard reads
+with a `container_` in the name (`kube_pod_container_info`,
+`kube_pod_container_status_*`) is kube-state-metrics, not cadvisor, and that
+job is still scraped in full.
+
+**Adding a panel on a cadvisor or kubelet family that is not in the keep regex
+gets you NO DATA, not a slow query.** The fix is to widen the regex in the job's
+`metric_relabel_configs` in `80-monitoring.yaml`. The comment above each job
+says which names are in and why one is deliberately out.
+
+Two things bite here. First, `up` and the other synthetic scrape series are
+appended after metric relabeling, so a broken keep regex looks like a healthy
+target serving nothing, not like a dead target. Second, **applying the ConfigMap
+does not reload the agent**: it runs without `--web.enable-lifecycle` and reads
+its config once, at boot. Carrier served a 13-day-stale Prometheus config
+exactly that way, and every per-tenant panel was blank while nothing looked
+wrong.
+
+```sh
+kubectl apply -f deploy/hosted/80-monitoring.yaml
+kubectl -n monitoring rollout restart deploy/prometheus-agent
+```
+
+To see what a target actually offers before guessing at a name, dump the
+families off the endpoint:
+
+```sh
+NODE=$(kubectl get node -o jsonpath='{.items[0].status.addresses[0].address}')
+kubectl -n monitoring exec deploy/prometheus-agent -- sh -c \
+  "wget -qO- --no-check-certificate \
+     --header=\"Authorization: Bearer \$(cat /var/run/secrets/kubernetes.io/serviceaccount/token)\" \
+     https://$NODE:10250/metrics/cadvisor" | grep '^# TYPE' | awk '{print $3}'
+```
+
+The agent does not scrape itself, so its own memory is not on the dashboard.
+Read it off the box:
+
+```sh
+kubectl -n monitoring top pod -l app.kubernetes.io/name=prometheus-agent
+kubectl -n monitoring exec deploy/prometheus-agent -- \
+  wget -qO- localhost:9090/metrics \
+  | grep -E '^(process_resident_memory_bytes|prometheus_agent_active_series|prometheus_remote_storage_samples_in_total) '
+```
 
 ## What the dashboard answers
 
