@@ -2115,10 +2115,14 @@ final class AppStore {
     }
 
     /// How long the mailbox has been dark, for the banner's subtitle.
-    var gmailDisconnectedSince: Date? {
-        guard let raw = sitrep.stats?.gmail?.disconnected_since else { return nil }
-        return ISO8601DateFormatter().date(from: raw)
-    }
+    ///
+    /// `Fmt.date` and not a formatter of its own: the daemon emits fractional
+    /// seconds on some fields and not others, and a bare `ISO8601DateFormatter`
+    /// parses only one of those shapes — silently returning nil for the other,
+    /// which here would quietly drop "expired 3 hours ago" and leave the vaguer
+    /// sentence with nothing announcing the loss. `Fmt` tries both, memoizes,
+    /// and holds the lock these formatters need; this is read every render.
+    var gmailDisconnectedSince: Date? { Fmt.date(sitrep.stats?.gmail?.disconnected_since) }
 
 
     // MARK: - invite sharing
