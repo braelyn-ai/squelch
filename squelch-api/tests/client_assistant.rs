@@ -5,6 +5,13 @@
 //! body cross back VERBATIM (the app's SSE parser depends on exact framing),
 //! the daemon's credential — never the client's bearer — is what goes upstream,
 //! and every request that spends money leaves an audit row.
+//!
+//! Two bodies are called "verbatim" in here and they are NOT the same property.
+//! The RESPONSE is verbatim without exception. The REQUEST is verbatim except
+//! for the model id, which the relay qualifies with its provider on the way to
+//! a gateway, because only the daemon knows a gateway is downstream (see
+//! `qualify_model_for_gateway`). Each half gets its own test so a future change
+//! to one cannot pass itself off as the other.
 
 use std::sync::{Arc, Mutex};
 
@@ -21,9 +28,20 @@ use tower::ServiceExt;
 mod common;
 use common::{TOKEN, authed, body_json, harness, state_with};
 
-/// A conversation body the tests post; content is arbitrary but must cross
-/// upstream byte-for-byte.
+/// A conversation body the tests post. Its model is BARE, which is what the app
+/// actually sends: the same Settings choice drives BYOK straight to Anthropic,
+/// where the provider prefix is the invalid spelling.
 const REQUEST_BODY: &str = r#"{"model":"claude-sonnet-5","stream":true,"messages":[]}"#;
+
+/// What the gateway must see instead, and the ONLY edit the relay is allowed to
+/// make to a request body.
+const QUALIFIED_MODEL: &str = "anthropic/claude-sonnet-5";
+
+/// A body whose model already names a provider, spelled with whitespace and an
+/// unusual key order so that a re-serialization would be visible in the bytes.
+/// The relay has nothing to fix here, so these exact bytes must cross.
+const PREQUALIFIED_BODY: &str =
+    r#"{ "stream": true, "model": "anthropic/claude-sonnet-5", "messages": [] }"#;
 
 /// What the mock gateway captured from one relayed request.
 type Seen = Arc<Mutex<Vec<(HeaderMap, Bytes)>>>;
@@ -80,6 +98,12 @@ fn relay_app(url: String) -> (axum::Router, Arc<squelch_core::store::SqliteStore
 
 /// An authed POST of [`REQUEST_BODY`] to the relay route.
 fn relay_request(bearer: bool) -> Request<Body> {
+    relay_request_of(bearer, REQUEST_BODY)
+}
+
+/// [`relay_request`] over an arbitrary body, for the tests that care which
+/// spelling of the model the app sent.
+fn relay_request_of(bearer: bool, body: &'static str) -> Request<Body> {
     let mut b = Request::builder()
         .method("POST")
         .uri("/client/assistant/messages")
@@ -87,7 +111,7 @@ fn relay_request(bearer: bool) -> Request<Body> {
     if bearer {
         b = b.header(header::AUTHORIZATION, format!("Bearer {TOKEN}"));
     }
-    b.body(Body::from(REQUEST_BODY)).unwrap()
+    b.body(Body::from(body)).unwrap()
 }
 
 #[tokio::test]
@@ -129,11 +153,16 @@ async fn relay_streams_upstream_bytes_verbatim_and_audits() {
     assert_eq!(body, FRAMES.concat().as_bytes());
 
     // The upstream saw the daemon's credential and wire pins — and NOT the
-    // client's bearer — with the conversation body forwarded byte-for-byte.
+    // client's bearer. What the body looked like is a separate property with
+    // its own tests below; this one is about the response.
     let seen = seen.lock().unwrap();
     assert_eq!(seen.len(), 1);
-    let (headers, body) = &seen[0];
+    let (headers, _body) = &seen[0];
     assert_eq!(headers.get("x-api-key").unwrap(), "sk-bf-test");
+    // The gateway reads its virtual key ONLY from `x-bf-vk`; a mock on a
+    // loopback port is still not Anthropic's endpoint, so the gate is open and
+    // the same one the model qualifier rides.
+    assert_eq!(headers.get("x-bf-vk").unwrap(), "sk-bf-test");
     assert_eq!(headers.get("anthropic-version").unwrap(), "2023-06-01");
     assert_eq!(
         headers.get(header::CONTENT_TYPE).unwrap(),
@@ -141,7 +170,6 @@ async fn relay_streams_upstream_bytes_verbatim_and_audits() {
     );
     assert_eq!(headers.get(header::ACCEPT).unwrap(), "text/event-stream");
     assert!(headers.get(header::AUTHORIZATION).is_none());
-    assert_eq!(body, REQUEST_BODY.as_bytes());
 
     // Spend honesty: one audit row, no content details.
     let audit = store.list_audit(acct, 10).unwrap();
@@ -150,6 +178,58 @@ async fn relay_streams_upstream_bytes_verbatim_and_audits() {
     assert_eq!(audit[0].action, "assistant_relay");
     assert_eq!(audit[0].target, None);
     assert_eq!(audit[0].detail.as_deref(), Some("status:200"));
+}
+
+#[tokio::test]
+async fn relay_names_the_provider_on_a_bare_model_and_changes_nothing_else() {
+    // The bug this pins: the app sends a bare `claude-sonnet-5`, the gateway
+    // resolves a provider before it looks at anything else, and the turn 400s
+    // with "could not auto resolve a provider" before the virtual key, its
+    // allow-list, or the budget are ever consulted. The app cannot send the
+    // qualified id instead — the same setting drives BYOK straight to
+    // Anthropic, where that spelling is the invalid one — so the daemon makes
+    // the edit, behind the gate that already decides who gets a virtual key.
+    const FRAMES: &[&str] = &["event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"];
+    let (url, seen) = spawn_upstream(StatusCode::OK, "text/event-stream", &[], FRAMES).await;
+    let (app, _store, _acct) = relay_app(url);
+
+    let resp = app.oneshot(relay_request(true)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let seen = seen.lock().unwrap();
+    let (_headers, body) = &seen[0];
+    let sent: Value = serde_json::from_slice(body).unwrap();
+    assert_eq!(sent["model"], QUALIFIED_MODEL);
+
+    // ...and the model is the ONLY difference. The conversation is what makes
+    // reading this body at all a thing worth bounding: the relay parses one
+    // top-level field and must not touch, reorder, or drop anything else,
+    // including keys it has never heard of.
+    let mut posted: Value = serde_json::from_str(REQUEST_BODY).unwrap();
+    posted["model"] = Value::String(QUALIFIED_MODEL.into());
+    assert_eq!(sent, posted);
+}
+
+#[tokio::test]
+async fn relay_forwards_an_already_qualified_body_byte_for_byte() {
+    // The other half of the contract: with no edit to make, the relay does not
+    // re-serialize at all, so a body it has no business rewriting reaches the
+    // gateway as the app spelled it — whitespace, key order, and everything the
+    // daemon does not model included. That is also what keeps the gateway's own
+    // error about the app's own bytes truthful.
+    const FRAMES: &[&str] = &["event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"];
+    let (url, seen) = spawn_upstream(StatusCode::OK, "text/event-stream", &[], FRAMES).await;
+    let (app, _store, _acct) = relay_app(url);
+
+    let resp = app
+        .oneshot(relay_request_of(true, PREQUALIFIED_BODY))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let seen = seen.lock().unwrap();
+    let (_headers, body) = &seen[0];
+    assert_eq!(body, PREQUALIFIED_BODY.as_bytes());
 }
 
 #[tokio::test]
