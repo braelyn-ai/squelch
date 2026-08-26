@@ -1342,7 +1342,7 @@
     "type": "prometheus",
     "uid": "prometheus"
    },
-   "description": "Both flat at zero when healthy",
+   "description": "All flat at zero when healthy. The third line is the collector itself: cadvisor and kubelet are allow-listed by metric name in 80-monitoring.yaml, so a keep regex that matches nothing is a live target contributing no samples, which every other panel would show as an empty graph rather than as a fault.",
    "gridPos": {
     "h": 8,
     "w": 12,
@@ -1371,6 +1371,17 @@
      "range": true,
      "instant": false,
      "legendFormat": "containers last killed by OOM"
+    },
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prometheus"
+     },
+     "expr": "sum(up{job=~\"cadvisor|kubelet\"} == bool 0) + sum(scrape_samples_post_metric_relabeling{job=~\"cadvisor|kubelet\"} == bool 0) OR on() vector(0)",
+     "refId": "C",
+     "range": true,
+     "instant": false,
+     "legendFormat": "cadvisor/kubelet targets down or serving nothing"
     }
    ],
    "fieldConfig": {

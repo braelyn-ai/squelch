@@ -226,9 +226,15 @@ about each, and "Alerting on this, without alerting on normal" has the query.
 If the release touched monitoring (scrape config, dashboards):
 
 ```sh
-kubectl apply -f deploy/hosted/80-monitoring.yaml       # on carrier
-railway up -s grafana                                    # dashboards are baked; UI edits die
+kubectl apply -f deploy/hosted/80-monitoring.yaml               # on carrier
+kubectl -n monitoring rollout restart deploy/prometheus-agent   # the apply is not the reload
 ```
+
+The restart is not optional: the agent runs without `--web.enable-lifecycle`
+and reads its config once, at boot, so an apply alone leaves it scraping the
+config it booted with. Dashboards need no command at all: they are baked into
+the Grafana image (UI edits die), and grafana auto-deploys from `main`, so
+merging is the deploy.
 
 Litestream: image rollouts do not touch it, but any restore-shaped operation
 does. The first line of every restore drill is

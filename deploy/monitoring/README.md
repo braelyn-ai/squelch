@@ -60,11 +60,14 @@ small tenant of the box and has to be kept that way on purpose; see below.
 ### cadvisor and kubelet are allow-listed by metric name
 
 Those two endpoints are the cardinality hogs, and the agent is what pays for
-them: it sat at 213 MiB against a 256Mi limit on a 3.8 GB box that has already
-global-OOM-killed tenant daemons. So they are not scraped whole. cadvisor keeps
-four families and drops the `id`, `name` and `image` labels; kubelet keeps
-`kubelet_volume_stats_*` and nothing else. Everything else the dashboard reads
-with a `container_` in the name (`kube_pod_container_info`,
+them: a 213 MiB working set against a 256Mi limit on a 3.8 GB box that has
+already global-OOM-killed tenant daemons. (How much of that 213 was series and
+how much was page cache over the agent's WAL is unmeasured; the agent now
+scrapes itself, so the next answer is a measurement.) So once the config below
+is applied they are not scraped whole: cadvisor keeps five families, drops the
+`id`, `name` and `image` labels, and drops the container-less rollups; kubelet
+keeps `kubelet_volume_stats_*` and nothing else. Everything else the dashboard
+reads with a `container_` in the name (`kube_pod_container_info`,
 `kube_pod_container_status_*`) is kube-state-metrics, not cadvisor, and that
 job is still scraped in full.
 
@@ -75,11 +78,13 @@ says which names are in and why one is deliberately out.
 
 Two things bite here. First, `up` and the other synthetic scrape series are
 appended after metric relabeling, so a broken keep regex looks like a healthy
-target serving nothing, not like a dead target. Second, **applying the ConfigMap
-does not reload the agent**: it runs without `--web.enable-lifecycle` and reads
-its config once, at boot. Carrier served a 13-day-stale Prometheus config
-exactly that way, and every per-tenant panel was blank while nothing looked
-wrong.
+target serving nothing, not like a dead target. That is what the third line on
+the dashboard's **Unhealthy signals** panel watches for: it counts cadvisor and
+kubelet targets that are either down or reporting zero samples past relabeling,
+and it should sit flat at zero. Second, **applying the ConfigMap does not
+reload the agent**: it runs without `--web.enable-lifecycle` and reads its
+config once, at boot. Carrier served a 13-day-stale Prometheus config exactly
+that way, and every per-tenant panel was blank while nothing looked wrong.
 
 ```sh
 kubectl apply -f deploy/hosted/80-monitoring.yaml
@@ -87,24 +92,36 @@ kubectl -n monitoring rollout restart deploy/prometheus-agent
 ```
 
 To see what a target actually offers before guessing at a name, dump the
-families off the endpoint:
+families off the endpoint through the API server's node proxy, which spares you
+the service-account token, the TLS flags and a shell inside the agent's
+container:
 
 ```sh
-NODE=$(kubectl get node -o jsonpath='{.items[0].status.addresses[0].address}')
-kubectl -n monitoring exec deploy/prometheus-agent -- sh -c \
-  "wget -qO- --no-check-certificate \
-     --header=\"Authorization: Bearer \$(cat /var/run/secrets/kubernetes.io/serviceaccount/token)\" \
-     https://$NODE:10250/metrics/cadvisor" | grep '^# TYPE' | awk '{print $3}'
+NODE=$(kubectl get node -o jsonpath='{.items[0].metadata.name}')
+kubectl get --raw "/api/v1/nodes/$NODE/proxy/metrics/cadvisor" \
+  | grep '^# TYPE' | awk '{print $3}'
 ```
 
-The agent does not scrape itself, so its own memory is not on the dashboard.
-Read it off the box:
+Swap `/metrics/cadvisor` for `/metrics` to do the same for the kubelet's own
+families.
+
+The agent scrapes itself on a job of its own (`prometheus-agent`, under ten
+series), because the allow-lists are a memory argument and it should be possible
+to read whether they worked. On the Railway Prometheus:
+
+```promql
+prometheus_agent_active_series{cluster="carrier"}
+process_resident_memory_bytes{cluster="carrier", job="prometheus-agent"}
+```
+
+The two do not track each other: resident memory includes page cache over the
+agent's WAL under `/data`, so a series cut moves the first immediately and the
+second only as the cache turns over. `prometheus_target_scrapes_sample_out_of_order_total`
+is on the same job, and it is where a relabel rule that collapses two series
+into one shows up. From the box, the resident half of that, without Grafana:
 
 ```sh
 kubectl -n monitoring top pod -l app.kubernetes.io/name=prometheus-agent
-kubectl -n monitoring exec deploy/prometheus-agent -- \
-  wget -qO- localhost:9090/metrics \
-  | grep -E '^(process_resident_memory_bytes|prometheus_agent_active_series|prometheus_remote_storage_samples_in_total) '
 ```
 
 ## What the dashboard answers
