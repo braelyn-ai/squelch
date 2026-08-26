@@ -1432,11 +1432,24 @@ struct ThreadViewer: View {
     private func doneAndNext() async {
         let queue = store.threadQueue
         let cur = queue.firstIndex(where: { $0.thread_id == threadId })
-        // Read BEFORE the resolve: `Actions.done` pulls the row out of the
-        // bands, and on the sitrep the queue is the ranked standing list — the
-        // same list. Asking afterwards would be asking a list this call just
-        // shortened, and the walk would skip an email.
-        let next = cur.flatMap { queue[safe: $0 + 1] }
+        // THE NEXT DIFFERENT EMAIL, not merely the next row. Every band listing
+        // is one row per THREAD — the store partitions them that way, and
+        // resolving one resolves the whole thread — so on those queues this
+        // reads exactly like `cur + 1`. The REMINDER SCHEDULE is the exception
+        // the store spells out: it lists one row per REMINDER, so two siblings
+        // of one thread can both be on it, and stepping onto the second would
+        // re-open the email just finished. `cur` would then find that same row
+        // again, and the walk would never move for as long as the key is held.
+        //
+        // Already-resolved rows are skipped for the same reason: a queue is a
+        // snapshot taken when the reader opened, and mail dealt with since (the
+        // sibling the store just resolved, a row done from a list underneath) is
+        // not something to walk a reader onto.
+        let next = cur.flatMap { c in
+            queue[(c + 1)...].first {
+                $0.thread_id != threadId && !store.resolvedIds.contains($0.id)
+            }
+        }
 
         let liftedAt = liftOff()
         await resolveOpenThread()
