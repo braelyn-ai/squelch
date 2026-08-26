@@ -261,6 +261,12 @@ data:
   # SQUELCH_WARDEN_EMBED_IDLE_UNLOAD_SECS: "0"
   # Moves the whole fleet's embedding model without cutting a new daemon image;
   # unset means the daemon's own pin, which is Xenova/bge-small-en-v1.5.
+  #
+  # SEED THE MODEL PVC WITH THE NEW WEIGHTS FIRST. Naming a model
+  # SQUELCH_WARDEN_MODEL_PVC does not hold puts a cold download in front of
+  # every tenant that restarts for the change, which is the same failure the
+  # warden warns about for HTTP readiness with no PVC at all, and the roller
+  # takes those pods one at a time.
   # SQUELCH_WARDEN_EMBED_MODEL: "Xenova/bge-small-en-v1.5"
   # Uncomment if the squelchd image is private. This is the pull secret for
   # TENANT pods; the warden's own pod takes `imagePullSecrets` in
