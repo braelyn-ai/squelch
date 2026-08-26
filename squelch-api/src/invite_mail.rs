@@ -173,6 +173,9 @@ pub fn compose(to: &str, subject: &str, body: &str) -> ReplyParts {
     ReplyParts {
         to: to.to_string(),
         cc: None,
+        // An invite reaches exactly one person, named. Neither copy list has
+        // anything to carry.
+        bcc: None,
         subject: subject.to_string(),
         body: body.to_string(),
         in_reply_to: None,

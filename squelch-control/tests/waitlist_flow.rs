@@ -506,7 +506,11 @@ async fn approving_mails_a_code_that_redeems() {
     let analytics_id = h.analytics_id(id).await;
 
     let (status, headers, _) = h
-        .post_form("/admin/approve", format!("id={id}&confirmed=yes"), Some(&cookie))
+        .post_form(
+            "/admin/approve",
+            format!("id={id}&confirmed=yes"),
+            Some(&cookie),
+        )
         .await;
     assert_eq!(status, StatusCode::SEE_OTHER);
     assert_eq!(header_of(&headers, header::LOCATION), "/admin");
@@ -577,12 +581,20 @@ async fn a_replayed_approval_mints_nothing() {
     let id = h.only_row_id().await;
     let cookie = h.sign_in().await;
 
-    h.post_form("/admin/approve", format!("id={id}&confirmed=yes"), Some(&cookie))
-        .await;
+    h.post_form(
+        "/admin/approve",
+        format!("id={id}&confirmed=yes"),
+        Some(&cookie),
+    )
+    .await;
     let after_first = h.invite_ids().await;
 
     let (status, _, body) = h
-        .post_form("/admin/approve", format!("id={id}&confirmed=yes"), Some(&cookie))
+        .post_form(
+            "/admin/approve",
+            format!("id={id}&confirmed=yes"),
+            Some(&cookie),
+        )
         .await;
     assert_eq!(
         status,
@@ -604,8 +616,12 @@ async fn a_failed_send_leaves_a_row_the_operator_can_repair() {
     let cookie = h.sign_in().await;
 
     h.fail_sends(true);
-    h.post_form("/admin/approve", format!("id={id}&confirmed=yes"), Some(&cookie))
-        .await;
+    h.post_form(
+        "/admin/approve",
+        format!("id={id}&confirmed=yes"),
+        Some(&cookie),
+    )
+    .await;
 
     let (row_status, first_invite, notified) = h.row_state(id).await;
     assert_eq!(row_status, "approved", "the person is approved either way");
@@ -621,7 +637,11 @@ async fn a_failed_send_leaves_a_row_the_operator_can_repair() {
     // than anybody approved.
     h.fail_sends(false);
     let (status, _, _) = h
-        .post_form("/admin/send", format!("id={id}&confirmed=yes"), Some(&cookie))
+        .post_form(
+            "/admin/send",
+            format!("id={id}&confirmed=yes"),
+            Some(&cookie),
+        )
         .await;
     assert_eq!(status, StatusCode::SEE_OTHER);
 
@@ -650,8 +670,12 @@ async fn a_spent_invite_is_not_replaced() {
     h.join(APPLICANT).await;
     let id = h.only_row_id().await;
     let cookie = h.sign_in().await;
-    h.post_form("/admin/approve", format!("id={id}&confirmed=yes"), Some(&cookie))
-        .await;
+    h.post_form(
+        "/admin/approve",
+        format!("id={id}&confirmed=yes"),
+        Some(&cookie),
+    )
+    .await;
 
     // Spend it, the way a finished signup does.
     let code = code_in(&h.sends()[0].1);
@@ -674,7 +698,11 @@ async fn a_spent_invite_is_not_replaced() {
         .unwrap();
 
     let (status, _, body) = h
-        .post_form("/admin/send", format!("id={id}&confirmed=yes"), Some(&cookie))
+        .post_form(
+            "/admin/send",
+            format!("id={id}&confirmed=yes"),
+            Some(&cookie),
+        )
         .await;
     assert_eq!(status, StatusCode::OK);
     assert!(body.contains("already been used"), "{body}");
@@ -695,15 +723,23 @@ async fn a_revoked_invite_is_replaced_rather_than_refused() {
     h.join(APPLICANT).await;
     let id = h.only_row_id().await;
     let cookie = h.sign_in().await;
-    h.post_form("/admin/approve", format!("id={id}&confirmed=yes"), Some(&cookie))
-        .await;
+    h.post_form(
+        "/admin/approve",
+        format!("id={id}&confirmed=yes"),
+        Some(&cookie),
+    )
+    .await;
 
     let (_, first, _) = h.row_state(id).await;
     assert!(h.state.store().revoke_invite(first.unwrap()).await.unwrap());
     assert!(h.invite_ids().await.is_empty());
 
     let (status, _, _) = h
-        .post_form("/admin/send", format!("id={id}&confirmed=yes"), Some(&cookie))
+        .post_form(
+            "/admin/send",
+            format!("id={id}&confirmed=yes"),
+            Some(&cookie),
+        )
         .await;
     assert_eq!(status, StatusCode::SEE_OTHER);
     let (_, second, notified) = h.row_state(id).await;
@@ -765,7 +801,11 @@ async fn a_signup_cookie_is_not_an_admin_cookie() {
         assert!(!body.contains(APPLICANT), "{body}");
 
         let (status, _, _) = h
-            .post_form("/admin/approve", format!("id={id}&confirmed=yes"), Some(&value))
+            .post_form(
+                "/admin/approve",
+                format!("id={id}&confirmed=yes"),
+                Some(&value),
+            )
             .await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
     }
@@ -784,7 +824,11 @@ async fn an_expired_admin_cookie_is_refused() {
 
     let stale = admin_cookie_at(now - ADMIN_COOKIE_TTL_SECS - 1);
     let (status, headers, body) = h
-        .post_form("/admin/approve", format!("id={id}&confirmed=yes"), Some(&stale))
+        .post_form(
+            "/admin/approve",
+            format!("id={id}&confirmed=yes"),
+            Some(&stale),
+        )
         .await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
     assert!(body.contains("session has ended"), "{body}");
@@ -797,7 +841,11 @@ async fn an_expired_admin_cookie_is_refused() {
     // A tampered one fails the same way, and one inside the window works.
     let forged = format!("{}x", admin_cookie_at(now));
     let (status, _, _) = h
-        .post_form("/admin/approve", format!("id={id}&confirmed=yes"), Some(&forged))
+        .post_form(
+            "/admin/approve",
+            format!("id={id}&confirmed=yes"),
+            Some(&forged),
+        )
         .await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
 
@@ -863,8 +911,12 @@ async fn two_racing_sends_mail_one_code() {
     h.join(APPLICANT).await;
     let id = h.only_row_id().await;
     let cookie = h.sign_in().await;
-    h.post_form("/admin/approve", format!("id={id}&confirmed=yes"), Some(&cookie))
-        .await;
+    h.post_form(
+        "/admin/approve",
+        format!("id={id}&confirmed=yes"),
+        Some(&cookie),
+    )
+    .await;
     let first = h.row_state(id).await.1.expect("approved with an invite");
     assert_eq!(h.sends().len(), 1);
 
@@ -872,7 +924,11 @@ async fn two_racing_sends_mail_one_code() {
     // so the race is staged: the row is moved on before the second one lands,
     // which is exactly the state the loser of a real race would find.
     let (status, _, _) = h
-        .post_form("/admin/send", format!("id={id}&confirmed=yes"), Some(&cookie))
+        .post_form(
+            "/admin/send",
+            format!("id={id}&confirmed=yes"),
+            Some(&cookie),
+        )
         .await;
     assert_eq!(status, StatusCode::SEE_OTHER);
     let second = h.row_state(id).await.1.expect("a fresh invite");
@@ -907,8 +963,12 @@ async fn a_held_invite_is_left_alone() {
     h.join(APPLICANT).await;
     let id = h.only_row_id().await;
     let cookie = h.sign_in().await;
-    h.post_form("/admin/approve", format!("id={id}&confirmed=yes"), Some(&cookie))
-        .await;
+    h.post_form(
+        "/admin/approve",
+        format!("id={id}&confirmed=yes"),
+        Some(&cookie),
+    )
+    .await;
     let invite_id = h.row_state(id).await.1.unwrap();
 
     // The applicant pastes the code and is redirected to Google.
@@ -928,7 +988,11 @@ async fn a_held_invite_is_left_alone() {
     assert_eq!(held, Some(invite_id), "the store handed out the hold");
 
     let (status, _, body) = h
-        .post_form("/admin/send", format!("id={id}&confirmed=yes"), Some(&cookie))
+        .post_form(
+            "/admin/send",
+            format!("id={id}&confirmed=yes"),
+            Some(&cookie),
+        )
         .await;
     assert_eq!(status, StatusCode::OK, "a banner, not a redirect");
     assert!(body.contains("redeeming that code right now"), "{body}");
@@ -1166,8 +1230,14 @@ async fn an_unanswered_confirmation_approves_nothing() {
 
     // A page, not a redirect: the operator has something to read and answer.
     assert_eq!(status, StatusCode::OK);
-    assert!(body.contains("test user list"), "it asks the question: {body}");
-    assert!(body.contains(APPLICANT), "and names who it is about: {body}");
+    assert!(
+        body.contains("test user list"),
+        "it asks the question: {body}"
+    );
+    assert!(
+        body.contains(APPLICANT),
+        "and names who it is about: {body}"
+    );
     // The console's standing rule holds on this page like every other one.
     assert!(!body.contains("<script"), "{body}");
 

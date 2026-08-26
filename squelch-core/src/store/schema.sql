@@ -830,6 +830,12 @@ CREATE TABLE IF NOT EXISTS drafts (
     account_id          INTEGER NOT NULL,
     reply_to_message_id INTEGER,          -- NULL = the new-message draft
     to_addr             TEXT NOT NULL DEFAULT '',
+    -- The composer's other two recipient lists, same comma-joined shape as
+    -- to_addr. A draft that could not hold them would restore as a message
+    -- addressed to fewer people than it was written for, and a Bcc lost that
+    -- way is invisible: nothing else on screen would show it had ever been set.
+    cc_addr             TEXT NOT NULL DEFAULT '',
+    bcc_addr            TEXT NOT NULL DEFAULT '',
     subject             TEXT NOT NULL DEFAULT '',
     body                TEXT NOT NULL DEFAULT '',
     created_at          TEXT NOT NULL,
