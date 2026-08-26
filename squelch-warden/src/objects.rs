@@ -323,6 +323,26 @@ pub const BLOCKED_EGRESS_CIDRS: &[&str] = &[
 /// relative and point inside the directory being copied: preserved they still
 /// resolve, dereferenced the copy is just bigger. A per-file copy is what would
 /// break, which is why the loop iterates `/models/*` and not what is under it.
+///
+/// TEMP PATH THEN RENAME, because "skip what is already there" and "copy in
+/// place" combine into a trap. A `cp -r` straight to `$d` that dies partway
+/// (the node under memory pressure, the init container OOM-killed, `set -e`
+/// firing) leaves a half-populated model directory; every later boot then sees
+/// `-e "$d"` and skips it, and the daemon loads a cache whose snapshot symlinks
+/// point at blobs that were never copied. That degrades to keyword-only search
+/// FOREVER, silently, on a tenant that looks provisioned. Copying to
+/// `$d.seed-tmp` and renaming means `$d` only ever appears complete: rename is
+/// atomic, and both paths are on the tenant's own volume so it is a rename and
+/// not a cross-device copy. The `rm -rf "$t"` at the top of each iteration
+/// sweeps the leftovers of a run that died, so an interrupted seed costs disk
+/// once rather than accumulating.
+///
+/// The limit, stated: this protects a directory THIS script wrote. A cache
+/// already half-populated under the model's real name (a download the daemon
+/// itself did not finish) is indistinguishable from a good one at `-e`, and the
+/// script leaves it alone. Repairing that is the operator's job, and the
+/// procedure is the reclaim step in `deploy/hosted/PRODUCTION.md`: delete the
+/// bad directory and let the next boot seed or re-download it.
 pub const SEED_SCRIPT: &str = "set -eu\n\
     want=$(sha256sum /etc/squelch/credential/credentials.json | cut -d ' ' -f 1)\n\
     have=''\n\
@@ -333,12 +353,17 @@ pub const SEED_SCRIPT: &str = "set -eu\n\
     \x20 printf '%s\\n' \"$want\" > /data/.credentials.seed\n\
     fi\n\
     if [ -d /models ]; then\n\
-    \x20 mkdir -p /data/.local/share/squelch/models\n\
-    \x20 for m in /models/*; do\n\
-    \x20\x20 [ -e \"$m\" ] || continue\n\
-    \x20\x20 d=/data/.local/share/squelch/models/${m#/models/}\n\
-    \x20\x20 [ -e \"$d\" ] || cp -r \"$m\" \"$d\"\n\
-    \x20 done\n\
+    \x20\x20mkdir -p /data/.local/share/squelch/models\n\
+    \x20\x20for m in /models/*; do\n\
+    \x20\x20\x20\x20[ -e \"$m\" ] || continue\n\
+    \x20\x20\x20\x20d=/data/.local/share/squelch/models/${m#/models/}\n\
+    \x20\x20\x20\x20t=$d.seed-tmp\n\
+    \x20\x20\x20\x20rm -rf \"$t\"\n\
+    \x20\x20\x20\x20if [ ! -e \"$d\" ]; then\n\
+    \x20\x20\x20\x20\x20\x20cp -r \"$m\" \"$t\"\n\
+    \x20\x20\x20\x20\x20\x20mv \"$t\" \"$d\"\n\
+    \x20\x20\x20\x20fi\n\
+    \x20\x20done\n\
     fi\n";
 
 /// The init container's bounds. Constants rather than config: it copies at most
@@ -2220,12 +2245,33 @@ mod tests {
     fn the_seed_script_fills_in_a_missing_model_beside_the_ones_a_tenant_has() {
         // The guard that made it first-boot-only.
         assert!(!SEED_SCRIPT.contains("[ ! -d /data/.local/share/squelch/models ]"));
-        // Per entry, skipping what is already there, never clobbering.
+        // Per entry, and skipping what is already there.
         assert!(SEED_SCRIPT.contains("for m in /models/*; do"));
-        assert!(SEED_SCRIPT.contains("[ -e \"$d\" ] || cp -r \"$m\" \"$d\""));
+        assert!(SEED_SCRIPT.contains("if [ ! -e \"$d\" ]; then"));
         // A shell that fails a step must fail the init container, not carry on
         // and hand the daemon a half-copied model directory.
         assert!(SEED_SCRIPT.starts_with("set -eu\n"));
+    }
+
+    /// The destination appears complete or not at all. Copying in place would
+    /// pair with the "skip what exists" guard to make one interrupted `cp` a
+    /// permanent one: the half-copied directory is skipped by every later boot,
+    /// and the daemon loads snapshot symlinks pointing at blobs that never
+    /// arrived. Keyword-only search forever, on a tenant that looks fine.
+    #[test]
+    fn a_model_is_copied_to_a_temp_path_and_renamed_into_place() {
+        assert!(SEED_SCRIPT.contains("t=$d.seed-tmp"));
+        assert!(SEED_SCRIPT.contains("cp -r \"$m\" \"$t\""));
+        assert!(SEED_SCRIPT.contains("mv \"$t\" \"$d\""));
+        // Never the destination directly: that is the whole bug.
+        assert!(!SEED_SCRIPT.contains("cp -r \"$m\" \"$d\""));
+        // An interrupted run costs disk once, not once per restart.
+        assert!(SEED_SCRIPT.contains("rm -rf \"$t\""));
+        // And the sweep has to come BEFORE the copy, or it collects the temp
+        // directory the same iteration just built.
+        let sweep = SEED_SCRIPT.find("rm -rf \"$t\"").unwrap();
+        let copy = SEED_SCRIPT.find("cp -r \"$m\" \"$t\"").unwrap();
+        assert!(sweep < copy, "the sweep must precede the copy");
     }
 
     #[test]

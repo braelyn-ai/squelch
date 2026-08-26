@@ -1061,6 +1061,26 @@ it either.
 Do the four existing tenants and then forget this section. Tenants provisioned
 after the pin only ever fetch one model.
 
+**The same `rm -rf` is the repair for a CORRUPT model directory**, which is the
+one case the init container cannot fix itself. It seeds by copying to
+`<model>.seed-tmp` and renaming, so a copy it started and did not finish leaves
+no destination and is retried on the next boot. A directory half-populated under
+the model's real name, by a download the daemon itself did not finish, is
+indistinguishable from a good one: the seeder sees it exists and skips it,
+forever. The symptom is a tenant that never reaches `embedder ready`, or reaches
+it and then errors on the first embed with a missing file under `snapshots/`.
+
+```sh
+kubectl -n tenants exec deploy/<label> -c squelchd -- \
+  sh -c 'ls -lLR /data/.local/share/squelch/models/models--Xenova--bge-small-en-v1.5/snapshots'
+
+# Broken links, or no blobs/ at all: delete the directory and restart. The init
+# container re-seeds it from the PVC, or the daemon re-downloads it.
+kubectl -n tenants exec deploy/<label> -c squelchd -- \
+  rm -rf /data/.local/share/squelch/models/models--Xenova--bge-small-en-v1.5
+kubectl -n tenants rollout restart deploy/<label>
+```
+
 ## Cluster secrets
 
 Inventory only. Nothing here should ever be printed into a document, a ticket or
