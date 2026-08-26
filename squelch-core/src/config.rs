@@ -1937,12 +1937,12 @@ mod tests {
 
     #[test]
     fn embed_defaults_are_sane() {
+        // Only the two lengths this test owns. The model pin and the backfill
+        // batch size have their own tests where they are decided.
         let c = EmbedConfig::default();
-        assert_eq!(c.model, "bge-small-en-v1.5");
         assert_eq!(c.dims, 384);
         assert_eq!(c.max_chars, 1000);
         assert_eq!(c.max_tokens, 256);
-        assert_eq!(c.backfill_batch, 64);
     }
 
     /// `settings()` carries the token budget through to the embedder, and the
@@ -1956,7 +1956,7 @@ mod tests {
         assert_eq!(cfg.embed.max_chars, 700);
         let s = cfg.embed.settings();
         assert_eq!(s.max_tokens, 128);
-        assert_eq!(s.model_name, "bge-small-en-v1.5");
+        assert_eq!(s.model_name, cfg.embed.model);
         assert_eq!(s.dims, 384);
 
         // A config written before the field existed still parses to the default.
