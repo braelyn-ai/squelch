@@ -125,12 +125,17 @@ pub fn router(state: ControlState) -> Router {
         ))
         .with_state(state.clone());
 
-    // BOTH LOGIN HOPS, on ONE bucket. They are the same errand through the same
-    // consent, and a limiter each would let the same client spend twice by
-    // alternating them.
+    // ALL THREE UNAUTHENTICATED CONSENT HOPS, on ONE bucket. They are the same
+    // errand through the same consent, and a limiter each would let the same
+    // client spend three times by rotating them.
+    //
+    // `/reconnect` belongs here rather than with signup despite being a grant:
+    // what this bucket rations is the ability of a stranger to start consent
+    // hops, and a reconnect is reachable with no credential at all.
     let console = Router::new()
         .route("/console/auth", get(handlers::console_auth))
         .route("/app/auth", get(handlers::app_auth))
+        .route("/reconnect", get(handlers::reconnect_start))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             ratelimit::limit_console_auth,

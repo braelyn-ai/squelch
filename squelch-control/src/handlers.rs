@@ -204,6 +204,27 @@ const APP_NO_TENANT: &str = "Nothing is set up for the account you signed in wit
 const APP_SESSION_REFUSED: &str = "That sign in could not be verified, or it took too long. Go back to Passband and sign in \
      again.";
 
+/// [`CONSOLE_SESSION_REFUSED`] in the reconnect flow's words. The way back is
+/// the link they arrived by, which is the only one this page can name: a
+/// reconnect does not learn its label until Google answers.
+const RECONNECT_SESSION_REFUSED: &str = "That reconnection could not be verified, or it took too long. Nothing changed. Open the \
+     reconnect link again and approve access with the Google account your mailbox reads.";
+
+/// [`APP_NO_TENANT`] in the reconnect flow's words, and not an oracle for the
+/// same reason: the person reading it has just proved to Google that they own
+/// this mailbox, so it tells them nothing about anyone else's.
+const RECONNECT_NO_TENANT_HEADING: &str = "No Passband mailbox for that Google account";
+const RECONNECT_NO_TENANT: &str = "Nothing is set up for the account you approved. If your Passband mailbox reads a \
+     different Google account, start again and pick that one.";
+
+/// The reconnect worked. Deliberately says what happens NEXT rather than
+/// stopping at "done": mail does not reappear the instant the credential lands,
+/// and somebody who has been staring at an empty mailbox for days deserves to
+/// know that a few minutes of quiet is the expected shape of success.
+const RECONNECT_DONE_HEADING: &str = "Your mailbox is reconnected";
+const RECONNECT_DONE: &str = "Passband can read your mail again. Syncing starts within a few minutes, and anything that \
+     arrived while it was disconnected will be picked up. You can close this page.";
+
 /// The three answers `POST /waitlist` gives. JSON rather than a page: the only
 /// client is the site's own form, which shows its own copy in its own voice, so
 /// what crosses the wire is a machine reason and never a sentence.
@@ -435,6 +456,7 @@ pub async fn signup(State(state): State<ControlState>, body: Bytes) -> Response 
         label: label.clone(),
         invite: Some(invite_id),
         app: false,
+        reconnect: false,
         iat: chrono::Utc::now().timestamp(),
     };
     let cookie_value = cookie::sign(&config.cookie_key, &claim);
@@ -636,6 +658,7 @@ pub async fn console_auth(
         // refused as a mismatch.
         invite: None,
         app: false,
+        reconnect: false,
         iat: chrono::Utc::now().timestamp(),
     };
     let cookie_value = cookie::sign(&config.cookie_key, &claim);
@@ -721,6 +744,7 @@ pub async fn app_auth(State(state): State<ControlState>) -> Response {
         // The one thing that tells the two apart from the cookie alone, and it
         // decides nothing but the wording of a refusal. See `SessionClaim::app`.
         app: true,
+        reconnect: false,
         iat: chrono::Utc::now().timestamp(),
     };
     let cookie_value = cookie::sign(&config.cookie_key, &claim);
@@ -740,6 +764,110 @@ pub async fn app_auth(State(state): State<ControlState>) -> Response {
         ],
     )
         .into_response()
+}
+
+/// `GET /reconnect` — start a fresh Gmail grant for a mailbox that already has
+/// a tenant.
+///
+/// TAKES NO INPUT, exactly like [`app_auth`], and for a stronger reason. An app
+/// login that let you name a tenant would be an oracle; a reconnect that let you
+/// name one would be an oracle AND a way to aim a credential you legitimately
+/// own at a mailbox you do not. The only mailbox this flow will ever install to
+/// is the one Google names on the way back, so there is nothing to type and
+/// nothing to tamper with.
+///
+/// WHY THIS EXISTS: a refresh token can stop working while everything else is
+/// healthy — revoked by the user, or expired because the consent screen is still
+/// in Testing, where Google expires them after seven days. The daemon cannot ask
+/// for a new one: it holds a sealed credential and has no way to run a consent
+/// flow. Before this route the only repair was an operator running `squelchd
+/// auth` inside the tenant's pod, which does not scale past the people who have
+/// a shell on the cluster.
+pub async fn reconnect_start(State(state): State<ControlState>) -> Response {
+    let config = state.config();
+
+    let (sid, csrf_state) = match (random_token(), random_token()) {
+        (Ok(a), Ok(b)) => (a, b),
+        _ => {
+            tracing::error!("the system random source failed");
+            return reconnect_unavailable();
+        }
+    };
+
+    // Flow::Reconnect: signup's scopes, offline, and prompt=consent. The last of
+    // those is what makes this worth doing at all — without it Google recognises
+    // a returning user and can answer with no refresh token, which is the exact
+    // thing being replaced.
+    let consent = match oauth::consent_url(&endpoints(&state), csrf_state, Flow::Reconnect) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!(error = %e, "building the reconnect consent url failed");
+            return reconnect_unavailable();
+        }
+    };
+
+    let inserted = state.sessions().insert(
+        sid.clone(),
+        SessionKind::Reconnect,
+        consent.state,
+        consent.pkce_verifier,
+        // EMPTY and it stays empty, as on an app login: this flow does not know
+        // which tenant it is for until Google answers, so an empty label is a
+        // fact both sides agree on rather than a value one of them made up.
+        String::new(),
+        Instant::now(),
+    );
+    if let Err(InsertError::Full) = inserted {
+        tracing::warn!(sessions = state.live_sessions(), "session table full");
+        return reconnect_unavailable();
+    }
+
+    let claim = SessionClaim {
+        sid,
+        label: String::new(),
+        // A reconnect spends no invite: the tenant was paid for once already.
+        invite: None,
+        app: false,
+        // Refusal copy only. See `SessionClaim::reconnect`.
+        reconnect: true,
+        iat: chrono::Utc::now().timestamp(),
+    };
+    let cookie_value = cookie::sign(&config.cookie_key, &claim);
+
+    // PRIVACY: a count and nothing else. No label exists on this path and the
+    // mailbox is not known yet.
+    tracing::info!(sessions = state.live_sessions(), "reconnect started");
+
+    (
+        StatusCode::FOUND,
+        [
+            (header::LOCATION, consent.url),
+            (
+                header::SET_COOKIE,
+                cookie::set_cookie(&cookie_value, !config.is_insecure()),
+            ),
+        ],
+    )
+        .into_response()
+}
+
+/// What a reconnect gets when THIS service could not do its job. Says "try
+/// again", which is true, rather than "check who you are", which would not be.
+fn reconnect_unavailable() -> Response {
+    pages::console_problem(
+        StatusCode::BAD_GATEWAY,
+        "Reconnecting is unavailable right now",
+        "Nothing changed. Please try again in a few minutes.",
+    )
+}
+
+/// What a reconnect gets when GOOGLE would not complete the grant.
+fn reconnect_refused() -> Response {
+    pages::console_problem(
+        StatusCode::BAD_REQUEST,
+        "That reconnection could not be completed",
+        "Nothing changed. Start again, and approve access with the Google account your mailbox reads.",
+    )
 }
 
 /// `GET /oauth/callback` — Google's redirect target.
@@ -851,6 +979,15 @@ pub async fn oauth_callback(
         }
         SessionKind::App => {
             return done(app_login(&state, code, session.pkce_verifier).await);
+        }
+        // RECONNECT forks here with the two logins rather than continuing into
+        // the signup half, even though it is a GRANT like signup is. What it
+        // shares with signup is the exchange; what it must not share is
+        // everything after — no label was chosen, no invite is held, no tenant
+        // is created, and the mailbox it acts on is not known until Google
+        // answers.
+        SessionKind::Reconnect => {
+            return done(reconnect_install(&state, code, session.pkce_verifier).await);
         }
     };
 
@@ -1361,6 +1498,136 @@ async fn console_login(
 ///
 /// Nothing is looked up before Google here for the same reason nothing is on the
 /// console hop: there is no input to look anything up BY.
+/// Complete a reconnect: exchange the grant, find the mailbox's existing
+/// tenant, and install a fresh sealed credential over the dead one.
+///
+/// THE ORDER IS THE SAFETY PROPERTY, and it is the reverse of signup's. Signup
+/// creates a tenant and then seals to it; this must find a tenant that already
+/// exists and refuse if there is not one, because "reconnect" that provisioned
+/// something would let any Google account conjure a mailbox without an invite.
+///
+/// THE RECIPIENT COMES FROM ITS OWN ROUTE, not from the create call. Create is
+/// idempotent only while a tenant is PENDING and answers 409 for anything
+/// serving, which is correct for signup — a second POST for a live tenant is
+/// somebody claiming a taken subdomain — and useless here, where every tenant
+/// worth reconnecting is serving. `recipient_for` is the re-consent's own door,
+/// and it still presents the mailbox: a 409 from it is the warden independently
+/// refusing to hand this process a recipient for a mailbox the grant does not
+/// belong to. So custody is checked twice, by two services, from two records.
+async fn reconnect_install(state: &ControlState, code: String, pkce_verifier: String) -> Response {
+    // A FULL GMAIL GRANT, not an identity hop: this is the credential the daemon
+    // will hold, so it is exchanged and scope-checked exactly as signup's is.
+    let grant = match oauth::exchange_code(&endpoints(state), code, pkce_verifier).await {
+        Ok(g) => g,
+        Err(oauth::OAuthError::Scope) => {
+            // NOT `partial_consent_problem`: that page says "your invite code
+            // has not been used", which is true of a signup and meaningless to
+            // somebody reconnecting a mailbox they have had for weeks.
+            tracing::info!("reconnect consent granted only part of the scope set");
+            return pages::console_problem(
+                StatusCode::OK,
+                "Passband needs all three Gmail permissions",
+                "Nothing changed and your mailbox is still disconnected. Passband needs all                  three: reading your mail to triage it, changing it to archive and label, and                  sending so you can reply from the app. Start again and leave every box checked                  on Google's screen.",
+            );
+        }
+        Err(e) => {
+            // PRIVACY: the error type only. Never the code, the token, or
+            // anything Google said verbatim.
+            tracing::info!(error = %e, "reconnect did not complete at Google");
+            return reconnect_refused();
+        }
+    };
+
+    // Normalized the way the store normalizes on insert, so a capitalized Google
+    // answer finds the same row rather than none.
+    let label = match state
+        .store()
+        .active_tenant_for_email(&grant.account_email)
+        .await
+    {
+        Ok(Some(label)) => label,
+        // A real Google account with no mailbox here. Said plainly, and not an
+        // oracle: see [`RECONNECT_NO_TENANT`].
+        Ok(None) => {
+            tracing::info!("reconnect found no active tenant for that mailbox");
+            return pages::console_problem(
+                StatusCode::NOT_FOUND,
+                RECONNECT_NO_TENANT_HEADING,
+                RECONNECT_NO_TENANT,
+            );
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "reconnect tenant lookup failed");
+            return reconnect_unavailable();
+        }
+    };
+
+    // Re-learn the recipient. Creates nothing and mutates nothing; what it does
+    // is refuse if this mailbox is not the account the CLUSTER says owns the
+    // label.
+    let created = match state
+        .warden()
+        .recipient_for(&label, &grant.account_email)
+        .await
+    {
+        Ok(c) => c,
+        Err(WardenError::LabelTaken | WardenError::NotFound) => {
+            // The store said this email owns this label and the cluster says
+            // otherwise (a different account, or no tenant at all). Two records
+            // disagreeing about custody is not something to paper over with a
+            // retry, and it is not something to explain to the browser either:
+            // which of the two it was is exactly what an attacker would want.
+            tracing::error!(label = %label, "reconnect: warden and store disagree about the owner");
+            return reconnect_unavailable();
+        }
+        Err(e) => {
+            // PRIVACY: the error type and the label. Never the recipient.
+            tracing::error!(error = %e, label = %label, "reconnect: reading the recipient failed");
+            return reconnect_unavailable();
+        }
+    };
+
+    // The ONE moment a plaintext refresh token exists on this machine ends
+    // here, exactly as at signup.
+    let ciphertext = match seal::seal_credentials(
+        &created.recipient,
+        &grant.account_email,
+        &grant.token,
+    ) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!(error = %e, label = %label, "reconnect: sealing the credential failed");
+            return reconnect_unavailable();
+        }
+    };
+    drop(grant.token);
+
+    // INSTALL, on the REPLACE route: the signup route answers 409 for a live
+    // tenant, which is every tenant worth reconnecting. Until this call lands
+    // nothing has changed — the tenant is still running on its dead credential,
+    // which is the right thing to fail back to.
+    //
+    // THE POD RESTARTS. The credential's hash rides on the Deployment's pod
+    // template, so a new credential is a new template and Kubernetes recreates
+    // the pod; the warden waits for the rollout before answering. That is a
+    // brief interruption, and it is the correct trade here: the mailbox this
+    // runs against is one whose sync is already dead, so the pod being replaced
+    // is not doing anything worth protecting.
+    if let Err(e) = state
+        .warden()
+        .replace_credentials(&label, &grant.account_email, &ciphertext)
+        .await
+    {
+        tracing::error!(error = %e, label = %label, "reconnect: installing the credential failed");
+        return reconnect_unavailable();
+    }
+
+    // PRIVACY: the label, never the mailbox.
+    tracing::info!(label = %label, "reconnect complete");
+
+    pages::console_problem(StatusCode::OK, RECONNECT_DONE_HEADING, RECONNECT_DONE)
+}
+
 async fn app_login(state: &ControlState, code: String, pkce_verifier: String) -> Response {
     // Identity only, and the function that does it hands back a mailbox rather
     // than a token: there is no credential on this path for anything downstream
@@ -1586,6 +1853,14 @@ fn refused_session_for(state: &ControlState, voice: Voice) -> Response {
             CONSOLE_REFUSED_HEADING,
             APP_SESSION_REFUSED,
         ),
+        // NO LINK, for the App reason plus one of its own: a reconnect does not
+        // know its label until Google answers, so there is no tenant URL to
+        // offer. The way back is the same link they arrived by.
+        Voice::Reconnect => pages::console_problem(
+            StatusCode::BAD_REQUEST,
+            CONSOLE_REFUSED_HEADING,
+            RECONNECT_SESSION_REFUSED,
+        ),
     }
 }
 
@@ -1601,6 +1876,7 @@ enum Voice {
     Signup,
     Console(String),
     App,
+    Reconnect,
 }
 
 impl Voice {
@@ -1609,10 +1885,11 @@ impl Voice {
     /// this is used exclusively on paths that are already refusing. Every path
     /// that acts uses [`Voice::from_session`].
     fn from_cookie(claim: &SessionClaim) -> Self {
-        match (claim.invite, claim.app) {
-            (Some(_), _) => Voice::Signup,
-            (None, true) => Voice::App,
-            (None, false) => Voice::Console(claim.label.clone()),
+        match (claim.invite, claim.app, claim.reconnect) {
+            (Some(_), _, _) => Voice::Signup,
+            (None, _, true) => Voice::Reconnect,
+            (None, true, false) => Voice::App,
+            (None, false, false) => Voice::Console(claim.label.clone()),
         }
     }
 
@@ -1623,6 +1900,7 @@ impl Voice {
             SessionKind::Signup { .. } => Voice::Signup,
             SessionKind::Console => Voice::Console(label.to_string()),
             SessionKind::App => Voice::App,
+            SessionKind::Reconnect => Voice::Reconnect,
         }
     }
 }

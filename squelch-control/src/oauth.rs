@@ -2,12 +2,17 @@
 //! the authorization code, and ask Google which mailbox the resulting token
 //! opens.
 //!
-//! TWO FLOWS RUN THROUGH HERE and they ask Google for different things, which is
-//! why every entry point takes a [`Flow`]:
+//! THREE FLOWS RUN THROUGH HERE and they ask Google for different things, which
+//! is why every entry point takes a [`Flow`]:
 //!
 //! - [`Flow::Signup`] is a GRANT. It asks for all three Gmail scopes and
 //!   `access_type=offline`, because what it is for is a refresh token a daemon
 //!   will use for years.
+//! - [`Flow::Reconnect`] is THE SAME GRANT, asked for again. Identical scopes
+//!   and parameters; only the callback differs, re-sealing a mailbox that
+//!   already exists instead of provisioning one. It exists because a refresh
+//!   token can stop working (revoked, or expired under a consent screen still
+//!   in Testing) and the daemon cannot ask for a new one itself.
 //! - [`Flow::Console`] is a LOGIN. It asks for identity alone (`openid email`),
 //!   online, and the only thing it ever produces is a verified mailbox address:
 //!   see [`verify_identity`], which returns a `String` and no token at all.
@@ -88,8 +93,8 @@ pub struct GoogleEndpoints<'a> {
     pub auth_url: &'a str,
     pub token_url: &'a str,
     /// Gmail's profile endpoint, which names the mailbox behind a Gmail grant.
-    /// [`Flow::Signup`] only: it needs `gmail.readonly`, which is precisely what
-    /// a console login does not have.
+    /// The GRANT flows only ([`Flow::Signup`] and [`Flow::Reconnect`]): it needs
+    /// `gmail.readonly`, which is precisely what a console login does not have.
     pub profile_url: &'a str,
     /// OpenID Connect's userinfo endpoint. [`Flow::Console`] only: it is what an
     /// `openid email` token can read, and reading it is the whole errand.
@@ -105,6 +110,20 @@ pub enum Flow {
     Signup,
     /// A console login for a tenant that already exists.
     Console,
+    /// RECONNECT: a fresh Gmail grant for a tenant that already exists,
+    /// replacing a refresh token that has stopped working.
+    ///
+    /// Asks Google for exactly what [`Flow::Signup`] asks — the same scopes,
+    /// `access_type=offline`, `prompt=consent` — because it wants the same
+    /// thing: a refresh token the daemon can hold. It differs only in what the
+    /// callback does with it, which is to re-seal an existing mailbox rather
+    /// than provision a new one.
+    ///
+    /// `prompt=consent` is not optional here even though the user has consented
+    /// before. Without it Google recognises a returning user and may answer
+    /// with an access token and NO refresh token, which is precisely the thing
+    /// this flow exists to replace.
+    Reconnect,
 }
 
 /// A consent URL plus the two secrets that must be remembered until the user
@@ -181,7 +200,10 @@ const EMAIL_SCOPE_URL: &str = "https://www.googleapis.com/auth/userinfo.email";
 /// they already approved once at signup.
 fn requested_scopes(flow: Flow) -> Vec<&'static str> {
     match flow {
-        Flow::Signup => {
+        // RECONNECT rides with SIGNUP deliberately: a replacement credential
+        // that covered less than the original would leave a mailbox half
+        // readable, and the daemon checks a token against these same strings.
+        Flow::Signup | Flow::Reconnect => {
             let mut scopes = Vec::with_capacity(1 + WRITE_SCOPES.len());
             scopes.push(GMAIL_READONLY_SCOPE);
             scopes.extend_from_slice(WRITE_SCOPES);
@@ -200,7 +222,7 @@ fn requested_scopes(flow: Flow) -> Vec<&'static str> {
 fn required_scopes(flow: Flow) -> Vec<Vec<&'static str>> {
     match flow {
         // Every Gmail scope, spelled one way, exactly as before.
-        Flow::Signup => requested_scopes(flow)
+        Flow::Signup | Flow::Reconnect => requested_scopes(flow)
             .into_iter()
             .map(|s| vec![s])
             .collect(),
@@ -236,7 +258,7 @@ pub fn consent_url(
         )
         .set_pkce_challenge(challenge);
     request = match flow {
-        Flow::Signup => request
+        Flow::Signup | Flow::Reconnect => request
             .add_extra_param("access_type", "offline")
             .add_extra_param("prompt", "consent"),
         Flow::Console => request.add_extra_param("prompt", "select_account"),
