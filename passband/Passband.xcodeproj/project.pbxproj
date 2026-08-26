@@ -143,6 +143,7 @@
 		88DA0B8D32AA1FE0E82DA026 /* AnthropicStream.swift in Sources */ = {isa = PBXBuildFile; fileRef = E949BF41848E8F43B63C7AB7 /* AnthropicStream.swift */; };
 		8CCC6315E27DD5683F55D274 /* CidImages.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9C9C77BCE41A573ED04E49AA /* CidImages.swift */; };
 		8DD946F7BC6990641C19ACC1 /* ProcessView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 639F5C0DB9AE5A1AE8DF69A1 /* ProcessView.swift */; };
+		8E4141BFBB745019FB5C7D4D /* GmailDisconnectedBanner.swift in Sources */ = {isa = PBXBuildFile; fileRef = C756C9A9A4570C1AFFE7003E /* GmailDisconnectedBanner.swift */; };
 		903D181BC549637A0AEEB564 /* EmailWebCore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3BFBFFBE499370A5F88E2540 /* EmailWebCore.swift */; };
 		911E2DC6E6549AECE86FFBAA /* Sounds in Resources */ = {isa = PBXBuildFile; fileRef = F538ABF63F676ADB2910AE59 /* Sounds */; };
 		918EB3663E912FF4F36229C2 /* EmailWebCore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3BFBFFBE499370A5F88E2540 /* EmailWebCore.swift */; };
@@ -154,6 +155,7 @@
 		97EC2DEB9B2424CD580A8AD1 /* WebKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = BBC8D81B089AFD24BD4AC367 /* WebKit.framework */; };
 		98449AA2FEF0989C76FA6503 /* AuditView.swift in Sources */ = {isa = PBXBuildFile; fileRef = E6D39F14D1F28EEB5D9E86FE /* AuditView.swift */; };
 		99109D16A6A60C17BEB753BE /* AuthArrival.swift in Sources */ = {isa = PBXBuildFile; fileRef = FE241E317BA5B3B4D25B892E /* AuthArrival.swift */; };
+		999288733123CB9385DBE681 /* GmailDisconnectedBanner.swift in Sources */ = {isa = PBXBuildFile; fileRef = C756C9A9A4570C1AFFE7003E /* GmailDisconnectedBanner.swift */; };
 		99CFBE791F3799FBEFB5D213 /* ComposePane.swift in Sources */ = {isa = PBXBuildFile; fileRef = B97BB8DF0B7CB3C4E9EC791B /* ComposePane.swift */; };
 		99E823237BD7F3F4EE5C26DF /* Newsletters.swift in Sources */ = {isa = PBXBuildFile; fileRef = 47779240FEC7579D6A0072CB /* Newsletters.swift */; };
 		9B3E18E0184901FAE39CB499 /* ThreadMinimap.swift in Sources */ = {isa = PBXBuildFile; fileRef = 06AB2FB92191FC4913C38FFF /* ThreadMinimap.swift */; };
@@ -390,6 +392,7 @@
 		C09F1065514BF2244F027952 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = Info.plist; sourceTree = "<group>"; };
 		C10C0C8780CCB9C6BAB2709C /* MailCSP.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MailCSP.swift; sourceTree = "<group>"; };
 		C465B24E00D0436CD5704294 /* SwipeRow.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SwipeRow.swift; sourceTree = "<group>"; };
+		C756C9A9A4570C1AFFE7003E /* GmailDisconnectedBanner.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GmailDisconnectedBanner.swift; sourceTree = "<group>"; };
 		C9CC93E238228B2BA4D4569A /* Passband.icon */ = {isa = PBXFileReference; lastKnownFileType = wrapper.icon; path = Passband.icon; sourceTree = "<group>"; };
 		CDDAB6C380027F87A19022BF /* RemindTimes.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RemindTimes.swift; sourceTree = "<group>"; };
 		CE462B9CE6C195F53B48B801 /* EventStream.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EventStream.swift; sourceTree = "<group>"; };
@@ -468,6 +471,7 @@
 				6D358053F47CDAD2D0B7EAB5 /* EmailsView.swift */,
 				3BFBFFBE499370A5F88E2540 /* EmailWebCore.swift */,
 				49697D28E02B833310EE2C12 /* EmailWebView.swift */,
+				C756C9A9A4570C1AFFE7003E /* GmailDisconnectedBanner.swift */,
 				E5B001C6ABDDB051E2B57205 /* InlineReply.swift */,
 				4A52E20474A0D6F31073DA61 /* ListRow.swift */,
 				A77BC580144CC1AF7B5B8AEF /* MarkdownStyle.swift */,
@@ -880,6 +884,7 @@
 				BD58A1B90A390D639D6D0AEB /* Format.swift in Sources */,
 				D71AFB170CE49A2A793EA34F /* FrameMeasurer.swift in Sources */,
 				EC7F67DBCCFA67E4FFC1A4C5 /* Glass.swift in Sources */,
+				8E4141BFBB745019FB5C7D4D /* GmailDisconnectedBanner.swift in Sources */,
 				85A1CC563396C7890FB07C1F /* HTMLImg.swift in Sources */,
 				F6CCF6C021CD68BA6BED3944 /* HeroCache.swift in Sources */,
 				E3F69438A22E2036CD7742D2 /* ImageFill.swift in Sources */,
@@ -1003,6 +1008,7 @@
 				CDD154C0CEFB4D530E29DD34 /* Format.swift in Sources */,
 				D573F38D0D9CD3402667A0F2 /* FrameMeasurer.swift in Sources */,
 				7F575E0848A8BD54AF622141 /* Glass.swift in Sources */,
+				999288733123CB9385DBE681 /* GmailDisconnectedBanner.swift in Sources */,
 				E796A08FD35B6AFC987CF6A6 /* HTMLImg.swift in Sources */,
 				9F54901230BBCD7044B85B48 /* Haptics.swift in Sources */,
 				765C0A73FABBBF4F7A041A83 /* HeroCache.swift in Sources */,

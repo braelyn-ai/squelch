@@ -87,6 +87,16 @@ struct SitrepView: View {
 
         return VStack(spacing: 0) {
             masthead
+            // ABOVE THE HERO, because it outranks it. The hero's question is
+            // "what needs you today", and its answer is worthless while the
+            // mailbox behind it has been frozen since Tuesday. This is the
+            // landing page, so it is where somebody wondering why nothing has
+            // arrived actually looks.
+            if store.gmailDisconnected {
+                GmailDisconnectedBanner()
+                    .padding(.horizontal, 28)
+                    .padding(.top, 14)
+            }
             // THE HERO STAYS PUT. It sits above BOTH columns, so it cannot scroll
             // with one of them and hold still for the other; and "one item needs
             // you today" is the page's standing answer, which is worth keeping on

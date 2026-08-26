@@ -544,11 +544,20 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
     /// included — so it is counted as `auth` on the typed variant here rather
     /// than string-matched out of an error chain later.
     async fn token_for_request(&self) -> Result<crate::credentials::OAuthToken> {
-        self.creds.token(self.account_id).await.inspect_err(|e| {
-            if matches!(e, CoreError::Credential(_)) {
-                self.metrics.record_gmail_error(GmailErrorKind::Auth);
-            }
-        })
+        self.creds
+            .token(self.account_id)
+            .await
+            // The SUCCESS half, and it is not decoration: the failure below sets
+            // a state a client renders as "your mailbox is disconnected", so
+            // something has to clear it when the credential works again. Without
+            // this the banner would latch on and send somebody who has already
+            // reconnected round the same loop a second time.
+            .inspect(|_| self.metrics.note_credential_ok())
+            .inspect_err(|e| {
+                if matches!(e, CoreError::Credential(_)) {
+                    self.metrics.record_gmail_error(GmailErrorKind::Auth);
+                }
+            })
     }
 
     async fn bearer_get(&self, url: &str, access_token: &str) -> Result<reqwest::Response> {

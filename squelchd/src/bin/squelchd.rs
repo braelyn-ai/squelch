@@ -1856,6 +1856,10 @@ fn cmd_serve(
     let api_state = squelch_api::ApiState::from_config(store.clone(), &email, &config, cap_sources)
         .map_err(|e| other_err(format!("{e}")))?
         .with_refresh(refresh.clone())
+        // THE SAME registry the sync engine writes, so `/client/stats` answers
+        // "is this mailbox still connected" from live state rather than from a
+        // copy taken at boot.
+        .with_sync_metrics(sync_metrics.clone())
         .with_event_notifier(event_tx);
     // Carrier polling is BYOK, so the no-poller path is the common one and is
     // spelled out rather than left implicit: the door still serves

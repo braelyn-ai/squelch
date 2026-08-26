@@ -36,8 +36,11 @@ pub const LEDGER_ALL_DAYS: u32 = u32::MAX;
 /// responses (re-auth, wait, file a bug, check the network).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GmailErrorKind {
-    /// 401, or a credential that could not be refreshed at all (`invalid_grant`
-    /// means the refresh token is dead and only `squelchd auth` fixes it).
+    /// 401, or a credential that could not be refreshed at all. `invalid_grant`
+    /// means the refresh token is dead: a hosted tenant repairs that by
+    /// re-consenting through the control plane's `/reconnect`, and a self-host
+    /// one with `squelchd auth`. Either way the daemon cannot fix it alone,
+    /// which is why this kind also sets a state a client can render.
     Auth,
     /// 429, or a 403 whose body names a rate/quota reason.
     Quota,
@@ -188,6 +191,16 @@ pub struct SyncMetrics {
     sync_consecutive_failures: AtomicU64,
 
     gmail_auth: AtomicU64,
+    /// Unix seconds of the FIRST credential failure in the current outage, or 0
+    /// while the mailbox is connected. A STATE, not a count, for the same
+    /// reason `sync_consecutive_failures` is one: `gmail_auth` answers "how
+    /// often has this ever failed", and the only question a person staring at
+    /// an empty mailbox has is "is it broken now, and since when".
+    ///
+    /// Stamped on the first failure and left alone by later ones, so the value
+    /// is when the mailbox went dark rather than when it last retried. Cleared
+    /// by the next token that works.
+    gmail_auth_failed_since: AtomicI64,
     gmail_quota: AtomicU64,
     gmail_http: AtomicU64,
     gmail_network: AtomicU64,
@@ -271,6 +284,36 @@ impl SyncMetrics {
             GmailErrorKind::Network => &self.gmail_network,
         };
         slot.fetch_add(1, Ordering::Relaxed);
+        // A credential failure is the one Gmail error a person can DO something
+        // about, so it gets a state as well as a count. Only the first one in
+        // an outage stamps: `compare_exchange` against 0 leaves an existing
+        // stamp where it is, so the value keeps meaning "since when".
+        if kind == GmailErrorKind::Auth {
+            let _ = self.gmail_auth_failed_since.compare_exchange(
+                0,
+                Utc::now().timestamp(),
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            );
+        }
+    }
+
+    /// A credential just worked: the mailbox is connected again.
+    ///
+    /// The pair to [`SyncMetrics::record_gmail_error`]'s auth arm, and it has to
+    /// be called on the SUCCESS path or the state would only ever latch on. A
+    /// reconnect that fixed the mailbox but left a banner up would send the
+    /// person round the loop a second time.
+    pub fn note_credential_ok(&self) {
+        self.gmail_auth_failed_since.store(0, Ordering::Relaxed);
+    }
+
+    /// When the current credential outage began, or `None` while connected.
+    pub fn gmail_auth_failed_since(&self) -> Option<i64> {
+        match self.gmail_auth_failed_since.load(Ordering::Relaxed) {
+            0 => None,
+            at => Some(at),
+        }
     }
 
     pub fn record_stage1(&self, verdict: Stage1Verdict) {
@@ -595,6 +638,12 @@ pub fn render(metrics: &SyncMetrics, db: Option<&StoreSnapshot>) -> String {
     // has never synced then reads as ~56 years stale and fires, which is
     // exactly right. An absent series would instead make the alert silently
     // evaluate to nothing for the one tenant most likely to be broken.
+    e.scalar(
+        "squelchd_gmail_auth_failed_since_timestamp_seconds",
+        MetricKind::Gauge,
+        "Unix timestamp of the first credential failure in the current outage; 0 while the mailbox is connected.",
+        metrics.gmail_auth_failed_since.load(Ordering::Relaxed) as f64,
+    );
     e.scalar(
         "squelchd_sync_last_success_timestamp_seconds",
         MetricKind::Gauge,
@@ -1142,5 +1191,68 @@ mod tests {
         std::fs::write(dir.join("squelch.db-wal"), b"01234").unwrap();
         assert_eq!(db_file_sizes(&db), (10, 5));
         std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
+#[cfg(test)]
+mod gmail_auth_state_tests {
+    use super::*;
+
+    /// The state answers "is it broken NOW and since when", which is the only
+    /// question the person with the empty mailbox has. The counter beside it
+    /// answers "how often, ever", which is nobody's question.
+    #[test]
+    fn the_first_failure_stamps_and_later_ones_do_not_move_it() {
+        let m = SyncMetrics::new();
+        assert_eq!(m.gmail_auth_failed_since(), None, "starts connected");
+
+        m.record_gmail_error(GmailErrorKind::Auth);
+        let first = m.gmail_auth_failed_since().expect("stamped");
+
+        // Every retry after the first is the SAME outage. If later failures
+        // re-stamped, the value would drift forward to "when it last retried"
+        // and a client would render "disconnected 4 seconds ago" forever.
+        m.record_gmail_error(GmailErrorKind::Auth);
+        m.record_gmail_error(GmailErrorKind::Auth);
+        assert_eq!(
+            m.gmail_auth_failed_since(),
+            Some(first),
+            "since when, not last"
+        );
+
+        // The count still counts.
+        assert_eq!(m.gmail_auth.load(Ordering::Relaxed), 3);
+    }
+
+    /// A credential that works clears it. Without this the banner latches on and
+    /// sends somebody who has already reconnected round the loop again.
+    #[test]
+    fn a_working_credential_reconnects_the_mailbox() {
+        let m = SyncMetrics::new();
+        m.record_gmail_error(GmailErrorKind::Auth);
+        assert!(m.gmail_auth_failed_since().is_some());
+
+        m.note_credential_ok();
+        assert_eq!(m.gmail_auth_failed_since(), None);
+
+        // And a later outage stamps afresh rather than staying cleared.
+        m.record_gmail_error(GmailErrorKind::Auth);
+        assert!(m.gmail_auth_failed_since().is_some());
+    }
+
+    /// Only the credential kind sets it. A quota or transport error is not
+    /// something re-consenting fixes, and telling somebody to reconnect over a
+    /// 429 would send them through Google for nothing.
+    #[test]
+    fn only_a_credential_failure_disconnects_the_mailbox() {
+        let m = SyncMetrics::new();
+        for kind in [
+            GmailErrorKind::Quota,
+            GmailErrorKind::Http,
+            GmailErrorKind::Network,
+        ] {
+            m.record_gmail_error(kind);
+        }
+        assert_eq!(m.gmail_auth_failed_since(), None);
     }
 }

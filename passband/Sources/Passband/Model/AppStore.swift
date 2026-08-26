@@ -2093,6 +2093,34 @@ final class AppStore {
     /// the switch is simply not offered (same posture as `trackingAvailable`).
     var relayAvailable: Bool { sitrep.stats?.assistant_relay == true }
 
+    // MARK: - gmail connection
+
+    /// Whether this mailbox's Gmail credential has stopped working.
+    ///
+    /// `== false` and not `!= true` on purpose, and it is the whole posture of
+    /// this flag: nil means the daemon did not say (too old, or a door wired
+    /// without a metrics registry), and a daemon that cannot see the credential
+    /// must not have its silence rendered as an alarm. A false alarm here sends
+    /// somebody through a Google consent screen for nothing.
+    var gmailDisconnected: Bool { sitrep.stats?.gmail?.connected == false }
+
+    /// Where to re-consent, when the daemon offered a link.
+    ///
+    /// Hosted only. A self-host mailbox is repaired with `squelchd auth` at a
+    /// shell, so nil is the branch that shows the instruction instead of a
+    /// button, never an error.
+    var gmailReconnectURL: String? {
+        guard let raw = sitrep.stats?.gmail?.reconnect_url, Opener.isHTTP(raw) else { return nil }
+        return raw
+    }
+
+    /// How long the mailbox has been dark, for the banner's subtitle.
+    var gmailDisconnectedSince: Date? {
+        guard let raw = sitrep.stats?.gmail?.disconnected_since else { return nil }
+        return ISO8601DateFormatter().date(from: raw)
+    }
+
+
     // MARK: - invite sharing
 
     /// Raise the share sheet, remembering what raised it.

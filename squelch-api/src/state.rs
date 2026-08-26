@@ -107,6 +107,15 @@ pub struct ApiState {
     /// a LINK TARGET and nothing more: no trust flows from here, because whatever
     /// comes back is a pairing code the store adjudicates on its own terms.
     pub(crate) console_sso_url: Option<Arc<str>>,
+    /// The process's metrics registry, read by `/client/stats` to answer
+    /// whether this mailbox's Gmail credential is currently working.
+    ///
+    /// The same `Arc` the sync engine writes, so the answer is live rather than
+    /// a copy taken at boot. `None` in tests and in any embedding that did not
+    /// wire one, and absence is reported as "no answer" rather than as
+    /// "connected": a door that cannot see the credential must not tell a
+    /// client the mailbox is fine.
+    pub(crate) sync_metrics: Option<Arc<squelch_core::metrics::SyncMetrics>>,
     /// THE ESCAPE HATCH, from `[console] allow_insecure_cookie` /
     /// `SQUELCH_CONSOLE_ALLOW_INSECURE_COOKIE`: the operator's declaration that
     /// this console is served over plain http on an origin that is not loopback.
@@ -342,6 +351,7 @@ impl ApiState {
                 crate::auth::DEVICE_AUTH_CONCURRENCY,
             )),
             console_sso_url: None,
+            sync_metrics: None,
             console_allow_insecure_cookie: false,
             console_signin_limiter: Arc::new(std::sync::Mutex::new(
                 ConsoleRateLimiter::per_minute(crate::console::CONSOLE_SIGNIN_REQUESTS_PER_MINUTE),
@@ -475,6 +485,13 @@ impl ApiState {
     /// slash is trimmed, and a value with no http(s) scheme is unset, because it
     /// would ride into the page as a RELATIVE href and resolve against the tenant
     /// origin rather than the control plane.
+    /// Wire the process's metrics registry so `/client/stats` can answer
+    /// whether the Gmail credential is currently working.
+    pub fn with_sync_metrics(mut self, metrics: Arc<squelch_core::metrics::SyncMetrics>) -> Self {
+        self.sync_metrics = Some(metrics);
+        self
+    }
+
     pub fn with_console_sso_url(mut self, url: Option<String>) -> Self {
         self.console_sso_url = url
             .map(|u| u.trim().trim_end_matches('/').to_string())
@@ -489,6 +506,10 @@ impl ApiState {
 
     /// The control plane's origin, if console SSO is configured. `None` => the
     /// console renders the pasted-code form only, which is the self-host posture.
+    pub(crate) fn sync_metrics(&self) -> Option<&Arc<squelch_core::metrics::SyncMetrics>> {
+        self.sync_metrics.as_ref()
+    }
+
     pub(crate) fn console_sso_url(&self) -> Option<&str> {
         self.console_sso_url.as_deref()
     }
