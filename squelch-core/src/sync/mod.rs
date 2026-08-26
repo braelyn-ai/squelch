@@ -114,13 +114,67 @@ const BACKOFF_START: Duration = Duration::from_secs(2);
 const BACKOFF_CAP: Duration = Duration::from_secs(5 * 60);
 
 /// The longest the FIRST backfill waits on the embedder gate before going ahead
-/// without it. Generous on purpose: a first run downloads the model (128 MB from
-/// Hugging Face) and a slow link can be minutes over that. The ceiling is not a
-/// deadline anybody is meant to hit, it is the guarantee that a gate nobody ever
-/// opens (an init task wedged on a hung download) degrades to exactly today's
-/// behaviour, an unembedded backfill the vector pass drains later, rather than
-/// to a daemon that never syncs at all. See [`SyncEngine::with_embedder_gate`].
-const EMBEDDER_GATE_CEILING: Duration = Duration::from_secs(15 * 60);
+/// without it. The ceiling is not a deadline anybody is meant to hit, it is the
+/// guarantee that a gate nobody ever opens (an init task wedged on a hung
+/// download) degrades to exactly today's behaviour, an unembedded backfill the
+/// vector pass drains later, rather than to a daemon that never syncs at all.
+/// See [`SyncEngine::with_embedder_gate`].
+///
+/// THREE MINUTES, and short on purpose, because the wait is time a brand-new
+/// tenant's mailbox is EMPTY: nothing is on the wire until the backfill runs.
+/// A cached model loads in about a second and a cold download of the 126 MB
+/// model takes tens of seconds on a normal link, so past this the init is not
+/// coming back. Hosted makes that cost concrete today: readiness there is
+/// TCP-only and there is no models volume yet, so every new signup's first run
+/// IS the cold download, and a generous ceiling would show them an empty
+/// mailbox for all of it. 15 minutes, the first cut of this, was also exactly
+/// the documented sync-staleness alert threshold (900 s, see
+/// `deploy/monitoring/README.md`), which would park every first-run tenant on
+/// the alert line for the duration.
+///
+/// The trade against releasing early is bounded now: a backfill that starts
+/// unembedded costs one vector pass at `embed.backfill_batch`, +324 MB at a
+/// batch of 8, not the +1.7 GB a batch of 64 cost. It is also paid AGAIN per
+/// retry, because a backfill that errors before the cursor is stored comes back
+/// through here on the next lifecycle.
+const EMBEDDER_GATE_CEILING: Duration = Duration::from_secs(3 * 60);
+
+/// How a wait on the embedder gate ended. Every variant but `Settled` says the
+/// same thing to a caller ("nothing more is coming, go ahead"); they are apart
+/// because they read differently in a log and only one of them is worth a
+/// metric.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EmbedderGate {
+    /// The embedder init resolved, whichever way it resolved.
+    Settled,
+    /// The sender is gone, so nothing is ever going to open this gate.
+    Dropped,
+    /// [`EMBEDDER_GATE_CEILING`] passed first.
+    TimedOut,
+}
+
+/// Park until the embedder gate opens, the ceiling passes, or whoever would have
+/// opened it goes away. Returns at once on a gate that is already open, so the
+/// steady state (a restart, model on disk) pays nothing.
+///
+/// Public because TWO callers wait on this one bit for two different reasons.
+/// The first backfill waits for memory ([`SyncEngine::with_embedder_gate`]). The
+/// daemon's one-time Sent sweeps wait for Gmail quota: their stagger is meant to
+/// sit past the startup sync burst, and the gate can now push the start of that
+/// burst minutes out, which would leave a metadata GET per Sent message racing a
+/// 30-day raw backfill on one credential.
+pub async fn wait_for_embedder_gate(gate: &mut tokio::sync::watch::Receiver<bool>) -> EmbedderGate {
+    if *gate.borrow() {
+        return EmbedderGate::Settled;
+    }
+    tokio::select! {
+        settled = gate.wait_for(|settled| *settled) => match settled {
+            Ok(_) => EmbedderGate::Settled,
+            Err(_) => EmbedderGate::Dropped,
+        },
+        _ = tokio::time::sleep(EMBEDDER_GATE_CEILING) => EmbedderGate::TimedOut,
+    }
+}
 
 /// Collapse an untrusted header-derived string to printable ASCII before it
 /// reaches the log: control chars, ANSI escapes and log-forging newlines become
@@ -553,19 +607,29 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
         }
         eprintln!("squelch: waiting for the embedder before the first backfill");
         tokio::select! {
-            settled = gate.wait_for(|settled| *settled) => match settled {
-                Ok(_) => eprintln!("squelch: embedder settled; starting the first backfill"),
+            how = wait_for_embedder_gate(&mut gate) => match how {
+                EmbedderGate::Settled => {
+                    eprintln!("squelch: embedder settled; starting the first backfill")
+                }
                 // The sender is gone, so whatever would have opened this is gone
                 // too and nothing is ever arriving. Same outcome as the ceiling.
-                Err(_) => eprintln!(
-                    "squelch: embedder gate dropped; starting the first backfill without it"
+                EmbedderGate::Dropped => eprintln!(
+                    "squelch: embedder gate dropped; the first backfill is running without the \
+                     embedder, and its vectors will be drained by the backfill pass"
                 ),
+                EmbedderGate::TimedOut => {
+                    // The one event that re-arms the memory this whole gate
+                    // exists to avoid, so it goes to the scrape and not only to
+                    // this line. See `EMBEDDER_GATE_CEILING`.
+                    self.metrics.record_embedder_gate_timeout();
+                    eprintln!(
+                        "squelch: embedder still not settled after {}m; the first backfill is \
+                         running without the embedder, and its vectors will be drained by the \
+                         backfill pass",
+                        EMBEDDER_GATE_CEILING.as_secs() / 60
+                    )
+                }
             },
-            _ = tokio::time::sleep(EMBEDDER_GATE_CEILING) => eprintln!(
-                "squelch: embedder still not settled after {}m; starting the first backfill \
-                 without it",
-                EMBEDDER_GATE_CEILING.as_secs() / 60
-            ),
             _ = shutdown.changed() => {
                 // `changed()` fires on any send and on the last sender dropping,
                 // so the VALUE decides. Only a real shutdown skips the backfill:
@@ -4687,6 +4751,110 @@ mod tests {
             cursor_of(&store, acct),
             Some(900),
             "no gate, no wait: the first backfill ran on this call"
+        );
+    }
+
+    /// An engine parked on the gate, for the three tests below. No mock: they
+    /// drive the WAIT, and the wait touches neither Gmail nor the store, so the
+    /// base is a port nothing is listening on and reaching it would be the bug.
+    fn gated_engine(
+        gate: tokio::sync::watch::Receiver<bool>,
+        metrics: Arc<SyncMetrics>,
+    ) -> SyncEngine<SqliteStore, FixedToken> {
+        let (store, acct) = store_at_cursor(None);
+        engine(store, acct, "http://127.0.0.1:1")
+            .with_metrics(metrics)
+            .with_embedder_gate(gate)
+    }
+
+    /// `changed()` fires on ANY send and on the last sender dropping, so the
+    /// value is the only thing that says a shutdown happened. Read the wakeup
+    /// alone as one and the cost is not a slow first backfill, it is no sync at
+    /// all: `run_once` returns `Ok` on a reported shutdown and `run` reads that
+    /// as "we are done" and stops the lifecycle.
+    ///
+    /// MUTATION: `_ = shutdown.changed() => return false`, dropping the value
+    /// check — the obvious reading. This asserts the wait reports "go ahead".
+    #[tokio::test(start_paused = true)]
+    async fn a_shutdown_wakeup_carrying_false_is_not_a_shutdown() {
+        let (_gate_tx, gate_rx) = tokio::sync::watch::channel(false);
+        let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+        // Unseen by this receiver, so `changed()` completes the instant the
+        // engine parks. The VALUE stays false: nobody asked for a shutdown.
+        shutdown_tx.send(false).unwrap();
+        let e = gated_engine(gate_rx, SyncMetrics::new());
+
+        // Half the ceiling: any implementation that sits the wakeup out fails
+        // here rather than hanging, because the paused clock advances itself.
+        let go_ahead = tokio::time::timeout(
+            EMBEDDER_GATE_CEILING / 2,
+            e.wait_for_embedder(&mut shutdown_rx),
+        )
+        .await
+        .expect("a wakeup releases the wait");
+        assert!(go_ahead, "false on the shutdown watch is not a shutdown");
+    }
+
+    /// The gate's sender dropping is the init task GONE. Nothing is ever going
+    /// to open it, so waiting the ceiling out would buy a brand-new tenant
+    /// minutes of empty mailbox for an answer that has already arrived.
+    ///
+    /// MUTATION: folding `Err` into the "keep waiting" side (an `Err` arm that
+    /// falls through to the sleep, or no `Err` arm at all). Under a paused clock
+    /// that runs to the ceiling, which this timeout is half of.
+    #[tokio::test(start_paused = true)]
+    async fn a_dropped_embedder_gate_releases_the_backfill_at_once() {
+        let (gate_tx, gate_rx) = tokio::sync::watch::channel(false);
+        drop(gate_tx);
+        // Never signalled: the shutdown arm must not be what ends this wait.
+        let (_shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+        let e = gated_engine(gate_rx, SyncMetrics::new());
+
+        let go_ahead = tokio::time::timeout(
+            EMBEDDER_GATE_CEILING / 2,
+            e.wait_for_embedder(&mut shutdown_rx),
+        )
+        .await
+        .expect("a gate nobody holds any more is not worth waiting on");
+        assert!(go_ahead, "a dropped gate releases the first backfill");
+    }
+
+    /// The ceiling arm: a gate whose sender is alive and never sends (an init
+    /// wedged on a hung download) degrades to the behaviour that predates the
+    /// gate — an unembedded backfill the vector pass drains later — rather than
+    /// to a daemon that never syncs. And it SAYS SO to the scrape, because this
+    /// is the one event that re-arms the memory the gate exists to avoid, and
+    /// nobody reads a tenant's stderr until something has already fallen over.
+    ///
+    /// Time is paused, so the ceiling is a fact here and not three real minutes.
+    ///
+    /// MUTATIONS: no ceiling arm at all (the outer timeout fires instead of the
+    /// wait returning); a ceiling that reports a shutdown (`go_ahead`); a
+    /// ceiling that does not wait, e.g. `Duration::ZERO` (`elapsed`); and the
+    /// counter left unrecorded (the exposition assert).
+    #[tokio::test(start_paused = true)]
+    async fn the_gate_ceiling_releases_the_backfill_and_says_so_to_the_scrape() {
+        let (_gate_tx, gate_rx) = tokio::sync::watch::channel(false);
+        let (_shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+        let metrics = SyncMetrics::new();
+        let e = gated_engine(gate_rx, metrics.clone());
+
+        let started = tokio::time::Instant::now();
+        let go_ahead = tokio::time::timeout(
+            EMBEDDER_GATE_CEILING * 2,
+            e.wait_for_embedder(&mut shutdown_rx),
+        )
+        .await
+        .expect("a wedged init must not wedge sync");
+        assert!(go_ahead, "the ceiling releases the backfill");
+        assert!(
+            started.elapsed() >= EMBEDDER_GATE_CEILING,
+            "and only after the ceiling, not instead of waiting"
+        );
+        assert!(
+            crate::metrics::render(&metrics, None)
+                .contains("squelchd_embedder_gate_timeouts_total 1\n"),
+            "a ceiling nobody can scrape is a ceiling nobody knows fired"
         );
     }
 

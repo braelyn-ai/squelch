@@ -23,7 +23,7 @@ use squelch_core::credentials::{
 use squelch_core::embed::{Embedder, FastEmbedder};
 use squelch_core::store::sqlite::device_tokens::PAIRING_TTL_SECS;
 use squelch_core::store::{SqliteStore, Store};
-use squelch_core::sync::SyncEngine;
+use squelch_core::sync::{SyncEngine, wait_for_embedder_gate};
 use squelch_core::types::AccountId;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::PathBuf;
@@ -2001,12 +2001,22 @@ fn cmd_serve(
         // just retries on the next daemon start — each done flag is only set on
         // completion — and neither can block the sync loop, which runs in its own
         // task.
+        //
+        // The stagger is measured from when that burst can actually START, which
+        // is why this waits on the SAME embedder gate the first backfill does: on
+        // a cold model cache the backfill now begins minutes into the run, and a
+        // sweep that is one metadata GET per Sent message (the heaviest Gmail
+        // consumer here) landing on top of a 30-day raw backfill on one
+        // credential is how a tenant earns a 429 — which bubbles out of
+        // `run_once` and bounces the whole sync lifecycle through backoff.
         {
             let store = store.clone();
             let email = email.clone();
             let config = config.clone();
             let creds = sync_creds.clone();
+            let mut embedder_gate = readiness.embedder_gate();
             tokio::spawn(async move {
+                wait_for_embedder_gate(&mut embedder_gate).await;
                 tokio::time::sleep(std::time::Duration::from_secs(180)).await;
                 let engine = SyncEngine::new(store, creds, account_id, email, config);
                 if let Err(e) = engine.harvest_sent_contacts().await {
