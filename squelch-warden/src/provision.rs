@@ -2362,6 +2362,50 @@ impl Warden {
     }
 
     /// The idempotent-retry path of phase one.
+    /// The age recipient of a tenant that ALREADY EXISTS, for the control plane
+    /// to seal a REPLACEMENT credential to.
+    ///
+    /// [`Warden::create_tenant`] deliberately cannot answer this: it 409s for
+    /// anything past `pending`, because a second POST for a serving tenant is
+    /// somebody claiming a taken subdomain. That is the right rule for signup
+    /// and the wrong one for a re-consent, which is a request about a mailbox
+    /// the caller has just proved ownership of.
+    ///
+    /// `account_email` is REQUIRED and matched, so this route cannot be used to
+    /// enumerate recipients or to aim a credential at somebody else's mailbox.
+    /// The control plane checks the same thing from its own store first; this
+    /// is the second check, made by a different service from a different
+    /// record, and it is the one that is authoritative about custody.
+    ///
+    /// Returning the recipient is safe by construction: it is the PUBLIC half
+    /// of the tenant's identity. The private half never leaves the Secret this
+    /// reads, and a recipient is exactly what the control plane is already
+    /// handed at signup.
+    pub async fn recipient_for(
+        &self,
+        raw_label: &str,
+        raw_email: &str,
+    ) -> Result<Created, WardenError> {
+        let name = TenantName::parse(raw_label)?;
+        let account_email = validate::validate_account_email(raw_email)?;
+
+        let Some(existing) = self.identity(&name).await? else {
+            return Err(WardenError::NotFound);
+        };
+        let stored_email = secret_value(&existing, objects::ACCOUNT_EMAIL_KEY);
+        let recipient = secret_value(&existing, objects::RECIPIENT_KEY);
+        match (stored_email, recipient) {
+            (Some(stored), Some(recipient)) if stored == account_email => {
+                tracing::info!(tenant = %name, "re-issued the recipient for a re-consent");
+                Ok(Created { recipient })
+            }
+            // A DIFFERENT mailbox, or a Secret this warden did not write. Both
+            // are 409 and not 404: the tenant exists, and which of the two it
+            // was is not something a caller gets to distinguish.
+            _ => Err(WardenError::Conflict),
+        }
+    }
+
     async fn reuse(
         &self,
         name: &TenantName,

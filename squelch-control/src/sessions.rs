@@ -99,6 +99,15 @@ pub enum SessionKind {
     /// mailbox Google names on the way back is what decides which tenant this
     /// was for.
     App,
+    /// A RECONNECT: a fresh Gmail grant for a mailbox that already has a
+    /// tenant, replacing a refresh token that stopped working.
+    ///
+    /// Like [`SessionKind::App`] its label is EMPTY on the way out and stays
+    /// empty. Nobody types which mailbox they are reconnecting: Google says
+    /// which account consented, and that is the only answer this flow will
+    /// accept. Asking would turn the page into an oracle and, worse, would let
+    /// somebody aim a credential they legitimately own at a tenant they do not.
+    Reconnect,
 }
 
 impl SessionKind {
@@ -108,16 +117,29 @@ impl SessionKind {
     pub fn invite_id(self) -> Option<i64> {
         match self {
             SessionKind::Signup { invite_id } => Some(invite_id),
-            SessionKind::Console | SessionKind::App => None,
+            // A reconnect spends nothing either: the tenant it is for was paid
+            // for by an invite once already, and re-consenting must not cost a
+            // second one.
+            SessionKind::Console | SessionKind::App | SessionKind::Reconnect => None,
         }
     }
 
-    /// Whether this session is one of the two LOGINS, which share
-    /// [`MAX_IDENTITY_SESSIONS`]. Asked as a question about the kind rather than
-    /// spelled as a match at each call site, so a fourth kind cannot be added
-    /// without deciding which budget it spends.
+    /// Whether this session shares [`MAX_IDENTITY_SESSIONS`], the budget for
+    /// sessions a STRANGER can open. Asked as a question about the kind rather
+    /// than spelled as a match at each call site, so a fourth kind cannot be
+    /// added without deciding which budget it spends.
+    ///
+    /// RECONNECT counts here, despite being a grant flow rather than a login.
+    /// The budget is not about what the session ends up holding, it is about
+    /// who can open one: `/reconnect` is reachable without credentials, exactly
+    /// like the two logins, so it has to draw from the pool sized for that.
+    /// Charging it to the signup pool instead would let anyone exhaust the
+    /// table an invite holder needs.
     pub fn is_identity(self) -> bool {
-        matches!(self, SessionKind::Console | SessionKind::App)
+        matches!(
+            self,
+            SessionKind::Console | SessionKind::App | SessionKind::Reconnect
+        )
     }
 }
 
