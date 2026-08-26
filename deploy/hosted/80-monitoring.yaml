@@ -1,7 +1,15 @@
 # Monitoring: the on-box half. Everything heavy (storage, dashboards, alerting,
 # external probes) lives on Railway (deploy/monitoring/); this file is only the
-# collectors, sized to steal as little tenant headroom as possible (~200 MB
-# between the three of them).
+# collectors, sized to steal as little tenant headroom as possible. That
+# sizing is not free and it is not automatic: prometheus-agent's working set
+# was 213 MiB against its 256Mi limit on 2026-08-26, on a box that has already
+# global-OOM-killed tenant daemons, while two of its scrape jobs were keeping
+# every series their targets offered. How much of that 213 is active series
+# and how much is page cache over the agent's own WAL is unmeasured
+# (--storage.agent.path=/data is a disk emptyDir, and page cache counts in
+# working_set). The series cut is right either way; the size of the effect is
+# read after the restart off the agent's self-scrape job below. See the
+# allow-lists on the kubelet and cadvisor jobs.
 #
 # prometheus-agent scrapes locally and PUSHES via remote_write, so carrier's
 # firewall stays inbound 22/80/443 — nothing here listens to the internet
@@ -203,6 +211,33 @@ data:
             regex: "9100"
             action: keep
 
+      # The agent, scraping itself. Three numbers, because the allow-lists
+      # below are a memory argument and a memory argument you cannot read back
+      # is a guess: active_series is what the cut is supposed to move,
+      # resident_memory is what the 256Mi limit actually judges (it includes
+      # page cache over the WAL, which is why the two do not track), and the
+      # out-of-order counter is where a duplicate-series mistake in a relabel
+      # rule shows up instead of in a panel. Under ten series in total, the
+      # synthetic scrape report included.
+      - job_name: prometheus-agent
+        static_configs:
+          - targets: ['localhost:9090']
+        metric_relabel_configs:
+          - source_labels: [__name__]
+            regex: prometheus_agent_active_series|process_resident_memory_bytes|prometheus_target_scrapes_sample_out_of_order_total|up
+            action: keep
+
+      # The kubelet's own /metrics is not cadvisor, and almost none of it is
+      # read here: it is go_*, process_*, rest_client_*, workqueue_*,
+      # storage_operation_*, csi_operations_* and a pile of runtime-operation
+      # histograms, none of which any panel or documented alert query names.
+      # The one family that IS charted is kubelet_volume_stats_*, which is how
+      # the per-tenant PVC gauge gets filled. The family is allow-listed whole
+      # rather than by exact name because it is bounded by the tenant cap
+      # (6 series per PVC: available/capacity/used bytes and inodes_free/
+      # inodes/inodes_used; a 7th, health_status_abnormal, needs the alpha
+      # CSIVolumeHealth gate we do not run) and because an inodes panel should
+      # not need a config change and a pod restart to light up.
       - job_name: kubelet
         kubernetes_sd_configs:
           - role: node
@@ -211,7 +246,35 @@ data:
           insecure_skip_verify: true
         authorization:
           credentials_file: /var/run/secrets/kubernetes.io/serviceaccount/token
+        metric_relabel_configs:
+          - source_labels: [__name__]
+            regex: kubelet_volume_stats_.*
+            action: keep
 
+      # cadvisor is the cardinality hog, and this agent is the thing that pays
+      # for it: a 213 MiB working set against a 256Mi limit on a 3.8 GB box
+      # that has already global-OOM-killed tenant daemons. Keeping "every
+      # series with a pod label" was still every cadvisor family for every
+      # container: network, filesystem, blkio, per-cpu, tasks_state, spec_*,
+      # the lot. Two of those families are charted; the rest were shipped to
+      # Railway, stored for 30 days, and never queried once. What share of the
+      # 213 MiB was those series rather than page cache over the agent WAL is
+      # unmeasured, so read the effect after the restart rather than assuming
+      # it: prometheus_agent_active_series and process_resident_memory_bytes,
+      # both on the prometheus-agent self-scrape job above.
+      #
+      # TO RE-WIDEN: add the family to the keep regex below, `kubectl apply -f`
+      # this file, then RESTART THE POD. The agent does not run with
+      # --web.enable-lifecycle and does not watch the ConfigMap, so an apply
+      # alone leaves it serving the config it booted with. Carrier ran a
+      # 13-day-stale Prometheus config exactly that way once. The restart, and
+      # the command that dumps what the endpoint actually offers so you widen
+      # this to a name that exists, are in deploy/monitoring/README.md.
+      #
+      # `up`, `scrape_duration_seconds` and the other synthetic report series
+      # are appended after metric relabeling and are not affected by any of
+      # this, so a keep that matches nothing looks like a live target serving
+      # no data rather than like a dead one.
       - job_name: cadvisor
         kubernetes_sd_configs:
           - role: node
@@ -222,10 +285,82 @@ data:
         authorization:
           credentials_file: /var/run/secrets/kubernetes.io/serviceaccount/token
         metric_relabel_configs:
-          # cadvisor is the cardinality hog; keep only pod-attributed series.
+          # The allow-list, cheapest rejection first. Every name here is
+          # either charted today or is the thing we wished we had during an
+          # incident:
+          #   working_set  - "Memory by pod (top 10)" and "Tenant memory", the
+          #                  two panels that read it, and what the OOM killer
+          #                  actually judges.
+          #   cpu_usage    - the two CPU panels.
+          #   memory_rss   - working set still counts active page cache, so a
+          #                  daemon that mmaps a big SQLite store reads as
+          #                  fat when it is not. rss is the anonymous half,
+          #                  and one extra series per container is cheap next
+          #                  to guessing.
+          #   spec_memory_limit_bytes
+          #                - no panel reads it yet, and it is here anyway: the
+          #                  question this whole allow-list came out of was "is
+          #                  this pod near its limit", which is working_set
+          #                  over the limit, and without the denominator every
+          #                  memory panel is a number with no scale. One series
+          #                  per container, and it only moves on a redeploy.
+          #   oom_events   - the OOM panel reads
+          #                  kube_pod_container_status_last_terminated_reason,
+          #                  which only sees a container the kubelet
+          #                  restarted, and forgets the moment that container
+          #                  terminates for some other reason. This is a
+          #                  counter, so increase() over a window still shows
+          #                  the kill after the fact. UNVERIFIED HERE: cadvisor
+          #                  #3015 ("always returns 0", closed not planned)
+          #                  clusters on cgroup v2, which is what this box
+          #                  runs. It is kept because it costs one series per
+          #                  container, not because it is known to work. After
+          #                  the next OOM kill somebody sees, check it:
+          #                    increase(container_oom_events_total{
+          #                      namespace="tenants"}[24h])
+          #                  If that is flat while the kube-state-metrics OOM
+          #                  panel showed the kill, the family is a decoy and
+          #                  should come out of this regex.
+          # container_memory_max_usage_bytes is deliberately NOT here: cadvisor
+          # reads it from memory.max_usage_in_bytes, a cgroup v1 file, and this
+          # box is Ubuntu 26.04 on the unified hierarchy, so the family is
+          # absent or pinned at 0. Dump the endpoint and check before anyone
+          # adds it back on the strength of the name alone.
+          - source_labels: [__name__]
+            regex: container_(memory_working_set_bytes|cpu_usage_seconds_total|memory_rss|spec_memory_limit_bytes|oom_events_total)
+            action: keep
+          # Keep only pod-attributed series.
           - source_labels: [pod]
             regex: ""
             action: drop
+          # And drop what is left with no container of its own. Two different
+          # things arrive with container="" and a pod set: the pod cgroup
+          # rollup (the kubelet fills pod/namespace in for it so the sandbox is
+          # accounted somewhere) and the pause container, which has the pod
+          # labels but no io.kubernetes.container.name. Nothing queries either
+          # one; every panel filters container!="". This drop is what makes the
+          # labeldrop below safe, so the two must stay in this order: strip
+          # `id` while both are still present and they become the SAME series
+          # at the same timestamp, one of them is rejected on every scrape
+          # forever, and the survivor flips between the pod total and the
+          # pause container's half a megabyte.
+          - source_labels: [container]
+            regex: ""
+            action: drop
+          # namespace/pod/container are the only labels any query groups by.
+          # `id` is a ~90-character cgroup path carried on every sample, `name`
+          # is the runtime's container id and `image` duplicates what
+          # kube_pod_container_info already says with a stable spelling. None of
+          # them add a series, all three add bytes to every remote_write batch.
+          # (During a container restart the old and new cgroup can still
+          # collide for one scrape once `id` is gone. In agent mode that lands
+          # as an out-of-order sample, not a duplicate one: the agent rejects
+          # t <= lastTs on a series it already has, so it shows up in
+          # prometheus_target_scrapes_sample_out_of_order_total and
+          # prometheus_agent_out_of_order_samples_total. Either way the rest of
+          # the scrape is kept, so it costs a sample, not a target.)
+          - regex: (id|name|image)
+            action: labeldrop
 
       - job_name: kube-state-metrics
         kubernetes_sd_configs:
