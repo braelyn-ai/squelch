@@ -589,6 +589,33 @@ struct StoreStats: Codable, Sendable, Hashable {
     /// to catch and no undo for a send, so the only place to stop it is before
     /// the composer opens. See `AppStore.forwardingAvailable`.
     var forwarding: Bool?
+    /// Whether Gmail still opens for this mailbox, and what to do if it does
+    /// not. ABSENT on a daemon too old to say and on any door wired without a
+    /// metrics registry, and nil must read as "we do not know" rather than as
+    /// "connected": claiming a mailbox is fine on a daemon that cannot see is
+    /// the failure this whole field exists to end.
+    var gmail: GmailHealth?
+}
+
+/// The daemon's answer to "is this mailbox still connected".
+///
+/// A dead refresh token is invisible from everywhere a person looks: mail
+/// simply stops arriving, which is indistinguishable from a quiet week. The
+/// daemon has always detected it exactly and, until this field, told only
+/// Prometheus — so an operator could find out and the person with the empty
+/// mailbox could not.
+struct GmailHealth: Codable, Sendable, Hashable {
+    /// False while the refresh token is dead. The only field that is always
+    /// present when this object is.
+    var connected: Bool
+    /// RFC3339, when the current outage began. Present only while disconnected,
+    /// and it is when the mailbox went dark rather than when it last retried.
+    var disconnected_since: String?
+    /// Where to re-consent. Present only while disconnected AND only on hosted:
+    /// a self-host mailbox is repaired with `squelchd auth` at a shell, which is
+    /// not a link anything can offer. Nil is therefore the self-host branch, not
+    /// an error.
+    var reconnect_url: String?
 }
 
 // MARK: - invites

@@ -17,8 +17,7 @@ use crate::types::{
     AccountId, AttachmentInfo, AttentionStatus, AttentionUpdate, AuditEntry, Banking,
     CalendarUpdate, Deadline, Disposition, Event, EventKind, FieldReasons, NewMessage, OpenRate,
     Receipt, RetriageProgress, SealedKind, SearchHit, SenderRule, Sensitivity, ShredCandidate,
-    StoreStats,
-    ThreadView, Tier, TriageAxis, TriageFeedback, UnsubscribeRecord, Update,
+    StoreStats, ThreadView, Tier, TriageAxis, TriageFeedback, UnsubscribeRecord, Update,
 };
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};

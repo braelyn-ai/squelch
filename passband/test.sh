@@ -147,6 +147,16 @@ run_suite remind-times \
 # is why the correspondent graph stays local — so the brand/robot heuristics
 # guarding it are asserted rather than reasoned about. Pure string work;
 # WireTypes and Format ride along for the Tier and the capitalizer.
+# The wire contract behind the disconnected banner, and the RFC3339 shapes its
+# since-when has to survive. WireTypes carries the object; Format carries the
+# parser that tries both fractional and plain, which is the bug this pins.
+run_suite gmail-health \
+  Sources/Passband/Model/WireTypes.swift \
+  Sources/Passband/Model/SubjectText.swift \
+  Sources/Passband/Lib/Format.swift \
+  Sources/Passband/Lib/AsyncMemo.swift \
+  Tests/GmailHealthTests.swift
+
 run_suite sender-identity \
   Sources/Passband/Model/SubjectText.swift \
   Sources/Passband/Model/WireTypes.swift \

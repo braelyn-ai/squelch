@@ -2182,6 +2182,38 @@ final class AppStore {
     /// the switch is simply not offered (same posture as `trackingAvailable`).
     var relayAvailable: Bool { sitrep.stats?.assistant_relay == true }
 
+    // MARK: - gmail connection
+
+    /// Whether this mailbox's Gmail credential has stopped working.
+    ///
+    /// `== false` and not `!= true` on purpose, and it is the whole posture of
+    /// this flag: nil means the daemon did not say (too old, or a door wired
+    /// without a metrics registry), and a daemon that cannot see the credential
+    /// must not have its silence rendered as an alarm. A false alarm here sends
+    /// somebody through a Google consent screen for nothing.
+    var gmailDisconnected: Bool { sitrep.stats?.gmail?.connected == false }
+
+    /// Where to re-consent, when the daemon offered a link.
+    ///
+    /// Hosted only. A self-host mailbox is repaired with `squelchd auth` at a
+    /// shell, so nil is the branch that shows the instruction instead of a
+    /// button, never an error.
+    var gmailReconnectURL: String? {
+        guard let raw = sitrep.stats?.gmail?.reconnect_url, Opener.isHTTP(raw) else { return nil }
+        return raw
+    }
+
+    /// How long the mailbox has been dark, for the banner's subtitle.
+    ///
+    /// `Fmt.date` and not a formatter of its own: the daemon emits fractional
+    /// seconds on some fields and not others, and a bare `ISO8601DateFormatter`
+    /// parses only one of those shapes — silently returning nil for the other,
+    /// which here would quietly drop "expired 3 hours ago" and leave the vaguer
+    /// sentence with nothing announcing the loss. `Fmt` tries both, memoizes,
+    /// and holds the lock these formatters need; this is read every render.
+    var gmailDisconnectedSince: Date? { Fmt.date(sitrep.stats?.gmail?.disconnected_since) }
+
+
     // MARK: - invite sharing
 
     /// Raise the share sheet, remembering what raised it.

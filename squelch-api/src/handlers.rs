@@ -1695,6 +1695,37 @@ pub async fn get_stats(State(state): State<ApiState>) -> Result<impl IntoRespons
             "fetched_at": unread.fetched_at.to_rfc3339(),
         });
     }
+    // IS THE MAILBOX STILL CONNECTED, and if not, what does this person do
+    // about it. The daemon detects a dead refresh token exactly (the refresh
+    // exchange fails, `invalid_grant` included) and until now said so only to
+    // Prometheus — so the operator could find out and the person staring at an
+    // empty mailbox could not.
+    //
+    // OMITTED ENTIRELY when this door has no metrics handle, so a client reads
+    // absence rather than a cheerful "connected" from a process that cannot
+    // see. Absence means "no answer", and a client must not render it as good
+    // news.
+    //
+    // `reconnect_url` is the hosted/self-host split, and it is the console SSO
+    // origin because that is the same control plane that minted the credential
+    // in the first place: hosted tenants have one, self-host has `None` and
+    // repairs with `squelchd auth`, which is not a link anything can offer.
+    if let Some(metrics) = state.sync_metrics() {
+        let failed_since = metrics.gmail_auth_failed_since();
+        let mut gmail = json!({ "connected": failed_since.is_none() });
+        if let Some(at) = failed_since {
+            if let Some(ts) = chrono::DateTime::from_timestamp(at, 0) {
+                gmail["disconnected_since"] = json!(ts.to_rfc3339());
+            }
+            // Only on the broken path: a link to re-consent is noise while the
+            // mailbox works, and worse, an invitation to re-consent for no
+            // reason.
+            if let Some(origin) = state.console_sso_url() {
+                gmail["reconnect_url"] = json!(format!("{origin}/reconnect"));
+            }
+        }
+        body["gmail"] = gmail;
+    }
     // Capability flag for the app: whether /client/assistant/messages will
     // relay (hosted, gateway configured) or 404 (self-host, BYOK in the app).
     // Always present so a client reads an answer, not absence.

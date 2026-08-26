@@ -14,7 +14,7 @@ use squelch_core::types::{SealedKind, Sensitivity, Tier};
 use tower::ServiceExt;
 
 mod common;
-use common::{Harness, TOKEN, authed, authed_json, body_json, harness, msg, sent_msg};
+use common::{Harness, TOKEN, authed, authed_json, body_json, harness, msg, sent_msg, state_with};
 
 #[tokio::test]
 async fn missing_token_is_401() {
@@ -308,7 +308,7 @@ async fn shipments_carry_the_carrier_poll_fields() {
 #[tokio::test]
 async fn shipment_poll_kicks_the_poller_and_lists_its_carriers() {
     let kick = Arc::new(tokio::sync::Notify::new());
-    let (state, _store, _acct) = common::state_with(|_, _| {});
+    let (state, _store, _acct) = state_with(|_, _| {});
     // Deliberately unsorted + duplicated: the response must not depend on how
     // the caller assembled the list.
     let app = router(
@@ -1789,7 +1789,7 @@ async fn mock_gmail_seq(
 
 /// The default harness plus a write credential pointed at a mock Gmail `base`.
 fn app_with_writes(base: String, seed: impl FnOnce(&SqliteStore, i64)) -> Harness {
-    let (state, store, acct) = common::state_with(seed);
+    let (state, store, acct) = state_with(seed);
     let state = state.with_write_test_harness(Arc::new(StubCreds), base);
     Harness {
         app: router(state),
@@ -2337,7 +2337,7 @@ fn app_with_tracking(
     track_base: Option<&str>,
     seed: impl FnOnce(&SqliteStore, i64),
 ) -> Harness {
-    let (state, store, acct) = common::state_with(seed);
+    let (state, store, acct) = state_with(seed);
     let state = state
         .with_write_test_harness(Arc::new(StubCreds), base)
         .with_tracking_base_url(track_base.map(str::to_string));
@@ -3860,7 +3860,7 @@ fn harness_pointing_inference_at(url: String, seed: impl FnOnce(&SqliteStore, i6
     use squelch_core::config::Stage2Provider;
     use squelch_core::triage::rule_infer::RuleInferClient;
 
-    let (state, store, acct) = common::state_with(seed);
+    let (state, store, acct) = state_with(seed);
     let state = state.with_rule_inference(Some(RuleInferClient::new(
         reqwest::Client::new(),
         url,
@@ -7450,7 +7450,7 @@ async fn a_forward_whose_write_credential_is_dead_says_so_instead_of_blaming_gma
     // composer to blame Gmail when the fix is `squelchd auth --write`, which the
     // client already knows how to say when it sees the 403.
     let (base, handle) = mock_gmail(0).await;
-    let (state, store, acct) = common::state_with(|store, acct| {
+    let (state, store, acct) = state_with(|store, acct| {
         seed_one_signal(
             store,
             acct,
@@ -7498,4 +7498,80 @@ async fn a_forward_whose_write_credential_is_dead_says_so_instead_of_blaming_gma
             .any(|a| a.detail.as_deref() == Some("failed:fetch_original")),
         "and it must not be audited as one"
     );
+}
+
+/// The daemon says whether Gmail still opens, and OMITS the answer when it
+/// cannot see. A door wired without a metrics registry must not report a
+/// cheerful "connected" on behalf of a process that has no idea.
+#[tokio::test]
+async fn stats_omit_the_gmail_answer_when_this_door_cannot_see_the_credential() {
+    let Harness { app, .. } = harness(|_, _| {});
+    let resp = app.oneshot(authed("GET", "/client/stats")).await.unwrap();
+    let json = body_json(resp).await;
+    assert!(
+        json.get("gmail").is_none(),
+        "absence means 'no answer'; a client must not render it as good news"
+    );
+}
+
+/// A live credential reads as connected, and carries NO reconnect link: an
+/// invitation to re-consent for no reason is worse than no invitation.
+#[tokio::test]
+async fn stats_report_a_working_mailbox_as_connected_with_nothing_to_do() {
+    let (state, _store, _acct) = state_with(|_, _| {});
+    let metrics = squelch_core::metrics::SyncMetrics::new();
+    let app = router(
+        state
+            .with_sync_metrics(metrics.clone())
+            .with_console_sso_url(Some("https://signup.example".into())),
+    );
+
+    let resp = app.oneshot(authed("GET", "/client/stats")).await.unwrap();
+    let json = body_json(resp).await;
+    assert_eq!(json["gmail"]["connected"], serde_json::json!(true));
+    assert!(json["gmail"].get("reconnect_url").is_none());
+    assert!(json["gmail"].get("disconnected_since").is_none());
+}
+
+/// A dead credential reads as disconnected, says since when, and on HOSTED
+/// hands back the link that repairs it.
+#[tokio::test]
+async fn stats_report_a_dead_credential_with_the_link_that_repairs_it() {
+    let (state, _store, _acct) = state_with(|_, _| {});
+    let metrics = squelch_core::metrics::SyncMetrics::new();
+    metrics.record_gmail_error(squelch_core::metrics::GmailErrorKind::Auth);
+    let app = router(
+        state
+            .with_sync_metrics(metrics.clone())
+            .with_console_sso_url(Some("https://signup.example".into())),
+    );
+
+    let resp = app.oneshot(authed("GET", "/client/stats")).await.unwrap();
+    let json = body_json(resp).await;
+    assert_eq!(json["gmail"]["connected"], serde_json::json!(false));
+    assert_eq!(
+        json["gmail"]["reconnect_url"],
+        serde_json::json!("https://signup.example/reconnect")
+    );
+    assert!(
+        json["gmail"]["disconnected_since"].as_str().is_some(),
+        "since when is the half a person actually reads"
+    );
+}
+
+/// SELF-HOST: the same dead credential, no link. `squelchd auth` at a shell is
+/// not something a button can do, and offering one that goes nowhere is worse
+/// than the sentence that tells the truth.
+#[tokio::test]
+async fn a_self_host_mailbox_is_told_it_is_disconnected_and_offered_no_link() {
+    let (state, _store, _acct) = state_with(|_, _| {});
+    let metrics = squelch_core::metrics::SyncMetrics::new();
+    metrics.record_gmail_error(squelch_core::metrics::GmailErrorKind::Auth);
+    // No console SSO origin configured: that IS the self-host branch.
+    let app = router(state.with_sync_metrics(metrics.clone()));
+
+    let resp = app.oneshot(authed("GET", "/client/stats")).await.unwrap();
+    let json = body_json(resp).await;
+    assert_eq!(json["gmail"]["connected"], serde_json::json!(false));
+    assert!(json["gmail"].get("reconnect_url").is_none());
 }
