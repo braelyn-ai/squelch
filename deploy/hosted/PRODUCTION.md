@@ -19,11 +19,30 @@ Values are never in here. Names, namespaces and key names only.
 | Firewall | inbound 22, 80, 443 only |
 | Backups | ON — 7 daily snapshots, **root disk only** (see "Backups" below) |
 | SSH | `ssh carrier` (host alias in `~/.ssh/config`) |
+| Node memory | 3814 MiB total, and **all of it is offered to pods today**: no `system-reserved`, `kubepods.slice` `memory.max` = 3.72 GiB, while the host's own processes hold ~1.4 GB. `SETUP.md` §2b reserves 1200Mi (allocatable becomes ~2.4 GiB); **not applied here yet** |
+| Swap | none. §2b's 2 GB zram device is written (`deploy/hosted/node/`) and **not installed here yet** |
 
 Shared vCPU on purpose: tenant daemons are idle between syncs, and dedicated
 (CCX) costs roughly triple for headroom this workload spends most of its life not
 using. Scale vertically by resizing **CPU and RAM only** — a Hetzner resize that
 grows the disk is a one-way door and blocks every later downsize.
+
+**If a tenant is OOM-killed, read the constraint before anything else.**
+`kubectl` will tell you a container restarted; only the kernel says which of the
+two kinds of out-of-memory it was.
+
+```sh
+ssh carrier "journalctl -k --since '-24h'" | grep -i 'out of memory'
+```
+
+`constraint=CONSTRAINT_MEMCG` with an `oom_memcg=` is that container exceeding
+its own limit: the culprit is the victim, and the answer is its limit or its
+code. `constraint=CONSTRAINT_NONE` with `global_oom` is the node running out
+with nobody over their limit, and the kernel picks the largest RSS rather than
+whatever grew, so the tenant that died is unrelated to the tenant that caused
+it. That happened twice on 2026-08-19 (21:13 and 21:20) with four tenants on
+this box, and preventing it is what `SETUP.md` §2b is for. None of §2b is
+applied here yet.
 
 ## The volume
 

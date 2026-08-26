@@ -1,0 +1,79 @@
+# INSTALL AS /var/lib/rancher/k3s/agent/etc/kubelet.conf.d/10-squelch.conf
+#
+# NOT as kubelet.yaml. The kubelet reads its drop-in directory by extension:
+# a file in there that does not end in `.conf` is ignored in silence, which
+# looks exactly like a setting that did not take. It is .yaml in the repo
+# because it is YAML; it is .conf on the box because the kubelet says so.
+#
+#   install -d -m 0755 /var/lib/rancher/k3s/agent/etc/kubelet.conf.d
+#   install -m 0644 deploy/hosted/node/kubelet.yaml \
+#     /var/lib/rancher/k3s/agent/etc/kubelet.conf.d/10-squelch.conf
+#   systemctl restart k3s
+#
+# WHY A DROP-IN AND NOT `kubelet-arg:` IN config.yaml. k3s v1.32+ ships its own
+# defaults at 00-k3s-defaults.conf in this same directory and merges what it
+# finds here on top, per key. Two things follow, and both of them matter:
+#
+#   - `evictionHard` below ADDS memory.available to k3s's disk thresholds
+#     instead of replacing them. The `--eviction-hard` flag is a whole-map
+#     flag: setting it to memory.available alone silently drops k3s's
+#     imagefs/nodefs thresholds, and nobody notices until the disk fills.
+#   - A `kubelet-arg:` list in /etc/rancher/k3s/config.yaml is DISCARDED
+#     ENTIRELY if the k3s systemd unit passes any --kubelet-arg of its own,
+#     which this box's does (the UserNamespacesSupport feature gate, from
+#     SETUP.md §2). For repeatable flags the command line does not merge with
+#     the config file, it replaces it. See SETUP.md §2b.
+#
+# Ordering is lexical, so 10- lands after k3s's 00- and before anything a
+# future k3s adds at 50-. Keep the numeric prefix.
+#
+# SETUP.md §2b is the reasoning, the arithmetic, and the verify commands.
+
+apiVersion: kubelet.config.k8s.io/v1beta1
+kind: KubeletConfiguration
+
+# What the NODE costs, subtracted from what the scheduler may spend on pods.
+# Measured on carrier, 2026-08-26: k3s-server 803 MB, its embedded containerd
+# ~120 MB, systemd-journald 129 MB (capped by journald-squelch.conf in this
+# directory), litestream 67 MB, sshd and the rest of the OS ~100 MB. That is
+# ~1220 MB, and 1200Mi is the round number under it that assumes you also did
+# the journald cap and turned off the system docker/containerd pair.
+#
+# One bucket rather than a kubeReserved/systemReserved split: allocatable
+# subtracts both the same way, neither is enforced as its own cgroup unless
+# you ask for it, and one number is easier to keep true than two.
+#
+# RAISE THIS if you add anything to the host: another agent, a build, a shell
+# that stays open with a compile in it.
+systemReserved:
+  memory: 1200Mi
+
+# Subtracted from allocatable as well, and the kubelet starts evicting pods
+# when the node gets this close to the edge. An eviction is a pod the kubelet
+# chose, in an order it publishes, with an event explaining itself. The kernel
+# OOM killer is none of those things: it picks the largest RSS on the box,
+# which here is always a tenant daemon and never the thing that grew. 200Mi is
+# the price of being the one who chooses.
+#
+# Map keys merge with k3s's defaults, so imagefs.available and nodefs.available
+# survive. Do not restate them here.
+evictionHard:
+  memory.available: 200Mi
+
+# --- swap. Both lines are inert until a swap device exists. ---
+#
+# The kubelet refuses to start on a node with swap on unless it is told not to.
+# This is that. With no swap device present it changes nothing.
+failSwapOn: false
+
+# LimitedSwap rations swap by request: a Burstable container may use, at most,
+# (its memory request / node total memory) x total swap. Guaranteed pods
+# (request == limit) and BestEffort pods get NONE, which is the trap in
+# "tidying up" a tenant's spec so its request equals its limit.
+#
+# If the kubelet refuses to start after installing this file, comment these
+# two lines out and restart again: that isolates the swap half from the
+# reservation half, which is worth doing before you start reading feature
+# gates.
+memorySwap:
+  swapBehavior: LimitedSwap
