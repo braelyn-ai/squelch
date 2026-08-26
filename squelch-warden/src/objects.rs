@@ -303,6 +303,26 @@ pub const BLOCKED_EGRESS_CIDRS: &[&str] = &[
 /// operator configured a model PVC (see `deploy/hosted/SETUP.md`). Copied
 /// rather than symlinked because the daemon's root filesystem is read-only and
 /// fastembed expects to own its cache directory.
+///
+/// PER MODEL DIRECTORY, not per cache. The obvious condition is "copy if the
+/// cache directory does not exist", and it has a hole the size of the whole
+/// feature: a tenant that booted once BEFORE the PVC was configured downloaded
+/// its own weights, so the cache directory exists, so it never takes anything
+/// from the PVC again, including a model it does not have. Every tenant
+/// provisioned before this volume existed is in exactly that state, and so is
+/// every tenant on the day the pinned model changes. Copying entry by entry and
+/// skipping the ones already present fixes both, keeps the tenant's own
+/// downloads untouched, and stays idempotent across restarts. `$m` is
+/// `/models/<model dir>`, so `${m#/models/}` is its name without needing
+/// `basename` in the image.
+///
+/// Per DIRECTORY is also what makes the copy safe. A model in fastembed's
+/// Hugging Face cache layout is mostly symlinks from `snapshots/` into
+/// `blobs/`, and whether `cp -r` recreates those or dereferences them differs
+/// between coreutils and BSD. Either is correct here, because the links are
+/// relative and point inside the directory being copied: preserved they still
+/// resolve, dereferenced the copy is just bigger. A per-file copy is what would
+/// break, which is why the loop iterates `/models/*` and not what is under it.
 pub const SEED_SCRIPT: &str = "set -eu\n\
     want=$(sha256sum /etc/squelch/credential/credentials.json | cut -d ' ' -f 1)\n\
     have=''\n\
@@ -312,9 +332,13 @@ pub const SEED_SCRIPT: &str = "set -eu\n\
     \x20 chmod 600 /data/credentials.json\n\
     \x20 printf '%s\\n' \"$want\" > /data/.credentials.seed\n\
     fi\n\
-    if [ -d /models ] && [ ! -d /data/.local/share/squelch/models ]; then\n\
-    \x20 mkdir -p /data/.local/share/squelch\n\
-    \x20 cp -r /models /data/.local/share/squelch/models\n\
+    if [ -d /models ]; then\n\
+    \x20 mkdir -p /data/.local/share/squelch/models\n\
+    \x20 for m in /models/*; do\n\
+    \x20\x20 [ -e \"$m\" ] || continue\n\
+    \x20\x20 d=/data/.local/share/squelch/models/${m#/models/}\n\
+    \x20\x20 [ -e \"$d\" ] || cp -r \"$m\" \"$d\"\n\
+    \x20 done\n\
     fi\n";
 
 /// The init container's bounds. Constants rather than config: it copies at most
@@ -2186,6 +2210,22 @@ mod tests {
         assert!(SEED_SCRIPT.contains("if [ \"$want\" != \"$have\" ]"));
         // The old no-clobber guard is what made rotation impossible.
         assert!(!SEED_SCRIPT.contains("if [ ! -f /data/credentials.json ]"));
+    }
+
+    /// The weights half seeds model by model. The whole-cache guard it replaced
+    /// could only ever fire on a tenant's very first boot, which meant a tenant
+    /// provisioned before the PVC existed, or one alive on the day the pinned
+    /// model changed, took nothing from it ever again and downloaded instead.
+    #[test]
+    fn the_seed_script_fills_in_a_missing_model_beside_the_ones_a_tenant_has() {
+        // The guard that made it first-boot-only.
+        assert!(!SEED_SCRIPT.contains("[ ! -d /data/.local/share/squelch/models ]"));
+        // Per entry, skipping what is already there, never clobbering.
+        assert!(SEED_SCRIPT.contains("for m in /models/*; do"));
+        assert!(SEED_SCRIPT.contains("[ -e \"$d\" ] || cp -r \"$m\" \"$d\""));
+        // A shell that fails a step must fail the init container, not carry on
+        // and hand the daemon a half-copied model directory.
+        assert!(SEED_SCRIPT.starts_with("set -eu\n"));
     }
 
     #[test]

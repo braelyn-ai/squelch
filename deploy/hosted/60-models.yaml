@@ -1,14 +1,23 @@
-# The shared embedding-weights volume. OPTIONAL, and only useful once you have
-# one tenant running: see "8. Embedding weights" in SETUP.md for how to fill it.
+# The shared embedding-weights volume. Fill it once; every tenant after that
+# starts with the weights already on its own volume: see "10. Embedding weights"
+# in SETUP.md for the seeding procedure.
 #
-# Without this, every tenant downloads about 130 MB from Hugging Face the first
-# time it embeds anything. That is not fatal, it is just the same bytes over and
-# over, and it happens inside the signup a person is watching.
+# Without this, every tenant downloads about 126 MB from Hugging Face the first
+# time it embeds anything. That is not fatal, but it is the same bytes over and
+# over, it happens inside the signup a person is watching, and it is slow enough
+# that the 30-day initial backfill outruns the embedder: the mailbox ingests
+# thousands of rows with no vectors and search is keyword-only until the
+# vector backfill catches up.
 #
 # ReadWriteOnce, mounted read-only by every tenant's init container. That works
 # because this is a single-node cluster: RWO is one NODE, not one pod. On a
 # second node it stops working, and the fix then is baking the weights into a
 # squelchd image instead (also in SETUP.md).
+#
+# It lands in the `tenants` namespace and so it spends that namespace's quota
+# (`70-tenant-limits.yaml`): one of the 25 PVC slots permanently, and one of the
+# 25 pod slots for as long as the seed pod is up. Delete the seed pod when the
+# copy is done and the pod slot comes back; the claim is meant to stay.
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
@@ -22,8 +31,8 @@ spec:
     requests:
       storage: 2Gi
 ---
-# A pod that does nothing but hold the volume open so `kubectl cp` has somewhere
-# to land. Delete it when the copy is done; nothing references it afterwards.
+# A pod that does nothing but hold the volume open so a copy has somewhere to
+# land. Delete it when the copy is done; nothing references it afterwards.
 apiVersion: v1
 kind: Pod
 metadata:
@@ -34,28 +43,61 @@ metadata:
 spec:
   restartPolicy: Never
   automountServiceAccountToken: false
+  enableServiceLinks: false
   securityContext:
     runAsNonRoot: true
     runAsUser: 10001
     runAsGroup: 10001
+    # Same uid/gid a tenant daemon runs as, and the same reason: it is what
+    # makes the PersistentVolume writable without anything in the pod being
+    # root. Seed the volume as any other id and every tenant's init container
+    # reads files it does not own.
     fsGroup: 10001
+    fsGroupChangePolicy: OnRootMismatch
     seccompProfile:
       type: RuntimeDefault
   containers:
     - name: seed
-      # Any image with a shell and tar. The squelchd image is the one already
-      # pulled on this node; substitute your tag.
-      image: ghcr.io/braelyn-ai/squelchd:daemon-0.0.3
+      # KEEP THIS ON THE WARDEN'S TAG (SQUELCH_WARDEN_IMAGE in
+      # 15-warden-config.yaml). Any image with a shell and tar would do, but the
+      # squelchd image is the one already pulled on this node, so naming the
+      # fleet's tag is a copy that starts immediately instead of a pull.
+      image: ghcr.io/braelyn-ai/squelchd:daemon-0.0.4
       command: ["/bin/sh", "-c", "sleep 3600"]
       volumeMounts:
         - name: models
           mountPath: /seed
+        # The root filesystem is read-only, and `tar -x` wants somewhere to put
+        # its temporaries. Same shape as a tenant pod's /tmp: an emptyDir with a
+        # sizeLimit, because one without is a hole with the node's free space at
+        # the bottom of it.
+        - name: tmp
+          mountPath: /tmp
+      # Explicit, because a container with no bounds takes the LimitRange's
+      # defaults, and those are one TENANT's worth (100m / 256Mi requested,
+      # 1000m / 1Gi limit). A pod whose whole job is to sleep while tar writes
+      # to a volume should not reserve a tenant's share of a 2-vCPU box out of
+      # the namespace quota. Above the LimitRange's floor (10m / 16Mi) and well
+      # under its ceiling.
+      resources:
+        requests:
+          cpu: 10m
+          memory: 32Mi
+          ephemeral-storage: 32Mi
+        limits:
+          cpu: 500m
+          memory: 128Mi
+          ephemeral-storage: 128Mi
       securityContext:
         allowPrivilegeEscalation: false
         readOnlyRootFilesystem: true
+        runAsNonRoot: true
         capabilities:
           drop: ["ALL"]
   volumes:
     - name: models
       persistentVolumeClaim:
         claimName: squelch-models
+    - name: tmp
+      emptyDir:
+        sizeLimit: 256Mi

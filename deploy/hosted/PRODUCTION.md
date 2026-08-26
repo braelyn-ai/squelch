@@ -952,15 +952,22 @@ and none of them come back until the knob goes off again.
 
 *And `/healthz` waits out the first-run model download.* It answers 503 until the
 daemon's background embedder init has settled, which on a cold weights cache
-means ~130 MB from Hugging Face — longer than
+means ~126 MB from Hugging Face — longer than
 `SQUELCH_WARDEN_READY_TIMEOUT_SECS` (default 180). Each tenant caches those
 weights on its own volume, so this bites the FIRST boot of any tenant: a new
 signup gets `500 not_ready` for a mailbox that is perfectly healthy, and the next
 roll reads that same tenant as a casualty and stops the whole fleet.
 `SQUELCH_WARDEN_MODEL_PVC` is what removes the download (every tenant's init
-container copies from a pre-seeded PVC instead), and it is commented out in
-`15-warden-config.yaml` today. The warden logs a warning at startup if this knob
-is on and that one is unset.
+container copies from a pre-seeded PVC instead). It is set in
+`15-warden-config.yaml`, but the value is only as good as the volume behind it:
+confirm the PVC exists and has the pinned model in it, not just that the variable
+is present. The warden logs a warning at startup if this knob is on and that one
+is unset.
+
+```sh
+kubectl -n tenants get pvc squelch-models
+kubectl -n warden exec deploy/squelch-warden -- printenv SQUELCH_WARDEN_MODEL_PVC
+```
 
 So, in order, with a roll between each:
 
@@ -969,9 +976,11 @@ So, in order, with a roll between each:
 2. Let the roller converge, and CHECK it did — a clean `roll --dry-run`, or
    `kubectl -n tenants get deploy -o jsonpath` over the images. Every tenant, not
    most of them: the ones left behind are exactly the ones the next step breaks.
-3. Seed and set `SQUELCH_WARDEN_MODEL_PVC` (or raise
+3. Seed the volume `SQUELCH_WARDEN_MODEL_PVC` names, and confirm the warden is
+   running with it (SETUP.md step 10; the variable is set in the ConfigMap, the
+   volume it points at is the part somebody has to fill). Or raise
    `SQUELCH_WARDEN_READY_TIMEOUT_SECS` past a cold model download and accept a
-   slow first provision). Skipping this does not break the tenants you have; it
+   slow first provision. Skipping this does not break the tenants you have; it
    breaks the next one that signs up.
 4. Set `SQUELCH_WARDEN_HTTP_READINESS: "on"` in `15-warden-config.yaml`, apply,
    restart the warden, and let the roller converge again. Each tenant's pod
@@ -988,6 +997,69 @@ every daemon image, costs half a minute per tenant on a roll, and has to stay
 below `SQUELCH_WARDEN_READY_TIMEOUT_SECS` — the warden refuses to boot otherwise,
 because a soak the rollout wait cannot outlast would time out on every healthy
 tenant.
+
+### Reclaiming the second copy of the model (one-off, run deliberately)
+
+**Nothing applies this. It is a `rm -rf` inside a tenant's mail volume, typed by
+a person who has first read what the running daemon actually loaded.** It buys
+63 MB per tenant, which is worth having on a 4-tenant box and is not worth being
+casual about.
+
+Until the model was pinned, the daemon resolved its embedding model by substring
+match over fastembed's supported list, and which of the two `bge-small-en-v1.5`
+builds won was not stable across versions. Every tenant volume provisioned in
+that window therefore holds BOTH:
+
+```
+/data/.local/share/squelch/models/
+├── models--Xenova--bge-small-en-v1.5          126 MB   <- the pinned one
+└── models--Qdrant--bge-small-en-v1.5-onnx-Q    63 MB   <- dead weight
+```
+
+Only one of them is ever loaded. Deleting the other is safe, once the daemon on
+that tenant is actually loading the pinned one.
+
+**Check that first, per tenant, and do not skip it.** The daemon logs the model
+code it resolved at init, so read it from the pod that is running rather than
+from a ConfigMap or from this document:
+
+```sh
+kubectl -n tenants get deploy/<label> \
+  -o jsonpath='{.spec.template.spec.containers[0].image}{"\n"}'
+kubectl -n tenants logs deploy/<label> -c squelchd | grep -i 'embedding model'
+
+# `exec` runs no shell, so the glob has to go inside one.
+kubectl -n tenants exec deploy/<label> -c squelchd -- \
+  sh -c 'du -sh /data/.local/share/squelch/models/*'
+```
+
+If the log does not name the Xenova build, STOP. There are two reasons it might
+not, and they want opposite things. Either this tenant is on a daemon image from
+before the pin, in which case deleting the directory it is loading costs it a
+126 MB download on its next restart and the fix is to roll it forward first; or
+the pod has been up since before that line existed and `logs` no longer reaches
+back that far, in which case restart it and read the fresh init rather than
+guessing from the image tag.
+
+Then, one tenant at a time:
+
+```sh
+kubectl -n tenants exec deploy/<label> -c squelchd -- \
+  rm -rf /data/.local/share/squelch/models/models--Qdrant--bge-small-en-v1.5-onnx-Q
+
+kubectl -n tenants exec deploy/<label> -c squelchd -- \
+  ls /data/.local/share/squelch/models
+# models--Xenova--bge-small-en-v1.5
+```
+
+No restart is needed and none should be taken: fastembed reads its weights at
+init and holds the session, so a running daemon does not touch the directory
+again. The next restart re-reads the Xenova copy that is still there, and the
+init container will not re-seed the deleted one, because the PVC does not carry
+it either.
+
+Do the four existing tenants and then forget this section. Tenants provisioned
+after the pin only ever fetch one model.
 
 ## Cluster secrets
 

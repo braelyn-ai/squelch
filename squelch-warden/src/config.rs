@@ -222,7 +222,12 @@ pub struct Config {
     pub user_namespaces: bool,
     /// Optional PVC holding a pre-seeded embedding-weights cache. When set,
     /// every tenant's init container copies from it instead of each tenant
-    /// downloading ~130 MB from Hugging Face on first boot.
+    /// downloading ~126 MB from Hugging Face on first boot.
+    ///
+    /// The copy is per model directory and skips what the tenant already has,
+    /// so it also fills in a model a tenant is missing rather than only ever
+    /// seeding an empty cache; see [`crate::objects::SEED_SCRIPT`]. Nothing a
+    /// tenant downloaded itself is ever overwritten.
     pub model_pvc: Option<String>,
     /// The node network, when the CNI drops kubelet probe traffic without one.
     ///
