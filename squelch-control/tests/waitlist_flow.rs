@@ -330,7 +330,7 @@ async fn invite_directly(h: &Harness, cookie: &str, email: &str) -> (StatusCode,
     let (status, _, body) = h
         .post_form(
             "/admin/invite",
-            format!("email={}", urlencode(email)),
+            format!("email={}&confirmed=yes", urlencode(email)),
             Some(cookie),
         )
         .await;
@@ -506,7 +506,7 @@ async fn approving_mails_a_code_that_redeems() {
     let analytics_id = h.analytics_id(id).await;
 
     let (status, headers, _) = h
-        .post_form("/admin/approve", format!("id={id}"), Some(&cookie))
+        .post_form("/admin/approve", format!("id={id}&confirmed=yes"), Some(&cookie))
         .await;
     assert_eq!(status, StatusCode::SEE_OTHER);
     assert_eq!(header_of(&headers, header::LOCATION), "/admin");
@@ -577,12 +577,12 @@ async fn a_replayed_approval_mints_nothing() {
     let id = h.only_row_id().await;
     let cookie = h.sign_in().await;
 
-    h.post_form("/admin/approve", format!("id={id}"), Some(&cookie))
+    h.post_form("/admin/approve", format!("id={id}&confirmed=yes"), Some(&cookie))
         .await;
     let after_first = h.invite_ids().await;
 
     let (status, _, body) = h
-        .post_form("/admin/approve", format!("id={id}"), Some(&cookie))
+        .post_form("/admin/approve", format!("id={id}&confirmed=yes"), Some(&cookie))
         .await;
     assert_eq!(
         status,
@@ -604,7 +604,7 @@ async fn a_failed_send_leaves_a_row_the_operator_can_repair() {
     let cookie = h.sign_in().await;
 
     h.fail_sends(true);
-    h.post_form("/admin/approve", format!("id={id}"), Some(&cookie))
+    h.post_form("/admin/approve", format!("id={id}&confirmed=yes"), Some(&cookie))
         .await;
 
     let (row_status, first_invite, notified) = h.row_state(id).await;
@@ -621,7 +621,7 @@ async fn a_failed_send_leaves_a_row_the_operator_can_repair() {
     // than anybody approved.
     h.fail_sends(false);
     let (status, _, _) = h
-        .post_form("/admin/send", format!("id={id}"), Some(&cookie))
+        .post_form("/admin/send", format!("id={id}&confirmed=yes"), Some(&cookie))
         .await;
     assert_eq!(status, StatusCode::SEE_OTHER);
 
@@ -650,7 +650,7 @@ async fn a_spent_invite_is_not_replaced() {
     h.join(APPLICANT).await;
     let id = h.only_row_id().await;
     let cookie = h.sign_in().await;
-    h.post_form("/admin/approve", format!("id={id}"), Some(&cookie))
+    h.post_form("/admin/approve", format!("id={id}&confirmed=yes"), Some(&cookie))
         .await;
 
     // Spend it, the way a finished signup does.
@@ -674,7 +674,7 @@ async fn a_spent_invite_is_not_replaced() {
         .unwrap();
 
     let (status, _, body) = h
-        .post_form("/admin/send", format!("id={id}"), Some(&cookie))
+        .post_form("/admin/send", format!("id={id}&confirmed=yes"), Some(&cookie))
         .await;
     assert_eq!(status, StatusCode::OK);
     assert!(body.contains("already been used"), "{body}");
@@ -695,7 +695,7 @@ async fn a_revoked_invite_is_replaced_rather_than_refused() {
     h.join(APPLICANT).await;
     let id = h.only_row_id().await;
     let cookie = h.sign_in().await;
-    h.post_form("/admin/approve", format!("id={id}"), Some(&cookie))
+    h.post_form("/admin/approve", format!("id={id}&confirmed=yes"), Some(&cookie))
         .await;
 
     let (_, first, _) = h.row_state(id).await;
@@ -703,7 +703,7 @@ async fn a_revoked_invite_is_replaced_rather_than_refused() {
     assert!(h.invite_ids().await.is_empty());
 
     let (status, _, _) = h
-        .post_form("/admin/send", format!("id={id}"), Some(&cookie))
+        .post_form("/admin/send", format!("id={id}&confirmed=yes"), Some(&cookie))
         .await;
     assert_eq!(status, StatusCode::SEE_OTHER);
     let (_, second, notified) = h.row_state(id).await;
@@ -765,7 +765,7 @@ async fn a_signup_cookie_is_not_an_admin_cookie() {
         assert!(!body.contains(APPLICANT), "{body}");
 
         let (status, _, _) = h
-            .post_form("/admin/approve", format!("id={id}"), Some(&value))
+            .post_form("/admin/approve", format!("id={id}&confirmed=yes"), Some(&value))
             .await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
     }
@@ -784,7 +784,7 @@ async fn an_expired_admin_cookie_is_refused() {
 
     let stale = admin_cookie_at(now - ADMIN_COOKIE_TTL_SECS - 1);
     let (status, headers, body) = h
-        .post_form("/admin/approve", format!("id={id}"), Some(&stale))
+        .post_form("/admin/approve", format!("id={id}&confirmed=yes"), Some(&stale))
         .await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
     assert!(body.contains("session has ended"), "{body}");
@@ -797,14 +797,14 @@ async fn an_expired_admin_cookie_is_refused() {
     // A tampered one fails the same way, and one inside the window works.
     let forged = format!("{}x", admin_cookie_at(now));
     let (status, _, _) = h
-        .post_form("/admin/approve", format!("id={id}"), Some(&forged))
+        .post_form("/admin/approve", format!("id={id}&confirmed=yes"), Some(&forged))
         .await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
 
     let (status, _, _) = h
         .post_form(
             "/admin/approve",
-            format!("id={id}"),
+            format!("id={id}&confirmed=yes"),
             Some(&admin_cookie_at(now - ADMIN_COOKIE_TTL_SECS + 60)),
         )
         .await;
@@ -829,7 +829,7 @@ async fn a_sibling_subdomain_cannot_press_the_buttons() {
         let (status, _, _) = h
             .post_from(
                 "/admin/approve",
-                format!("id={id}"),
+                format!("id={id}&confirmed=yes"),
                 Some(&cookie),
                 Some(origin),
             )
@@ -844,7 +844,7 @@ async fn a_sibling_subdomain_cannot_press_the_buttons() {
     let (status, _, _) = h
         .post_from(
             "/admin/approve",
-            format!("id={id}"),
+            format!("id={id}&confirmed=yes"),
             Some(&cookie),
             Some("https://signup.passband.test"),
         )
@@ -863,7 +863,7 @@ async fn two_racing_sends_mail_one_code() {
     h.join(APPLICANT).await;
     let id = h.only_row_id().await;
     let cookie = h.sign_in().await;
-    h.post_form("/admin/approve", format!("id={id}"), Some(&cookie))
+    h.post_form("/admin/approve", format!("id={id}&confirmed=yes"), Some(&cookie))
         .await;
     let first = h.row_state(id).await.1.expect("approved with an invite");
     assert_eq!(h.sends().len(), 1);
@@ -872,7 +872,7 @@ async fn two_racing_sends_mail_one_code() {
     // so the race is staged: the row is moved on before the second one lands,
     // which is exactly the state the loser of a real race would find.
     let (status, _, _) = h
-        .post_form("/admin/send", format!("id={id}"), Some(&cookie))
+        .post_form("/admin/send", format!("id={id}&confirmed=yes"), Some(&cookie))
         .await;
     assert_eq!(status, StatusCode::SEE_OTHER);
     let second = h.row_state(id).await.1.expect("a fresh invite");
@@ -907,7 +907,7 @@ async fn a_held_invite_is_left_alone() {
     h.join(APPLICANT).await;
     let id = h.only_row_id().await;
     let cookie = h.sign_in().await;
-    h.post_form("/admin/approve", format!("id={id}"), Some(&cookie))
+    h.post_form("/admin/approve", format!("id={id}&confirmed=yes"), Some(&cookie))
         .await;
     let invite_id = h.row_state(id).await.1.unwrap();
 
@@ -928,7 +928,7 @@ async fn a_held_invite_is_left_alone() {
     assert_eq!(held, Some(invite_id), "the store handed out the hold");
 
     let (status, _, body) = h
-        .post_form("/admin/send", format!("id={id}"), Some(&cookie))
+        .post_form("/admin/send", format!("id={id}&confirmed=yes"), Some(&cookie))
         .await;
     assert_eq!(status, StatusCode::OK, "a banner, not a redirect");
     assert!(body.contains("redeeming that code right now"), "{body}");
@@ -1139,4 +1139,82 @@ async fn an_unconfigured_deployment_links_to_no_waitlist_at_all() {
     assert_eq!(status, StatusCode::OK);
     assert!(!body.contains("waitlist"), "{body}");
     assert!(!body.contains("No invite code"), "{body}");
+}
+
+/// THE QUESTION IS A GATE, NOT A COURTESY.
+///
+/// The OAuth client is not verified yet (`docs/VERIFICATION.md`), so Google
+/// refuses consent to any account that is not on the project's test-user list.
+/// A code mailed to somebody who is not on it is spent on a wall, and the board
+/// afterwards cannot tell that row from a healthy one. So every button that puts
+/// a code in a mailbox asks first.
+///
+/// WHAT THIS PINS is that an unanswered POST changes NOTHING — not the row's
+/// status, not the invite table, not the outbox — because a half-approval is the
+/// one outcome worse than either answer. Cancelling is closing the tab, so the
+/// no-op has to be real rather than tidied up afterwards.
+#[tokio::test]
+async fn an_unanswered_confirmation_approves_nothing() {
+    let h = Harness::new().await;
+    h.join(APPLICANT).await;
+    let id = h.only_row_id().await;
+    let cookie = h.sign_in().await;
+
+    let (status, _, body) = h
+        .post_form("/admin/approve", format!("id={id}"), Some(&cookie))
+        .await;
+
+    // A page, not a redirect: the operator has something to read and answer.
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("test user list"), "it asks the question: {body}");
+    assert!(body.contains(APPLICANT), "and names who it is about: {body}");
+    // The console's standing rule holds on this page like every other one.
+    assert!(!body.contains("<script"), "{body}");
+
+    assert_eq!(h.row_state(id).await.0, "pending", "nothing was approved");
+    assert!(h.invite_ids().await.is_empty(), "and nothing was minted");
+    assert!(h.sends().is_empty(), "and nothing was mailed");
+
+    // The button on that page is the one that finishes the job.
+    let (status, _, _) = h
+        .post_form(
+            "/admin/approve",
+            format!("id={id}&confirmed=yes"),
+            Some(&cookie),
+        )
+        .await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    assert_eq!(h.row_state(id).await.0, "approved");
+    assert_eq!(h.sends().len(), 1, "exactly one invite went out");
+}
+
+/// The same gate on the direct-invite form, where there is no row yet.
+///
+/// THE ROW IS THE THING AT RISK HERE. `invite_directly` creates an approved row
+/// as its first act, so asking after it would leave an approved stranger on the
+/// board for an invite nobody sent. The question comes before the store call,
+/// and this proves the funnel is still empty when the answer never came.
+#[tokio::test]
+async fn an_unanswered_confirmation_invites_nobody_directly() {
+    let h = Harness::new().await;
+    let cookie = h.sign_in().await;
+
+    let (status, _, body) = h
+        .post_form(
+            "/admin/invite",
+            format!("email={}", urlencode("grace@example.com")),
+            Some(&cookie),
+        )
+        .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("test user list"), "{body}");
+    assert!(body.contains("grace@example.com"), "{body}");
+
+    assert!(
+        h.state.store().list_users().await.unwrap().is_empty(),
+        "no row was created for an unanswered invite",
+    );
+    assert!(h.invite_ids().await.is_empty(), "and nothing was minted");
+    assert!(h.sends().is_empty(), "and nothing was mailed");
 }
