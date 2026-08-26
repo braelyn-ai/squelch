@@ -1323,6 +1323,14 @@ fn daemon_env(config: &Config, name: &TenantName) -> Vec<EnvVar> {
         ),
     ];
 
+    // Which embedding weights the daemon loads, when the operator pinned one.
+    // ABSENT unless set, so a warden with the knob unset builds the same pod a
+    // warden that never heard of it did: the daemon ships its own pin, and this
+    // exists only so the fleet can be moved off it without cutting an image.
+    if let Some(model) = &config.embed_model {
+        env.push(plain("SQUELCH_EMBED_MODEL", model));
+    }
+
     // The control plane's origin, behind the console's "Continue with Google"
     // link. ABSENT when the operator did not configure one, rather than empty:
     // the daemon treats a blank value as unset anyway, but an empty env var in a
@@ -1673,6 +1681,9 @@ mod tests {
             "/etc/squelch/identity/identity.txt"
         );
         assert_eq!(plain["HOME"], "/data");
+        // Unpinned, the daemon picks its own embedding model, and the var is
+        // absent rather than empty.
+        assert!(!plain.contains_key("SQUELCH_EMBED_MODEL"));
 
         // The address comes from the Secret, so it is encrypted at rest and is
         // not in the Deployment anyone can `kubectl get -o yaml`.
@@ -1803,6 +1814,30 @@ mod tests {
         assert!(!plain.contains_key("SQUELCH_STAGE2_MODEL"));
         assert_eq!(plain["SQUELCH_STAGE1_GLOBAL_DAILY_CAP"], "200");
         assert_eq!(plain["SQUELCH_STAGE2_GLOBAL_DAILY_CAP"], "40");
+    }
+
+    /// The embedding pin reaching a tenant. Not part of the LLM block: it needs
+    /// no gateway, because it names weights the daemon loads locally.
+    ///
+    /// The var is a CLOSED list's newest member. The daemon has read
+    /// `SQUELCH_EMBED_MODEL` since the model was pinned, but nothing this file
+    /// does not render can reach a tenant, so without this line the daemon-side
+    /// override would be unreachable on hosted and moving the fleet's embedding
+    /// model would mean cutting a new image.
+    #[test]
+    fn a_pinned_embedding_model_reaches_the_daemon_without_a_gateway() {
+        let mut c = test_config();
+        c.embed_model = Some("Xenova/bge-small-en-v1.5".to_string());
+        let pod = tenant_deployment(&c).spec.unwrap().template.spec.unwrap();
+        let env = pod.containers[0].env.clone().unwrap();
+
+        let plain: BTreeMap<&str, &str> = env
+            .iter()
+            .filter_map(|e| Some((e.name.as_str(), e.value.as_deref()?)))
+            .collect();
+        assert_eq!(plain["SQUELCH_EMBED_MODEL"], "Xenova/bge-small-en-v1.5");
+        // No gateway was configured, and the LLM block is still absent.
+        assert!(!plain.contains_key("SQUELCH_ANTHROPIC_BASE_URL"));
     }
 
     /// The rotation mechanism for the virtual key, same story as the

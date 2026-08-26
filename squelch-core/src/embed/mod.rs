@@ -12,7 +12,7 @@ use crate::text::truncate_chars;
 
 mod fastembed_impl;
 
-pub use fastembed_impl::FastEmbedder;
+pub use fastembed_impl::{DEFAULT_MODEL_CODE, FastEmbedder};
 
 /// Turns text into a fixed-dimension embedding vector. CPU-bound; callers run it
 /// under `spawn_blocking` so ingest never stalls on it. `dims()` MUST match the
@@ -33,7 +33,7 @@ pub trait Embedder: Send + Sync {
 /// Resolved embedding config: which model, how wide, and where weights cache.
 #[derive(Debug, Clone)]
 pub struct EmbedSettings {
-    /// fastembed model identifier string (e.g. "bge-small-en-v1.5").
+    /// fastembed model identifier string (e.g. "Xenova/bge-small-en-v1.5").
     pub model_name: String,
     /// Expected output dimension; must match the vec0 table declaration.
     pub dims: usize,

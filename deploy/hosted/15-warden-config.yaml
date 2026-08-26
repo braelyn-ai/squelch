@@ -255,6 +255,9 @@ data:
   # tenant per run, so the fleet catches up at the CronJob's schedule times the
   # number of tenants: four tenants on the */5 schedule is about twenty minutes.
   # SQUELCH_WARDEN_MODEL_PVC: "squelch-models"
+  # Moves the whole fleet's embedding model without cutting a new daemon image;
+  # unset means the daemon's own pin, which is Xenova/bge-small-en-v1.5.
+  # SQUELCH_WARDEN_EMBED_MODEL: "Xenova/bge-small-en-v1.5"
   # Uncomment if the squelchd image is private. This is the pull secret for
   # TENANT pods; the warden's own pod takes `imagePullSecrets` in
   # `20-warden.yaml`, and the roller's in `90-warden-roller.yaml`.

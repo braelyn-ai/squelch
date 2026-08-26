@@ -745,8 +745,13 @@ pub fn default_embed_cache_dir() -> PathBuf {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct EmbedConfig {
-    /// fastembed model name/alias. Default: BGE-small-en-v1.5 (384-dim, small,
-    /// English). Accepts the fastembed `model_code` or a friendly alias.
+    /// fastembed model, written as a full `model_code`. Default:
+    /// `"Xenova/bge-small-en-v1.5"` (BGE-small-en-v1.5, fp32, 384-dim, English).
+    /// The full code is the point: fastembed also ships
+    /// `Qdrant/bge-small-en-v1.5-onnx-Q`, the int8 build of the same family, and
+    /// the bare family name this used to default to picked between the two at
+    /// random per boot. Short aliases still parse and still mean the fp32 code;
+    /// anything that could name more than one model is refused at startup.
     pub model: String,
     /// Embedding dimensionality; must match `model` and the vec0 table width.
     pub dims: usize,
@@ -761,7 +766,7 @@ pub struct EmbedConfig {
 impl Default for EmbedConfig {
     fn default() -> Self {
         Self {
-            model: "bge-small-en-v1.5".to_string(),
+            model: crate::embed::DEFAULT_MODEL_CODE.to_string(),
             dims: 384,
             cache_dir: default_embed_cache_dir(),
             max_chars: crate::embed::DEFAULT_EMBED_MAX_CHARS,
@@ -1489,6 +1494,11 @@ impl Config {
             "SQUELCH_NOTIFY_MIN_IMPORTANCE",
             &mut self.notify.min_importance,
         );
+        // Which embedding weights this daemon loads. An env var so a fleet-wide
+        // pin can be moved without cutting a new image, and validated where
+        // every other spelling is, by `FastEmbedder::new`: an unresolvable value
+        // there disables semantic recall rather than taking the daemon down.
+        env_override("SQUELCH_EMBED_MODEL", &mut self.embed.model);
         // ---- APNs pusher (blind relay) -------------------------------------
         // The relay token is never echoed anywhere.
         for (name, slot) in [
@@ -2297,6 +2307,44 @@ backfill_days = 90
         unsafe {
             std::env::remove_var("SQUELCH_CLIENT_ID");
             std::env::remove_var("SQUELCH_BACKFILL_DAYS");
+        }
+    }
+
+    /// The pin itself. The default model is the full fp32 `model_code`, not the
+    /// family name that used to pick between two builds per boot, and
+    /// `settings()` is what hands it to the embedder, so it has to carry it.
+    #[test]
+    fn embed_default_is_the_pinned_code_and_settings_carries_it() {
+        let c = EmbedConfig::default();
+        assert_eq!(c.model, crate::embed::DEFAULT_MODEL_CODE);
+        assert_eq!(c.model, "Xenova/bge-small-en-v1.5");
+        assert_eq!(c.settings().model_name, crate::embed::DEFAULT_MODEL_CODE);
+        assert_eq!(c.settings().dims, c.dims);
+    }
+
+    /// The fleet-wide escape hatch: moving the pin without cutting an image.
+    #[test]
+    fn env_overrides_the_embed_model() {
+        let _g = ENV_LOCK.lock().unwrap();
+        // SAFETY: guarded by ENV_LOCK so no other test reads env concurrently.
+        unsafe {
+            std::env::set_var("SQUELCH_EMBED_MODEL", "BGESmallENV15Q");
+        }
+        let mut c = Config::default();
+        c.apply_env_overrides();
+        assert_eq!(c.embed.model, "BGESmallENV15Q");
+        assert_eq!(c.embed.settings().model_name, "BGESmallENV15Q");
+
+        // Exported but blank is "unset", the rule every env_override follows: it
+        // must not clear the pin and leave the embedder resolving an empty name.
+        unsafe {
+            std::env::set_var("SQUELCH_EMBED_MODEL", "");
+        }
+        let mut c = Config::default();
+        c.apply_env_overrides();
+        assert_eq!(c.embed.model, crate::embed::DEFAULT_MODEL_CODE);
+        unsafe {
+            std::env::remove_var("SQUELCH_EMBED_MODEL");
         }
     }
 

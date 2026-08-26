@@ -72,6 +72,7 @@ pub fn test_config() -> Config {
         pull_secret: None,
         user_namespaces: true,
         model_pvc: None,
+        embed_model: None,
         node_cidr: None,
         // Off, like production until the whole fleet is on a daemon that serves
         // `/healthz`: the tests that render the HTTP probe turn it on.
