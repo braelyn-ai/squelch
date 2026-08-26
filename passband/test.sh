@@ -152,6 +152,7 @@ run_suite remind-times \
 # parser that tries both fractional and plain, which is the bug this pins.
 run_suite gmail-health \
   Sources/Passband/Model/WireTypes.swift \
+  Sources/Passband/Model/SubjectText.swift \
   Sources/Passband/Lib/Format.swift \
   Sources/Passband/Lib/AsyncMemo.swift \
   Tests/GmailHealthTests.swift
