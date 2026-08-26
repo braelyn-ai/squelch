@@ -770,6 +770,28 @@ pub struct ShredStats {
     pub write_ready: bool,
 }
 
+/// How far a dev re-triage has got. The "run" is every row carrying a LIVE
+/// `retriage_at` stamp — the same [`crate::triage::retriage_forced`] window the
+/// passes themselves read, so this counts exactly the rows the force still
+/// covers. Two kicks inside the window are ONE run here, which is the honest
+/// answer: they are one pile of work to the queues.
+///
+/// `done` is derived from the queue predicates rather than from a marker of its
+/// own, so it can never disagree with what the passes will actually pick up: a
+/// row is finished when neither the Stage-1 queue nor the Stage-2 queue would
+/// still hand it out.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RetriageProgress {
+    /// Rows in the live window. Zero means no run is in flight — nothing was
+    /// ever asked for, or every stamp has aged out.
+    pub total: i64,
+    /// Rows of `total` that have left both queues.
+    pub done: i64,
+    /// The OLDEST live stamp: when the run being counted began. `None` exactly
+    /// when `total` is 0.
+    pub started_at: Option<DateTime<Utc>>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

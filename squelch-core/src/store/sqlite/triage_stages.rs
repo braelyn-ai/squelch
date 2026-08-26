@@ -437,6 +437,58 @@ impl SqliteStore {
         Ok(n as u64)
     }
 
+    /// How far the live re-triage has got — see [`RetriageProgress`].
+    ///
+    /// PENDING IS THE TWO QUEUE PREDICATES, NOT A MARKER OF ITS OWN. A row is
+    /// still being worked exactly when `stage1_queue` or `stage2_queue` would
+    /// still hand it out, so the two spellings are kept side by side here and
+    /// any change to a queue's WHERE has to be answered in this one. Anything
+    /// else drifts: a "done = stage1_model_used IS NOT NULL" counter would
+    /// reach 100% while every escalated row was still waiting on Stage-2.
+    ///
+    /// The window matches [`crate::triage::retriage_forced`] rather than
+    /// restating 24 hours, and it is a `>=` on the stamp, which keeps a
+    /// FUTURE-dated stamp (clock skew) in the run exactly as that predicate does.
+    pub(super) fn retriage_progress(&self, account_id: AccountId) -> Result<RetriageProgress> {
+        let conn = self.lock()?;
+        let since = (Utc::now() - crate::triage::RETRIAGE_FORCE_WINDOW).to_rfc3339();
+        // Sealed and sent rows are excluded for the same reason the queues
+        // exclude them: they re-enter nothing, so counting one would leave the
+        // run permanently short of its own total. `retriage_reset` never stamps
+        // them, but a row SEALED AFTER its stamp was written would otherwise
+        // wedge the counter at 99%.
+        let (total, done, started_at) = conn.query_row(
+            "SELECT COUNT(*),
+                    COALESCE(SUM(
+                        CASE WHEN t.stage1_model_used IS NULL
+                                  OR (t.needs_stage2 = 1 AND t.model_used IS NULL)
+                             THEN 0 ELSE 1 END), 0),
+                    MIN(t.retriage_at)
+             FROM triage t
+             JOIN messages m ON m.id = t.message_id
+             WHERE t.account_id = ?1
+               AND t.retriage_at >= ?2
+               AND t.sensitivity = 'normal'
+               AND m.is_sent = 0",
+            params![account_id, since],
+            |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, Option<String>>(2)?,
+                ))
+            },
+        )?;
+        Ok(RetriageProgress {
+            total,
+            done,
+            started_at: started_at
+                .as_deref()
+                .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+                .map(|d| d.with_timezone(&Utc)),
+        })
+    }
+
     pub(super) fn extract_mark_processed(
         &self,
         account_id: AccountId,

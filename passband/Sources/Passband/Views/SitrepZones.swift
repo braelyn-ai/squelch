@@ -65,8 +65,8 @@ struct CalendarZone: View {
 // MARK: - shipments
 
 /// Still-active shipments plus anything delivered TODAY; older deliveries drop
-/// out. No j/k, but each card opens its email, the Track chip is real, and a
-/// context menu clears a package the user is done looking at.
+/// out. No j/k, but each card opens its email and a context menu clears a
+/// package the user is done looking at.
 struct ShipmentsZone: View {
     @Environment(AppStore.self) private var store
     private var shipments: [Shipment] { store.zones.shipments }
@@ -115,8 +115,8 @@ private struct ShipmentCard: View {
     @State private var hovering = false
 
     private var title: String {
-        let trimmed = shipment.item_name.trimmingCharacters(in: .whitespaces)
-        return trimmed.isEmpty ? "Package via \(shipment.carrier.label)" : trimmed
+        let name = shipment.displayItem
+        return name.isEmpty ? "Package via \(shipment.carrier.label)" : name
     }
 
     /// Status → tone: out_for_delivery is the loud one, delivered fades back.
@@ -228,10 +228,14 @@ private struct ShipmentCard: View {
     }
 
     var body: some View {
-        // The whole card opens the email; the Track chip is a real Button inside
-        // it. The card is a tap gesture, not an outer Button, because a Button
-        // beats a gesture in hit-testing — the chip keeps its clicks by
-        // construction (AttachmentStrip's card + download button, same shape).
+        // The whole card opens the email, as a tap GESTURE rather than an outer
+        // Button: nothing inside competes for the click any more, and a gesture
+        // leaves the context menu's own press unclaimed.
+        //
+        // The status rides on the TITLE LINE, hard right. It is the one thing
+        // every card has, so on its own row it left a lone pill under a lone
+        // title; up here most packages are a one-line card and the rest add a
+        // line only when they have something else to say.
         VStack(alignment: .leading, spacing: 7) {
             HStack(spacing: 7) {
                 CarrierBadge(carrier: shipment.carrier)
@@ -241,21 +245,18 @@ private struct ShipmentCard: View {
                     .lineLimit(2)
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .help(titleHelp)
-            }
-            HStack(spacing: 7) {
                 Chip(
                     text: statusText, tone: tone,
                     symbol: shipment.status == .delivered ? "checkmark.circle.fill" : nil,
                     filled: shipment.status == .outForDelivery)
-                if let etaText {
+            }
+            // Conditional on the chip, not a row holding an empty `if`: an
+            // always-present HStack still spends the VStack's spacing on both
+            // sides of nothing.
+            if let etaText {
+                HStack(spacing: 7) {
                     Chip(text: etaText, tone: etaTone)
-                }
-                Spacer(minLength: 0)
-                if let url = shipment.tracking_url {
-                    ChromeChip(
-                        text: "Track", icon: "arrow.up.right", tone: Palette.accent,
-                        help: "track \(shipment.tracking_number) · \(shipment.carrier.label)"
-                    ) { Opener.open(url) }
+                    Spacer(minLength: 0)
                 }
             }
             if let note {
@@ -275,11 +276,10 @@ private struct ShipmentCard: View {
         .onTapGesture { if let target { store.openThread(target) } }
         .onHover { hovering = $0 }
         // A CONTEXT MENU rather than a chip or a swipe: the card's whole face is
-        // already spoken for (the tap opens the email, the Track chip is a real
-        // Button that beats it), and this rail is a VStack of cards on both
-        // platforms, not a List — `swipeActions` would do nothing here. Right
-        // click on the Mac, long press on the phone, one gesture neither of the
-        // other two uses.
+        // already spoken for (the tap opens the email), and this rail is a VStack
+        // of cards on both platforms, not a List — `swipeActions` would do
+        // nothing here. Right click on the Mac, long press on the phone, one
+        // gesture neither of the other two uses.
         .contextMenu {
             Button {
                 Task { await store.clearShipment(shipment.id) }

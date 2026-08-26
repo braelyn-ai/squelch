@@ -585,6 +585,118 @@ async fn retriage_route_exists_resets_and_audits() {
     );
 }
 
+/// The counter the blocking modal polls. GET and POST share the path, so the
+/// GET half is exactly the "is it mounted" regression the POST test above
+/// guards against — and the client BLOCKS THE APP on this route, so a 404 here
+/// is a modal nobody can watch.
+#[tokio::test]
+async fn retriage_progress_route_reports_the_run_it_kicked() {
+    let Harness { app, store, acct } = harness(|store, acct| {
+        let m = store
+            .upsert_message(&msg(acct, "g1", "t1", "s", "b"))
+            .unwrap();
+        store
+            .set_triage(
+                m,
+                acct,
+                60,
+                Tier::Signal,
+                Sensitivity::Normal,
+                None,
+                "",
+                "",
+                None,
+            )
+            .unwrap();
+        store
+            .stage1_apply(&squelch_core::store::Stage1Applied {
+                message_id: m,
+                account_id: acct,
+                importance: 50,
+                tier: squelch_core::types::Tier::Signal,
+                one_line: "x".into(),
+                reason: "x".into(),
+                field_reasons: Default::default(),
+                stage1_model_used: "claude-x".into(),
+                needs_stage2: false,
+                escalation_reason: None,
+                deadline: None,
+                category: Some("general".into()),
+            })
+            .unwrap();
+    });
+
+    // Before anything is asked for: no run, and NO `started_at` — the client
+    // reads a zero total as "nothing in flight", so it must not be confusable
+    // with a finished one.
+    let resp = app
+        .clone()
+        .oneshot(authed("GET", "/client/retriage"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+    assert_eq!(json["total"], 0);
+    assert_eq!(json["done"], 0);
+    assert!(json["started_at"].is_null());
+
+    let resp = app
+        .clone()
+        .oneshot(authed_json(
+            "POST",
+            "/client/retriage",
+            serde_json::json!({ "days": 7 }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(body_json(resp).await["reset"], 1);
+
+    let resp = app
+        .clone()
+        .oneshot(authed("GET", "/client/retriage"))
+        .await
+        .unwrap();
+    let json = body_json(resp).await;
+    assert_eq!(json["total"], 1, "the kicked row is the run");
+    assert_eq!(json["done"], 0, "and it has not been re-run yet");
+    assert!(
+        json["started_at"].is_string(),
+        "a live run says when it began"
+    );
+
+    // Stage-1 runs again: the row leaves both queues and the run is complete.
+    let queued = store.stage1_queue(acct, 10).unwrap();
+    assert_eq!(queued.len(), 1);
+    store
+        .stage1_apply(&squelch_core::store::Stage1Applied {
+            message_id: queued[0].message_id,
+            account_id: acct,
+            importance: 50,
+            tier: squelch_core::types::Tier::Noise,
+            one_line: "y".into(),
+            reason: "y".into(),
+            field_reasons: Default::default(),
+            stage1_model_used: "claude-y".into(),
+            needs_stage2: false,
+            escalation_reason: None,
+            deadline: None,
+            category: Some("general".into()),
+        })
+        .unwrap();
+
+    let resp = app
+        .clone()
+        .oneshot(authed("GET", "/client/retriage"))
+        .await
+        .unwrap();
+    let json = body_json(resp).await;
+    assert_eq!(
+        (json["total"].as_i64(), json["done"].as_i64()),
+        (Some(1), Some(1)),
+        "the modal unblocks only when the queues are actually empty"
+    );
+}
+
 #[tokio::test]
 async fn banking_returns_rows_newest_first_and_is_bearer_gated() {
     use squelch_core::store::BankingApplied;
