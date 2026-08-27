@@ -3379,6 +3379,198 @@ async fn an_explicit_to_wins_but_keeps_the_derived_copies() {
 }
 
 #[tokio::test]
+async fn a_stated_cc_replaces_the_derived_one_and_an_empty_one_clears_it() {
+    // The composer that SHOWS a Cc field has to be able to empty it. Absent
+    // means derive (the pre-field wire); present — `""` included — means the
+    // caller is stating the whole copy list.
+    for (stated, expected) in [
+        (
+            serde_json::json!("erin@example.com"),
+            Some("Cc: erin@example.com\r\n"),
+        ),
+        (serde_json::json!(""), None),
+    ] {
+        let (base, handle) =
+            mock_gmail_seq(vec![(200, group_metadata_body()), (200, "{}".to_string())]).await;
+        let Harness { app, store, acct } = app_with_writes(base, |store, acct| {
+            seed_one_signal(store, acct, "gmail-parent", "thread-77", "Lunch?");
+        });
+        let id = store.search(acct, "lunch", 10, 0).unwrap()[0].id;
+        let resp = app
+            .oneshot(authed_json(
+                "POST",
+                "/client/actions/send",
+                serde_json::json!({
+                    "reply_to_message_id": id,
+                    "body": "noon works",
+                    "reply_all": true,
+                    "cc": stated,
+                    "confirm": true
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let mime = sent_mime(&handle.await.unwrap()[1]);
+        match expected {
+            Some(line) => assert!(mime.contains(line), "{mime}"),
+            None => assert!(
+                !mime.contains("Cc:"),
+                "an emptied Cc must stay empty: {mime}"
+            ),
+        }
+        // The parent's own copies are never put back either way.
+        assert!(!mime.contains("carol@example.com"), "{mime}");
+        assert!(!mime.contains("dave@example.com"), "{mime}");
+    }
+}
+
+#[tokio::test]
+async fn a_stated_cc_keeps_the_display_names_the_sender_typed() {
+    // Verbatim, not through `cc_excluding`: that parses to bare addresses, and
+    // running a STATED list through it would quietly delete the names.
+    let (base, handle) =
+        mock_gmail_seq(vec![(200, group_metadata_body()), (200, "{}".to_string())]).await;
+    let Harness { app, store, acct } = app_with_writes(base, |store, acct| {
+        seed_one_signal(store, acct, "gmail-parent", "thread-77", "Lunch?");
+    });
+    let id = store.search(acct, "lunch", 10, 0).unwrap()[0].id;
+    let resp = app
+        .oneshot(authed_json(
+            "POST",
+            "/client/actions/send",
+            serde_json::json!({
+                "reply_to_message_id": id,
+                "body": "noon works",
+                "cc": "Bob Smith <bob@example.com>",
+                "confirm": true
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let mime = sent_mime(&handle.await.unwrap()[1]);
+    assert!(
+        mime.contains("Cc: Bob Smith <bob@example.com>\r\n"),
+        "{mime}"
+    );
+}
+
+#[tokio::test]
+async fn a_bcc_reaches_the_header_and_the_ledger_counts_it() {
+    let (base, handle) =
+        mock_gmail_seq(vec![(200, group_metadata_body()), (200, "{}".to_string())]).await;
+    let Harness { app, store, acct } = app_with_writes(base, |store, acct| {
+        seed_one_signal(store, acct, "gmail-parent", "thread-77", "Lunch?");
+    });
+    let id = store.search(acct, "lunch", 10, 0).unwrap()[0].id;
+    let resp = app
+        .oneshot(authed_json(
+            "POST",
+            "/client/actions/send",
+            serde_json::json!({
+                "reply_to_message_id": id,
+                "body": "noon works",
+                "cc": "bob@example.com",
+                "bcc": "erin@example.com, frank@example.com",
+                "confirm": true
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let mime = sent_mime(&handle.await.unwrap()[1]);
+    assert!(
+        mime.contains("Bcc: erin@example.com, frank@example.com\r\n"),
+        "{mime}"
+    );
+    // THE LEDGER IS THE ONLY PLACE A BCC IS WRITTEN DOWN: the copies that reach
+    // the visible recipients carry no trace of it, so the audit line has to.
+    // Counts, never addresses — and a stated `cc` gets no line of its own,
+    // because it is legible in the delivered mail.
+    let detail = store
+        .list_audit(acct, 20)
+        .unwrap()
+        .into_iter()
+        .find(|a| a.action == "send")
+        .and_then(|a| a.detail);
+    assert_eq!(detail.as_deref(), Some("ok:bcc:2"));
+    assert!(
+        !detail.unwrap().contains("erin"),
+        "the ledger counts recipients, it does not name them"
+    );
+}
+
+#[tokio::test]
+async fn a_smuggled_header_never_reaches_the_wire_from_either_copy_list() {
+    // TWO DIFFERENT GUARDS, because the two lists take different paths.
+    //
+    // A `bcc` is filtered through `addrs_excluding` first, which parses to bare
+    // addresses and CUTS the value at an embedded header token — so the honest
+    // prefix survives and the smuggled line is simply gone. Fewer recipients,
+    // never a forged one.
+    let (base, handle) =
+        mock_gmail_seq(vec![(200, group_metadata_body()), (200, "{}".to_string())]).await;
+    let Harness { app, store, acct } = app_with_writes(base, |store, acct| {
+        seed_one_signal(store, acct, "gmail-parent", "thread-77", "Lunch?");
+    });
+    let id = store.search(acct, "lunch", 10, 0).unwrap()[0].id;
+    let resp = app
+        .oneshot(authed_json(
+            "POST",
+            "/client/actions/send",
+            serde_json::json!({
+                "reply_to_message_id": id,
+                "body": "noon works",
+                "bcc": "erin@example.com\r\nBcc: attacker@evil.test",
+                "confirm": true
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let mime = sent_mime(&handle.await.unwrap()[1]);
+    let headers = mime.split("\r\n\r\n").next().unwrap();
+    assert!(headers.contains("Bcc: erin@example.com\r\n"), "{headers}");
+    assert!(
+        !mime.contains("evil.test"),
+        "the smuggled recipient must not exist anywhere: {mime}"
+    );
+
+    // A STATED `cc` is taken verbatim — that is what preserves the display names
+    // the sender typed — so the MIME builder's CR/LF refusal is the whole of the
+    // guard on that path, and it refuses rather than repairs.
+    let (base, handle) = mock_gmail_seq(vec![(200, group_metadata_body())]).await;
+    let Harness { app, store, acct } = app_with_writes(base, |store, acct| {
+        seed_one_signal(store, acct, "gmail-parent", "thread-77", "Lunch?");
+    });
+    let id = store.search(acct, "lunch", 10, 0).unwrap()[0].id;
+    let resp = app
+        .oneshot(authed_json(
+            "POST",
+            "/client/actions/send",
+            serde_json::json!({
+                "reply_to_message_id": id,
+                "body": "noon works",
+                "cc": "bob@example.com\r\nBcc: attacker@evil.test",
+                "confirm": true
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    // Only the metadata fetch happened; nothing was sent.
+    assert_eq!(handle.await.unwrap().len(), 1);
+    assert!(
+        store
+            .list_audit(acct, 20)
+            .unwrap()
+            .iter()
+            .any(|a| a.action == "send" && a.detail.as_deref() == Some("rejected:compose"))
+    );
+}
+
+#[tokio::test]
 async fn reply_all_without_a_parent_is_a_400() {
     let (base, handle) = mock_gmail(0).await;
     let Harness { app, store, acct } = app_with_writes(base, |_, _| {});

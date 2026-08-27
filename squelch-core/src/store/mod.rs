@@ -275,6 +275,10 @@ pub struct Device {
     pub token: String,
     /// Free-form platform tag; `ios` today.
     pub platform: String,
+    /// Opaque client-minted label naming the account this device registered
+    /// under, stamped onto every push sent here so the receiver can tell which
+    /// mailbox an event id belongs to. `None` for a client that never sent one.
+    pub tag: Option<String>,
     pub created_at: DateTime<Utc>,
     /// Refreshed on every re-registration — iOS re-hands its token each launch,
     /// so this, not `created_at`, is the liveness signal.
@@ -401,14 +405,33 @@ pub struct Draft {
     /// The message this replies to; `None` is the new-message draft.
     pub reply_to_message_id: Option<i64>,
     pub to_addr: String,
-    /// Blind recipients, comma-joined. `""` when there are none, which is every
-    /// draft written before the column existed.
+    /// The other two recipient lists, comma-joined exactly like `to_addr`. `""`
+    /// when there are none, which is every draft written before the columns
+    /// existed — and for `bcc_addr` empty is the ONLY state anything else can
+    /// infer, since nothing derives a blind copy list.
+    pub cc_addr: String,
     pub bcc_addr: String,
     pub subject: String,
     pub body: String,
     /// First save of this draft; an edit keeps it.
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+}
+
+/// The COMPOSITION half of a draft: everything the composer holds, with the
+/// keys (`account_id`, `reply_to_message_id`) left out. Taken by
+/// [`SqliteStore::upsert_draft`](sqlite::SqliteStore::upsert_draft) as one
+/// value rather than as five adjacent `&str` parameters, and that is the whole
+/// reason it exists: five strings in a row is a transposition waiting to
+/// happen, and two of them are recipient lists — swap `cc_addr` and `bcc_addr`
+/// and a restored draft sends the blind list where everyone can read it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DraftFields<'a> {
+    pub to_addr: &'a str,
+    pub cc_addr: &'a str,
+    pub bcc_addr: &'a str,
+    pub subject: &'a str,
+    pub body: &'a str,
 }
 
 /// One non-confident triage row queued for the Stage-2 LLM pass, with message
@@ -1516,7 +1539,17 @@ pub trait Store: Send + Sync {
     /// A token registered to ANOTHER account is refused with
     /// [`CoreError::InvalidInput`] and nothing is written — re-registration must
     /// never silently repoint a device's pushes at a different account.
-    fn upsert_device(&self, account_id: AccountId, token: &str, platform: &str) -> Result<Device>;
+    ///
+    /// `tag` is overwritten on every re-registration, including back to `None`:
+    /// it describes where this device currently files the account, and a stale
+    /// one would route a push at a mailbox the phone has since forgotten.
+    fn upsert_device(
+        &self,
+        account_id: AccountId,
+        token: &str,
+        platform: &str,
+        tag: Option<&str>,
+    ) -> Result<Device>;
 
     /// Every registered device for the account, oldest first — a stable order, so
     /// a push fan-out and its response array line up reproducibly.

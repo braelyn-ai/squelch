@@ -138,6 +138,15 @@ run_suite share-nudge \
 # through an injected now/calendar — which is the whole reason it is testable:
 # a reminder is only ever wrong LATER, so the arithmetic has to be pinned here
 # rather than discovered by an email that never came back.
+# Who a message is addressed to. One file, no dependencies — Recipients.swift is
+# kept free of SwiftUI precisely so the move-to-Bcc rule can be asserted without
+# an app, because every way it can go wrong is invisible on screen: a list split
+# on the wrong comma, or an address left in To while the sender believes it went
+# out blind.
+run_suite recipients \
+  Sources/Passband/Lib/Recipients.swift \
+  Tests/RecipientsTests.swift
+
 run_suite remind-times \
   Sources/Passband/Lib/RemindTimes.swift \
   Tests/RemindTimesTests.swift
@@ -174,6 +183,14 @@ run_suite sender-identity \
 run_suite key-dispatch \
   Sources/Passband/Keys/KeyDispatch.swift \
   Tests/KeyDispatchTests.swift
+
+# The ledger between the live event feed, the 10s poll and the person reading
+# the thread they both have news about. Pure value logic — no store, no
+# network — because the rule it encodes ("ask again as often as you like, tell
+# them once") is the kind that is only ever wrong later.
+run_suite thread-arrivals \
+  Sources/Passband/Lib/ThreadArrivals.swift \
+  Tests/ThreadArrivalsTests.swift
 
 # The settings search. A ranking is the one kind of code where a green build
 # says nothing at all: the matcher compiles whatever weights it is given, and

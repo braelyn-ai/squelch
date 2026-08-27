@@ -112,6 +112,11 @@ struct MobileRootView: View {
             } else {
                 SitrepPoller.shared.stop()
                 AccountManager.shared.stopAllFeeds()
+                // The Connect gate is now the whole screen, and it is the same
+                // form this sheet holds. Leaving one stacked on the other would
+                // offer two ways to connect at once, the front one adding an
+                // account to an install that no longer has any.
+                store.addAccountSheetOpen = false
             }
         }
     }
@@ -257,6 +262,23 @@ private struct MobileShell: View {
                     .presentationBackground(Palette.canvas)
             }
         }
+        // ADD ACCOUNT — the same `ConnectView` the gate is, off the same
+        // `store.addAccountSheetOpen` the Mac's shell presents, so the button in
+        // Settings works on both and the flag is never set into the void.
+        //
+        // Hung on the SHELL and not on the Account page, for the reason the
+        // Mac's is: the flag is raised from the Account pane, from the selector
+        // above it, and by a pair link arriving from a second daemon, and none
+        // of those can be sure which page is on screen.
+        //
+        // Full height because the form autofocuses a field and the keyboard
+        // takes the bottom half of a phone — the same trade the composer makes.
+        .sheet(isPresented: addAccountOpen) {
+            ConnectView(purpose: .addAccount)
+                .presentationDetents([.large])
+                .presentationDragIndicator(.visible)
+                .presentationBackground(Palette.canvas)
+        }
         // THE TWO-WEEK ASK, over the shell on both platforms.
         .overlay { ShareNudgeModal() }
         .onChange(of: store.shareAvailable) { _, canShare in
@@ -288,6 +310,15 @@ private struct MobileShell: View {
         Binding(
             get: { store.shareSheetOpen },
             set: { store.shareSheetOpen = $0 })
+    }
+
+    /// The add-account sheet is a plain flag on the store rather than a derived
+    /// presence: `ConnectView` owns the whole flow behind it and has nothing to
+    /// tear down, so a dragged-down sheet is a dismissal and nothing else.
+    private var addAccountOpen: Binding<Bool> {
+        Binding(
+            get: { store.addAccountSheetOpen },
+            set: { store.addAccountSheetOpen = $0 })
     }
 
     /// Presented-ness derived from the store's own `triageFix`, so dismissing the

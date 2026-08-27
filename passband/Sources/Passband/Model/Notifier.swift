@@ -4,8 +4,9 @@
 // BackgroundAuthWatch), whose tap opens the Auth view instead of a thread.
 //
 // The Event row is a denormalized snapshot, so a banner renders from the frame
-// alone with no round trip. `copy(for:)` is that mapping, kept pure and separate
-// from posting. On a dev machine the grant resets every recompile: an ad-hoc
+// alone with no round trip. `EventBanner.copy(for:)` is that mapping, kept pure
+// and in a file of its own because the notification extension posts the same
+// banner from the same event. On a dev machine the grant resets every recompile: an ad-hoc
 // signature's identity is a hash of the build.
 //
 // Every banner also carries the SENDER's mark as an attachment — see
@@ -35,25 +36,6 @@ import UserNotifications
 @MainActor
 final class Notifier {
     static let shared = Notifier()
-
-    /// userInfo keys — a tap routes on the thread id, WITHIN the account named
-    /// by the account id. `nonisolated` because the delegate reads the payload
-    /// on whatever queue the system delivers it to.
-    nonisolated static let threadKey = "passband.thread_id"
-    nonisolated static let eventKey = "passband.event_id"
-    /// The posting account's uuid, as a string (userInfo has to survive being
-    /// written to disk by the system and read back into a later launch).
-    nonisolated static let accountKey = "passband.account_id"
-    /// Where the tap goes when there is no thread to open. Carried ONLY by the
-    /// background auth banners; its absence is how every event banner says
-    /// "open the thread named in `threadKey`".
-    nonisolated static let routeKey = "passband.route"
-    nonisolated static let authRoute = "auth"
-    /// The Settings test banner. It routes nowhere, but it is marked because
-    /// the system has to be told to DRAW it — see `presentation` — and because
-    /// a tap on it is not a human opening their mail and must not be counted
-    /// as one.
-    nonisolated static let testRoute = "test"
 
     /// UNUserNotificationCenter holds its delegate WEAKLY. This property is the
     /// only strong reference in the process — assigning a freshly-made delegate
@@ -115,83 +97,15 @@ final class Notifier {
             .requestAuthorization(options: [.alert, .sound])
     }
 
-    // MARK: - content mapping
-
-    /// The display copy for one event. Pure: same event in, same banner out.
-    struct Copy: Equatable {
-        var title: String
-        var subtitle: String
-        var body: String
-        var threadIdentifier: String
-        var sound: Bool
-    }
-
-    static func copy(for event: Event, now: Date = Date()) -> Copy {
-        // "Sarah Chen <sarah@acme.com>" is not a notification title.
-        let sender = flatten(SenderID.displayName(event.sender), max: 64)
-        let summary = flatten(event.one_line, max: 240)
-        let due = Fmt.deadlineChip(event.deadline, now: now)?.text ?? ""
-        // Coalescing key: events on one thread stack into ONE group. The
-        // fallback must be unique, or an empty thread id would glue unrelated
-        // mail together.
-        let group =
-            event.thread_id.isEmpty ? "passband.event.\(event.id)" : event.thread_id
-
-        // A read receipt on the user's OWN tracked mail, and NOT a triage
-        // verdict: `sender` is the account's own address (using it as the title
-        // would read as mail from yourself), `one_line` is the sent subject, and
-        // `importance` is a placeholder. It renders on its own terms.
-        if event.kind == .opened {
-            return Copy(
-                title: "Opened",
-                subtitle: "",
-                body: summary.isEmpty ? "Someone opened your email." : "Opened: \(summary)",
-                threadIdentifier: group,
-                // News, not an obligation — no chime.
-                sound: false)
-        }
-
-        let subtitle: String
-        switch event.kind {
-        // Urgent is the dated-obligation tiers. When there is a real date, SAY it —
-        // "2d PAST DUE" is why the banner is worth interrupting for.
-        case .urgent: subtitle = due.isEmpty ? "needs attention" : due
-        case .deadline: subtitle = due
-        // No second line for the ordinary case: a subtitle on every
-        // notification is a subtitle that means nothing. `.opened` returned
-        // above and is listed only to keep this switch exhaustive.
-        case .surfaced, .opened: subtitle = ""
-        }
-
-        return Copy(
-            title: sender.isEmpty ? "Passband" : sender,
-            subtitle: subtitle,
-            // An empty one_line means triage stored no summary; say something
-            // true rather than posting a blank banner.
-            body: summary.isEmpty ? "New mail worth your attention." : summary,
-            threadIdentifier: group,
-            // Sound only for the time-bound kinds — a chime per surfaced email
-            // is how a notification stream gets muted wholesale.
-            sound: event.kind != .surfaced)
-    }
-
-    /// Collapse to one line and cap the length: notification text is a small
-    /// fixed box.
-    private static func flatten(_ s: String, max: Int) -> String {
-        let flat = s.split(whereSeparator: { $0.isNewline || $0 == "\t" })
-            .joined(separator: " ")
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        return Fmt.truncate(flat, max)
-    }
-
     // MARK: - posting
 
-    /// Post one event's banner on behalf of one account. `copy(for:)` stays
+    /// Post one event's banner on behalf of one account. `EventBanner.copy(for:)`
+    /// stays
     /// account-blind — the display copy is the same wherever the mail landed —
     /// and the account is folded into the two IDENTIFIERS below plus userInfo.
     func post(_ event: Event, accountId: UUID) {
         let account = accountId.uuidString
-        let copy = Self.copy(for: event)
+        let copy = EventBanner.copy(for: event)
         let content = UNMutableNotificationContent()
         content.title = copy.title
         if !copy.subtitle.isEmpty { content.subtitle = copy.subtitle }
@@ -203,9 +117,9 @@ final class Notifier {
         // were one conversation.
         content.threadIdentifier = "\(account).\(copy.threadIdentifier)"
         content.userInfo = [
-            Self.threadKey: event.thread_id,
-            Self.eventKey: event.id,
-            Self.accountKey: account,
+            EventBanner.threadKey: event.thread_id,
+            EventBanner.eventKey: event.id,
+            EventBanner.accountKey: account,
         ]
         if copy.sound { content.sound = Self.sound(for: Prefs.shared.notificationSound) }
 
@@ -272,15 +186,15 @@ final class Notifier {
         // is the app's one vocabulary for the other half ("sealed" is internal
         // jargon and never reaches a human).
         content.title = "\(AuthCopy.label(meta.kind)) · \(accountName)"
-        let sender = Self.flatten(SenderID.displayName(meta.sender), max: 64)
+        let sender = EventBanner.flatten(SenderID.displayName(meta.sender), max: 64)
         content.body = sender.isEmpty ? "New auth mail." : "from \(sender)"
         // One group per account's auth mail: a login code and the sign-in alert
         // behind it are the same conversation, and account-prefixed because two
         // daemons' auth mail is not.
         content.threadIdentifier = "\(account).passband.auth"
         content.userInfo = [
-            Self.accountKey: account,
-            Self.routeKey: Self.authRoute,
+            EventBanner.accountKey: account,
+            EventBanner.routeKey: EventBanner.authRoute,
         ]
         // Always a chime. A login code is the definition of time-bound — it
         // expires while you are not looking at it.
@@ -339,7 +253,7 @@ final class Notifier {
         // window, so the ordinary rule would file the test banner silently into
         // Notification Center and the button would look broken — and the
         // delegate reads it to keep a self-test out of the open-rate metric.
-        content.userInfo = [Self.routeKey: Self.testRoute]
+        content.userInfo = [EventBanner.routeKey: EventBanner.testRoute]
         send(content, identifier: "passband.test", sender: "Passband <hello@passband.app>")
         return true
     }
@@ -493,7 +407,7 @@ final class NotificationDelegate: NSObject, UNUserNotificationCenterDelegate {
     func userNotificationCenter(
         _ center: UNUserNotificationCenter, willPresent notification: UNNotification
     ) async -> UNNotificationPresentationOptions {
-        let route = notification.request.content.userInfo[Notifier.routeKey] as? String
+        let route = notification.request.content.userInfo[EventBanner.routeKey] as? String
         let (active, visible) = await MainActor.run {
             #if os(macOS)
                 (NSApp.isActive, MainWindow.find()?.isVisible == true)
@@ -504,31 +418,31 @@ final class NotificationDelegate: NSObject, UNUserNotificationCenterDelegate {
             #endif
         }
         return Notifier.presentation(
-            appActive: active, windowVisible: visible, isTest: route == Notifier.testRoute)
+            appActive: active, windowVisible: visible, isTest: route == EventBanner.testRoute)
     }
 
     func userNotificationCenter(
         _ center: UNUserNotificationCenter, didReceive response: UNNotificationResponse
     ) async {
         let userInfo = response.notification.request.content.userInfo
-        let threadId = userInfo[Notifier.threadKey] as? String
+        let threadId = userInfo[EventBanner.threadKey] as? String
         // Stored as a string and parsed here rather than crossing as one: a
         // payload that survived a relaunch (or came from an older build) can
         // hold anything, and an unparseable id must read as "no account", not
         // as some other account.
-        let accountId = (userInfo[Notifier.accountKey] as? String).flatMap(UUID.init(uuidString:))
+        let accountId = (userInfo[EventBanner.accountKey] as? String).flatMap(UUID.init(uuidString:))
         // An auth banner carries no thread to open — routing it as an ordinary
         // one would front the app and then do nothing.
-        let route = userInfo[Notifier.routeKey] as? String
+        let route = userInfo[EventBanner.routeKey] as? String
         await MainActor.run {
             switch route {
-            case Notifier.authRoute:
+            case EventBanner.authRoute:
                 Notifier.shared.handleAuthTap(accountId: accountId)
             // A self-test opens nothing and is COUNTED as nothing: routing it
             // through handleTap would file a `notification_opened` and quietly
             // inflate the one metric that says whether banners are worth
             // posting at all.
-            case Notifier.testRoute:
+            case EventBanner.testRoute:
                 Notifier.shared.front()
             default:
                 Notifier.shared.handleTap(threadId: threadId, accountId: accountId)

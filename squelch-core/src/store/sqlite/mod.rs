@@ -36,13 +36,13 @@ use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::error::{CoreError, Result};
 use crate::store::{
-    AttachmentBytes, BankingApplied, ContactEntry, Device, DeviceToken, Draft, ExtractQueued,
-    InboxUnread, IssuedDeviceToken, MarketingApplied, MarketingOffer, MessageOpen, MessageUnsub,
-    MintedPairingCode, MissingVector, NewAuditEntry, NewEvent, RevisitQueued, SealedBody,
-    SealedMessage, SearchFilter, SeedVerdict, SenderHistory, SentMessage, SentMissingRecipients,
-    SitrepBand, Stage1Applied, Stage1Queued, Stage2Applied, Stage2CapOverrides, Stage2Queued,
-    Stage2Usage, Stage2UsageDay, Store, SyncState, ThreadSibling, TrackedMessage, TriageDebug,
-    TriagedMessage, UsageTokens,
+    AttachmentBytes, BankingApplied, ContactEntry, Device, DeviceToken, Draft, DraftFields,
+    ExtractQueued, InboxUnread, IssuedDeviceToken, MarketingApplied, MarketingOffer, MessageOpen,
+    MessageUnsub, MintedPairingCode, MissingVector, NewAuditEntry, NewEvent, RevisitQueued,
+    SealedBody, SealedMessage, SearchFilter, SeedVerdict, SenderHistory, SentMessage,
+    SentMissingRecipients, SitrepBand, Stage1Applied, Stage1Queued, Stage2Applied,
+    Stage2CapOverrides, Stage2Queued, Stage2Usage, Stage2UsageDay, Store, SyncState, ThreadSibling,
+    TrackedMessage, TriageDebug, TriagedMessage, UsageTokens,
 };
 use crate::types::{
     AccountId, AttachmentInfo, AttentionStatus, AttentionUpdate, AuditEntry, BandCounts, Banking,
@@ -236,19 +236,63 @@ impl SqliteStore {
     }
 
     /// Convenience for tests/other crates: create an account, return its id.
+    /// Also seeds the one contact row the mail path can never produce — the
+    /// account's own address (see [`SqliteStore::seed_self_contact_conn`]).
     pub fn ensure_account(&self, email: &str) -> Result<AccountId> {
+        let now = Utc::now().to_rfc3339();
         let conn = self.lock()?;
         conn.execute(
             "INSERT INTO accounts(email, created_at) VALUES(?1, ?2)
              ON CONFLICT(email) DO NOTHING",
-            params![email, Utc::now().to_rfc3339()],
+            params![email, now],
         )?;
         let id: i64 = conn.query_row(
             "SELECT id FROM accounts WHERE email = ?1",
             params![email],
             |r| r.get(0),
         )?;
+        Self::seed_self_contact_conn(&conn, id, email, &now)?;
         Ok(id)
+    }
+
+    /// The user is a contact of the user. Nothing in the mail path will ever say
+    /// so: the per-message Sent seed and the Sent-history harvest both STRIP the
+    /// account's own address from the recipients they record, deliberately — a
+    /// CC to yourself is not evidence you know yourself. So without this row a
+    /// note the user mails to themselves arrives from a total stranger: Stage-1
+    /// misses its known-contact rung, neither LLM pass gets the importance
+    /// floor, the standing band's correspondence arm does not match, and the
+    /// composer cannot autocomplete the user's own address.
+    ///
+    /// ONE ROW, seeded here, because all four of those tests are the same
+    /// `contacts` lookup — the two LLM queues and the standing band ask it in
+    /// SQL, `is_known_contact` and `search_contacts` ask it in Rust. A self case
+    /// written into each of them instead is four chances to drift apart.
+    ///
+    /// This runs on every daemon start, which is also what backfills an account
+    /// created before the row existed. DO NOTHING on conflict rather than an
+    /// upsert, precisely because it re-runs: a later start must not stomp a
+    /// count or a name that has since moved. `sent_count = 1` satisfies the
+    /// `sent_count > 0` every known-contact predicate applies, and the display
+    /// name is what makes typing "me" offer your own address.
+    fn seed_self_contact_conn(
+        conn: &Connection,
+        account_id: AccountId,
+        email: &str,
+        now: &str,
+    ) -> Result<()> {
+        let addr = email.trim().to_ascii_lowercase();
+        if addr.is_empty() {
+            return Ok(());
+        }
+        conn.execute(
+            "INSERT INTO contacts(account_id, addr, sent_count, first_seen,
+                                  last_sent_at, display_name)
+             VALUES(?1,?2,1,?3,?3,'Me')
+             ON CONFLICT(account_id, addr) DO NOTHING",
+            params![account_id, addr, now],
+        )?;
+        Ok(())
     }
 
     /// The account's own email address. [`CoreError::NotFound`] for an unknown
@@ -913,8 +957,14 @@ impl Store for SqliteStore {
         self.latest_event_id(account_id)
     }
 
-    fn upsert_device(&self, account_id: AccountId, token: &str, platform: &str) -> Result<Device> {
-        self.upsert_device(account_id, token, platform)
+    fn upsert_device(
+        &self,
+        account_id: AccountId,
+        token: &str,
+        platform: &str,
+        tag: Option<&str>,
+    ) -> Result<Device> {
+        self.upsert_device(account_id, token, platform, tag)
     }
 
     fn list_devices(&self, account_id: AccountId) -> Result<Vec<Device>> {

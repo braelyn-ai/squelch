@@ -808,6 +808,13 @@ CREATE TABLE IF NOT EXISTS devices (
     -- silently repoint an existing device's pushes.
     token              TEXT NOT NULL UNIQUE,
     platform           TEXT NOT NULL DEFAULT 'ios',
+    -- Opaque client-minted label for the account this device filed the
+    -- registration under, echoed back on every push aimed at it. The receiving
+    -- extension has nothing else to go on: event ids are per-daemon ints, so a
+    -- phone holding two mailboxes cannot tell whose event 41 just arrived. NULL
+    -- for anything registered before the field existed, and for the macOS
+    -- client, which never asks a daemon to push at all.
+    tag                TEXT,
     created_at         TEXT NOT NULL,
     last_registered_at TEXT NOT NULL
 );
@@ -830,10 +837,12 @@ CREATE TABLE IF NOT EXISTS drafts (
     account_id          INTEGER NOT NULL,
     reply_to_message_id INTEGER,          -- NULL = the new-message draft
     to_addr             TEXT NOT NULL DEFAULT '',
-    -- BLIND recipients, comma-joined, exactly as `to_addr` holds the visible
-    -- ones. A draft that could not hold these would silently lose the whole
-    -- audience of a bcc send across a close-and-reopen, which is the one thing
-    -- a draft exists to prevent.
+    -- The composer's other two recipient lists, comma-joined exactly as
+    -- to_addr holds the visible ones. A draft that could not hold these would
+    -- restore addressed to fewer people than it was written for -- and for a
+    -- bcc that loss is silent, since nothing else on screen would show the
+    -- audience had ever been set.
+    cc_addr             TEXT NOT NULL DEFAULT '',
     bcc_addr            TEXT NOT NULL DEFAULT '',
     subject             TEXT NOT NULL DEFAULT '',
     body                TEXT NOT NULL DEFAULT '',

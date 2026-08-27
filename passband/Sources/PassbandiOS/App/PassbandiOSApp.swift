@@ -6,6 +6,7 @@
 // the menu commands, Sparkle. Those are the Mac shell, and the Mac keeps them.
 
 import SwiftUI
+import UserNotifications
 
 @main
 struct PassbandiOSApp: App {
@@ -47,11 +48,30 @@ final class AppDelegate: NSObject, UIApplicationDelegate {
         StagedAttachment.purgeRoot()
         MainActor.assumeIsolated {
             Notifier.shared.install()
+            PushRegistration.shared.start()
             Analytics.start()
             // The boot view never passes through route(to:), so its screen event
             // is recorded here or not at all.
             Analytics.screen(AppStore.shared.activeView.rawValue)
         }
         return true
+    }
+
+    func applicationDidBecomeActive(_ application: UIApplication) {
+        Task { @MainActor in await PushRegistration.shared.registerAndSync() }
+    }
+
+    func application(
+        _ application: UIApplication,
+        didRegisterForRemoteNotificationsWithDeviceToken deviceToken: Data
+    ) {
+        Task { @MainActor in await PushRegistration.shared.received(deviceToken) }
+    }
+
+    func application(
+        _ application: UIApplication,
+        didFailToRegisterForRemoteNotificationsWithError error: Error
+    ) {
+        Task { @MainActor in PushRegistration.shared.registrationFailed() }
     }
 }

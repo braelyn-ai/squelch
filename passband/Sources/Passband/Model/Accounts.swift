@@ -619,6 +619,15 @@ final class AccountManager {
         // (or the seen-set) straight back under the id that was removed.
         stopStream(id)
         stopWatch(id)
+        // The daemon is told to stop pushing while the credentials that
+        // authorize saying so are still here: after the clear below there is
+        // nothing left to present, and the registration would outlive the
+        // account that asked for it.
+        #if os(iOS)
+            if let settings = await settings(for: id) {
+                await PushRegistration.shared.unregister(settings)
+            }
+        #endif
         let cleared = await offMain { Result { try SettingsStore.clear(accountId: id) } }
         if case .failure = cleared { AccountIndex.parkOrphan(id) }
         AccountIndex.remove(id)

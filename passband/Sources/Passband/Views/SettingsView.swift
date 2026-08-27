@@ -1471,28 +1471,31 @@ struct AccountSection: View {
                         isOnly: accounts.count == 1)
                     if account.id != accounts.last?.id { Hairline() }
                 }
-                // ADD IS MAC-ONLY, AND THE BUTTON SAYS SO BY NOT BEING HERE.
-                // `addAccountSheetOpen` is presented by the Mac's action layer;
-                // nothing on the phone mounts that sheet, so shipping the button
-                // would ship a control that sets a flag into the void. Every
-                // other verb on this pane (rename, make active, remove) is
-                // AccountManager and works identically on both.
+                // BOTH SHELLS MOUNT THE SHEET THIS FLAG RAISES, so the button
+                // ships on both. It did not always: the phone had no host for
+                // `ConnectView(purpose: .addAccount)`, and a button that only
+                // set a flag into the void was worse than no button. Every other
+                // verb on this pane (rename, make active, remove) was already
+                // AccountManager and worked identically on both.
+                HStack(spacing: 12) {
+                    Button("Add Account…") { store.addAccountSheetOpen = true }
+                        .buttonStyle(.glassProminent)
+                        .tint(Palette.accent)
+                    Text("one daemon per mailbox, each with its own rules and triage")
+                        .font(Typo.micro)
+                        .foregroundStyle(Palette.inkFaintest)
+                }
+                .padding(.top, 4)
+                // WHAT SWITCHES THEM differs, so the hint does. The Mac has nine
+                // chords; the phone has the selector this pane sits under.
                 #if os(macOS)
-                    HStack(spacing: 12) {
-                        Button("Add Account…") { store.addAccountSheetOpen = true }
-                            .buttonStyle(.glassProminent)
-                            .tint(Palette.accent)
-                        Text("one daemon per mailbox, each with its own rules and triage")
-                            .font(Typo.micro)
-                            .foregroundStyle(Palette.inkFaintest)
-                    }
-                    .padding(.top, 4)
                     SettingsHint(
                         "⌘1 through ⌘9 switch accounts in the order listed here. Tokens live in your keychain, one pair of slots per account."
                     )
                 #else
-                    SettingsHint("Adding accounts happens in the Mac app for now.")
-                    SettingsHint("Tokens live in your keychain, one pair of slots per account.")
+                    SettingsHint(
+                        "The selector at the top of Account switches between them. Tokens live in your keychain, one pair of slots per account."
+                    )
                 #endif
             }
             SectionCard(label: "Live account") {

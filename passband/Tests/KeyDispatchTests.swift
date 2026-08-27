@@ -33,6 +33,8 @@ struct KeyDispatchTests {
         decliningPassesTheKeyOn()
         typingIsNeverAVerb()
         shiftIsSpelledOutForNamedKeysOnly()
+        aChordAndItsBareTwinCoexist()
+        aChordNeverFallsBackToItsBareTwin()
 
         if failures > 0 {
             print("FAILED: \(failures) of \(checks) checks")
@@ -121,11 +123,41 @@ struct KeyDispatchTests {
             "a shifted named key says so")
     }
 
+    // MARK: - the meta rule
+
+    /// The rules card binds Enter TWICE in one set, bare and ⌘-chorded, and both
+    /// save. That is only legal because `meta` is matched in BOTH directions.
+    static func aChordAndItsBareTwinCoexist() {
+        stage([[verb("Enter", "save", allowInInput: true), chord("Enter", "save-chord")]]) {
+            equal(press("Enter"), ["save"], "bare Enter reaches the bare binding")
+            equal(press("Enter", meta: true), ["save-chord"], "and ⌘Enter reaches the chord")
+        }
+    }
+
+    /// The other half, and the one that sent someone looking: a chord does NOT
+    /// fall back to its bare twin the way a shifted letter falls back to its
+    /// lowercase one. Bind only the bare spelling and ⌘Enter is simply unheard,
+    /// which is exactly what the rules card did before both were bound.
+    static func aChordNeverFallsBackToItsBareTwin() {
+        stage([[verb("Enter", "save", allowInInput: true)]]) {
+            equal(press("Enter", meta: true), [], "no chord binding, no chord")
+        }
+        stage([[chord("Enter", "save")]]) {
+            equal(press("Enter"), [], "and a bare press never reaches a chord binding")
+        }
+    }
+
     // MARK: - harness
 
     /// A plain verb that records itself.
-    static func verb(_ key: String, _ tag: String) -> KeyBinding {
-        KeyBinding(key, tag) { ran.append(tag) }
+    static func verb(_ key: String, _ tag: String, allowInInput: Bool = false) -> KeyBinding {
+        KeyBinding(key, tag, allowInInput: allowInInput) { ran.append(tag) }
+    }
+
+    /// The ⌘-chorded twin. Chords are allowed in input by convention — that is
+    /// most of why they exist — so the helper bakes it in.
+    static func chord(_ key: String, _ tag: String) -> KeyBinding {
+        KeyBinding(key, tag, meta: true, allowInInput: true) { ran.append(tag) }
     }
 
     /// A declining binding: records that it was ASKED, then holds or passes.
@@ -150,11 +182,11 @@ struct KeyDispatchTests {
 
     /// Press a key and hand back every handler that ran. Shift is inferred from
     /// the case, exactly as the AppKit bridge reports it.
-    static func press(_ key: String, editing: Bool = false) -> [String] {
+    static func press(_ key: String, meta: Bool = false, editing: Bool = false) -> [String] {
         ran = []
         let shifted = key.count == 1 && key.lowercased() != key
         _ = KeyRegistry.shared.dispatch(
-            KeyEventLike(key: key, shift: shifted), editing: editing)
+            KeyEventLike(key: key, command: meta, shift: shifted), editing: editing)
         return ran
     }
 

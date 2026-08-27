@@ -289,9 +289,12 @@ struct ComposeState: Sendable, Equatable {
     /// nothing at all).
     var forwardOfMessageId: Int?
     var to: String = ""
-    /// BLIND recipients, comma-joined, in the same wire-string form as `to`.
-    /// Empty on every composer that has not been handed a bcc group or opened
-    /// the row by hand, so an ordinary send is unchanged.
+    /// The other two recipient headers, comma-joined in the same wire-string
+    /// form as `to`. Edited through [`Recipients`], which is what enforces the
+    /// rule that matters: an address is in ONE of the three, so moving somebody
+    /// to Bcc takes them out of the header everyone can read rather than listing
+    /// them twice.
+    var cc: String = ""
     var bcc: String = ""
     /// The send group this composition is addressed to, once one has been
     /// picked.
@@ -310,6 +313,29 @@ struct ComposeState: Sendable, Equatable {
     var groupName: String?
     var subject: String = ""
     var body: String = ""
+    /// WHETHER THESE THREE FIELDS ARE THE ANSWER, or whether the daemon still
+    /// derives the audience from the parent.
+    ///
+    /// A new message and a forward are addressed by hand, so they state it from
+    /// the first keystroke. A REPLY does not: it opens knowing only which
+    /// message it answers, and the real set — the parent's Reply-To, the room a
+    /// reply-all widens to — is derived server-side. Sending `cc: ""` before
+    /// that preview lands would be the client asserting an empty copy list it
+    /// never had, and on a reply-all that silently narrows the mail to one
+    /// person.
+    ///
+    /// So it flips exactly once per composer, when the derived set is seeded
+    /// into the fields (see `InlineReply.loadRecipients`). Until then the wire
+    /// carries no `cc` at all and the daemon derives, exactly as it always has
+    /// — which is also the safe answer if the preview never lands.
+    var recipientsStated = false
+    /// WHAT THIS COMPOSER OPENED WITH — the daemon's derivation on a reply,
+    /// nothing at all everywhere else. Compared against by the autosave: a reply
+    /// whose three fields still say exactly what was derived has not been
+    /// addressed by anybody, and minting a draft for it would make every
+    /// abandoned `r` come back as restorable mail. A Bcc typed into it, or a
+    /// name moved out of the Cc, makes the two differ and the draft real.
+    var seededRecipients = Recipients()
     /// The server-side draft this composer is autosaving into, once one exists.
     /// Rides along to `send` so a successful send deletes the draft in the same
     /// transaction — otherwise the next `c` would restore mail already gone.
@@ -355,6 +381,29 @@ struct ComposeState: Sendable, Equatable {
     /// actually goes out is the original as Gmail holds it, pixels and all.
     /// Nothing else drifts — same message, same id, same files.
     var forwardedMessage: ClientMessage?
+
+    /// The three recipient headers as one editable value. The strings stay the
+    /// stored form — they are what goes on the wire, verbatim — and this is the
+    /// view of them that knows the list grammar.
+    var recipients: Recipients {
+        get { Recipients(to: to, cc: cc, bcc: bcc) }
+        set {
+            to = newValue.to
+            cc = newValue.cc
+            bcc = newValue.bcc
+        }
+    }
+
+    /// Write the three recipient fields AND record that they are now the
+    /// answer. Every recipient edit a composer offers goes through here: the
+    /// moment a person touches one of these fields they have stated who the
+    /// mail reaches, and the daemon's derivation stops applying. Setting
+    /// `recipients` directly is for SEEDING — filling the fields with what the
+    /// daemon already derived — which the seeder marks itself.
+    mutating func stateRecipients(_ next: Recipients) {
+        recipients = next
+        recipientsStated = true
+    }
 
     /// The one word both compose events use for what this draft IS —
     /// `compose_opened` and `compose_send` must not disagree about that.
@@ -572,17 +621,24 @@ final class AppStore {
         else { return nil }
         return summary
     }
-    /// Bumped when a sync brings a message NEWER than the one the reader holds
-    /// into the thread on screen — see SitrepPoller.performPull. The viewer
-    /// watches it and refetches without moving the reading position.
+    /// Bumped when a message NEWER than the one the reader holds lands in the
+    /// thread on screen — from the live event feed the instant triage emits it,
+    /// or from the 10s poll behind it. The viewer watches it and refetches
+    /// without moving the reading position. See `noteThreadArrival`.
     ///
-    /// A token rather than the mail itself: the poller reads the attention
-    /// bands, which say a thread moved but not what it now contains, and the
-    /// viewer is the one place that knows how to adopt a thread. It is also why
-    /// nothing resets it — a counter only has to CHANGE, so a thread switch
-    /// under a live token is a viewer that simply never hears about the bump it
-    /// no longer cares about.
+    /// A token rather than the mail itself: neither reporter carries the
+    /// thread's new contents (the feed has one denormalized row, the poller
+    /// reads the attention bands, which say a thread moved and not what it now
+    /// holds), and the viewer is the one place that knows how to adopt a
+    /// thread. It is also why nothing resets it — a counter only has to CHANGE,
+    /// so a thread switch under a live token is a viewer that simply never
+    /// hears about the bump it no longer cares about.
     var openThreadRefreshToken = 0
+    /// WHAT THE HUMAN HAS ALREADY BEEN TOLD about the thread they are reading.
+    /// Private because `noteThreadArrival` is the only door: the refetch and
+    /// the announcement have different rules, and ThreadArrivals is where the
+    /// difference lives.
+    private var arrivals = ThreadArrivals()
     var compose: ComposeState?
     /// The reader's inline reply composer. Deliberately NOT part of
     /// `modalOverlayOpen`: it is a bar inside the reading surface, not an overlay
@@ -675,6 +731,9 @@ final class AppStore {
                 settings = stored
                 connStatus = .connected
                 connError = nil
+                #if os(iOS)
+                    await PushRegistration.shared.registerAndSync()
+                #endif
                 // A link that arrived during boot (the app was LAUNCHED by one)
                 // races the keychain read and finds no Connect gate to land on.
                 // On the Mac it is not dropped for that: this install having an
@@ -792,6 +851,9 @@ final class AppStore {
             settings = fresh
             connStatus = .connected
             connError = nil
+            #if os(iOS)
+                await PushRegistration.shared.registerAndSync()
+            #endif
             Analytics.capture("connect_succeeded")
             // Fresh connection = fresh sync history; a stale lastRefresh from a
             // prior session must not make a failing daemon look recently synced.
@@ -831,6 +893,9 @@ final class AppStore {
             // — streams take their credentials at construction and keep them.
             AccountManager.shared.restartFeeds(account.id, with: fresh)
             settings = fresh
+            #if os(iOS)
+                await PushRegistration.shared.registerAndSync()
+            #endif
             return (true, nil)
         } catch {
             // Restore the prior working client — a fat-fingered token must not
@@ -927,6 +992,9 @@ final class AppStore {
         guard await performSwitch(to: record) else {
             return (false, "account added, but the keychain refused its credentials; pick it from the account switcher to retry")
         }
+        #if os(iOS)
+            await PushRegistration.shared.registerAndSync()
+        #endif
         return (true, nil)
     }
 
@@ -1159,6 +1227,9 @@ final class AppStore {
         // through `closeThread`/`closeCompose`: those flush drafts, and step
         // (4) already saved and settled everything there was to save.
         threadId = nil
+        // The ledger goes with it: what the other mailbox's reader had already
+        // been told about says nothing about this one's.
+        arrivals.reset(to: nil)
         threadQueue = []
         pendingReplyMessageId = nil
         compose = nil
@@ -1354,6 +1425,9 @@ final class AppStore {
         // mounted and may never re-adopt.
         if self.threadId != threadId { openThreadSummary = nil }
         self.threadId = threadId
+        // The arrivals ledger follows the thread, and declines to forget on a
+        // REOPEN of the same one — see ThreadArrivals.reset.
+        arrivals.reset(to: threadId)
         self.threadQueue = queue
         // An ordinary open puts the reader straight in the window — opening an
         // email is a jump. Only done+next passes an edge, and it walks the
@@ -1376,6 +1450,7 @@ final class AppStore {
 
     func closeThread() {
         threadId = nil
+        arrivals.reset(to: nil)
         threadQueue = []
         // The flight is deliberately left where it is: the last email of a queue
         // is mid-departure when this runs, and there is nothing left to put back
@@ -1384,6 +1459,49 @@ final class AppStore {
         DraftSaver.shared.flush(.inlineReply, inlineReply)
         inlineReply = nil
         pendingReplyMessageId = nil
+    }
+
+    // MARK: - live arrivals
+
+    /// A frame off the live event feed, offered to the thread on screen.
+    ///
+    /// THE ACCOUNT IS AN ARGUMENT and never read from here. One event stream
+    /// runs per account — including the ones nobody is looking at, which is the
+    /// entire reason they are held — and thread ids and message ids alike are
+    /// one daemon's SQLite ints. A background mailbox whose ids happened to
+    /// collide with the live thread's would otherwise pull a stranger's mail
+    /// into the email on screen.
+    func noteLiveEvent(_ event: Event, accountId: UUID) {
+        guard AccountManager.shared.activeId == accountId else { return }
+        // A read receipt is not new mail: nothing joined the thread, and
+        // `sender` on one of those rows is the user's own address. The reader
+        // keeps its receipts fresh on its own schedule.
+        guard event.kind != .opened else { return }
+        noteThreadArrival(
+            thread: event.thread_id, message: event.message_id, sender: event.sender)
+    }
+
+    /// NEW MAIL IN THE THREAD SOMEBODY IS READING — the one door, and both
+    /// reporters come through it: the event feed the moment triage emits, and
+    /// the 10s poll that is the only one to see an arrival the feed missed or
+    /// never carried.
+    ///
+    /// Two things follow and they are decided separately (see ThreadArrivals).
+    /// The REFETCH is a token bump the viewer answers by adopting a fresh copy
+    /// in place — that is what puts the reply into the thread under the
+    /// reader's eyes, without taking the page away from them. The ANNOUNCEMENT
+    /// is the toast, and it is the only thing that says so out loud: the system
+    /// banner is deliberately suppressed while the app is frontmost with a
+    /// window up (see Notifier.presentation), which is precisely the case a
+    /// person reading the thread is in.
+    func noteThreadArrival(thread: String, message: Int, sender: String) {
+        let verdict = arrivals.admit(
+            thread: thread, message: message, held: currentThreadSummary?.newestMessageId)
+        guard verdict.refetch else { return }
+        openThreadRefreshToken &+= 1
+        guard verdict.announce else { return }
+        let name = SenderID.displayName(sender)
+        pushToast(name.isEmpty ? "new message in this thread" : "new message from \(name)")
     }
 
     /// True while a modal owns the screen; the surfaces under it blur so the modal
@@ -2041,6 +2159,20 @@ final class AppStore {
         // The signature, below where typing starts. Only into an empty body — a
         // caller arriving with content composed that content, not a signature.
         if next.body.isEmpty { next.body = Prefs.shared.signatureSeed }
+        // A composer with NO PARENT addresses itself: there is nothing for the
+        // daemon to derive an audience from, so its three fields are the whole
+        // answer from the first keystroke.
+        //
+        // A REPLY opened into this pane — the agent's hand-off — keeps deriving,
+        // UNLESS it arrived carrying a copy list. That case is the hand-off of a
+        // send the model addressed and the person read on the confirm card, and
+        // leaving it deriving would drop those addresses on the floor between
+        // the card and the composer.
+        if next.replyToMessageId == nil || !next.cc.isEmpty || !next.bcc.isEmpty {
+            next.recipientsStated = true
+        }
+        // Whatever it opened with is what "untouched" means for the autosave.
+        next.seededRecipients = next.recipients
         compose = next
         DraftSaver.shared.noteOpened(.compose)
         Analytics.capture("compose_opened", ["kind": next.analyticsKind])
@@ -2157,10 +2289,16 @@ final class AppStore {
         // this seeds would survive as the only visible trace.
         guard var next = compose, next.replyToMessageId == nil, next.forwardOfMessageId == nil,
             next.draftId == nil,
-            next.to.isEmpty, next.subject.isEmpty, Prefs.shared.isBodyUntouched(next.body)
+            next.to.isEmpty, next.cc.isEmpty, next.bcc.isEmpty, next.subject.isEmpty,
+            Prefs.shared.isBodyUntouched(next.body)
         else { return }
         next.to = draft.to
-        next.bcc = draft.bcc
+        // Nil is a daemon too old to carry them, not an emptied field — leave
+        // the composer's own (empty) values rather than writing "" over them,
+        // which reads identically here but would not if the seeding rule ever
+        // changes.
+        next.cc = draft.cc ?? next.cc
+        next.bcc = draft.bcc ?? next.bcc
         next.subject = draft.subject
         next.body = draft.body
         next.draftId = draft.id
@@ -2220,8 +2358,11 @@ final class AppStore {
     }
 
     /// Fill the just-opened inline composer from the draft keyed to this parent.
-    /// Body only: a reply carries nothing else — the daemon derives the recipient
-    /// and `Re: <subject>` from the parent.
+    ///
+    /// The BODY, plus any copy lists the draft holds. A reply still derives its
+    /// `to` and its `Re: <subject>` from the parent, but a Bcc never derives
+    /// from anything — so a saved one has to come back, or closing a reply to
+    /// think about it would silently un-blind-copy somebody.
     private func restoreReply(_ messageId: Int) async {
         let e = epoch
         guard let rows = try? await APIClient.shared.listDrafts(),
@@ -2235,6 +2376,15 @@ final class AppStore {
             Prefs.shared.isBodyUntouched(next.body)
         else { return }
         next.body = draft.body
+        // Only a draft that actually recorded a copy list gets to state one:
+        // restoring `""` over an unseeded composer would flip
+        // `recipientsStated` on a reply that has not learned its audience yet.
+        if let cc = draft.cc, let bcc = draft.bcc, !cc.isEmpty || !bcc.isEmpty {
+            next.cc = cc
+            next.bcc = bcc
+            next.to = draft.to.isEmpty ? next.to : draft.to
+            next.recipientsStated = true
+        }
         next.draftId = draft.id
         inlineReply = next
     }

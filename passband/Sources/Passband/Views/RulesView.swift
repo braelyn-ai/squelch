@@ -334,7 +334,17 @@ struct RuleEditor: View {
             // ⌘-chorded because the want field owns every bare letter, and the
             // hint row below teaches it.
             KeyBinding("d", "advanced", meta: true, allowInInput: true) { toggleAdvanced() },
+            // BOTH SPELLINGS SAVE. Bare Enter is this card's own convention and
+            // the hint row has taught it since the card existed. ⌘Enter is the
+            // one every OTHER multi-line surface in the app uses — the group
+            // editor, the composer, the inline reply — so a hand arriving from
+            // any of them tries it first and, until now, got nothing. They
+            // coexist because dispatch matches `meta` exactly in both
+            // directions, so neither binding can answer for the other.
             KeyBinding("Enter", "save rule", allowInInput: true) { Task { await save() } },
+            KeyBinding("Enter", "save rule", meta: true, allowInInput: true) {
+                Task { await save() }
+            },
         ])
         .onAppear {
             // The want text is the rule, so it takes focus everywhere except
@@ -513,7 +523,7 @@ struct RuleEditor: View {
                     Text("·").font(Typo.micro).foregroundStyle(Palette.inkFaintest)
                     KeyHint("⌥↵", "new line")
                     Text("·").font(Typo.micro).foregroundStyle(Palette.inkFaintest)
-                    KeyHint("↵", "save")
+                    KeyHint(["↵", "⌘↵"], "save")
                     Spacer()
                 }
             #endif

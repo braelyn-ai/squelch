@@ -86,7 +86,7 @@ enum Analytics {
         "email_archived", "email_done", "email_reopened", "email_labeled",
         "email_remind",
         "block_rule_created", "compose_opened", "compose_send",
-        "thread_opened", "undo_fired", "assistant_asked",
+        "thread_opened", "thread_live_arrival", "undo_fired", "assistant_asked",
         "triage_corrected", "triage_digest", "rule_created", "rule_deleted",
         "process_completed", "notification_opened", "sealed_revealed",
         "shipment_cleared", "shipments_poll_kicked",
@@ -105,6 +105,11 @@ enum Analytics {
     private static let minimalEvents: Set<String> = [
         "email_archived", "email_done", "email_reopened", "email_remind",
         "block_rule_created", "compose_send", "thread_opened",
+        // One bool: mail landed in the thread on screen, and whether the reader
+        // was at the end of it (carried to the new message) or up in the
+        // history (held in place, pointed at it). Anonymous, and it is the only
+        // measure of whether live-loading is worth the round trips.
+        "thread_live_arrival",
         "undo_fired", "assistant_asked",
         "triage_corrected", "triage_digest", "rule_created", "rule_deleted",
         "process_completed", "notification_opened", "sealed_revealed",
@@ -313,6 +318,31 @@ final class PostHogClient: @unchecked Sendable {
         return f
     }()
 
+    /// PostHog's own device buckets: an iPad is a Tablet, everything else this
+    /// target runs on is a Mobile.
+    ///
+    /// Asked of the KERNEL rather than of `UIDevice.current.userInterfaceIdiom`,
+    /// which the SDK marks main-actor. This is not a style preference: the
+    /// client is a lazy `static let`, so its initializer runs on whichever
+    /// thread captures the first event, and reading a main-actor API from
+    /// there is exactly the thing the compiler now refuses. The model
+    /// identifier is a process constant and answers the same question without
+    /// an actor to hop to.
+    #if os(iOS)
+        private static var deviceType: String {
+            var info = utsname()
+            uname(&info)
+            let machine = withUnsafeBytes(of: &info.machine) { raw in
+                String(decoding: raw.prefix(while: { $0 != 0 }), as: UTF8.self)
+            }
+            // A simulator reports the HOST's architecture there ("arm64"), so
+            // the device it is pretending to be comes from the environment.
+            let model =
+                ProcessInfo.processInfo.environment["SIMULATOR_MODEL_IDENTIFIER"] ?? machine
+            return model.hasPrefix("iPad") ? "Tablet" : "Mobile"
+        }
+    #endif
+
     /// The per-event envelope PostHog reads to place a session on a platform.
     ///
     /// The platform half is COMPILED, not detected: this file ships in both the
@@ -335,12 +365,7 @@ final class PostHogClient: @unchecked Sendable {
         ]
         #if os(iOS)
             ctx["$os_name"] = "iOS"
-            // PostHog's own device buckets: an iPad is a Tablet, everything
-            // else the target runs on is a Mobile. Read off the main thread on
-            // purpose and safely — `userInterfaceIdiom` is a compile-time-ish
-            // constant for the process, not view state.
-            ctx["$device_type"] =
-                UIDevice.current.userInterfaceIdiom == .pad ? "Tablet" : "Mobile"
+            ctx["$device_type"] = PostHogClient.deviceType
         #else
             ctx["$os_name"] = "macOS"
             ctx["$device_type"] = "Desktop"

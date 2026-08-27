@@ -360,6 +360,7 @@ pub const BLOCKED_EGRESS_CIDRS: &[&str] = &[
 /// bad directory and let the next boot seed or re-download it.
 pub const SEED_SCRIPT: &str = "set -eu\n\
     want=$(sha256sum /etc/squelch/credential/credentials.json | cut -d ' ' -f 1)\n\
+    [ -n \"$want\" ] || { echo 'squelch-seed: no credential file to seed from' >&2; exit 1; }\n\
     have=''\n\
     if [ -f /data/.credentials.seed ]; then have=$(cat /data/.credentials.seed); fi\n\
     if [ \"$want\" != \"$have\" ]; then\n\
@@ -2370,6 +2371,25 @@ mod tests {
     /// are wrong) exits every tenant's init container 1 on its next roll, and
     /// [`crate::provision`]'s roll reads a tenant that will not come up as a
     /// casualty and halts. So the copy is chained, not left to `set -e`.
+    /// `want=$(sha256sum ... | cut ...)` takes the PIPELINE's status, which is
+    /// `cut`'s, so under `set -e` a missing or unreadable credential file did
+    /// not stop the script: `want` came out empty, matched the empty `have` of a
+    /// fresh volume, the copy was skipped, and the init container exited 0 with
+    /// no credentials installed. A daemon with no credentials file is not a
+    /// daemon, so an empty hash is the init container's failure, said out loud.
+    #[test]
+    fn an_absent_credential_file_fails_the_seed_instead_of_seeding_nothing() {
+        let guard = "[ -n \"$want\" ] || { echo 'squelch-seed: no credential file to seed from' >&2; exit 1; }";
+        assert!(SEED_SCRIPT.contains(guard));
+        let hashed = SEED_SCRIPT.find("want=$(sha256sum").unwrap();
+        let guarded = SEED_SCRIPT.find(guard).unwrap();
+        let compared = SEED_SCRIPT.find("if [ \"$want\" != \"$have\" ]").unwrap();
+        assert!(
+            hashed < guarded && guarded < compared,
+            "guard sits between the hash and the compare"
+        );
+    }
+
     #[test]
     fn a_failed_model_copy_does_not_fail_the_pod() {
         // Chained, with the fallback branch that keeps the shell's status 0.

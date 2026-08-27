@@ -6,8 +6,14 @@ use super::*;
 
 impl SqliteStore {
     /// HUMAN-DOOR ONLY: rank contacts for a typed fragment. Prefix matches (on
-    /// the address or the display name) sort above substring matches, then by
-    /// how often and how recently the user has written to them.
+    /// the address or the display name) sort above substring matches, then the
+    /// user's OWN address, then by how often and how recently the user has
+    /// written to them.
+    ///
+    /// Self is ranked WITHIN the tier the fragment earned, never above it: for
+    /// your own address you are the answer and not the person you write to
+    /// most, but a fragment that prefix-matches somebody else and merely
+    /// appears somewhere inside your address still belongs to them.
     pub fn search_contacts(
         &self,
         account_id: AccountId,
@@ -32,6 +38,8 @@ impl SqliteStore {
              WHERE account_id = ?1
                AND (addr LIKE ?2 ESCAPE '\\' OR display_name LIKE ?2 ESCAPE '\\')
              ORDER BY (addr LIKE ?3 ESCAPE '\\' OR display_name LIKE ?3 ESCAPE '\\') DESC,
+                      (lower(addr) = (SELECT lower(trim(email)) FROM accounts
+                                      WHERE id = ?1)) DESC,
                       sent_count DESC,
                       COALESCE(last_sent_at, '') DESC,
                       addr ASC
@@ -146,6 +154,62 @@ mod tests {
             hits[0].last_sent_at.unwrap(),
             Utc.with_ymd_and_hms(2026, 7, 10, 12, 0, 0).unwrap()
         );
+    }
+
+    #[test]
+    fn your_own_address_is_a_contact_you_never_had_to_earn() {
+        // Nothing in the mail path seeds it — both the Sent seed and the harvest
+        // strip self — so `ensure_account` is the only thing standing between
+        // the user and being a stranger to their own inbox.
+        let (store, acct) = store_with(&[]);
+        assert!(store.is_known_contact(acct, "me@example.com").unwrap());
+        assert!(
+            store.is_known_contact(acct, "ME@Example.COM").unwrap(),
+            "the header spells it however it likes"
+        );
+        let hits = store.search_contacts(acct, "me@ex", 10).unwrap();
+        assert_eq!(hits[0].addr, "me@example.com");
+        assert_eq!(hits[0].display_name.as_deref(), Some("Me"));
+    }
+
+    #[test]
+    fn typing_me_offers_yourself_first() {
+        // The display name earns its keep here: "me" is how a person reaches for
+        // their own address, and it outranks the contact they write to most.
+        let (store, acct) = store_with(&[entry("mel@x.com", Some("Mel"), 99, 1)]);
+        let hits = store.search_contacts(acct, "me", 10).unwrap();
+        assert_eq!(hits[0].addr, "me@example.com");
+        assert_eq!(hits[1].addr, "mel@x.com");
+    }
+
+    #[test]
+    fn self_ranks_inside_its_tier_not_above_it() {
+        // "exa" prefix-matches this contact and only appears INSIDE the user's
+        // own address. The fragment picked its owner; self does not jump it.
+        let (store, acct) = store_with(&[entry("example@x.com", None, 1, 1)]);
+        let addrs: Vec<_> = store
+            .search_contacts(acct, "exa", 10)
+            .unwrap()
+            .into_iter()
+            .map(|h| h.addr)
+            .collect();
+        assert_eq!(addrs, ["example@x.com", "me@example.com"]);
+    }
+
+    #[test]
+    fn reseeding_self_never_stomps_the_row() {
+        // `ensure_account` runs on every daemon start. Suppose the row has moved
+        // since (a name the user set, a count real mail bumped): a restart must
+        // leave it exactly where it is, and must not double it.
+        let (store, acct) = store_with(&[]);
+        store
+            .merge_harvested_contacts(acct, &[entry("me@example.com", Some("Braelyn"), 7, 11)])
+            .unwrap();
+        assert_eq!(store.ensure_account("me@example.com").unwrap(), acct);
+        let hits = store.search_contacts(acct, "me@example.com", 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].sent_count, 7);
+        assert_eq!(hits[0].display_name.as_deref(), Some("Braelyn"));
     }
 
     #[test]

@@ -32,7 +32,7 @@ use std::time::Duration;
 use crate::error::ApiError;
 use crate::gmail_write::{
     ForwardParts, GmailWriteClient, ReplyParts, SentRef, WriteError, addrs_excluding,
-    build_forward_rfc822, build_references, build_reply_rfc822, cc_excluding,
+    build_forward_rfc822, build_references, build_reply_rfc822, cc_excluding, count_addrs,
     derive_reply_recipients, forward_subject, parse_forwarded_original, reply_subject,
 };
 use crate::group_send;
@@ -1315,8 +1315,12 @@ struct DraftView {
     id: i64,
     reply_to_message_id: Option<i64>,
     to: String,
-    /// Blind recipients, spelled the way the send endpoint spells them. Always
-    /// present, `""` when there are none, so a client need not branch on absence.
+    /// The other two recipient lists, spelled the way the send endpoint spells
+    /// them. Always present, `""` when there are none, so a client need not
+    /// branch on absence — and an omitted field would be indistinguishable from
+    /// a daemon too old to have one, which is exactly the case where a silently
+    /// dropped Bcc would matter most.
+    cc: String,
     bcc: String,
     subject: String,
     body: String,
@@ -1330,6 +1334,7 @@ impl From<Draft> for DraftView {
             id: d.id,
             reply_to_message_id: d.reply_to_message_id,
             to: d.to_addr,
+            cc: d.cc_addr,
             bcc: d.bcc_addr,
             subject: d.subject,
             body: d.body,
@@ -1416,8 +1421,12 @@ pub struct DraftBody {
     /// so a missing (or null) field stores "" rather than 400ing.
     #[serde(default)]
     to: Option<String>,
-    /// Blind recipients. Absent stores `""` like every other field here — a
-    /// half-composed draft is the normal case.
+    /// The other two recipient lists. Absent stores `""` like every other field
+    /// here — a half-composed draft is the normal case — and unlike the SEND
+    /// route, absence has no second meaning: nothing is ever derived into a
+    /// draft.
+    #[serde(default)]
+    cc: Option<String>,
     #[serde(default)]
     bcc: Option<String>,
     #[serde(default)]
@@ -1442,12 +1451,24 @@ pub async fn put_draft(
     }
     let reply_to = body.reply_to_message_id;
     let to = body.to.unwrap_or_default();
+    let cc = body.cc.unwrap_or_default();
     let bcc = body.bcc.unwrap_or_default();
     let subject = body.subject.unwrap_or_default();
     let text = body.body.unwrap_or_default();
 
     let draft = store_call(&state, move |store, account_id| {
-        store.upsert_draft(account_id, reply_to, &to, &bcc, &subject, &text, Utc::now())
+        store.upsert_draft(
+            account_id,
+            reply_to,
+            squelch_core::store::DraftFields {
+                to_addr: &to,
+                cc_addr: &cc,
+                bcc_addr: &bcc,
+                subject: &subject,
+                body: &text,
+            },
+            Utc::now(),
+        )
     })
     .await?;
     Ok((no_store(), Json(DraftView::from(draft))))
@@ -2404,6 +2425,16 @@ pub struct SendBody {
     /// Explicit recipient (overrides the reply default).
     #[serde(default)]
     to: Option<String>,
+    /// Explicit carbon copies, comma-joined.
+    ///
+    /// PRESENT — INCLUDING AS `""` — means the caller states the whole copy
+    /// list and the parent's derived Cc is not consulted. That distinction is
+    /// the whole point: a composer that shows a Cc field has to be able to
+    /// EMPTY one, and a client that empties a field it was shown must not have
+    /// the daemon quietly put the addresses back. ABSENT keeps the derivation,
+    /// which is what every caller written before this field existed sends.
+    #[serde(default)]
+    cc: Option<String>,
     /// Reply to EVERYONE on the parent: `to` from its Reply-To/From, `cc` from
     /// the rest of its To/Cc minus this account. Requires
     /// `reply_to_message_id` — there is no audience to widen without a parent —
@@ -2412,9 +2443,11 @@ pub struct SendBody {
     #[serde(default)]
     reply_all: bool,
     /// BLIND copies, comma-joined, for a send whose audience must not see each
-    /// other. Never derived from anything (see [`crate::gmail_write::ReplyParts`]),
-    /// and filtered against `to`/`cc` before it composes so nobody is delivered
-    /// two copies of one message.
+    /// other. Never derived from anything (see [`crate::gmail_write::ReplyParts`])
+    /// and nothing ever will derive it — no header of a parent records who was
+    /// blind-copied on it, which is what blind means, so absent and `""` are the
+    /// same thing here, unlike `cc`. Filtered against `to`/`cc` before it
+    /// composes so nobody is delivered two copies of one message.
     ///
     /// A send carrying ONLY `bcc` is legitimate — it is the whole shape of a bcc
     /// blast — and the `To` header then falls back to the account's own address
@@ -2987,15 +3020,26 @@ pub async fn action_send(
             }
         },
     };
-    let cc = cc_excluding(&derived_cc, &to);
+    // A STATED `cc` REPLACES THE DERIVATION, and absent keeps it. That
+    // distinction is what lets a composer showing a Cc field EMPTY one: a
+    // daemon that put the parent's copies back would make the field a lie.
+    // Taken verbatim rather than through `cc_excluding`, which parses to bare
+    // addresses and would silently strip the display names the sender typed.
+    let cc = match body.cc.clone() {
+        Some(stated) => stated,
+        None => cc_excluding(&derived_cc, &to),
+    };
     // BLIND COPIES LAST, filtered against everyone already VISIBLE on the
     // message. Someone in both `to` and `bcc` would otherwise receive two copies
     // of one mail, and the second would look like a blind copy of a message they
     // are openly on.
     let bcc = addrs_excluding(&bcc_requested, &[&to, &cc]);
     // For the audit line, counted before either moves into the MIME parts.
-    let copied = cc.split(',').filter(|s| !s.trim().is_empty()).count();
-    let blind = bcc.split(',').filter(|s| !s.trim().is_empty()).count();
+    // Quote-aware, because a stated `cc` carries display names: the comma in
+    // `"Doe, John" <j@x>` is part of a name, and counting it would put a
+    // recipient in the ledger who does not exist.
+    let copied = count_addrs(&cc);
+    let blind = count_addrs(&bcc);
 
     let subject = body
         .subject
@@ -3046,6 +3090,9 @@ pub async fn action_send(
     // never the addresses. Two shapes do: a reply-all, and a blind copy list —
     // the second matters more, because it is the one whose audience is invisible
     // in the mail itself, so the ledger is the only place it is written down.
+    //
+    // A STATED `cc` gets no line of its own, deliberately: it is legible in the
+    // delivered mail, which is the test for whether the ledger has to carry it.
     let outcome = if blind > 0 {
         format!("ok:bcc:{blind}")
     } else if body.reply_all {
@@ -3292,6 +3339,11 @@ async fn forward_send(
 
     let parts = ForwardParts {
         to,
+        // Stated or nothing: a forward derives NOTHING about its audience from
+        // the original (see the `to` rejection in `action_send`), and that goes
+        // double for a copy list.
+        cc: body.cc.clone().filter(|s| !s.trim().is_empty()),
+        bcc: body.bcc.clone().filter(|s| !s.trim().is_empty()),
         subject,
         note: body.body.clone(),
         note_html: match body.body_format.as_deref() {
@@ -3315,13 +3367,25 @@ async fn forward_send(
     // NO threadId and NO resolve: a forward opens a new conversation rather than
     // filing the user's "look at this" inside the correspondence it came out of,
     // and passing a message on is not handling it. Both are the `None`s below.
+    // Same ledger rule as a reply's: counts, never addresses. A forward has no
+    // derived audience at all, so every one of these is somebody the sender
+    // typed.
+    let mut outcome = "ok:forward".to_string();
+    let copied = count_addrs(parts.cc.as_deref().unwrap_or(""));
+    let blind = count_addrs(parts.bcc.as_deref().unwrap_or(""));
+    if copied > 0 {
+        outcome.push_str(&format!(":cc:{copied}"));
+    }
+    if blind > 0 {
+        outcome.push_str(&format!(":bcc:{blind}"));
+    }
     finish_send(
         state,
         client,
         &raw,
         None,
         None,
-        "ok:forward".to_string(),
+        outcome,
         tracker,
         body.draft_id,
         target,

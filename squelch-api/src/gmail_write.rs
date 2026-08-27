@@ -72,9 +72,9 @@ pub fn archive_request(gmail_msg_id: &str) -> (String, Value) {
 pub struct ReplyParts {
     /// Recipient. For a reply this defaults to the original sender.
     pub to: String,
-    /// Carbon copies, comma-joined. `Some` only for reply-all; the header is
-    /// omitted entirely when this is `None` or empty, so an ordinary reply is
-    /// byte-identical to what it has always been.
+    /// Carbon copies, comma-joined. `None` or empty omits the header entirely,
+    /// so an ordinary reply is byte-identical to what it has always been.
+    /// Either derived (reply-all) or stated outright by the composer.
     pub cc: Option<String>,
     /// BLIND carbon copies, comma-joined, omitted entirely when `None` or empty.
     ///
@@ -561,6 +561,14 @@ pub fn derive_reply_recipients(
         to: to.join(", "),
         cc: cc.join(", "),
     }
+}
+
+/// How many addresses a comma-joined header value actually names. Quote-aware,
+/// because [`parse_addr_list`] is: a comma inside `"Doe, John" <j@x>` is part of
+/// a display name, and counting it would put a recipient in the audit ledger who
+/// does not exist.
+pub fn count_addrs(value: &str) -> usize {
+    parse_addr_list(value).len()
 }
 
 /// `cc` minus every address already in `to`. Used when an explicit `to`
@@ -1059,6 +1067,14 @@ pub fn parse_forwarded_original(raw: &[u8]) -> Option<ForwardedOriginal> {
 #[derive(Debug, Clone)]
 pub struct ForwardParts {
     pub to: String,
+    /// Carbon copies for the forward itself, comma-joined — the people the
+    /// SENDER is passing this on to alongside `to`, never anyone off the
+    /// original. `None` or empty writes no header.
+    pub cc: Option<String>,
+    /// Blind carbon copies for the forward, same rules as [`ReplyParts::bcc`]:
+    /// only ever typed, never derived, stripped by Gmail from the copies the
+    /// visible recipients receive.
+    pub bcc: Option<String>,
     pub subject: String,
     /// The user's typed note. MAY BE EMPTY: an uncommented forward is a normal
     /// thing to send, which is why the send path skips its empty-body rejection
@@ -1673,6 +1689,8 @@ fn alternative_section(boundary: &str, text: &str, html: &str) -> String {
 pub fn build_forward_rfc822(parts: &ForwardParts) -> Result<Vec<u8>, WriteError> {
     for (name, val) in [
         ("To", parts.to.as_str()),
+        ("Cc", parts.cc.as_deref().unwrap_or("")),
+        ("Bcc", parts.bcc.as_deref().unwrap_or("")),
         ("Subject", parts.subject.as_str()),
     ] {
         if val.contains('\r') || val.contains('\n') {
@@ -1719,6 +1737,13 @@ pub fn build_forward_rfc822(parts: &ForwardParts) -> Result<Vec<u8>, WriteError>
 
     let mut out = String::new();
     out.push_str(&format!("To: {}\r\n", parts.to));
+    // Empty is no header, exactly as on a reply — see `build_reply_rfc822`.
+    if let Some(cc) = parts.cc.as_deref().filter(|s| !s.trim().is_empty()) {
+        out.push_str(&format!("Cc: {cc}\r\n"));
+    }
+    if let Some(bcc) = parts.bcc.as_deref().filter(|s| !s.trim().is_empty()) {
+        out.push_str(&format!("Bcc: {bcc}\r\n"));
+    }
     out.push_str(&format!("Subject: {}\r\n", parts.subject));
     if parts.original.attachments.is_empty() {
         out.push_str(&format!(
@@ -2141,6 +2166,97 @@ mod tests {
     }
 
     #[test]
+    fn reply_rfc822_writes_bcc_after_cc_and_omits_a_blank_one() {
+        let mut parts = bare_parts("hi");
+        parts.cc = Some("bob@example.com".into());
+        parts.bcc = Some("carol@example.com, dave@example.com".into());
+        let s = String::from_utf8(build_reply_rfc822(&parts).unwrap()).unwrap();
+        assert!(s.contains("Cc: bob@example.com\r\n"));
+        assert!(s.contains("Bcc: carol@example.com, dave@example.com\r\n"));
+        // Order matters only in that both live in the header block, before the
+        // blank line — assert they do rather than assert a byte offset.
+        let headers_end = s.find("\r\n\r\n").unwrap();
+        assert!(s.find("Bcc:").unwrap() < headers_end);
+
+        // Absent, empty and whitespace-only all write NO line: a bare `Bcc: `
+        // on a message that blind-copied nobody is a header every recipient's
+        // client may show, announcing a secret list that does not exist.
+        for bcc in [None, Some(String::new()), Some("   ".to_string())] {
+            let mut parts = bare_parts("hi");
+            parts.bcc = bcc.clone();
+            let s = String::from_utf8(build_reply_rfc822(&parts).unwrap()).unwrap();
+            assert!(!s.contains("Bcc:"), "{bcc:?} must not write a Bcc header");
+        }
+    }
+
+    #[test]
+    fn reply_rfc822_rejects_a_bcc_carrying_crlf() {
+        // The same second belt the To and Cc headers get. A Bcc is the one list
+        // whose contents nobody downstream can see, so a smuggled extra line in
+        // it is the least visible way to add a recipient.
+        for bcc in [
+            "carol@example.com\r\nBcc: evil@x.com",
+            "carol@example.com\nX-Whatever: evil@x.com",
+        ] {
+            let mut parts = bare_parts("hi");
+            parts.bcc = Some(bcc.into());
+            match build_reply_rfc822(&parts).unwrap_err() {
+                WriteError::Invalid(m) => assert!(m.starts_with("Bcc header"), "{m}"),
+                other => panic!("expected Invalid, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn forward_rfc822_carries_the_senders_own_copy_lists() {
+        let mut parts = fwd_parts("look at this");
+        parts.cc = Some("dana@example.com".into());
+        parts.bcc = Some("erin@example.com".into());
+        let s = String::from_utf8(build_forward_rfc822(&parts).unwrap()).unwrap();
+        assert!(s.contains("To: carol@example.com\r\n"));
+        assert!(s.contains("Cc: dana@example.com\r\n"));
+        assert!(s.contains("Bcc: erin@example.com\r\n"));
+        // NOT the original's audience: the quoted block still states who was on
+        // the message being passed on, and the two must not be confused.
+        assert!(
+            s.contains("bob@example.com"),
+            "the quoted block still names the original's To"
+        );
+        let headers_end = s.find("\r\n\r\n").unwrap();
+        assert!(!s[..headers_end].contains("bob@example.com"));
+    }
+
+    #[test]
+    fn forward_rfc822_rejects_copy_lists_carrying_crlf() {
+        for (field, value) in [
+            ("Cc", "dana@example.com\r\nBcc: evil@x.com"),
+            ("Bcc", "erin@example.com\nSubject: forged"),
+        ] {
+            let mut parts = fwd_parts("note");
+            if field == "Cc" {
+                parts.cc = Some(value.into());
+            } else {
+                parts.bcc = Some(value.into());
+            }
+            match build_forward_rfc822(&parts).unwrap_err() {
+                WriteError::Invalid(m) => assert!(m.starts_with(field), "{m}"),
+                other => panic!("expected Invalid, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn counting_addresses_is_quote_aware() {
+        assert_eq!(count_addrs(""), 0);
+        assert_eq!(count_addrs("   "), 0);
+        assert_eq!(count_addrs("a@x.test"), 1);
+        assert_eq!(count_addrs("a@x.test, b@y.test"), 2);
+        // The comma lives inside the display name; there is ONE person here.
+        assert_eq!(count_addrs("\"Doe, John\" <j@x.test>"), 1);
+        assert_eq!(count_addrs("\"Doe, John\" <j@x.test>, b@y.test"), 2);
+    }
+
+    #[test]
     fn reply_rfc822_has_threading_headers() {
         let parts = ReplyParts {
             to: "alice@example.com".into(),
@@ -2467,6 +2583,8 @@ mod tests {
     fn fwd_parts(note: &str) -> ForwardParts {
         ForwardParts {
             to: "carol@example.com".into(),
+            cc: None,
+            bcc: None,
             subject: "Fwd: Quarterly numbers".into(),
             note: note.into(),
             note_html: None,
