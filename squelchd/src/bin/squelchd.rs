@@ -20,10 +20,11 @@ use squelch_core::credentials::{
     CredentialStore, FileCredentialStore, KeyringCredentialStore, load_token_backend,
     store_token_backend, store_tokens_backend, write_private,
 };
-use squelch_core::embed::{Embedder, FastEmbedder};
+use squelch_core::embed::{Embedder, LazyEmbedder, ReapOutcome};
+use squelch_core::metrics::SyncMetrics;
 use squelch_core::store::sqlite::device_tokens::PAIRING_TTL_SECS;
 use squelch_core::store::{SqliteStore, Store};
-use squelch_core::sync::SyncEngine;
+use squelch_core::sync::{SyncEngine, wait_for_embedder_gate};
 use squelch_core::types::AccountId;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::PathBuf;
@@ -436,9 +437,18 @@ fn make_credential_store(
 
 /// Build the semantic-recall embedder. `None` on failure — search then degrades
 /// to keyword-only.
-fn build_embedder(config: &Config) -> Option<Arc<dyn Embedder>> {
-    match FastEmbedder::new(&config.embed.settings()) {
-        Ok(e) => Some(Arc::new(e) as Arc<dyn Embedder>),
+///
+/// The concrete [`LazyEmbedder`] rather than `Arc<dyn Embedder>`, because the
+/// reaper in [`spawn_embedder_reaper`] needs the unload method and the trait
+/// deliberately does not carry it: unloading is a property of THIS embedder, not
+/// of embedding. Attach sites coerce.
+fn build_embedder(config: &Config, metrics: Option<Arc<SyncMetrics>>) -> Option<Arc<LazyEmbedder>> {
+    let built = LazyEmbedder::new(&config.embed.settings()).map(|e| match metrics {
+        Some(m) => e.with_metrics(m),
+        None => e,
+    });
+    match built {
+        Ok(e) => Some(Arc::new(e)),
         Err(e) => {
             eprintln!(
                 "squelch: embedder unavailable ({e}); semantic recall disabled \
@@ -447,6 +457,121 @@ fn build_embedder(config: &Config) -> Option<Arc<dyn Embedder>> {
             None
         }
     }
+}
+
+/// How often the reaper looks. A minute is far below any sane idle window and
+/// costs one uncontended `try_lock` when there is nothing to do, so there is no
+/// reason to make it a knob.
+///
+/// It is also a FLOOR on `[embed] idle_unload_secs`: nothing is unloaded
+/// between ticks, so the effective window is the configured one rounded up to
+/// the next minute. The startup line below prints both numbers rather than
+/// leaving an operator who set 5 wondering why it took 65.
+const EMBEDDER_REAP_INTERVAL_SECS: u64 = 60;
+
+/// How many consecutive contended ticks before the reaper says so. An embed
+/// holding the lock is normal and happens all day; a whole hour of them is a
+/// session no reaper can ever reach, which is the memory this feature exists to
+/// give back sitting there anyway.
+const EMBEDDER_CONTENDED_TICKS_BEFORE_WARNING: u32 = 60;
+
+/// Drop the embedding session once it has gone `idle_secs` without a call. That
+/// session is 85-90% of a tenant daemon's memory (~250-300 MB against ~25-40 MB
+/// for everything else, SQLite included) and a mailbox is idle nearly all the
+/// time, so a daemon that holds it forever is a pod that is mostly ONNX arenas
+/// waiting for mail. Reloading costs ~200 ms off the cached weights, paid by
+/// whichever search or poll tick lands first.
+///
+/// `idle_secs == 0` means never unload: no task is spawned at all, and the
+/// daemon behaves exactly as it did before this existed.
+fn spawn_embedder_reaper(
+    embedder: Arc<LazyEmbedder>,
+    idle_secs: u64,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+) {
+    if idle_secs == 0 {
+        return;
+    }
+    let max_idle = std::time::Duration::from_secs(idle_secs);
+    let interval = std::time::Duration::from_secs(EMBEDDER_REAP_INTERVAL_SECS);
+    // Once, at startup, with the EFFECTIVE numbers: the configured window and
+    // the tick that rounds it up are two different values and an operator who
+    // reads only the first will misread every unload line that follows.
+    eprintln!(
+        "squelchd: embedder reaper armed: unloads after {idle_secs} s idle, \
+         checked every {EMBEDDER_REAP_INTERVAL_SECS} s (so the session goes at \
+         {idle_secs}-{} s past the last use)",
+        idle_secs + EMBEDDER_REAP_INTERVAL_SECS
+    );
+    tokio::spawn(async move {
+        let mut contended_run: u32 = 0;
+        loop {
+            tokio::select! {
+                _ = tokio::time::sleep(interval) => {}
+                // An Err is the SENDER being dropped, which is the daemon on its
+                // way out. It has to end the task rather than fall through: a
+                // dropped sender makes `changed()` return instantly forever, and
+                // this loop would spin a core until the process died.
+                res = shutdown.changed() => {
+                    if res.is_err() {
+                        return;
+                    }
+                }
+            }
+            if *shutdown.borrow() {
+                return;
+            }
+            // Dropping an ONNX session and trimming glibc's arenas are both
+            // millisecond-scale rather than instant, and this runs on the same
+            // runtime as the doors.
+            let e = embedder.clone();
+            let outcome = match tokio::task::spawn_blocking(move || e.reap_if_idle(max_idle)).await
+            {
+                Ok(outcome) => outcome,
+                Err(e) => {
+                    // A panic inside the reap (a session whose Drop blew up, say)
+                    // must not vanish into a Kept: it would repeat every tick
+                    // with the gauge pinned at 1 and nothing in the log. Say so
+                    // and leave the contention count alone.
+                    eprintln!(
+                        "squelchd: embedder reap task join error ({e}); trying again next tick"
+                    );
+                    continue;
+                }
+            };
+            match outcome {
+                ReapOutcome::Unloaded => {
+                    contended_run = 0;
+                    eprintln!(
+                        "squelchd: embedder unloaded after {idle_secs} s idle; \
+                         reloads on the next embed or search"
+                    );
+                }
+                ReapOutcome::Kept => contended_run = 0,
+                ReapOutcome::Contended => {
+                    contended_run += 1;
+                    // ONCE per run, not per tick: the whole point is a line an
+                    // operator can find, and a line every minute forever is a
+                    // line nobody reads. The task keeps going either way — a
+                    // reaper that gave up would be the leak it was built to
+                    // stop.
+                    // Every N ticks rather than once: permanent contention is
+                    // the case this exists for, and one line at minute 60 has
+                    // rotated out of the log by the time anyone looks.
+                    if contended_run.is_multiple_of(EMBEDDER_CONTENDED_TICKS_BEFORE_WARNING) {
+                        eprintln!(
+                            "squelchd: the embedder lock has been held on every \
+                             reap for {} minutes; the session is not being \
+                             unloaded and its memory is not coming back",
+                            EMBEDDER_CONTENDED_TICKS_BEFORE_WARNING as u64
+                                * EMBEDDER_REAP_INTERVAL_SECS
+                                / 60
+                        );
+                    }
+                }
+            }
+        }
+    });
 }
 
 /// Mirror the loaded `.env` into config.toml so other binaries and non-repo CWDs
@@ -1349,11 +1474,15 @@ fn run_daemon(config: Config) -> Result<(), squelch_core::CoreError> {
 
     // Attach the embedder to both the store (query-side) and the engine
     // (write-side); `None` keeps everything working without vector recall.
-    let embedder = build_embedder(&config);
+    // No metrics registry: this mode serves no scrape endpoint, so the
+    // loaded/unloaded gauge would have no reader.
+    let embedder = build_embedder(&config, None);
     if let Some(e) = &embedder {
-        store = store.with_embedder(e.clone())?;
+        store = store.with_embedder(e.clone() as Arc<dyn Embedder>)?;
     }
     let store = Arc::new(store);
+    // Read off config before the engine takes ownership of it below.
+    let idle_unload_secs = config.embed.idle_unload_secs;
 
     let creds = make_credential_store(
         config.credential_backend,
@@ -1375,7 +1504,8 @@ fn run_daemon(config: Config) -> Result<(), squelch_core::CoreError> {
 
         let mut engine = SyncEngine::new(store, creds, account_id, email, config);
         if let Some(e) = embedder {
-            engine = engine.with_embedder(e);
+            spawn_embedder_reaper(e.clone(), idle_unload_secs, shutdown_rx.clone());
+            engine = engine.with_embedder(e as Arc<dyn Embedder>);
         }
         engine.run(shutdown_rx).await
     })?;
@@ -1542,10 +1672,29 @@ struct Readiness {
     flags: Arc<ReadinessFlags>,
 }
 
-#[derive(Default)]
 struct ReadinessFlags {
     sync_running: AtomicBool,
-    embedder_settled: AtomicBool,
+    /// A watch sender rather than an `AtomicBool` because two things now read
+    /// this bit: `/healthz`, and the sync engine, whose first backfill parks
+    /// until the embedder init has resolved (see
+    /// `SyncEngine::with_embedder_gate`). ONE bit for both, so settling the
+    /// probe always releases the backfill, and there is no second flag to forget
+    /// in a new arm of the init task. The reverse does not hold: the backfill
+    /// also releases ITSELF at `EMBEDDER_GATE_CEILING` (three minutes) with the
+    /// probe still 503, and that is the same 180 s as the warden's default ready
+    /// timeout, so a wedged init fails the signup at about the instant the
+    /// backfill starts without it. The ceiling's log line describes the
+    /// daemon, not the tenant's fate.
+    embedder_settled: tokio::sync::watch::Sender<bool>,
+}
+
+impl Default for ReadinessFlags {
+    fn default() -> Self {
+        Self {
+            sync_running: AtomicBool::new(false),
+            embedder_settled: tokio::sync::watch::channel(false).0,
+        }
+    }
 }
 
 /// Clears the sync flag when the sync task ends, HOWEVER it ends: a returned
@@ -1573,15 +1722,26 @@ impl Readiness {
     }
 
     /// Mark the background embedder init resolved, whichever way it resolved.
+    /// Every gate handed out by [`Readiness::embedder_gate`] opens in the same
+    /// motion, because it is the same bit.
     fn embedder_settled(&self) {
-        self.flags.embedder_settled.store(true, Ordering::Relaxed);
+        // `send_replace`, not `send`: the latter is an error when no receiver is
+        // alive, and a daemon whose sync task has already died still has a probe
+        // to answer.
+        self.flags.embedder_settled.send_replace(true);
+    }
+
+    /// A receiver on the embedder-settled bit, for the sync engine's first
+    /// backfill to wait on. Already true if the init resolved before the caller
+    /// asked, so a late subscriber never waits for something that has happened.
+    fn embedder_gate(&self) -> tokio::sync::watch::Receiver<bool> {
+        self.flags.embedder_settled.subscribe()
     }
 
     /// Both conditions, and nothing derived from either: the caller gets one
     /// bit because one bit is all `/healthz` may say.
     fn is_up(&self) -> bool {
-        self.flags.sync_running.load(Ordering::Relaxed)
-            && self.flags.embedder_settled.load(Ordering::Relaxed)
+        self.flags.sync_running.load(Ordering::Relaxed) && *self.flags.embedder_settled.borrow()
     }
 }
 
@@ -1940,7 +2100,12 @@ fn cmd_serve(
             make_credential_store(backend, account_id, email.clone(), creds_path, client);
 
         // No embedder override: the loop resolves it from the shared store each
-        // tick, so it picks up the background-attached one.
+        // tick, so it picks up the background-attached one. The gate is what
+        // keeps a brand-new tenant's FIRST backfill from racing that attach:
+        // without it the whole 30-day window ingests with no vector while the
+        // model is still downloading, and the vector pass then has to embed all
+        // of it in batches, which is the memory that OOM-killed tenant daemons.
+        // Only the first backfill waits; polling and catch-up never do.
         let sync_handle = {
             let store = store.clone();
             let email = email.clone();
@@ -1951,11 +2116,13 @@ fn cmd_serve(
             // Taken before the spawn and dropped by the task, so readiness
             // tracks the engine and not the intention to start one.
             let sync_running = readiness.sync_started();
+            let embedder_gate = readiness.embedder_gate();
             tokio::spawn(async move {
                 let _sync_running = sync_running;
                 SyncEngine::new(store, creds, account_id, email, config)
                     .with_refresh(refresh)
                     .with_metrics(sync_metrics)
+                    .with_embedder_gate(embedder_gate)
                     .run(shutdown_rx)
                     .await
             })
@@ -1969,12 +2136,22 @@ fn cmd_serve(
         // just retries on the next daemon start — each done flag is only set on
         // completion — and neither can block the sync loop, which runs in its own
         // task.
+        //
+        // The stagger is measured from when that burst can actually START, which
+        // is why this waits on the SAME embedder gate the first backfill does: on
+        // a cold model cache the backfill now begins minutes into the run, and a
+        // sweep that is one metadata GET per Sent message (the heaviest Gmail
+        // consumer here) landing on top of a 30-day raw backfill on one
+        // credential is how a tenant earns a 429 — which bubbles out of
+        // `run_once` and bounces the whole sync lifecycle through backoff.
         {
             let store = store.clone();
             let email = email.clone();
             let config = config.clone();
             let creds = sync_creds.clone();
+            let mut embedder_gate = readiness.embedder_gate();
             tokio::spawn(async move {
+                wait_for_embedder_gate(&mut embedder_gate).await;
                 tokio::time::sleep(std::time::Duration::from_secs(180)).await;
                 let engine = SyncEngine::new(store, creds, account_id, email, config);
                 if let Err(e) = engine.harvest_sent_contacts().await {
@@ -2097,22 +2274,38 @@ fn cmd_serve(
             let store = store.clone();
             let config = config.clone();
             let readiness = readiness.clone();
+            let sync_metrics = sync_metrics.clone();
+            // Read off config here because the blocking closure below takes it.
+            let idle_unload_secs = config.embed.idle_unload_secs;
+            // Its own receiver, taken here rather than inside the task, for the
+            // same reason the metrics server takes one: it must not depend on
+            // where in this block the sync engine took the original.
+            let reaper_shutdown = shutdown_tx.subscribe();
             eprintln!(
                 "squelchd: initializing semantic-recall embedder in the background \
                  (first run downloads the model; the server is already serving, \
                  search is keyword-only until the embedder is ready)"
             );
             tokio::spawn(async move {
-                let built = tokio::task::spawn_blocking(move || build_embedder(&config)).await;
+                let built =
+                    tokio::task::spawn_blocking(move || build_embedder(&config, Some(sync_metrics)))
+                        .await;
                 match built {
-                    Ok(Some(embedder)) => match store.attach_embedder(embedder) {
-                        Ok(_) => eprintln!(
-                            "squelchd: embedder ready — semantic + hybrid search now enabled"
-                        ),
-                        Err(e) => eprintln!(
-                            "squelchd: embedder attach failed ({e}); search stays keyword-only"
-                        ),
-                    },
+                    Ok(Some(embedder)) => {
+                        match store.attach_embedder(embedder.clone() as Arc<dyn Embedder>) {
+                            Ok(_) => eprintln!(
+                                "squelchd: embedder ready — semantic + hybrid search now enabled"
+                            ),
+                            Err(e) => eprintln!(
+                                "squelchd: embedder attach failed ({e}); search stays keyword-only"
+                            ),
+                        }
+                        // Spawned even when the attach failed, and especially
+                        // then: an embedder nobody can reach still loaded a
+                        // session at construction, and this is what puts that
+                        // 250 MB down instead of holding it until restart.
+                        spawn_embedder_reaper(embedder, idle_unload_secs, reaper_shutdown);
+                    }
                     Ok(None) => { /* build_embedder already logged the reason */ }
                     Err(e) => eprintln!(
                         "squelchd: embedder init task join error ({e}); search stays keyword-only"
@@ -2121,6 +2314,9 @@ fn cmd_serve(
                 // Every arm above, including the ones that gave up: this is the
                 // last step of startup, and readiness waits on it having
                 // HAPPENED rather than on it having worked. See [`Readiness`].
+                // The sync engine's first backfill waits on this same call for
+                // the same reason: an init that failed is one to stop waiting
+                // for, not one to wait out.
                 readiness.embedder_settled();
             });
         }
@@ -3180,7 +3376,18 @@ mod tests {
         let sync_running = readiness.sync_started();
         assert_eq!(probe(app.clone()).await.0, StatusCode::SERVICE_UNAVAILABLE);
 
+        // The sync engine's gate is this same bit, which is the point of it
+        // being one bit: a gate taken before the settle opens with it, and one
+        // taken after is already open.
+        let gate_before = readiness.embedder_gate();
+        assert!(!*gate_before.borrow(), "shut until the init resolves");
         readiness.embedder_settled();
+        assert!(*gate_before.borrow(), "settling the probe opens the gate");
+        assert!(
+            *readiness.embedder_gate().borrow(),
+            "and a late one is open"
+        );
+
         let (status, body) = probe(app.clone()).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body, "ok");

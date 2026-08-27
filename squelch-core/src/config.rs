@@ -745,38 +745,127 @@ pub fn default_embed_cache_dir() -> PathBuf {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct EmbedConfig {
-    /// fastembed model name/alias. Default: BGE-small-en-v1.5 (384-dim, small,
-    /// English). Accepts the fastembed `model_code` or a friendly alias.
+    /// fastembed model, written as a full `model_code`. Default:
+    /// `"Xenova/bge-small-en-v1.5"` (BGE-small-en-v1.5, fp32, 384-dim, English).
+    /// The full code is the point: fastembed also ships
+    /// `Qdrant/bge-small-en-v1.5-onnx-Q`, the int8 build of the same family, and
+    /// the bare family name this used to default to picked between the two at
+    /// random per boot. Short aliases still parse and still mean the fp32 code;
+    /// anything that could name more than one model is refused at startup.
     pub model: String,
     /// Embedding dimensionality; must match `model` and the vec0 table width.
     pub dims: usize,
     /// Where ONNX weights cache on disk. Default: [`default_embed_cache_dir`].
     pub cache_dir: PathBuf,
-    /// Characters of `subject + body` fed to the embedder per message.
+    /// Characters of `subject + body` fed to the embedder per message. Default
+    /// 1000. A pair with `max_tokens` AT INGEST: keep this near tokens x 4 so we
+    /// neither pad past what the model reads nor truncate twice at different
+    /// places. The pairing covers ingest only. A query is embedded raw
+    /// (`semantic_search` / `hybrid_search` hand `embedder.embed` the query text
+    /// as typed), so nothing cuts a long query but `max_tokens`.
     pub max_chars: usize,
-    /// Backfill batch size: how many missing-vector messages to embed per pass.
+    /// Tokens the model reads per text (fastembed `max_length`). Default 256,
+    /// not the model's 512 ceiling: attention scratch is quadratic in sequence
+    /// length and a batch pads to its longest member, so on the fp32 model, at
+    /// a `backfill_batch` of 8, a pass of 512-token texts adds +324 MB against
+    /// +123 MB at 256 (at batch 1, +44 MB against +13 MB); at a larger batch
+    /// the same ratio applies to a far larger base. The subject and first ~1000
+    /// characters are where recall lives; long newsletters lose their tails.
+    /// The chars-to-tokens ratio above is an English one, and the pinned model's
+    /// vocabulary is English-only, so this is not the knob where CJK recall is
+    /// decided. CLAMPED by [`EmbedConfig::settings`]; 0 is not "unlimited".
+    pub max_tokens: usize,
+    /// Backfill batch size: how many missing-vector messages to embed per
+    /// `embed_batch` call. SMALL ON PURPOSE. The memory a batch takes is not
+    /// given back when the batch ends, so this number does not set a transient
+    /// peak, it sets a permanent RSS floor for the daemon. Measured at the
+    /// model's 512-token ceiling, the cap before `max_tokens` existed: a batch
+    /// of 64 costs +1.7 GB (int8) to +2.7 GB (fp32) of RSS that is never
+    /// released, against a hosted pod limit of 1 Gi; a batch of 8 costs +324 MB;
+    /// a batch of 1 costs +21-44 MB. At the shipped `max_tokens` of 256 the same
+    /// batch of 8 costs about +123 MB and a batch of 1 about +13 MB; the ratio
+    /// between batch sizes is the point and it does not move. 64 is what got two
+    /// tenant daemons OOM-killed on 2026-08-19.
+    ///
+    /// Throughput is not what this trades against, because the pass is only
+    /// ever draining what ingest could not embed at the time and ingest embeds
+    /// one message at a time. On a first run the daemon holds the backfill
+    /// until the embedder has settled (see `SyncEngine::with_embedder_gate`),
+    /// so the queue this drains is leftovers rather than the whole mailbox.
     pub backfill_batch: usize,
+    /// Seconds of no embedding or semantic search before the daemon DROPS the
+    /// ONNX session and hands the heap back. `0` disables it and keeps the
+    /// session loaded for the life of the process, which is what every release
+    /// before this one did.
+    ///
+    /// The session is 85-90% of a tenant daemon's memory: measured on a hosted
+    /// pod, loading it costs ~195 MB and a batch pass another ~324 MB, and
+    /// dropping it plus one `malloc_trim` takes the process from ~520 MB back to
+    /// ~40 MB. A mailbox is idle nearly all the time, so the default keeps that
+    /// memory for ten minutes past the last use and then gives it up. The bill
+    /// is ~200 ms on the next embed or search, spent reloading from the weights
+    /// already on disk.
+    ///
+    /// A FLOOR APPLIES. The daemon's reaper only looks every 60 seconds, so the
+    /// effective window is this value rounded up to the next tick: setting 5
+    /// gets an unload somewhere between 5 and 65 seconds after the last use,
+    /// not at 5. Anything at or above the ten-minute default is unaffected by
+    /// the rounding.
+    pub idle_unload_secs: u64,
 }
 
 impl Default for EmbedConfig {
     fn default() -> Self {
         Self {
-            model: "bge-small-en-v1.5".to_string(),
+            model: crate::embed::DEFAULT_MODEL_CODE.to_string(),
             dims: 384,
             cache_dir: default_embed_cache_dir(),
             max_chars: crate::embed::DEFAULT_EMBED_MAX_CHARS,
-            backfill_batch: 64,
+            max_tokens: crate::embed::DEFAULT_EMBED_MAX_TOKENS,
+            backfill_batch: 8,
+            idle_unload_secs: 600,
         }
     }
 }
 
 impl EmbedConfig {
     /// Build the resolved [`crate::embed::EmbedSettings`] the embedder needs.
+    ///
+    /// `max_tokens` is CLAMPED here, to
+    /// [`EMBED_MAX_TOKENS_FLOOR`](crate::embed::EMBED_MAX_TOKENS_FLOOR) ..=
+    /// [`EMBED_MAX_TOKENS_CEILING`](crate::embed::EMBED_MAX_TOKENS_CEILING).
+    /// A small value is not a smaller budget and 0 is NOT "unlimited" the way it
+    /// reads elsewhere: fastembed passes `max_length` to tokenizers, which
+    /// truncates at `max_length - n_added_tokens`, and `n_added_tokens` is 2 for
+    /// this model's `[CLS]` and `[SEP]`. At 0 or 1 that subtraction wraps a
+    /// `usize` (release builds carry no overflow checks), truncation stops
+    /// happening at all, and the setting UNCAPS the memory it exists to cap. At
+    /// 2 every text truncates to zero content tokens and every vector comes out
+    /// identical.
+    /// The ceiling is the model's own position budget; asking for more only pays
+    /// for padding.
+    ///
+    /// A clamp that fires says so on stderr, once, beside the line naming the
+    /// model: an operator who wrote a number and got a different one has to be
+    /// able to find that out from the log rather than from a memory graph.
     pub fn settings(&self) -> crate::embed::EmbedSettings {
+        let max_tokens = self.max_tokens.clamp(
+            crate::embed::EMBED_MAX_TOKENS_FLOOR,
+            crate::embed::EMBED_MAX_TOKENS_CEILING,
+        );
+        if max_tokens != self.max_tokens {
+            eprintln!(
+                "squelch: embed max_tokens {} is out of range, using {max_tokens} (allowed {}-{})",
+                self.max_tokens,
+                crate::embed::EMBED_MAX_TOKENS_FLOOR,
+                crate::embed::EMBED_MAX_TOKENS_CEILING,
+            );
+        }
         crate::embed::EmbedSettings {
             model_name: self.model.clone(),
             dims: self.dims,
             cache_dir: self.cache_dir.clone(),
+            max_tokens,
         }
     }
 }
@@ -1164,16 +1253,21 @@ fn env_nonempty(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|s| !s.is_empty())
 }
 
-/// Overwrite `slot` from env var `name` when it is set, non-empty, and parses as
-/// `T`. EMPTY IS "UNSET": an exported-but-blank var must never clear a
-/// configured value. The value is used verbatim — no trimming — so a var whose
-/// whitespace matters keeps it.
+/// Overwrite `slot` from env var `name` when it is set, non-blank, and parses as
+/// `T`. TRIMMED, and BLANK IS "UNSET": an exported-but-empty var must never
+/// clear a configured value, and neither must one carrying nothing but spaces.
+/// The whitespace half is not pedantry — `SQUELCH_EMBED_MODEL="   "` used to set
+/// a pin that `resolve_model` then trims back to empty, which takes semantic
+/// recall off for that run. Same rule the warden's `var()` follows, so a value
+/// means the same thing whichever door it comes through.
 fn env_override<T: std::str::FromStr>(name: &str, slot: &mut T) {
-    if let Ok(v) = std::env::var(name)
-        && !v.is_empty()
-        && let Ok(parsed) = v.parse::<T>()
-    {
-        *slot = parsed;
+    if let Ok(v) = std::env::var(name) {
+        let v = v.trim();
+        if !v.is_empty()
+            && let Ok(parsed) = v.parse::<T>()
+        {
+            *slot = parsed;
+        }
     }
 }
 
@@ -1484,11 +1578,22 @@ impl Config {
         }
         env_override("SQUELCH_BACKFILL_DAYS", &mut self.sync.backfill_days);
         env_override("SQUELCH_POLL_SECS", &mut self.sync.poll_secs);
+        // A per-pod memory knob, so it has to be reachable without editing a
+        // config file inside a container image. 0 pins the session in memory.
+        env_override(
+            "SQUELCH_EMBED_IDLE_UNLOAD_SECS",
+            &mut self.embed.idle_unload_secs,
+        );
         env_override("SQUELCH_SQUELCH_LEVEL", &mut self.squelch_level);
         env_override(
             "SQUELCH_NOTIFY_MIN_IMPORTANCE",
             &mut self.notify.min_importance,
         );
+        // Which embedding weights this daemon loads. An env var so a fleet-wide
+        // pin can be moved without cutting a new image, and validated where
+        // every other spelling is, by `FastEmbedder::new`: an unresolvable value
+        // there disables semantic recall rather than taking the daemon down.
+        env_override("SQUELCH_EMBED_MODEL", &mut self.embed.model);
         // ---- APNs pusher (blind relay) -------------------------------------
         // The relay token is never echoed anywhere.
         for (name, slot) in [
@@ -1925,6 +2030,66 @@ mod tests {
     }
 
     #[test]
+    fn embed_defaults_are_sane() {
+        // Only the two lengths this test owns. The model pin and the backfill
+        // batch size have their own tests where they are decided.
+        let c = EmbedConfig::default();
+        assert_eq!(c.dims, 384);
+        assert_eq!(c.max_chars, 1000);
+        assert_eq!(c.max_tokens, 256);
+    }
+
+    /// `settings()` carries the token budget through to the embedder, and the
+    /// two truncation lengths are independently configurable.
+    #[test]
+    fn embed_settings_carry_max_tokens() {
+        assert_eq!(EmbedConfig::default().settings().max_tokens, 256);
+
+        let cfg: Config = toml::from_str("[embed]\nmax_tokens = 128\nmax_chars = 700\n").unwrap();
+        assert_eq!(cfg.embed.max_tokens, 128);
+        assert_eq!(cfg.embed.max_chars, 700);
+        let s = cfg.embed.settings();
+        assert_eq!(s.max_tokens, 128);
+        assert_eq!(s.model_name, cfg.embed.model);
+        assert_eq!(s.dims, 384);
+
+        // A config written before the field existed still parses to the default.
+        let cfg: Config = toml::from_str("[embed]\nmax_chars = 2000\n").unwrap();
+        assert_eq!(cfg.embed.max_chars, 2000);
+        assert_eq!(cfg.embed.max_tokens, 256);
+    }
+
+    /// A hand-written `max_tokens` never reaches the tokenizer unclamped. The
+    /// small end is the point: 0 and 1 wrap `max_length - 2` and turn truncation
+    /// OFF, and 2 leaves no content tokens at all, so neither can be honoured as
+    /// written. See [`EmbedConfig::settings`].
+    #[test]
+    fn embed_settings_clamp_max_tokens() {
+        let resolved = |max_tokens: usize| {
+            EmbedConfig {
+                max_tokens,
+                ..EmbedConfig::default()
+            }
+            .settings()
+            .max_tokens
+        };
+
+        for n in [0, 1, 2] {
+            assert_eq!(
+                resolved(n),
+                crate::embed::EMBED_MAX_TOKENS_FLOOR,
+                "{n} tokens must clamp up, not disable truncation"
+            );
+        }
+        assert_eq!(resolved(4096), crate::embed::EMBED_MAX_TOKENS_CEILING);
+
+        // In range, passed through untouched, ends included.
+        assert_eq!(resolved(crate::embed::EMBED_MAX_TOKENS_FLOOR), 8);
+        assert_eq!(resolved(256), 256);
+        assert_eq!(resolved(crate::embed::EMBED_MAX_TOKENS_CEILING), 512);
+    }
+
+    #[test]
     fn mirror_env_pairs_creates_config_with_mapped_keys_only() {
         let dir = std::env::temp_dir().join(format!("squelch-mirror-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -2297,6 +2462,92 @@ backfill_days = 90
         unsafe {
             std::env::remove_var("SQUELCH_CLIENT_ID");
             std::env::remove_var("SQUELCH_BACKFILL_DAYS");
+        }
+    }
+
+    /// The pin itself. The default model is the full fp32 `model_code`, not the
+    /// family name that used to pick between two builds per boot, and
+    /// `settings()` is what hands it to the embedder, so it has to carry it.
+    #[test]
+    fn embed_default_is_the_pinned_code_and_settings_carries_it() {
+        let c = EmbedConfig::default();
+        assert_eq!(c.model, crate::embed::DEFAULT_MODEL_CODE);
+        assert_eq!(c.model, "Xenova/bge-small-en-v1.5");
+        assert_eq!(c.settings().model_name, crate::embed::DEFAULT_MODEL_CODE);
+        assert_eq!(c.settings().dims, c.dims);
+    }
+
+    /// The fleet-wide escape hatch: moving the pin without cutting an image.
+    #[test]
+    fn env_overrides_the_embed_model() {
+        let _g = ENV_LOCK.lock().unwrap();
+        // SAFETY: guarded by ENV_LOCK so no other test reads env concurrently.
+        unsafe {
+            std::env::set_var("SQUELCH_EMBED_MODEL", "BGESmallENV15Q");
+        }
+        let mut c = Config::default();
+        c.apply_env_overrides();
+        assert_eq!(c.embed.model, "BGESmallENV15Q");
+        assert_eq!(c.embed.settings().model_name, "BGESmallENV15Q");
+
+        // Exported but blank is "unset", the rule every env_override follows: it
+        // must not clear the pin and leave the embedder resolving an empty name.
+        // WHITESPACE COUNTS AS BLANK, and it is the spelling that actually turns
+        // up: a quoted value in a unit file or a `-e VAR=" "` is easy to write
+        // and impossible to see, and `resolve_model` trims it back to empty and
+        // refuses, which takes semantic recall off for the run.
+        for blank in ["", "   ", "\n\t "] {
+            unsafe {
+                std::env::set_var("SQUELCH_EMBED_MODEL", blank);
+            }
+            let mut c = Config::default();
+            c.apply_env_overrides();
+            assert_eq!(c.embed.model, crate::embed::DEFAULT_MODEL_CODE, "{blank:?}");
+        }
+
+        // A value with slack around it still means the value.
+        unsafe {
+            std::env::set_var("SQUELCH_EMBED_MODEL", "  BGESmallENV15Q\n");
+        }
+        let mut c = Config::default();
+        c.apply_env_overrides();
+        assert_eq!(c.embed.model, "BGESmallENV15Q");
+        unsafe {
+            std::env::remove_var("SQUELCH_EMBED_MODEL");
+        }
+    }
+
+    /// The daemon half of the warden's `SQUELCH_WARDEN_EMBED_IDLE_UNLOAD_SECS`:
+    /// this is the variable the pod actually has to parse.
+    #[test]
+    fn env_overrides_the_embed_idle_unload() {
+        let _g = ENV_LOCK.lock().unwrap();
+        // SAFETY: guarded by ENV_LOCK so no other test reads env concurrently.
+        unsafe {
+            std::env::set_var("SQUELCH_EMBED_IDLE_UNLOAD_SECS", "0");
+        }
+        let mut c = Config::default();
+        c.apply_env_overrides();
+        assert_eq!(
+            c.embed.idle_unload_secs, 0,
+            "0 is the off switch, not unset"
+        );
+
+        unsafe {
+            std::env::set_var("SQUELCH_EMBED_IDLE_UNLOAD_SECS", "90");
+        }
+        let mut c = Config::default();
+        c.apply_env_overrides();
+        assert_eq!(c.embed.idle_unload_secs, 90);
+
+        unsafe {
+            std::env::set_var("SQUELCH_EMBED_IDLE_UNLOAD_SECS", "");
+        }
+        let mut c = Config::default();
+        c.apply_env_overrides();
+        assert_eq!(c.embed.idle_unload_secs, 600, "blank is unset, not zero");
+        unsafe {
+            std::env::remove_var("SQUELCH_EMBED_IDLE_UNLOAD_SECS");
         }
     }
 

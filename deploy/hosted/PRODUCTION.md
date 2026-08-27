@@ -19,11 +19,39 @@ Values are never in here. Names, namespaces and key names only.
 | Firewall | inbound 22, 80, 443 only |
 | Backups | ON — 7 daily snapshots, **root disk only** (see "Backups" below) |
 | SSH | `ssh carrier` (host alias in `~/.ssh/config`) |
+| Node memory | 3814 MiB total, and **all of it is offered to pods today**: nothing is reserved, so `kubepods.slice` `memory.max` is the whole 3.72 GiB, while the host's own processes (k3s, its containerd, journald, litestream, sshd) hold ~1.2 GB that is outside every pod's budget. `SETUP.md` §2b reserves 1200Mi and evicts at 200Mi, which leaves ~2414Mi allocatable and room for five tenants. **Not applied here yet** |
+| Swap | none. §2b's 2 GB zram device is written (`deploy/hosted/node/`) and **not installed here yet**. With it, `LimitedSwap` rations about 206 MB per tenant at a 384Mi request |
 
 Shared vCPU on purpose: tenant daemons are idle between syncs, and dedicated
 (CCX) costs roughly triple for headroom this workload spends most of its life not
 using. Scale vertically by resizing **CPU and RAM only** — a Hetzner resize that
 grows the disk is a one-way door and blocks every later downsize.
+
+### If a tenant is OOM-killed, read the constraint first
+
+`kubectl` will tell you a container restarted. Only the kernel says which of the
+two kinds of out-of-memory that was, and they have different answers.
+
+```sh
+ssh carrier "journalctl -k --since '-24h'" | grep -i 'out of memory'
+```
+
+`constraint=CONSTRAINT_MEMCG` with an `oom_memcg=` naming one tenant's cgroup is
+that container over its own limit: the culprit is the victim, and the answer is
+its limit or its code. `constraint=CONSTRAINT_NONE` with `global_oom` is the box
+running out with nobody over their limit, and the kernel then picks by badness
+across everything on it, which means largest RSS, which means a tenant daemon
+unrelated to whatever actually grew. That is the shape of the 2026-08-19 kills;
+`SETUP.md` §2b is the arithmetic and the fix, and none of §2b is applied here
+yet.
+
+There is a third case that can only appear after §2b(a) is applied:
+`oom_memcg=/kubepods.slice`, the pods collectively over the node's allocatable.
+It picks its victim the same way, by largest RSS in the subtree, so it is no
+kinder to the tenant that dies; what it changes is that the host processes are
+no longer eligible and nothing outside the cluster is at risk. It also arrives
+with no eviction event and no node condition, so
+`/sys/fs/cgroup/kubepods.slice/memory.events` is where you count them.
 
 ## The volume
 
@@ -56,6 +84,43 @@ in this cluster's datastore. Verify with `k3s secrets-encrypt status`.
 Namespaces: `warden` (the provisioner), `tenants` (everything per-tenant, Pod
 Security Admission at `restricted`), `cert-manager`. Manifests applied from
 `deploy/hosted/` in the numbered order.
+
+## How many tenants fit
+
+**Five, and memory is what decides it.** Not CPU, not the `pods: "25"` line in
+`70-tenant-limits.yaml`, and there is no swap under any of it.
+
+A tenant daemon that has embedded anything keeps its ONNX session resident. The
+four tenant pods here read 91, 317, 376 and 509 MiB on 2026-08-26, and 123, 293,
+349 and 545 MB on another pass the same day: roughly 300-500 MB at rest, moving
+while you watch. The warden requests **384Mi** per tenant
+(`15-warden-config.yaml`), which is about the p50 of that rather than a
+comfortable number, and `70-tenant-limits.yaml` holds the namespace to
+`requests.memory: 1920Mi`, which is five of them. The subtraction is written out
+in that file and in `SETUP.md` §7: 3814 MiB of machine, less about 1200 for k3s,
+containerd, journald and litestream, less about 372 for the pods that are not
+tenants, leaving about 2.2 GiB.
+
+**The quota is the only refusal on this box.** Nothing is reserved outside the
+pod budget today: k3s takes nothing for itself by default, so the scheduler
+still sees all 3814 MiB as allocatable and would admit a sixth tenant and a
+seventh onto a machine that cannot run them. A kubelet `systemReserved` is what
+would make the scheduler a second gate; it is written up as `SETUP.md` §2b (PR
+#151) and **not applied here**.
+
+What that combination costs when the numbers are wrong is 2026-08-19: the
+request was 256Mi and the quota was 5Gi on a 4 GB box, four tenants ran it out
+of memory globally, and the kernel OOM-killed two squelchd processes. It takes a
+running mailbox, because a tenant pod is burstable, while the signup that
+overcommitted the box succeeded days earlier and is nobody's suspect. With both
+numbers telling the truth the sixth signup is refused instead, as the documented
+`500 not_ready`, reason in `kubectl -n tenants describe replicaset`.
+
+A sixth tenant is a RAM resize (CPU and RAM only, see "The box") or the
+daemon-side embedder unload landing and being measured for a week, whichever
+comes sooner. Raise it off `container_memory_working_set_bytes`, not off wanting
+a sixth tenant. Existing tenants take a changed bound the way they take any
+pod-shape change: see "Shipping a tenant-shape change".
 
 ## Railway
 
@@ -952,15 +1017,29 @@ and none of them come back until the knob goes off again.
 
 *And `/healthz` waits out the first-run model download.* It answers 503 until the
 daemon's background embedder init has settled, which on a cold weights cache
-means ~130 MB from Hugging Face — longer than
+means ~126 MB from Hugging Face — longer than
 `SQUELCH_WARDEN_READY_TIMEOUT_SECS` (default 180). Each tenant caches those
 weights on its own volume, so this bites the FIRST boot of any tenant: a new
 signup gets `500 not_ready` for a mailbox that is perfectly healthy, and the next
 roll reads that same tenant as a casualty and stops the whole fleet.
 `SQUELCH_WARDEN_MODEL_PVC` is what removes the download (every tenant's init
-container copies from a pre-seeded PVC instead), and it is commented out in
-`15-warden-config.yaml` today. The warden logs a warning at startup if this knob
-is on and that one is unset.
+container copies from a pre-seeded PVC instead). It ships commented out in
+`15-warden-config.yaml` and SETUP.md step 10 is what turns it on, in that order:
+the volume, then the seed, then the knob. Set ahead of the volume it is worse
+than unset, because a name that resolves to no claim leaves every new tenant pod
+Pending. And the value is only as good as the volume behind it, so confirm both
+ends rather than the variable alone. The warden logs a warning at startup if this
+knob is on and that one is unset.
+
+```sh
+kubectl -n tenants get pvc squelch-models
+kubectl -n warden exec deploy/squelch-warden -- printenv SQUELCH_WARDEN_MODEL_PVC
+
+# What is ON the volume, while the seed pod still exists. Once it is deleted the
+# check is a tenant's own cache instead: SETUP.md step 10, "Verify on the next
+# tenant".
+kubectl -n tenants exec squelch-models-seed -- ls /seed
+```
 
 So, in order, with a roll between each:
 
@@ -969,9 +1048,11 @@ So, in order, with a roll between each:
 2. Let the roller converge, and CHECK it did — a clean `roll --dry-run`, or
    `kubectl -n tenants get deploy -o jsonpath` over the images. Every tenant, not
    most of them: the ones left behind are exactly the ones the next step breaks.
-3. Seed and set `SQUELCH_WARDEN_MODEL_PVC` (or raise
+3. Create and seed the volume, THEN uncomment `SQUELCH_WARDEN_MODEL_PVC` and
+   restart the warden, and confirm it came up with the variable set (SETUP.md
+   step 10 is that whole sequence and the order is not negotiable). Or raise
    `SQUELCH_WARDEN_READY_TIMEOUT_SECS` past a cold model download and accept a
-   slow first provision). Skipping this does not break the tenants you have; it
+   slow first provision. Skipping this does not break the tenants you have; it
    breaks the next one that signs up.
 4. Set `SQUELCH_WARDEN_HTTP_READINESS: "on"` in `15-warden-config.yaml`, apply,
    restart the warden, and let the roller converge again. Each tenant's pod
@@ -988,6 +1069,130 @@ every daemon image, costs half a minute per tenant on a roll, and has to stay
 below `SQUELCH_WARDEN_READY_TIMEOUT_SECS` — the warden refuses to boot otherwise,
 because a soak the rollout wait cannot outlast would time out on every healthy
 tenant.
+
+### Reclaiming the second copy of the model (one-off, run deliberately)
+
+**Nothing applies this. It is a `rm -rf` inside a tenant's mail volume, typed by
+a person who has first established which build that tenant is loading.** It buys
+63 MB per tenant, which is worth having on a 4-tenant box and is not worth being
+casual about. Establishing that is the part with a dependency; see the gate
+below before deleting anything.
+
+Until the model was pinned, the daemon resolved its embedding model by substring
+match over fastembed's supported list, and which of the two `bge-small-en-v1.5`
+builds won was not stable across versions. Every tenant volume provisioned in
+that window therefore holds BOTH:
+
+```
+/data/.local/share/squelch/models/
+├── models--Xenova--bge-small-en-v1.5          126 MB   <- the pinned one
+└── models--Qdrant--bge-small-en-v1.5-onnx-Q    63 MB   <- dead weight
+```
+
+Only one of them is ever loaded. Deleting the other is safe, once the daemon on
+that tenant is actually loading the pinned one.
+
+**This step has a dependency, and today it is not met.** The gate you want is
+the daemon naming the model it actually loaded, which is the `squelch: embedding
+model <code> (<dim>-dim) loaded` line that arrives with the model pin. Until that
+build is what the fleet runs, there is no such line: the only thing a daemon
+prints about the model today is the first-run download notice, which echoes the
+CONFIG string rather than the resolved code and is suppressed entirely once the
+cache is warm. So `grep 'embedding model'` returns nothing on every tenant, and
+restarting to read a fresh init returns the same nothing. Do not read that
+silence as a verdict.
+
+With that line shipped, this is the check and nothing else is needed:
+
+```sh
+kubectl -n tenants logs deploy/<label> -c squelchd | grep -i 'embedding model'
+# squelch: embedding model Xenova/bge-small-en-v1.5 (384-dim) loaded
+```
+
+Until then the gate is two facts, both about configuration rather than about
+what got loaded, and BOTH have to hold before anything is deleted:
+
+```sh
+# 1. This tenant is on a daemon that carries the pin. Two parts, and the second
+#    is the one that gets skipped: the warden's configured tag has to BE a build
+#    with the pin in it, and the Deployment that is serving has to be on that
+#    tag rather than behind it.
+kubectl -n tenants get deploy/<label> \
+  -o jsonpath='{.spec.template.spec.containers[0].image}{"\n"}'
+kubectl -n warden get cm squelch-warden-config \
+  -o jsonpath='{.data.SQUELCH_WARDEN_IMAGE}{"\n"}'
+
+# 2. Nothing in this tenant's own configuration names the quantized build. The
+#    warden renders no embed model into the pod, so the daemon runs on the
+#    default unless a config.toml on the volume says otherwise, and `$HOME` is
+#    /data. `exec` runs no shell, so a glob or a missing file needs one.
+kubectl -n tenants exec deploy/<label> -c squelchd -- \
+  sh -c 'cat /data/.config/squelch/config.toml 2>/dev/null | grep -i model || echo "no config.toml"'
+
+# And what the two directories cost, so the 63 MB is a number you have seen.
+kubectl -n tenants exec deploy/<label> -c squelchd -- \
+  sh -c 'du -sh /data/.local/share/squelch/models/*'
+```
+
+If the tenant is behind on the image, STOP and roll it forward first
+(`squelch-control reconcile <label>`): on a pre-pin daemon the build being
+loaded is a coin flip per process, so the Qdrant directory may be the one in
+use, and deleting it costs that tenant a 126 MB download on its next restart. If
+a `config.toml` names the Qdrant code, that tenant is deliberately on it and this
+section does not apply to it at all.
+
+Then, one tenant at a time:
+
+```sh
+kubectl -n tenants exec deploy/<label> -c squelchd -- \
+  rm -rf /data/.local/share/squelch/models/models--Qdrant--bge-small-en-v1.5-onnx-Q
+
+kubectl -n tenants exec deploy/<label> -c squelchd -- \
+  ls /data/.local/share/squelch/models
+# models--Xenova--bge-small-en-v1.5
+```
+
+No restart is needed for THIS deletion: what goes is the build nothing loads, and
+the pinned directory beside it is untouched. The next restart re-reads that copy,
+and the init container will not re-seed the deleted one, because the PVC does not
+carry it either.
+
+Do not generalise it into "a running daemon never touches this directory again".
+That is true of the daemon on the box today, which reads its weights at init and
+holds the session for the life of the process, and it stops being true with the
+idle-unload work in flight: that one drops the session after a quiet window and
+RELOADS it from this same directory on the next search or poll tick. The pinned
+model's directory is live for as long as the pod is, so the only thing ever safe
+to delete under a running daemon is a build it is not using.
+
+Do the four existing tenants and then forget this section. Tenants provisioned
+after the pin only ever fetch one model.
+
+**The same `rm -rf` is the repair for a CORRUPT model directory**, which is the
+one case the init container cannot fix itself. It seeds by copying to
+`<model>.seed-tmp` and renaming, so a copy it started and did not finish leaves
+no destination and is retried on the next boot. A directory half-populated under
+the model's real name, by a download the daemon itself did not finish, is
+indistinguishable from a good one: the seeder sees it exists and skips it,
+forever. The symptom is a tenant that never reaches `embedder ready`, or reaches
+it and then errors on the first embed with a missing file under `snapshots/`.
+
+```sh
+kubectl -n tenants exec deploy/<label> -c squelchd -- \
+  sh -c 'ls -lLR /data/.local/share/squelch/models/models--Xenova--bge-small-en-v1.5/snapshots'
+
+# Broken links, or no blobs/ at all: delete the directory and restart. The init
+# container re-seeds it from the PVC, or the daemon re-downloads it.
+kubectl -n tenants exec deploy/<label> -c squelchd -- \
+  rm -rf /data/.local/share/squelch/models/models--Xenova--bge-small-en-v1.5
+kubectl -n tenants rollout restart deploy/<label>
+```
+
+**Delete and restart, as one action.** This is the pinned model, so it is the
+directory a running daemon loads from, and the restart is what puts it back:
+between the two commands the pod has no weights, and with idle unload shipped a
+reload landing in that window fails until the new pod's init container has
+re-seeded. Do not delete this one and walk away.
 
 ## Cluster secrets
 

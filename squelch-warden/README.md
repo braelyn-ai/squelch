@@ -304,13 +304,15 @@ holds even for a tenant reconciled by hand.
 | `SQUELCH_WARDEN_STORAGE_SIZE` | `10Gi` | Per-tenant volume. |
 | `SQUELCH_WARDEN_CPU_REQUEST` | `100m` | Tenant daemon container. |
 | `SQUELCH_WARDEN_CPU_LIMIT` | `1000m` | Tenant daemon container. |
-| `SQUELCH_WARDEN_MEMORY_REQUEST` | `256Mi` | Tenant daemon container. |
+| `SQUELCH_WARDEN_MEMORY_REQUEST` | `384Mi` | Tenant daemon container. What a daemon that has embedded anything actually rests at; the constant in `config.rs` carries the measurements and why a low one gets a neighbour OOM-killed. |
 | `SQUELCH_WARDEN_MEMORY_LIMIT` | `1Gi` | Tenant daemon container. Past it, OOM-killed and restarted. |
 | `SQUELCH_WARDEN_EPHEMERAL_REQUEST` | `256Mi` | `/tmp` plus logs. The mailbox is a PV and does not count. |
 | `SQUELCH_WARDEN_EPHEMERAL_LIMIT` | `1Gi` | What stops a tenant filling the node's root filesystem. |
 | `SQUELCH_WARDEN_TMP_SIZE` | `512Mi` | `sizeLimit` on the pod's `/tmp` emptyDir. |
 | `SQUELCH_WARDEN_USER_NAMESPACES` | `on` | `hostUsers: false`. Turn off only if the cluster cannot do it. |
 | `SQUELCH_WARDEN_MODEL_PVC` | unset | Shared pre-seeded embedding weights; see SETUP.md step 10. |
+| `SQUELCH_WARDEN_EMBED_MODEL` | unset | Fleet-wide embedding model, passed on as `SQUELCH_EMBED_MODEL`. Unset means the daemon's own pin. Reseed `SQUELCH_WARDEN_MODEL_PVC` with the new weights BEFORE moving it: a model the volume does not hold is a cold download on every tenant, which is the readiness failure the warden warns about at boot. |
+| `SQUELCH_WARDEN_EMBED_IDLE_UNLOAD_SECS` | unset | Passed on as `SQUELCH_EMBED_IDLE_UNLOAD_SECS`: seconds before a tenant daemon drops its idle embedding session. Unset keeps the daemon's default; `0` never unloads. |
 | `SQUELCH_WARDEN_IMAGE_PULL_SECRET` | unset | For a private squelchd image. |
 | `SQUELCH_WARDEN_NODE_CIDR` | unset | Lets the node reach 8848 and 9464, when the CNI drops kubelet probes. |
 | `SQUELCH_WARDEN_HTTP_READINESS` | `off` | Probe `/healthz` on 9464 instead of accepting on 8848. Turn on only once the whole fleet runs a daemon that serves it. |
