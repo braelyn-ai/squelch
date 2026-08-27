@@ -5,21 +5,10 @@
 import Foundation
 import SwiftUI
 
-/// The Settings sub-nav sections; the last-active one is restored on reopen.
-enum SettingsSection: String, CaseIterable, Sendable {
-    case general, mail, triage, assistant, privacy, account
-
-    var label: String {
-        switch self {
-        case .general: "General"
-        case .mail: "Mail"
-        case .triage: "Triage"
-        case .assistant: "Assistant"
-        case .privacy: "Privacy"
-        case .account: "Account"
-        }
-    }
-}
+// `SettingsSection` — the sub-nav's own enum, which the stored section below is
+// typed as — lives in Lib/SettingsSearch.swift, beside the card index that
+// files every setting under one. The taxonomy is one thing; this file only
+// remembers which of it you were last looking at.
 
 /// How much developer telemetry (PostHog) leaves the app. Opt-out: `full` is
 /// the default. `minimal` keeps sessions, screen views, and the anonymous

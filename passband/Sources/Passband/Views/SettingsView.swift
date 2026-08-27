@@ -18,8 +18,19 @@ struct SettingsView: View {
     @Environment(AppStore.self) private var store
     @Environment(Prefs.self) private var prefs
 
+    /// What is typed in the sub-nav's search field. NOT persisted, unlike the
+    /// section beneath it: a section is where you were, a query is what you
+    /// were doing, and coming back to Settings tomorrow into somebody else's
+    /// half-finished search would be a puzzle rather than a convenience.
+    @State private var query = ""
+    @FocusState private var searchFocused: Bool
+
+    /// Searching REPLACES the pane rather than filtering inside it, which is
+    /// why this reads as a mode: while it is true no category is selected and
+    /// the right side belongs to the results.
+    private var searching: Bool { !query.trimmed.isEmpty }
+
     var body: some View {
-        @Bindable var prefs = prefs
         VStack(spacing: 0) {
             // RoutedHeader lives in App/RootView.swift, which is the Mac's window
             // shell and is excluded from the iOS target. The phone titles this
@@ -31,29 +42,10 @@ struct SettingsView: View {
                 nav
                 ScrollView {
                     VStack(alignment: .leading, spacing: 16) {
-                        switch prefs.settingsSection {
-                        case .general:
-                            ConnectionSection()
-                            AppearanceSection()
-                            NotificationsSection()
-                            TourSection()
-                            WhatsNewSection()
-                            DeveloperSection()
-                            YouSection()
-                        case .mail:
-                            MailSection()
-                            SignatureSection()
-                            ReadTrackingSection()
-                        case .triage:
-                            TriagePipelineSection()
-                            TriageBudgetSection()
-                            RankingSection()
-                        case .assistant:
-                            AssistantSection()
-                        case .privacy:
-                            PrivacySection()
-                        case .account:
-                            AccountSection()
+                        if searching {
+                            results
+                        } else {
+                            pane(prefs.settingsSection)
                         }
                     }
                     .padding(.horizontal, 22)
@@ -71,8 +63,85 @@ struct SettingsView: View {
         // surface this full of text fields can still be left.
         .keyContext(.modal)
         .keyBindings(.modal, [
-            KeyBinding("Escape", "back to sitrep") { store.setView(.sitrep) }
+            // Escape unwinds one step at a time: a search is a state you can be
+            // in, so it is what Escape leaves first. Pressing it twice from a
+            // search still lands on the sitrep.
+            KeyBinding("Escape", searching ? "clear the search" : "back to sitrep") {
+                if searching {
+                    query = ""
+                    searchFocused = false
+                } else {
+                    store.setView(.sitrep)
+                }
+            },
+            // "/" is mail search everywhere else (RootView's global set). In
+            // here the nearer meaning wins: the active context is tried before
+            // global, so this shadows it for exactly as long as Settings is up.
+            // ⌘F is untouched and still opens mail search from the menu.
+            KeyBinding("/", "search settings") { searchFocused = true },
         ])
+    }
+
+    /// One category's cards, in the order that category presents them. The
+    /// switch is the ONLY place that ordering lives; search results reuse the
+    /// same card views through `SettingsCardView`.
+    @ViewBuilder private func pane(_ section: SettingsSection) -> some View {
+        switch section {
+        case .general:
+            ConnectionSection()
+            AppearanceSection()
+            NotificationsSection()
+            TourSection()
+            WhatsNewSection()
+            DeveloperSection()
+            YouSection()
+        case .mail:
+            MailSection()
+            SignatureSection()
+            ReadTrackingSection()
+        case .triage:
+            TriagePipelineSection()
+            TriageBudgetSection()
+            RankingSection()
+        case .assistant:
+            AssistantSection()
+        case .privacy:
+            PrivacySection()
+        case .account:
+            AccountSection()
+        }
+    }
+
+    /// THE MATCHES, DRAWN AS A CATEGORY WOULD BE: the same cards, live and
+    /// working, in ranked order rather than pane order. A result you have to
+    /// click through to reach is a search that has only told you where to look,
+    /// and the thing you came to change is one flip away either way.
+    ///
+    /// The words that did the matching (keywords, blurbs) are never shown. They
+    /// are how the list was ORDERED, not what it says; printing them would ask
+    /// the reader to audit the ranking instead of using it.
+    @ViewBuilder private var results: some View {
+        let cards = SettingsSearch.matches(query)
+        if cards.isEmpty {
+            SectionCard(label: "No matches") {
+                SettingsHint(
+                    "Nothing here answers to \"\(query.trimmed)\". Try what the control does rather than what it is called: dark, pictures, cost, invite."
+                )
+            }
+        } else {
+            ForEach(cards, id: \.self) { card in
+                VStack(alignment: .leading, spacing: 5) {
+                    // Where it lives, so a result also teaches the shape of the
+                    // panes: find the theme switch twice by search and you know
+                    // it is under General next time.
+                    Text(card.section.label)
+                        .font(Typo.micro)
+                        .foregroundStyle(Palette.inkFaintest)
+                        .padding(.leading, 2)
+                    SettingsCardView(card: card)
+                }
+            }
+        }
     }
 
     /// Which build this is, in the corner of every settings tab.
@@ -97,15 +166,23 @@ struct SettingsView: View {
     private var nav: some View {
         @Bindable var prefs = prefs
         return VStack(alignment: .leading, spacing: 2) {
+            search
+                .padding(.bottom, 10)
             ForEach(SettingsSection.allCases, id: \.self) { section in
+                // Nothing is selected while a search is up, because nothing IS:
+                // the pane on the right is the query's, not this section's, and
+                // a lit row beside it would be claiming otherwise.
+                let active = !searching && prefs.settingsSection == section
                 Button {
+                    // Picking a category is how you leave a search, so it
+                    // clears the field rather than selecting underneath it.
+                    query = ""
+                    searchFocused = false
                     prefs.settingsSection = section
                 } label: {
                     Text(section.label)
                         .font(.system(size: 12, weight: .medium))
-                        .foregroundStyle(
-                            prefs.settingsSection == section ? Palette.accent : Palette.inkFaint
-                        )
+                        .foregroundStyle(active ? Palette.accent : Palette.inkFaint)
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .padding(.horizontal, 11)
                         .padding(.vertical, 6)
@@ -114,7 +191,7 @@ struct SettingsView: View {
                 .buttonStyle(.plain)
                 .background(
                     RoundedRectangle(cornerRadius: 8, style: .continuous)
-                        .fill(prefs.settingsSection == section ? Palette.accentSoft : .clear)
+                        .fill(active ? Palette.accentSoft : .clear)
                 )
             }
             Spacer()
@@ -122,6 +199,107 @@ struct SettingsView: View {
         .frame(width: 158)
         .padding(.horizontal, 12)
         .padding(.vertical, 18)
+    }
+
+    /// The field above the categories. It sits HERE, in the column that lists
+    /// where things are, because it answers the same question that column does
+    /// and answers it better: the panes are a filing system somebody else
+    /// chose, and this one takes the word you already had.
+    private var search: some View {
+        HStack(spacing: 6) {
+            Image(systemName: "magnifyingglass")
+                .font(.system(size: 11, weight: .medium))
+                .foregroundStyle(Palette.inkFaintest)
+            TextField("search settings", text: $query)
+                .textFieldStyle(.plain)
+                .font(.system(size: 12))
+                .foregroundStyle(Palette.ink)
+                .autocorrectionDisabled()
+                .focused($searchFocused)
+                #if os(iOS)
+                    .textInputAutocapitalization(.never)
+                #endif
+                // Enter is a no-op on purpose: the results are already there,
+                // and there is nothing to submit to.
+                .onSubmit { searchFocused = false }
+            if searching {
+                Button {
+                    query = ""
+                    searchFocused = true
+                } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .font(.system(size: 11))
+                        .foregroundStyle(Palette.inkFaintest)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .help("Clear")
+            }
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 6)
+        .background(
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .fill(Palette.canvas.opacity(0.65))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .strokeBorder(
+                    searchFocused ? Palette.accent.opacity(0.55) : Palette.hairlineStrong,
+                    lineWidth: 0.75)
+        )
+    }
+}
+
+/// ONE CARD, BY NAME. The search pane's only way to draw a setting, and the
+/// reason a result can be the real control rather than a link to it: every card
+/// on every pane is reachable from an id, so a ranked list of ids renders as a
+/// ranked list of working settings.
+///
+/// Deliberately NOT a second copy of anything — each case hands back the same
+/// struct the category pane composes, so a card can never behave one way when
+/// you navigated to it and another when you searched for it.
+struct SettingsCardView: View {
+    let card: SettingsCard
+
+    var body: some View {
+        switch card {
+        case .connection: ConnectionSection()
+        case .appearance: AppearanceSection()
+        case .notifications: NotificationsSection()
+        case .tour:
+            // Mac-only, for the reason AccountPage.swift gives: the tour and the
+            // what's-new card are hosted by the desktop's ActionLayer, and the
+            // phone has nothing that could show one. `SettingsCard.isAvailable`
+            // keeps them out of the results there; this is the compile-time
+            // half of the same fact.
+            #if os(macOS)
+                TourSection()
+            #else
+                EmptyView()
+            #endif
+        case .whatsNew:
+            #if os(macOS)
+                WhatsNewSection()
+            #else
+                EmptyView()
+            #endif
+        case .developer: DeveloperSection()
+        case .you: YouSection()
+        case .mail: MailSection()
+        case .signature: SignatureSection()
+        case .readTracking: ReadTrackingSection()
+        case .triagePipeline: TriagePipelineSection()
+        case .triageBudget: TriageBudgetSection()
+        case .ranking: RankingSection()
+        case .assistant: AssistantSection()
+        case .privacy: PrivacySection()
+        // The one card that is really three (accounts, the live account,
+        // invites): AccountSection owns its own stack, so a hit on "invite"
+        // brings the whole account pane rather than a card that does not exist
+        // on its own.
+        case .account: AccountSection()
+        }
     }
 }
 

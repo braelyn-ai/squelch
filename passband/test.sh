@@ -174,3 +174,12 @@ run_suite sender-identity \
 run_suite key-dispatch \
   Sources/Passband/Keys/KeyDispatch.swift \
   Tests/KeyDispatchTests.swift
+
+# The settings search. A ranking is the one kind of code where a green build
+# says nothing at all: the matcher compiles whatever weights it is given, and
+# only a fixture says whether "dark mode" lands on the theme switch. One file,
+# Foundation only — the index is kept free of SwiftUI so this suite can hold the
+# whole taxonomy up with no app behind it.
+run_suite settings-search \
+  Sources/Passband/Lib/SettingsSearch.swift \
+  Tests/SettingsSearchTests.swift
