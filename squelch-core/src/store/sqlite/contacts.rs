@@ -1,6 +1,7 @@
-//! Recipient autocomplete over the Sent-derived contacts table, plus the
-//! Sent-history harvest's merge. Search is HUMAN-DOOR ONLY (`/client/contacts`);
-//! the agent door never learns the table exists.
+//! Recipient autocomplete over the contacts table — Sent-derived, plus the one
+//! row for the account itself that `ensure_account` seeds — and the Sent-history
+//! harvest's merge. Search is HUMAN-DOOR ONLY (`/client/contacts`); the agent
+//! door never learns the table exists.
 
 use super::*;
 
@@ -210,6 +211,59 @@ mod tests {
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].sent_count, 7);
         assert_eq!(hits[0].display_name.as_deref(), Some("Braelyn"));
+    }
+
+    #[test]
+    fn each_account_is_only_ever_itself() {
+        // The self-first key reads the account's own email THROUGH THE ID it was
+        // handed. A second mailbox in the same store must not inherit the
+        // first's idea of who "me" is.
+        let (store, mine) = store_with(&[]);
+        let theirs = store.ensure_account("you@example.com").unwrap();
+        store
+            .merge_harvested_contacts(theirs, &[entry("you.pal@x.com", None, 99, 1)])
+            .unwrap();
+
+        assert!(!store.is_known_contact(theirs, "me@example.com").unwrap());
+        assert!(store.search_contacts(theirs, "me@ex", 10).unwrap().is_empty());
+        assert_eq!(store.search_contacts(mine, "me@ex", 10).unwrap().len(), 1);
+        // Both prefix-match "you"; only the per-account self key can put the
+        // account's own address above a contact with 99 sends.
+        assert_eq!(
+            store.search_contacts(theirs, "you", 10).unwrap()[0].addr,
+            "you@example.com"
+        );
+    }
+
+    #[test]
+    fn a_shouty_account_address_is_still_you() {
+        // `accounts.email` is spelled however the config spelled it, and a From
+        // header is spelled however the sender liked. Neither side is normalized.
+        let store = SqliteStore::open_in_memory().unwrap();
+        let acct = store.ensure_account("Me@Example.COM").unwrap();
+        assert!(store.is_known_contact(acct, "me@example.com").unwrap());
+        assert!(store.is_known_contact(acct, "ME@EXAMPLE.COM").unwrap());
+        assert_eq!(
+            store.search_contacts(acct, "Me@Ex", 10).unwrap()[0].addr,
+            "me@example.com"
+        );
+    }
+
+    #[test]
+    fn an_account_that_predates_the_seed_gets_it_on_the_next_start() {
+        // The backfill claim, made good: `ensure_account` runs on every daemon
+        // start, so a store written before this row existed is one restart away
+        // from having it. Nothing else in the codebase would ever add it.
+        let (store, acct) = store_with(&[]);
+        store
+            .lock()
+            .unwrap()
+            .execute("DELETE FROM contacts WHERE account_id = ?1", params![acct])
+            .unwrap();
+        assert!(!store.is_known_contact(acct, "me@example.com").unwrap());
+
+        assert_eq!(store.ensure_account("me@example.com").unwrap(), acct);
+        assert!(store.is_known_contact(acct, "me@example.com").unwrap());
     }
 
     #[test]

@@ -907,8 +907,9 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
                         continue;
                     };
                     let addr = addr.trim().to_ascii_lowercase();
-                    // Same gate as ingest seeding: never the account itself,
-                    // never robot/unsubscribe traffic.
+                    // Same gate as ingest seeding: the harvest never counts the
+                    // account toward its own row (`ensure_account` seeds that
+                    // one), and never robot/unsubscribe traffic.
                     if addr.is_empty() || addr == self_addr || is_robot_address(&addr) {
                         continue;
                     }

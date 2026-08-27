@@ -994,8 +994,10 @@ pub fn ingest(
 
     // Finalize the contact recipients (Sent mail only): drop the account's OWN
     // address and the From address (on Sent mail From == the account), case-fold
-    // and dedup. This is the explicit guard that the user's own address can
-    // never become a contact.
+    // and dedup. This is the explicit guard that MAIL never makes the user their
+    // own contact: CC'ing yourself on a note to Alice is evidence about Alice.
+    // The account does hold one contact row for itself, seeded once by
+    // `ensure_account` and never counted up from here.
     let self_addr = fetched.account_addr.trim().to_ascii_lowercase();
     let from_lc = from_addr.trim().to_ascii_lowercase();
     let mut seen: Vec<String> = Vec::new();

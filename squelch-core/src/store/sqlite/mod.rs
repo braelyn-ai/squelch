@@ -262,10 +262,11 @@ impl SqliteStore {
     /// floor, the standing band's correspondence arm does not match, and the
     /// composer cannot autocomplete the user's own address.
     ///
-    /// ONE ROW, seeded here, because all four of those tests are the same
-    /// `contacts` lookup — the two LLM queues and the standing band ask it in
-    /// SQL, `is_known_contact` and `search_contacts` ask it in Rust. A self case
-    /// written into each of them instead is four chances to drift apart.
+    /// ONE ROW, seeded here, because every one of those tests is the same
+    /// `contacts` lookup: all three triage queues (Stage-1, Stage-2, revisit)
+    /// and the standing band ask it in SQL, `is_known_contact` and
+    /// `search_contacts` ask it in Rust. A self case written into each of those
+    /// six instead is six chances to drift apart.
     ///
     /// This runs on every daemon start, which is also what backfills an account
     /// created before the row existed. DO NOTHING on conflict rather than an

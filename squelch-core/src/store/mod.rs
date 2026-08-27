@@ -1249,13 +1249,16 @@ pub trait Store: Send + Sync {
     /// queryable as normal mail (docs/SECURITY.md §4).
     fn ingest_message(&self, triaged: &TriagedMessage) -> Result<i64>;
 
-    /// True if `addr` appears in this account's Sent-derived contacts (the
-    /// "people I know" signal the sync engine feeds to Stage-1).
+    /// True if `addr` appears in this account's contacts — the "people I know"
+    /// signal the sync engine feeds to Stage-1. That is the Sent-derived table
+    /// PLUS the account's own address, which no amount of mail would ever put
+    /// there and which `SqliteStore::ensure_account` seeds instead.
     fn is_known_contact(&self, account_id: AccountId, addr: &str) -> Result<bool>;
 
-    /// HUMAN-DOOR ONLY (`/client/contacts`): rank Sent-derived contacts for a
-    /// typed fragment — recipient autocomplete. MUST NOT be reachable from MCP;
-    /// the agent door never learns who the user writes to.
+    /// HUMAN-DOOR ONLY (`/client/contacts`): rank this account's contacts for a
+    /// typed fragment — recipient autocomplete, the user's own address included.
+    /// MUST NOT be reachable from MCP; the agent door never learns who the user
+    /// writes to.
     fn search_contacts(
         &self,
         account_id: AccountId,
