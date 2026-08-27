@@ -1,7 +1,7 @@
 //! Fixtures shared by the store test modules.
 
 use super::super::*;
-use crate::embed::{Embedder, message_embed_text};
+use crate::embed::{DEFAULT_EMBED_MAX_CHARS, Embedder, message_embed_text};
 use crate::triage::{CalendarInfo, CalendarKind, DeadlineHit, ReceiptInfo};
 use crate::types::{FieldReasons, SealedKind, Sensitivity, Tier};
 use chrono::TimeZone;
@@ -212,6 +212,16 @@ impl TriagedBuilder {
         TriagedMessage {
             message: self.msg(),
             recipients: vec![],
+            // DERIVED from `to_addrs` rather than set separately, so a test that
+            // says who a sent message went to gets the normalized index for free
+            // and cannot describe a message whose two recipient views disagree —
+            // which is exactly the state the ingest path makes impossible.
+            recipient_addrs: self
+                .msg
+                .to_addrs
+                .as_deref()
+                .map(crate::sync::ingest::parse_stored_recipients)
+                .unwrap_or_default(),
             sensitivity: self.sensitivity,
             sealed_kind: self.sealed_kind,
             importance: self.importance,
@@ -535,7 +545,7 @@ pub(super) fn embed_and_store(
     subject: &str,
     body: &str,
 ) {
-    let text = message_embed_text(subject, body, 2000);
+    let text = message_embed_text(subject, body, DEFAULT_EMBED_MAX_CHARS);
     let v = embedder.embed(&text).unwrap();
     store.upsert_message_vector(acct, message_id, &v).unwrap();
 }

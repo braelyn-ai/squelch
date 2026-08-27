@@ -514,6 +514,22 @@ impl SqliteStore {
             &triaged.message.received_at.to_rfc3339(),
         )?;
 
+        // 1b'. THE NORMALIZED RECIPIENT INDEX, from the FAITHFUL address set
+        //      rather than the contact-filtered one beside it, and in the same
+        //      transaction for the same reason: `message_recipients` is what
+        //      send-group history joins against, so it must never describe a
+        //      message the transaction rolled back. Received mail carries an
+        //      empty set, which writes nothing and clears nothing (the row has
+        //      none to clear).
+        if triaged.message.is_sent {
+            SqliteStore::sync_message_recipients_conn(
+                &tx,
+                triaged.message.account_id,
+                id,
+                &triaged.recipient_addrs,
+            )?;
+        }
+
         // 1c. UNSUBSCRIBE VIOLATION LEDGER: inbound mail from a sender the user
         //     unsubscribed from, past the 72h grace, bumps that sender's
         //     violation_count — in the SAME transaction as the message insert, so
@@ -1004,6 +1020,17 @@ impl SqliteStore {
              WHERE account_id = ?1 AND id = ?2 AND is_sent = 1",
             params![account_id, message_id, to_addrs],
         )?;
+        // Keep the normalized index in step with the column it is derived from.
+        // Only when the UPDATE matched: a row this backfill declined to touch
+        // (not sent, not ours) must not gain recipients either.
+        //
+        // Parsed back OUT of the display string because that is all this path
+        // ever has — the sweep hands over a rendered header, not the mailboxes.
+        // The ingest path, which does have them, never comes through here.
+        if n > 0 {
+            let addrs = crate::sync::ingest::parse_stored_recipients(to_addrs);
+            Self::sync_message_recipients_conn(&conn, account_id, message_id, &addrs)?;
+        }
         Ok(n > 0)
     }
 }

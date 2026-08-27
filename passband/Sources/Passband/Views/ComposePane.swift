@@ -35,6 +35,12 @@ struct ComposePane: View {
 
     private enum FocusTarget: Hashable { case recipient(RecipientSlot), subject }
 
+    @State private var groupPickerOpen = false
+    /// The picked group's size, for the fan-out pill's "· 12 ·". Held here rather
+    /// than on ComposeState because it is a display detail the daemon re-reads
+    /// from `groupId` anyway.
+    @State private var groupMemberCount = 0
+
     private var compose: ComposeState? { store.compose }
     private var inReview: Bool { compose?.phase == .review }
     private var guarded: Bool { !(compose?.guardKinds.isEmpty ?? true) }
@@ -245,11 +251,7 @@ struct ComposePane: View {
 
     private func editPane(_ compose: ComposeState) -> some View {
         VStack(alignment: .leading, spacing: 12) {
-            // `to`, with cc and bcc folded behind their labels — and unfolded
-            // on their own whenever they hold anybody. See `RecipientFields`.
-            RecipientFields(
-                recipients: recipientsBinding, focus: $focusedField,
-                field: FocusTarget.recipient)
+            recipientRow(compose)
             Field(label: "subject") {
                 // Left blank on a reply the daemon titles from the parent; the
                 // placeholder says so, because an empty field otherwise reads as
@@ -296,6 +298,140 @@ struct ComposePane: View {
         }
     }
 
+    /// The `to` line and the two affordances that live beside it: browse groups,
+    /// and open the bcc row.
+    ///
+    /// A REPLY GETS NEITHER. A group is an audience and a reply already has one;
+    /// the daemon refuses the combination outright, so offering the button here
+    /// would be offering a refusal.
+    @ViewBuilder
+    private func recipientRow(_ compose: ComposeState) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            // `to`, with cc and bcc folded behind their own labels on its line
+            // — and unfolded on their own whenever they hold anybody. The group
+            // affordances belong to `to` alone: a group is an audience, and an
+            // audience is who the mail is TO. See `RecipientFields`.
+            RecipientFields(
+                recipients: recipientsBinding, focus: $focusedField,
+                field: FocusTarget.recipient,
+                suggestGroups: canAddressGroup,
+                onGroupPicked: { pick($0) },
+                resolvedGroup: compose.groupName.map {
+                    (name: $0, count: groupMemberCount)
+                })
+            if canAddressGroup {
+                HStack(spacing: 8) {
+                    Button {
+                        groupPickerOpen = true
+                    } label: {
+                        HStack(spacing: 4) {
+                            Image(systemName: "person.2").font(.system(size: 9, weight: .semibold))
+                            Text("groups").font(Typo.micro)
+                        }
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .foregroundStyle(Palette.inkFaint)
+                    .popover(isPresented: $groupPickerOpen, arrowEdge: .bottom) {
+                        GroupPicker { group in
+                            groupPickerOpen = false
+                            pick(group)
+                        }
+                    }
+                    // The bcc toggle used to live here. It is on the `to`
+                    // field's own label row now, beside cc, where both fields
+                    // are unfolded from — and a bcc group still opens the row
+                    // on its own by filling it.
+                    Spacer()
+                }
+            }
+        }
+    }
+
+    /// Groups address a NEW message. A reply and a forward each already have an
+    /// audience, and the daemon refuses a `group_id` on either.
+    private var canAddressGroup: Bool {
+        compose?.replyToMessageId == nil && compose?.forwardOfMessageId == nil
+    }
+
+    /// What picking a group does, and the whole of the mode's meaning in this
+    /// composer:
+    ///
+    /// * `to` / `bcc` — EXPAND into that field now, as ordinary address pills.
+    ///   What goes on the wire is real recipients, so what the sender reviews is
+    ///   exactly who it reaches. The group id rides along as attribution only.
+    /// * `individual` — ONE pill, because there is no single message to address.
+    ///   The daemon reads the membership itself; `to` carries only the token that
+    ///   keeps the pill alive across a draft round-trip.
+    private func pick(_ group: SendGroup) {
+        Task {
+            // The list read carries counts, not membership, so to/bcc need the
+            // full group before they can expand it.
+            let full = (try? await APIClient.shared.group(group.id)) ?? group
+            let members = (full.members ?? []).map(\.addr)
+            patch { state in
+                state.groupId = full.id
+                state.groupMode = full.mode
+                state.groupName = full.name
+                switch full.mode {
+                case .to:
+                    state.to = merge(state.to, members)
+                case .bcc:
+                    // No reveal flag to set: `RecipientFields` unfolds any row
+                    // that holds somebody, which is the same rule that keeps a
+                    // restored draft's bcc from hiding itself.
+                    state.bcc = merge(state.bcc, members)
+                case .individual:
+                    // The token REPLACES whatever was in the field. A fan-out
+                    // addresses one audience and nobody else: leaving a typed
+                    // address beside it would be a second, silent recipient of a
+                    // mail whose whole point is that it is one-to-one.
+                    state.to = GroupToken.encode(full)
+                }
+            }
+            groupMemberCount = full.member_count
+            DraftSaver.shared.noteChange(.compose)
+        }
+    }
+
+    /// Add addresses to a comma-joined field without duplicating what is there.
+    private func merge(_ existing: String, _ addrs: [String]) -> String {
+        var out = existing.split(separator: ",").map { String($0).trimmed }
+            .filter { !$0.isEmpty }
+        let seen = Set(out.map { $0.lowercased() })
+        for addr in addrs where !seen.contains(addr.lowercased()) {
+            out.append(addr)
+        }
+        return out.joined(separator: ", ")
+    }
+
+    /// The `to` row in review. A fan-out's field holds only a token, which is a
+    /// client encoding and not something to show a person; the group's own name
+    /// is what they picked and what they should be asked to confirm.
+    private func reviewTo(_ compose: ComposeState) -> String {
+        if compose.groupMode == .individual, let name = compose.groupName {
+            return name
+        }
+        return compose.to.isEmpty ? "(none)" : compose.to
+    }
+
+    /// How this send is about to happen, when a group decided it. nil for an
+    /// ordinary message, whose fields already say everything.
+    private func reviewShape(_ compose: ComposeState) -> String? {
+        guard let mode = compose.groupMode, let name = compose.groupName else { return nil }
+        switch mode {
+        case .to:
+            return "\(name) · everyone can see the whole list"
+        case .bcc:
+            return "\(name) · nobody sees who else got it"
+        case .individual:
+            let n = groupMemberCount
+            return n > 0
+                ? "\(n) separate emails, one per person in \(name)"
+                : "one separate email per person in \(name)"
+        }
+    }
+
     private var isReply: Bool { compose?.replyToMessageId != nil }
 
     /// Stands in for an empty subject on a reply, in both panes: the daemon titles
@@ -336,15 +472,23 @@ struct ComposePane: View {
 
     private func reviewPane(_ compose: ComposeState) -> some View {
         VStack(alignment: .leading, spacing: 10) {
-            ComposeSummaryRow("to", compose.to.isEmpty ? "(none)" : compose.to)
+            ComposeSummaryRow("to", reviewTo(compose))
             // Only when there is one, and BOTH when there are — review's whole
-            // job is stating what goes out, and a blind copy is the part of
-            // that the sent mail will not show anybody, including the sender.
+            // job is stating what goes out, and a blind copy is the part of that
+            // the sent mail will not show anybody, including the sender.
             if !compose.cc.trimmed.isEmpty {
                 ComposeSummaryRow("cc", compose.cc)
             }
             if !compose.bcc.trimmed.isEmpty {
                 ComposeSummaryRow("bcc", compose.bcc)
+            }
+            // THE SHAPE OF THE SEND, said out loud, and only when a group made it
+            // something other than one message to the people listed above. This
+            // is the one irreversible action in the app and the mode is the part
+            // of it that the fields cannot show: twelve separate emails and one
+            // bcc'd email look identical up there and are nothing alike.
+            if let shape = reviewShape(compose) {
+                ComposeSummaryRow("sending", shape)
             }
             ComposeSummaryRow("subject", reviewSubject(compose))
             // Review states what is about to go out, and an invisible pixel in

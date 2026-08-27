@@ -35,10 +35,17 @@ Config comes from `~/.config/squelch/config.toml` (override with `--config`) plu
 | `SQUELCH_POLL_SECS` | Gmail poll interval | `45` |
 | `SQUELCH_MCP_ALLOWED_HOSTS` | extra Host values when fronted by a proxy | — |
 | `SQUELCH_METRICS_BIND` | second listener serving `GET /metrics` and `GET /healthz` | unset (no port opened) |
+| `SQUELCH_EMBED_MODEL` | semantic-recall weights, same value as `[embed] model` | `Xenova/bge-small-en-v1.5` |
 | `SQUELCH_CRED_BACKEND` | `keyring` or `file` | `keyring` on macOS, `file` on Linux |
 | `SQUELCH_CREDENTIALS_PATH` | where the `file` backend writes, mode 0600 | `~/.config/squelch/credentials.json` |
 
 The listener defaults to loopback and never silently widens. To expose it beyond the machine, front it with a reverse proxy (e.g. `tailscale serve --bg 8848`) and set `SQUELCH_MCP_ALLOWED_HOSTS`.
+
+### The embedding model
+
+`[embed] model` (or `SQUELCH_EMBED_MODEL`) is a fastembed `model_code`, and it must name exactly one build. Fastembed ships several families twice under one code, once in fp32 and once quantized, so a name that could mean either is now refused at startup instead of being resolved by whichever entry happened to come first. A refused name disables semantic recall for that run and logs one line; keyword search and triage are unaffected.
+
+The default is the full code `Xenova/bge-small-en-v1.5`, and the short spellings `bge-small-en-v1.5`, `bgesmallenv15` and `bge_small_en_v15` are aliases for exactly that, so a config that already says one of them needs no edit. What does need an edit is a name that fits more than one build: a bare family name like `bge-base-en-v1.5` or `all-MiniLM-L12-v2`, and the codes fastembed shares outright, which are `Xenova/all-MiniLM-L12-v2`, `nomic-ai/nomic-embed-text-v1.5`, `mixedbread-ai/mxbai-embed-large-v1`, `Alibaba-NLP/gte-base-en-v1.5`, `Alibaba-NLP/gte-large-en-v1.5`, `onnx-community/embeddinggemma-300m-ONNX` and the five `snowflake-arctic-embed-*` codes. Those come in two shapes and the error tells them apart, because the fix differs. When the builds sit under DIFFERENT codes, as `bge-base-en-v1.5` does, either full code names one of them and the error lists both: `Xenova/bge-base-en-v1.5 (BGEBaseENV15)`, `Qdrant/bge-base-en-v1.5-onnx-Q (BGEBaseENV15Q)`. When they sit under ONE code no code can pick between them, and `all-MiniLM-L12-v2` is that shape despite looking like the first: both its builds are `Xenova/all-MiniLM-L12-v2`, so the error names that code, says a full model_code cannot pick between them, and lists the two fastembed variant names, `AllMiniLML12V2` and `AllMiniLML12V2Q`. Either way what you paste back into config is a copy out of the log.
 
 ### Metrics and readiness
 

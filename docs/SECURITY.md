@@ -454,21 +454,30 @@ seal is a quotation of auth mail the user has already decided is auth.
 
 **The recipient headers a send states.** `to`, `cc` and `bcc` come from the caller
 and go into the outgoing message's headers, so `gmail_write::build_reply_rfc822` and
-`build_forward_rfc822` reject any of them carrying CR or LF **before** composing:
-a smuggled newline is how a recipient gets appended that the sender never approved,
+`build_forward_rfc822` reject any of them carrying CR or LF **before** composing: a
+smuggled newline is how a recipient gets appended that the sender never approved,
 and in a `Bcc` that addition is invisible to everyone downstream by construction.
-An explicit `cc` is written **verbatim** rather than through `cc_excluding`, which
-parses to bare addresses — running a stated list through it would delete the display
-names the sender typed — so the CR/LF check is the whole of the sanitization and has
-to be, which is why it lives at the builder rather than at the handler.
+
+The two copy lists reach that check by different routes, and the difference is worth
+stating because it decides which guard is load-bearing:
+
+- `bcc` is filtered through `addrs_excluding` first, which parses to bare addresses
+  and **cuts the value at an embedded header token** (`parse_addr_list`), so a
+  smuggled line is dropped and the honest prefix survives. Fewer recipients, never
+  a forged one.
+- A stated `cc` is written **verbatim** — running it through `cc_excluding` would
+  delete the display names the sender typed — so on that path the builder's CR/LF
+  refusal is the whole of the sanitization, and it refuses rather than repairs.
 
 **A Bcc is recorded in exactly one place: the audit ledger.** Every other recipient
 is legible in the delivered mail; a blind copy is stripped by Gmail from the copies
 the visible recipients receive, so nothing outside this machine records that it
-happened. `handlers::action_send` therefore appends `:cc:<n>:bcc:<n>` to the send's
-audit detail. **Counts, never addresses** — the ledger's job is that a send of this
-shape happened, not who it named, and the same rule that keeps matched secret text
-out of an audit row keeps recipients out of one.
+happened. `handlers::action_send` therefore writes `ok:bcc:<n>` as the send's audit
+detail. **Counts, never addresses** — the ledger's job is that a send of this shape
+happened, not who it named, and the same rule that keeps matched secret text out of
+an audit row keeps recipients out of one. A stated `cc` gets no line of its own,
+deliberately: it is legible in the delivered mail, which is the test for whether the
+ledger has to carry it.
 
 ## 5. Outbound secret guard
 

@@ -27,12 +27,18 @@ enum ShareOrigin: String, Sendable, Hashable {
 }
 
 enum MainView: String, Sendable, Hashable, CaseIterable {
-    case sitrep, emails, auth, rules, audit, usage, settings, process
+    case sitrep, emails, auth, rules, audit, groups, usage, settings, process
 
-    /// The TOP rail group — also the 1..5 number-key mapping. Usage/Settings are
-    /// excluded so that adding them never renumbers 1..5. `process` is off the
-    /// rail entirely: its one door is the all-mail header's peer-review chip.
-    static let mainViews: [MainView] = [.sitrep, .emails, .auth, .rules, .audit]
+    /// The TOP rail group — also the 1..N number-key mapping, taken from
+    /// POSITION in this array. Usage/Settings are excluded so that adding one
+    /// never renumbers the rest. `process` is off the rail entirely: its one door
+    /// is the all-mail header's peer-review chip.
+    ///
+    /// `groups` is APPENDED rather than inserted, which is the whole reason it
+    /// sits below Audit: anywhere earlier and every digit above it shifts, and
+    /// the keys people have in their fingers are worth more than alphabetical
+    /// tidiness.
+    static let mainViews: [MainView] = [.sitrep, .emails, .auth, .rules, .audit, .groups]
     /// The BOTTOM rail group, pinned below a divider.
     static let bottomViews: [MainView] = [.usage, .settings]
 
@@ -43,6 +49,7 @@ enum MainView: String, Sendable, Hashable, CaseIterable {
         case .auth: "Auth"
         case .rules: "Rules"
         case .audit: "Audit"
+        case .groups: "Groups"
         case .usage: "Usage"
         case .settings: "Settings"
         case .process: "Process"
@@ -56,6 +63,7 @@ enum MainView: String, Sendable, Hashable, CaseIterable {
         case .auth: "key"
         case .rules: "slider.horizontal.3"
         case .audit: "scroll"
+        case .groups: "person.2"
         case .usage: "waveform.path.ecg"
         case .settings: "gearshape"
         case .process: "checkmark.seal"
@@ -198,14 +206,15 @@ struct RefreshError: Equatable, Sendable {
 /// `remind` is its own kind rather than a flavour of `done`: the forward action
 /// resolves the thread AND schedules its return, so the inverse is two calls,
 /// and "undo_fired kind=done" would count a reminder as a completion.
-enum UndoKind: Sendable { case archive, done, label, ruleDelete, remind }
+enum UndoKind: Sendable { case archive, done, label, ruleDelete, groupDelete, remind }
 
 /// A queued undo. `revert` is the exact inverse call to fire on `u`/toast-click;
 /// the forward action has already gone out.
 struct PendingUndo: Identifiable, Sendable {
     let id = UUID()
     var kind: UndoKind
-    /// The message id for mail actions; the (now-deleted) rule id for ruleDelete.
+    /// The message id for mail actions; the (now-deleted) rule id for ruleDelete,
+    /// and the (now-deleted) group id for groupDelete.
     var messageId: Int
     var label: String
     var createdAt: Date = Date()
@@ -280,12 +289,28 @@ struct ComposeState: Sendable, Equatable {
     /// nothing at all).
     var forwardOfMessageId: Int?
     var to: String = ""
-    /// The other two recipient headers, comma-joined exactly like `to`. Edited
-    /// through [`Recipients`], which is what enforces the rule that matters:
-    /// an address is in ONE of the three, so moving somebody to Bcc takes them
-    /// out of the header everyone can read rather than listing them twice.
+    /// The other two recipient headers, comma-joined in the same wire-string
+    /// form as `to`. Edited through [`Recipients`], which is what enforces the
+    /// rule that matters: an address is in ONE of the three, so moving somebody
+    /// to Bcc takes them out of the header everyone can read rather than listing
+    /// them twice.
     var cc: String = ""
     var bcc: String = ""
+    /// The send group this composition is addressed to, once one has been
+    /// picked.
+    ///
+    /// For a `to`/`bcc` group this is ATTRIBUTION ONLY — the picker has already
+    /// expanded the membership into the fields above, and the daemon records
+    /// which group that was. For an `individual` group it is the whole audience:
+    /// `to` holds only the `#slug` token that keeps the pill alive across a draft
+    /// round-trip, and the daemon reads the membership itself.
+    var groupId: Int?
+    /// The picked group's mode and name, for what the composer has to SAY: the
+    /// pill's label, and the review pane's line about how many emails are about
+    /// to leave. Display state — the daemon re-reads both from `groupId`, so
+    /// nothing here can talk it into a different shape.
+    var groupMode: GroupMode?
+    var groupName: String?
     var subject: String = ""
     var body: String = ""
     /// WHETHER THESE THREE FIELDS ARE THE ANSWER, or whether the daemon still
@@ -436,6 +461,19 @@ struct RuleEditorRequest: Identifiable, Sendable {
     /// only caller — its rule is a demonstration, and a real write would both
     /// invent a rule nobody asked for and 403 on a read-only daemon.
     var intercept: (@MainActor @Sendable (CreateRuleBody) -> Void)?
+    /// Called after a successful save so the opener re-fetches its list.
+    var onSaved: (@MainActor @Sendable () -> Void)?
+}
+
+/// What the group editor was opened with. `group` nil is a create; present is an
+/// edit, and the editor opens on that group's own values.
+struct GroupEditorRequest: Identifiable, Sendable {
+    let id = UUID()
+    var group: SendGroup?
+    /// Seed a create with addresses the user already had in hand — the composer's
+    /// "save these people as a group" path. Ignored on an edit, which has its own
+    /// membership.
+    var seedMembers: [GroupMember] = []
     /// Called after a successful save so the opener re-fetches its list.
     var onSaved: (@MainActor @Sendable () -> Void)?
 }
@@ -607,6 +645,7 @@ final class AppStore {
     var triageFix: TriageFixTarget?
     var remindTarget: RemindTarget?
     var ruleEditor: RuleEditorRequest?
+    var groupEditor: GroupEditorRequest?
     var processModeOpen = false
     var askBarOpen = false
     /// The ⌘K agent's conversation, HELD HERE rather than in AskBar: the modal
@@ -1180,6 +1219,7 @@ final class AppStore {
         triageFix = nil
         remindTarget = nil
         ruleEditor = nil
+        groupEditor = nil
         // Every revert closure targets the old account's daemon.
         undos = []
         authRings = []
@@ -1408,6 +1448,7 @@ final class AppStore {
     var modalOverlayOpen: Bool {
         askBarOpen || shortcutsOpen || processModeOpen
             || triageFix != nil || remindTarget != nil || ruleEditor != nil
+            || groupEditor != nil
             || !authQueue.isEmpty || retriage != nil
             || tour.wantsBlur || whatsNew.active
     }
@@ -2193,6 +2234,32 @@ final class AppStore {
         next.body = draft.body
         next.draftId = draft.id
         compose = next
+        await resolveDraftGroup()
+    }
+
+    /// Turn a restored draft's `#slug` token back into a group.
+    ///
+    /// The token is all the draft could keep — the drafts row has no group
+    /// column, and giving it one would put the audience in two places that can
+    /// disagree. So the composer re-resolves on restore, and a token that no
+    /// longer names anything (deleted, or renamed, which changes the slug) simply
+    /// does not resolve: the pill renders as a problem and the daemon refuses the
+    /// send. Both are correct. Guessing which audience someone meant is not a
+    /// thing to do with an irreversible action.
+    private func resolveDraftGroup() async {
+        let e = epoch
+        guard let slug = compose.map({ GroupToken.firstSlug(in: $0.to) }) ?? nil,
+            let group = await GroupToken.resolve(slug),
+            e == epoch,
+            var next = compose,
+            // Still the same composition: a restore that raced a keystroke must
+            // not stamp a group onto whatever is in the slot now.
+            GroupToken.firstSlug(in: next.to) == slug
+        else { return }
+        next.groupId = group.id
+        next.groupMode = group.mode
+        next.groupName = group.name
+        compose = next
     }
 
     func closeCompose() {
@@ -2267,6 +2334,48 @@ final class AppStore {
     /// the switch is simply not offered (same posture as `trackingAvailable`).
     var relayAvailable: Bool { sitrep.stats?.assistant_relay == true }
 
+    // MARK: - gmail connection
+
+    /// Whether this mailbox's Gmail credential has stopped working.
+    ///
+    /// `== false` and not `!= true` on purpose, and it is the whole posture of
+    /// this flag: nil means the daemon did not say (too old, or a door wired
+    /// without a metrics registry), and a daemon that cannot see the credential
+    /// must not have its silence rendered as an alarm. A false alarm here sends
+    /// somebody through a Google consent screen for nothing.
+    var gmailDisconnected: Bool { sitrep.stats?.gmail?.connected == false }
+
+    /// A mailbox catch-up in flight, as `(done, total)`.
+    ///
+    /// Nil is the normal state. When it is not nil, triage is blocked upstream
+    /// and anything waiting on a verdict is waiting on this — which is the one
+    /// thing a stalled-looking progress bar needs to be able to say.
+    var catchUp: (done: Int, total: Int)? {
+        guard let c = sitrep.stats?.catch_up, c.total > 0 else { return nil }
+        return (c.done, c.total)
+    }
+
+    /// Where to re-consent, when the daemon offered a link.
+    ///
+    /// Hosted only. A self-host mailbox is repaired with `squelchd auth` at a
+    /// shell, so nil is the branch that shows the instruction instead of a
+    /// button, never an error.
+    var gmailReconnectURL: String? {
+        guard let raw = sitrep.stats?.gmail?.reconnect_url, Opener.isHTTP(raw) else { return nil }
+        return raw
+    }
+
+    /// How long the mailbox has been dark, for the banner's subtitle.
+    ///
+    /// `Fmt.date` and not a formatter of its own: the daemon emits fractional
+    /// seconds on some fields and not others, and a bare `ISO8601DateFormatter`
+    /// parses only one of those shapes — silently returning nil for the other,
+    /// which here would quietly drop "expired 3 hours ago" and leave the vaguer
+    /// sentence with nothing announcing the loss. `Fmt` tries both, memoizes,
+    /// and holds the lock these formatters need; this is read every render.
+    var gmailDisconnectedSince: Date? { Fmt.date(sitrep.stats?.gmail?.disconnected_since) }
+
+
     // MARK: - invite sharing
 
     /// Raise the share sheet, remembering what raised it.
@@ -2334,6 +2443,9 @@ final class AppStore {
 
     func openRuleEditor(_ request: RuleEditorRequest) { ruleEditor = request }
     func closeRuleEditor() { ruleEditor = nil }
+
+    func openGroupEditor(_ request: GroupEditorRequest) { groupEditor = request }
+    func closeGroupEditor() { groupEditor = nil }
 
     // MARK: - undo
 

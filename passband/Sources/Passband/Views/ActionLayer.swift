@@ -39,6 +39,9 @@ struct ActionLayer: View {
             if let request = store.ruleEditor {
                 RuleEditor(request: request) { store.closeRuleEditor() }
             }
+            if let request = store.groupEditor {
+                GroupEditor(request: request) { store.closeGroupEditor() }
+            }
             if store.processModeOpen { ProcessMode { store.processModeOpen = false } }
             if !store.authQueue.isEmpty { AuthCodeModal() }
             if let target = store.triageFix {
@@ -263,11 +266,12 @@ struct ShortcutsOverlay: View {
             title: "Thread viewer",
             items: [
                 (["j", "k"], "older / newer message"),
-                (["h", "l"], "previous / next queued email"),
+                (["←", "→"], "previous / next queued email"),
                 (["r"], "reply"),
                 (["Enter"], "reply all"),
                 (["c"], "new message"),
-                (["e", "d"], "done + next"),
+                (["e", "d"], "done, and close the reader"),
+                (["E", "D"], "done, and open the next email"),
                 (["h"], "remind + next"),
                 (["u"], "unsubscribe from this sender"),
                 (["t"], "new rule for this sender"),

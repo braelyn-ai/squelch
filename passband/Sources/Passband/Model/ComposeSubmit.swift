@@ -35,7 +35,12 @@ enum ComposeSubmit {
                 body: c.body, replyToMessageId: c.replyToMessageId,
                 // Empty = "derive it": on a reply the daemon reads the recipient
                 // off the parent message.
-                to: c.to.isEmpty ? nil : c.to,
+                //
+                // A FAN-OUT SENDS NO `to` AT ALL. The field holds only the
+                // `#slug` token, which is a client-side draft encoding the daemon
+                // refuses on sight — the audience travels as `groupId`, and the
+                // daemon reads the membership itself.
+                to: (c.groupMode == .individual || c.to.isEmpty) ? nil : c.to,
                 // THE ONE FIELD WHERE `""` AND ABSENT DIFFER, and the flag is
                 // what tells them apart: a composer whose fields state the
                 // audience sends its copy list whatever it holds, emptied
@@ -45,6 +50,11 @@ enum ComposeSubmit {
                 cc: c.recipientsStated ? c.cc : nil,
                 // Never derived, so this is simply what the sender typed.
                 bcc: c.bcc.isEmpty ? nil : c.bcc,
+                // Attribution for an expanded to/bcc group; the whole audience
+                // for a fan-out. Never set beside a reply or a forward — those
+                // have an audience already, and the daemon refuses the pair.
+                groupId: c.replyToMessageId == nil && c.forwardOfMessageId == nil
+                    ? c.groupId : nil,
                 // nil, never "": the daemon reads Some("") as an explicit blank
                 // subject and would send the reply untitled.
                 subject: c.subject.isEmpty ? nil : c.subject,
@@ -77,20 +87,24 @@ enum ComposeSubmit {
     }
 
     /// Outcome shape only — the draft's content never rides along.
+    ///
+    /// `group_mode` is the audience SHAPE and nothing about who is in it: whether
+    /// people reach for bcc or for a fan-out is the "does the product work"
+    /// question this feature has, and no count or address answers it.
     private static func capture(_ c: ComposeState, _ override: Bool, _ outcome: String) {
-        Analytics.capture(
-            "compose_send",
-            [
-                "kind": c.analyticsKind,
-                "outcome": outcome,
-                "override": override,
-                "tracked": c.includeTracker,
-                // Whether the send used the copy lists at all — booleans, so
-                // nothing about WHO is anywhere near this (see Analytics'
-                // closed string vocabulary).
-                "copied": !c.cc.isEmpty,
-                "blind": !c.bcc.isEmpty,
-            ])
+        var props: [String: Any] = [
+            "kind": c.analyticsKind,
+            "outcome": outcome,
+            "override": override,
+            "tracked": c.includeTracker,
+            // Whether the send used the copy lists at all — booleans, so
+            // nothing about WHO is anywhere near this (see Analytics' closed
+            // string vocabulary).
+            "copied": !c.cc.isEmpty,
+            "blind": !c.bcc.isEmpty,
+        ]
+        if let mode = c.groupMode { props["group_mode"] = mode.rawValue }
+        Analytics.capture("compose_send", props)
     }
 }
 

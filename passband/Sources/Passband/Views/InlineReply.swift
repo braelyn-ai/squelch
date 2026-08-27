@@ -513,14 +513,19 @@ struct InlineReply: View {
     /// REVIEW PHASE ONLY: the reader's own resolving verbs, swallowed.
     ///
     /// While review is up nothing is focused, so `isEditing` stops suppressing the
-    /// viewer's single-letter keys — and e/d (done + next) and h/l (queue nav)
-    /// would navigate away from a draft that is one keystroke from going out, with
-    /// no undo for a lost reply. These decline outside review, so the viewer keeps
-    /// them everywhere else, including while the body has focus and eats them
-    /// anyway. j/k (scrolling) and the modal verbs are left alone: harmless or
-    /// recoverable.
+    /// viewer's single-letter keys — and e/d (done), E/D (done + next) and h/l
+    /// (queue nav) would navigate away from a draft that is one keystroke from
+    /// going out, with no undo for a lost reply. These decline outside review, so
+    /// the viewer keeps them everywhere else, including while the body has focus
+    /// and eats them anyway. j/k (scrolling) and the modal verbs are left alone:
+    /// harmless or recoverable.
+    ///
+    /// THE SHIFTED PAIR IS LISTED EXPLICITLY and must stay that way: dispatch
+    /// runs an exact-case pass over every context BEFORE the case-folded one, so
+    /// a guard spelled only "e" loses `E` to the viewer's own exact "E" binding
+    /// — the draft would be abandoned by the one key this list exists to hold.
     private var reviewGuards: [KeyBinding] {
-        ["e", "d", "h", "l"].map { key in
+        ["e", "d", "E", "D", "h", "l"].map { key in
             KeyBinding(declining: key, "held — reviewing a reply") {
                 store.inlineReply?.phase == .review
             }

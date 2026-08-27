@@ -23,16 +23,19 @@ use squelch_core::store::{
 use squelch_core::sync::{decode_raw_b64url, parse_internal_date};
 use squelch_core::triage::llm::Usage;
 use squelch_core::triage::rule_infer;
-use squelch_core::types::{AccountId, AttentionStatus, Disposition, ShredStats, Tier, TriageAxis};
+use squelch_core::types::{
+    AccountId, AttentionStatus, Disposition, GroupMode, ShredStats, Tier, TriageAxis,
+};
 use std::collections::HashMap;
 use std::time::Duration;
 
 use crate::error::ApiError;
 use crate::gmail_write::{
-    ForwardParts, GmailWriteClient, ReplyParts, SentRef, WriteError, build_forward_rfc822,
-    build_references, build_reply_rfc822, cc_excluding, count_addrs, derive_reply_recipients,
-    forward_subject, parse_forwarded_original, reply_subject,
+    ForwardParts, GmailWriteClient, ReplyParts, SentRef, WriteError, addrs_excluding,
+    build_forward_rfc822, build_references, build_reply_rfc822, cc_excluding, count_addrs,
+    derive_reply_recipients, forward_subject, parse_forwarded_original, reply_subject,
 };
+use crate::group_send;
 use crate::guard;
 use crate::state::ApiState;
 
@@ -1312,10 +1315,11 @@ struct DraftView {
     id: i64,
     reply_to_message_id: Option<i64>,
     to: String,
-    /// Always present, `""` when empty — the client restores a composer from
-    /// this, and an omitted field would be indistinguishable from a daemon too
-    /// old to have one, which is exactly the case where a silently dropped Bcc
-    /// would matter most.
+    /// The other two recipient lists, spelled the way the send endpoint spells
+    /// them. Always present, `""` when there are none, so a client need not
+    /// branch on absence — and an omitted field would be indistinguishable from
+    /// a daemon too old to have one, which is exactly the case where a silently
+    /// dropped Bcc would matter most.
     cc: String,
     bcc: String,
     subject: String,
@@ -1417,9 +1421,10 @@ pub struct DraftBody {
     /// so a missing (or null) field stores "" rather than 400ing.
     #[serde(default)]
     to: Option<String>,
-    /// Absent stores `""`, same as every other text field here — a draft is a
-    /// half-finished thing by definition. Unlike the SEND route, absence has no
-    /// second meaning: nothing is ever derived into a draft.
+    /// The other two recipient lists. Absent stores `""` like every other field
+    /// here — a half-composed draft is the normal case — and unlike the SEND
+    /// route, absence has no second meaning: nothing is ever derived into a
+    /// draft.
     #[serde(default)]
     cc: Option<String>,
     #[serde(default)]
@@ -1722,6 +1727,50 @@ pub async fn get_stats(State(state): State<ApiState>) -> Result<impl IntoRespons
             "threads": unread.threads,
             "fetched_at": unread.fetched_at.to_rfc3339(),
         });
+    }
+    // IS THE MAILBOX STILL CONNECTED, and if not, what does this person do
+    // about it. The daemon detects a dead refresh token exactly (the refresh
+    // exchange fails, `invalid_grant` included) and until now said so only to
+    // Prometheus — so the operator could find out and the person staring at an
+    // empty mailbox could not.
+    //
+    // OMITTED ENTIRELY when this door has no metrics handle, so a client reads
+    // absence rather than a cheerful "connected" from a process that cannot
+    // see. Absence means "no answer", and a client must not render it as good
+    // news.
+    //
+    // `reconnect_url` is the hosted/self-host split, and it is the console SSO
+    // origin because that is the same control plane that minted the credential
+    // in the first place: hosted tenants have one, self-host has `None` and
+    // repairs with `squelchd auth`, which is not a link anything can offer.
+    if let Some(metrics) = state.sync_metrics() {
+        let failed_since = metrics.gmail_auth_failed_since();
+        let mut gmail = json!({ "connected": failed_since.is_none() });
+        if let Some(at) = failed_since {
+            if let Some(ts) = chrono::DateTime::from_timestamp(at, 0) {
+                gmail["disconnected_since"] = json!(ts.to_rfc3339());
+            }
+            // Only on the broken path: a link to re-consent is noise while the
+            // mailbox works, and worse, an invitation to re-consent for no
+            // reason.
+            if let Some(origin) = state.console_sso_url() {
+                gmail["reconnect_url"] = json!(format!("{origin}/reconnect"));
+            }
+        }
+        body["gmail"] = gmail;
+    }
+    // A CATCH-UP IN FLIGHT, and what it is a denominator of. When Gmail's
+    // history cursor expires the daemon re-walks a 30-day window, which is the
+    // sync loop's longest single call and blocks triage for the whole of it —
+    // so a client that does not know about it renders a working mailbox as a
+    // hung one. The re-triage modal is the sharp case: its own progress cannot
+    // move until this finishes, and without this field it has no way to say
+    // why.
+    //
+    // OMITTED when no catch-up is running, so absence is the normal state and
+    // presence is the explanation.
+    if let Some((done, total)) = state.sync_metrics().and_then(|m| m.catchup_progress()) {
+        body["catch_up"] = json!({ "done": done, "total": total });
     }
     // Capability flag for the app: whether /client/assistant/messages will
     // relay (hosted, gateway configured) or 404 (self-host, BYOK in the app).
@@ -2386,12 +2435,6 @@ pub struct SendBody {
     /// which is what every caller written before this field existed sends.
     #[serde(default)]
     cc: Option<String>,
-    /// Blind carbon copies, comma-joined. Nothing derives these and nothing
-    /// ever will — no header of the parent records who was blind-copied on it,
-    /// which is what blind means. Absent and `""` are therefore the same thing
-    /// here, unlike `cc`.
-    #[serde(default)]
-    bcc: Option<String>,
     /// Reply to EVERYONE on the parent: `to` from its Reply-To/From, `cc` from
     /// the rest of its To/Cc minus this account. Requires
     /// `reply_to_message_id` — there is no audience to widen without a parent —
@@ -2399,6 +2442,31 @@ pub struct SendBody {
     /// is unchanged. See [`crate::gmail_write::derive_reply_recipients`].
     #[serde(default)]
     reply_all: bool,
+    /// BLIND copies, comma-joined, for a send whose audience must not see each
+    /// other. Never derived from anything (see [`crate::gmail_write::ReplyParts`])
+    /// and nothing ever will derive it — no header of a parent records who was
+    /// blind-copied on it, which is what blind means, so absent and `""` are the
+    /// same thing here, unlike `cc`. Filtered against `to`/`cc` before it
+    /// composes so nobody is delivered two copies of one message.
+    ///
+    /// A send carrying ONLY `bcc` is legitimate — it is the whole shape of a bcc
+    /// blast — and the `To` header then falls back to the account's own address
+    /// rather than the send being refused. RFC822 wants a `To`, and every mail
+    /// client writes the sender there for exactly this case.
+    #[serde(default)]
+    bcc: Option<String>,
+    /// ADDRESS A SEND GROUP. What it does depends on the group's own mode, which
+    /// is a property of the audience rather than of this message:
+    ///
+    /// * `to` / `bcc` — the composer has ALREADY expanded the membership into
+    ///   `to`/`bcc`, so this is attribution only: the send goes out as one
+    ///   message and is recorded against the group afterwards.
+    /// * `individual` — the daemon fans out, one message per member, and the
+    ///   response is a `202` naming the batch rather than a sent message.
+    ///
+    /// Another account's id and an unknown id are the same 404.
+    #[serde(default)]
+    group_id: Option<i64>,
     /// Explicit subject (overrides the reply-derived subject).
     #[serde(default)]
     subject: Option<String>,
@@ -2439,7 +2507,7 @@ pub struct SendBody {
 /// AUDIT (contract, docs/SECURITY.md §5): action `send.echo`, detail
 /// `skipped:no_id` | `skipped:sealed` | `failed:fetch` | `failed:ingest` |
 /// `ok:<local id>`.
-async fn echo_sent(
+pub(crate) async fn echo_sent(
     state: &ApiState,
     client: &GmailWriteClient,
     target: Option<String>,
@@ -2780,10 +2848,40 @@ pub async fn action_send(
         ));
     }
 
+    // AN UNRESOLVED GROUP TOKEN NEVER REACHES THE WIRE. Checked before the guard
+    // so it costs nothing, and checked at all because the quiet failure is the
+    // dangerous one: `parse_addr_list` would drop `#preseed investors` as
+    // unemittable and send to everyone else on the line, silently missing the
+    // audience the user believed they had addressed.
+    for list in [body.to.as_deref(), body.bcc.as_deref()]
+        .into_iter()
+        .flatten()
+    {
+        if let Err(e) = group_send::reject_unresolved_tokens(list) {
+            audit_action(&state, "send", target, "rejected:unresolved_group").await;
+            return Err(e);
+        }
+    }
+
+    // A GROUP IS AN AUDIENCE, and a reply or a forward already has one. Blasting
+    // a list into someone else's thread is not a thing this composer can express
+    // and not a thing the daemon should invent a meaning for.
+    if body.group_id.is_some()
+        && (body.reply_to_message_id.is_some() || body.forward_of_message_id.is_some())
+    {
+        audit_action(&state, "send", target, "rejected:group_on_reply").await;
+        return Err(ApiError::bad_request(
+            "a group is addressed by a new message, not by a reply or a forward",
+        ));
+    }
+
     // OUTBOUND GUARD: report only REDACTED kinds, never the matched text. Scanned
     // here, before any Gmail spend. A FORWARD'S VERDICT WAITS — most of what it
     // sends is the original, which has not been read yet — so its kinds are
     // unioned in and judged once, in `forward_send`.
+    //
+    // ONE VERDICT FOR A FAN-OUT TOO: it is one composition, so it is asked about
+    // once here and never again per recipient.
     let matches = guard::scan_kinds(&body.body);
     if body.forward_of_message_id.is_none()
         && let Some(err) =
@@ -2802,6 +2900,19 @@ pub async fn action_send(
 
     if let Some(original_id) = body.forward_of_message_id {
         return forward_send(&state, &body, &client, target, original_id, matches).await;
+    }
+
+    // A GROUP SEND resolves its audience here, once, after the guard has cleared
+    // and the write credential is known good — so a fan-out that is going to be
+    // refused is refused before any of it has gone.
+    let audience = match body.group_id {
+        Some(group_id) => Some(group_send::resolve(&state, group_id).await?),
+        None => None,
+    };
+    if let Some(audience) = &audience
+        && audience.mode == GroupMode::Individual
+    {
+        return fan_out_send(&state, &body, audience).await;
     }
 
     let (parent, thread_id) = match body.reply_to_message_id {
@@ -2871,6 +2982,7 @@ pub async fn action_send(
     // the caller retyped the `to` would send to fewer people than they asked
     // for — always minus whoever the chosen `to` already covers.
     let derived_cc = derived.as_ref().map(|d| d.cc.clone()).unwrap_or_default();
+    let bcc_requested = body.bcc.clone().unwrap_or_default();
     let to = match body.to.clone().filter(|s| !s.trim().is_empty()) {
         Some(t) => t,
         None => match (&derived, &parent) {
@@ -2878,6 +2990,28 @@ pub async fn action_send(
             // stored From rather than composing a recipient-less reply.
             (Some(d), _) if !d.to.trim().is_empty() => d.to.clone(),
             (_, Some(p)) => p.from_addr.clone(),
+            // A BCC-ONLY SEND is not a send with no recipient: it is the shape
+            // of a blind blast, and the `To` it still needs is the sender. Read
+            // from the store rather than left blank — `build_reply_rfc822`
+            // refuses an empty `To`, and a mail addressed to nobody visible
+            // reads to a recipient's client as a header it cannot render.
+            (_, None) if !bcc_requested.trim().is_empty() => {
+                match store_call(&state, |store, account_id| store.account_email(account_id)).await
+                {
+                    Ok(own) if !own.trim().is_empty() => own,
+                    // The account row is what every other surface reads the
+                    // user's own address from, so this is near-impossible. It
+                    // still fails the send rather than composing something
+                    // half-addressed.
+                    _ => {
+                        audit_action(&state, "send", target, "rejected:no_recipient").await;
+                        return Err(ApiError::bad_request(
+                            "a bcc-only send needs this account's own address, \
+                             which could not be read",
+                        ));
+                    }
+                }
+            }
             (_, None) => {
                 audit_action(&state, "send", target, "rejected:no_recipient").await;
                 return Err(ApiError::bad_request(
@@ -2886,16 +3020,24 @@ pub async fn action_send(
             }
         },
     };
-    // An explicit `cc` is taken VERBATIM — not run through `cc_excluding`,
-    // which parses to bare addresses and would silently strip display names the
-    // sender typed. Absent falls back to the derivation minus whoever the
-    // chosen `to` already covers.
+    // A STATED `cc` REPLACES THE DERIVATION, and absent keeps it. That
+    // distinction is what lets a composer showing a Cc field EMPTY one: a
+    // daemon that put the parent's copies back would make the field a lie.
+    // Taken verbatim rather than through `cc_excluding`, which parses to bare
+    // addresses and would silently strip the display names the sender typed.
     let cc = match body.cc.clone() {
         Some(stated) => stated,
         None => cc_excluding(&derived_cc, &to),
     };
-    let bcc = body.bcc.clone().unwrap_or_default();
-    // For the audit line, counted before both move into the MIME parts.
+    // BLIND COPIES LAST, filtered against everyone already VISIBLE on the
+    // message. Someone in both `to` and `bcc` would otherwise receive two copies
+    // of one mail, and the second would look like a blind copy of a message they
+    // are openly on.
+    let bcc = addrs_excluding(&bcc_requested, &[&to, &cc]);
+    // For the audit line, counted before either moves into the MIME parts.
+    // Quote-aware, because a stated `cc` carries display names: the comma in
+    // `"Doe, John" <j@x>` is part of a name, and counting it would put a
+    // recipient in the ledger who does not exist.
     let copied = count_addrs(&cc);
     let blind = count_addrs(&bcc);
 
@@ -2916,6 +3058,9 @@ pub async fn action_send(
     )
     .await;
 
+    // Kept back for the group-send record, which is written after `subject` has
+    // moved into the MIME parts.
+    let subject_for_record = subject.clone();
     let parts = ReplyParts {
         to,
         cc: Some(cc).filter(|s| !s.trim().is_empty()),
@@ -2941,23 +3086,21 @@ pub async fn action_send(
         }
     };
 
-    // HOW FAR THE MAIL REACHED, never who it reached. A reply-all keeps its own
-    // spelling (recipients including the `to`); a stated copy list appends its
-    // own count, and a blind one ALWAYS does — a Bcc is the one recipient list
-    // that the delivered copies do not record anywhere, so the ledger is the
-    // only place it is written down at all.
-    let mut outcome = if body.reply_all {
+    // A send that reaches N people says so in the ledger, with the COUNT and
+    // never the addresses. Two shapes do: a reply-all, and a blind copy list —
+    // the second matters more, because it is the one whose audience is invisible
+    // in the mail itself, so the ledger is the only place it is written down.
+    //
+    // A STATED `cc` gets no line of its own, deliberately: it is legible in the
+    // delivered mail, which is the test for whether the ledger has to carry it.
+    let outcome = if blind > 0 {
+        format!("ok:bcc:{blind}")
+    } else if body.reply_all {
         format!("ok:reply_all:{}", copied + 1)
     } else {
         "ok".to_string()
     };
-    if !body.reply_all && copied > 0 {
-        outcome.push_str(&format!(":cc:{copied}"));
-    }
-    if blind > 0 {
-        outcome.push_str(&format!(":bcc:{blind}"));
-    }
-    finish_send(
+    let result = finish_send(
         &state,
         &client,
         &raw,
@@ -2969,7 +3112,82 @@ pub async fn action_send(
         body.draft_id,
         target,
     )
-    .await
+    .await;
+
+    // ATTRIBUTION, once the mail is away. A `to`/`bcc` group went out as one
+    // message that the composer addressed itself, so all the daemon adds is the
+    // record that this was that group — which is what makes the history entry
+    // exact ("12 of 12, sent as bcc") instead of inferred from its recipients.
+    if let (Some(audience), Ok(sent)) = (&audience, &result) {
+        let echo = sent
+            .0
+            .get("echo_message_id")
+            .and_then(serde_json::Value::as_i64);
+        group_send::record_single(&state, audience, subject_for_record, echo).await;
+    }
+    result
+}
+
+/// A fan-out: one message per member, run as a job because twelve serial sends
+/// plus twelve echoes do not fit inside the composer's POST budget.
+///
+/// Answers `202` with the batch id. The composer closes on it and the Groups
+/// page watches `reached` climb on its ordinary history read — the pending
+/// recipients ARE the progress bar, so nothing else has to be plumbed.
+async fn fan_out_send(
+    state: &ApiState,
+    body: &SendBody,
+    audience: &group_send::GroupAudience,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let target = Some(audience.group_id.to_string());
+    let subject = body
+        .subject
+        .clone()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_default();
+
+    // The tracker is minted ONCE for the batch; see `FanOut::pixel_url` for why
+    // it is not per recipient.
+    let tracker = mint_tracker(state, body.include_tracker.unwrap_or(false), target.clone()).await;
+
+    let plan = group_send::FanOut {
+        audience: group_send::GroupAudience {
+            group_id: audience.group_id,
+            mode: audience.mode,
+            addrs: audience.addrs.clone(),
+        },
+        subject,
+        body: body.body.clone(),
+        body_html: match body.body_format.as_deref() {
+            Some("markdown") => Some(crate::markdown::render_email_html(&body.body)),
+            _ => None,
+        },
+        pixel_url: tracker.as_ref().map(|(_, url)| url.clone()),
+    };
+    let recipients = plan.audience.addrs.len();
+
+    let group_send_id = match group_send::start(state, plan).await {
+        Ok(id) => id,
+        Err(e) => {
+            if let Some((token, _)) = &tracker {
+                discard_tracker(state, token, target.clone()).await;
+            }
+            audit_action(state, "send", target, "failed:fan_out_start").await;
+            return Err(e);
+        }
+    };
+
+    // The composition is away as far as the composer is concerned, so its draft
+    // goes with it — the same contract every other successful send has.
+    if let Some(draft_id) = body.draft_id {
+        discard_sent_draft(state, draft_id).await;
+    }
+
+    Ok(Json(json!({
+        "status": "sending",
+        "group_send_id": group_send_id,
+        "recipients": recipients,
+    })))
 }
 
 /// The largest original a forward will carry, in DECODED RFC822 bytes.

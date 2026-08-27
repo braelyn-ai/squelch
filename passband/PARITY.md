@@ -122,8 +122,12 @@ to get subtly wrong:
 - **Registration order** — last registered wins within a context, which is how a
   nested overlay's Escape beats the surface underneath.
 - **Two-pass matching** — an exact (case-sensitive) match always beats a
-  case-folded one, so `A` (audit) and `a` (browse) coexist while a shifted
-  letter with no exact binding still falls back to its lowercase sibling.
+  case-folded one, so `A` (audit) and `a` (browse) coexist, and so do the
+  reader's `e` (done) and `E` (done + next), while a shifted letter with no
+  exact binding still falls back to its lowercase sibling. The corollary bites:
+  a DECLINING guard spelled only `"e"` never sees `E`, because the exact pass
+  finds another set's `"E"` first. Guards list both cases (InlineReply's
+  `reviewGuards`), and `Tests/KeyDispatchTests.swift` asserts the ordering.
 - **Meta matched exactly**, like shift — a `meta` binding fires only with ⌘
   held and a plain binding never fires while ⌘ is held, so ⌘[ / ⌘] never
   collide with bare `[` / `]`.
@@ -140,8 +144,8 @@ to get subtly wrong:
 Full keymap: digits 1–5 view nav · ⌘[ / ⌘] history · ⌘K ask bar · ⌘, settings · j/k/arrows ·
 Enter open · r reply · c new message · e/d done · v fix triage · t tune · p process · a browse ·
 / search · u undo · T rules · A audit · g auth · `\` theme · `?` help · Esc
-close · thread viewer h/l queue nav, r reply (inline composer), c new message,
-u unsubscribe · rules n/e/x · browse ± noise.
+close · thread viewer E/D done + next, ←/→ queue nav, r reply (inline
+composer), c new message, u unsubscribe · rules n/e/x · browse ± noise.
 
 `c` is registered per-surface (list, sitrep, thread) rather than globally, so it
 cannot fire from inside a modal where the letter belongs to whatever is being

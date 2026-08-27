@@ -26,11 +26,9 @@ struct SharePanel: View {
     @Environment(AppStore.self) private var store
     @Environment(\.dismiss) private var dismiss
 
-    /// What `RecipientField` parses into pills. An invite has ONE list — there
-    /// is no copying somebody on an invitation — so this holds the composer's
-    /// three-header value with only `to` ever used, and the field is mounted
-    /// for that slot alone.
-    @State private var addressed = Recipients()
+    /// The wire string `RecipientField` parses into pills. Comma-joined, which
+    /// is also exactly what the POST wants split.
+    @State private var to = ""
     /// The draft: seeded from the daemon on load, and the user's from then on.
     /// Named `draft` rather than `body` because a `View` already has one of
     /// those, and a body that is sometimes markdown and sometimes a view is a
@@ -55,7 +53,11 @@ struct SharePanel: View {
     /// trip. It is the daemon's number that actually enforces it.
     private static let maxRecipients = 5
 
-    private var recipients: [String] { addressed.tokens(.to) }
+    private var recipients: [String] {
+        to.split(separator: ",")
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -137,8 +139,7 @@ struct SharePanel: View {
             .foregroundStyle(Palette.inkDim)
             .fixedSize(horizontal: false, vertical: true)
 
-            RecipientField(
-                recipients: $addressed, slot: .to, focus: $focus, field: FocusTarget.to)
+            RecipientField(text: $to, focus: $focus, field: FocusTarget.to)
 
             Field(label: "subject") {
                 TextField("", text: $subject)
