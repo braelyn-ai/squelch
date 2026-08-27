@@ -3742,8 +3742,10 @@ mod tests {
         ingest_into(&store, acct, &f, Utc::now());
         assert!(store.is_known_contact(acct, "alice@friends.com").unwrap());
         assert!(store.is_known_contact(acct, "bob@friends.com").unwrap());
-        // The account's own address must NEVER become a contact.
-        assert!(!store.is_known_contact(acct, "me@example.com").unwrap());
+        // The account's own address is a contact only because `ensure_account`
+        // seeds it — the From header must not add to it.
+        let me = store.search_contacts(acct, "me@example.com", 10).unwrap();
+        assert_eq!(me[0].sent_count, 1);
     }
 
     #[test]
@@ -3889,11 +3891,17 @@ mod tests {
         let f = fixture(acct, "g-sent", eml, /* is_sent */ true);
         ingest_into(&store, acct, &f, now);
 
-        // Recipients become contacts; the account's own address never does.
+        // Recipients become contacts; nobody else does.
         assert!(store.is_known_contact(acct, "alice@friends.com").unwrap());
         assert!(store.is_known_contact(acct, "bob@friends.com").unwrap());
-        assert!(!store.is_known_contact(acct, "me@example.com").unwrap());
         assert!(!store.is_known_contact(acct, "stranger@nowhere.io").unwrap());
+        // The account's own address is a contact — `ensure_account` seeds it —
+        // but NOT by way of this send: writing to Alice from your own address is
+        // not evidence you write to yourself, so the seeded count stands where
+        // it was.
+        let me = store.search_contacts(acct, "me@example.com", 10).unwrap();
+        assert_eq!(me.len(), 1);
+        assert_eq!(me[0].sent_count, 1, "From: self must not bump self");
 
         // Sent mail must NOT pollute the ranked inbox.
         let updates = store
@@ -3907,6 +3915,39 @@ mod tests {
         // And it must not appear in search results either.
         let hits = store.search(acct, "lunch", 10, 0).unwrap();
         assert!(hits.is_empty(), "sent mail must not appear in search");
+    }
+
+    #[test]
+    fn a_note_the_user_mails_themselves_stands_as_signal() {
+        // Gmail hands a self-addressed message to BOTH label walks and the INBOX
+        // walk wins, so it arrives here as ordinary received mail whose From is
+        // the user. With no contact row for self that read as a stranger writing
+        // in, and Stage-1 dropped a note-to-self to noise.
+        let store = SqliteStore::open_in_memory().unwrap();
+        let acct = store.ensure_account("me@example.com").unwrap();
+        let eml = "From: Braelyn <me@example.com>\r\n\
+                   To: me@example.com\r\n\
+                   Subject: remember the milk\r\n\
+                   Date: Mon, 7 Jul 2026 10:00:00 +0000\r\n\
+                   \r\n\
+                   and the eggs\r\n";
+        let now = Utc::now();
+        let f = fixture(acct, "g-self", eml, /* is_sent */ false);
+        let id = ingest_into(&store, acct, &f, now);
+
+        // A window wide enough to reach the fixture's own `Date:` header.
+        let updates = store
+            .ranked_updates(acct, now - ChronoDuration::days(365), None)
+            .unwrap();
+        let note = updates
+            .iter()
+            .find(|u| u.id == id)
+            .expect("a note to self is mail the user meant to see");
+        assert_eq!(note.tier, Tier::Signal);
+        assert_eq!(
+            note.importance,
+            Stage1Config::default().known_contact_importance
+        );
     }
 
     // ---- HTML body: ingest sanitize + human-door serving ------------------
