@@ -175,7 +175,7 @@ pub fn compose(to: &str, subject: &str, body: &str) -> ReplyParts {
         cc: None,
         // ONE invite, ONE recipient. An invite is addressed to a person by name;
         // a blind copy list on it would mail a stranger something that names
-        // them and hides who else got it.
+        // them and hides who else got it, and there is nobody to copy either.
         bcc: None,
         subject: subject.to_string(),
         body: body.to_string(),

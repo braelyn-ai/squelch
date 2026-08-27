@@ -9,16 +9,24 @@
 // shape and one error mapping. The body is markdown, live-styled by the same
 // MarkdownTextView the pane uses.
 //
-// Body only, on purpose: the request carries `reply_to_message_id` and the body,
-// and the daemon derives the recipient and `Re: <subject>` from the parent. The
-// header line here is INFORMATIONAL — it states what the daemon will do, it does
-// not send anything.
+// THE HEADER LINE IS A DISCLOSURE. Collapsed it says who this reply reaches, in
+// one line, because that is all most replies need. Opened it is three editable
+// recipient fields — to, cc, bcc — so the answer to "actually, put Dana on bcc"
+// is two clicks in the composer you are already in, rather than closing it and
+// starting the mail again somewhere that has the fields.
 //
-// REPLY-ALL keeps that shape: the send carries a `reply_all` FLAG and the daemon
-// expands the set. The addresses shown here are a separate read-only lookup of
-// the same derivation, so review states the real recipients — but the send never
-// carries them back, and a lookup that fails or is still in flight degrades to
-// naming the daemon as the authority rather than blocking a reply.
+// WHICH MEANS THE AUDIENCE CHANGES HANDS. The composer still opens knowing only
+// its parent, and the real set is still derived server-side — the parent's
+// Reply-To, the room a reply-all widens to. What is new is that the derivation
+// is SEEDED into the fields when it lands, and from that moment the fields are
+// the answer and the send carries them explicitly (`recipientsStated`). Before
+// it lands, and if it never does, the wire carries no recipients at all and the
+// daemon derives exactly as it always has — which is why a failed lookup costs a
+// preview and never a reply.
+//
+// The seeded set is also remembered (`seededRecipients`), so the autosave can
+// tell "a reply nobody addressed" from "a reply somebody moved to bcc": the
+// first must not mint a draft, the second must.
 //
 // ON A PHONE IT IS THE SAME BAR, pinned by `.safeAreaInset(edge: .bottom)`
 // instead of by a VStack — so the keyboard lifts it and insets the mail behind
@@ -46,6 +54,11 @@ struct InlineReply: View {
     let onEchoed: () -> Void
 
     @Environment(AppStore.self) private var store
+    @FocusState private var focusedField: RecipientSlot?
+
+    /// Whether the recipient fields are open. Per-composer by nature: it resets
+    /// when the reply closes, because the next one is a different audience.
+    @State private var editingRecipients = false
 
     /// The daemon's derived recipient set, TAGGED with the key it was fetched
     /// for. The tag is what makes a stale read impossible: this view is
@@ -95,6 +108,9 @@ struct InlineReply: View {
             VStack(alignment: .leading, spacing: 0) {
                 VStack(alignment: .leading, spacing: 9) {
                     headerLine(compose, parent: parent)
+                    if editingRecipients && !inReview {
+                        recipientEditor(compose)
+                    }
                     if inReview {
                         reviewPane(compose, parent: parent)
                     } else {
@@ -140,6 +156,10 @@ struct InlineReply: View {
             // other mode can never show the last one's addresses — not even for
             // the frame before this task runs.
             .task(id: recipientsKey) { await loadRecipients() }
+            // A different message (or the same one in the other mode) is a
+            // different audience: the fields close so nobody edits one reply's
+            // recipients believing they are another's.
+            .onChange(of: recipientsKey) { _, _ in editingRecipients = false }
         }
     }
 
@@ -152,27 +172,81 @@ struct InlineReply: View {
         guard let key = recipientsKey, let compose = store.inlineReply,
             let parentId = compose.replyToMessageId
         else { return }
+        let slot = compose.id
         let fetched = try? await APIClient.shared.replyRecipients(parentId, all: compose.replyAll)
         // The composer may have closed, or moved on, while this was in flight.
         guard recipientsKey == key else { return }
         fetchedRecipients = (key, fetched)
+        seed(fetched, into: slot)
+    }
+
+    /// HAND THE DERIVED SET TO THE COMPOSER, once, and only while the composer
+    /// has not been addressed by anybody yet.
+    ///
+    /// This is the moment the audience changes hands: before it, the send
+    /// carries no recipients and the daemon derives; after it, the fields are
+    /// the answer. Seeding what the daemon itself just derived means the two are
+    /// the same mail — nobody's reply is quietly re-addressed by the handover.
+    ///
+    /// Keyed to the composer's identity, like every other write that lands after
+    /// an await: the slot may hold a reply to another message by now, and
+    /// stamping one message's recipients onto another's draft is the worst
+    /// available outcome. `recipientsStated` already being true means either a
+    /// restored draft or the sender got here first, and both outrank a
+    /// derivation.
+    private func seed(_ derived: ReplyRecipients?, into slot: UUID) {
+        guard let derived, var next = store.inlineReply, next.id == slot,
+            !next.recipientsStated
+        else { return }
+        let set = Recipients(to: derived.to, cc: derived.cc ?? "")
+        next.recipients = set
+        // Remembered so the autosave can tell an untouched reply from an
+        // addressed one — see `ComposeState.seededRecipients`.
+        next.seededRecipients = set
+        next.recipientsStated = true
+        store.inlineReply = next
     }
 
     // MARK: - panes
 
     private func headerLine(_ compose: ComposeState, parent: ClientMessage) -> some View {
         HStack(spacing: 5) {
-            Text(compose.replyAll ? "replying to all" : "replying to")
-                .font(Typo.micro)
-                .foregroundStyle(Palette.inkFaintest)
-            // Addresses and sender strings alike are email-derived: rendered as
-            // Text only, never as markup, and never interpolated into a
-            // localized literal.
-            Text(headerTarget(compose, parent: parent))
-                .font(.system(size: 11, weight: .medium))
-                .foregroundStyle(Palette.inkDim)
-                .lineLimit(1)
-                .truncationMode(.tail)
+            // THE WHOLE "replying to <who>" PHRASE IS THE DISCLOSURE, chevron
+            // and all: the thing you want to change is the thing you click. In
+            // review it stops being a control — that pane's job is stating what
+            // goes out, and a live toggle in it is an invitation to edit the
+            // mail you are confirming.
+            Button {
+                editingRecipients.toggle()
+                if editingRecipients { focusedField = .to }
+            } label: {
+                HStack(spacing: 5) {
+                    Image(
+                        systemName: editingRecipients
+                            ? "chevron.down" : "chevron.right"
+                    )
+                    .font(.system(size: 8, weight: .semibold))
+                    .foregroundStyle(Palette.inkFaintest)
+                    Text(compose.replyAll ? "replying to all" : "replying to")
+                        .font(Typo.micro)
+                        .foregroundStyle(Palette.inkFaintest)
+                    // Addresses and sender strings alike are email-derived:
+                    // rendered as Text only, never as markup, and never
+                    // interpolated into a localized literal.
+                    Text(headerTarget(compose, parent: parent))
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundStyle(Palette.inkDim)
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                }
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .disabled(inReview)
+            // A sentence in the micro voice reads as a caption until the
+            // pointer says it is a control.
+            .pointingHand()
+            .accessibilityLabel(editingRecipients ? "hide recipients" : "edit recipients")
             Text("·").foregroundStyle(Palette.inkFaintest)
             Text(replySubject)
                 .font(Typo.micro)
@@ -197,42 +271,52 @@ struct InlineReply: View {
     /// who is NOT certainly in the set: a mailing list's Reply-To routes the
     /// mail somewhere the sender's own address never appears.
     private func headerTarget(_ compose: ComposeState, parent: ClientMessage) -> String {
+        // Once the fields hold the answer they ARE the answer, reply-all or
+        // not: somebody who just moved a name to bcc has to see the header
+        // agree with what they did.
+        if compose.recipientsStated, let summary = recipientSummary(compose) { return summary }
         let sender = SenderCache.resolved(parent.senderString).displayName
         guard compose.replyAll else { return sender }
-        if let summary = recipientSummary { return summary }
         return recipientsSettled ? "recipients derived at send" : "deriving recipients…"
     }
 
     /// "alice@example.com +3 more" — the header is one line above the mail, so a
     /// twelve-person thread has to collapse into a count rather than push the
-    /// composer around. The full set is in review, where it belongs.
-    private var recipientSummary: String? {
-        guard let recipients else { return nil }
-        let addresses =
-            Self.splitAddresses(recipients.to) + Self.splitAddresses(recipients.cc ?? "")
-        guard let first = addresses.first else { return nil }
-        guard addresses.count > 1 else { return first }
-        return "\(first) +\(addresses.count - 1) more"
+    /// composer around. The full set is in the fields below, and in review.
+    ///
+    /// COUNTS BLIND COPIES IN THE TOTAL but never names one first: the summary
+    /// leads with the visible audience, because "who is this to" is the question
+    /// it answers. The bcc row states itself, in the fields and in review.
+    private func recipientSummary(_ compose: ComposeState) -> String? {
+        let r = compose.recipients
+        let visible = r.tokens(.to) + r.tokens(.cc)
+        let total = visible.count + r.count(.bcc)
+        guard let first = visible.first ?? r.tokens(.bcc).first else { return nil }
+        guard total > 1 else { return first }
+        return "\(first) +\(total - 1) more"
     }
 
-    /// Split an address-list header on the commas that SEPARATE addresses. A
-    /// comma inside a quoted display name ("Doe, John" <j@x>) is part of the
-    /// name, and counting it would report a recipient who does not exist.
-    private static func splitAddresses(_ list: String) -> [String] {
-        var out: [String] = []
-        var current = ""
-        var quoted = false
-        for ch in list {
-            if ch == "\"" { quoted.toggle() }
-            if ch == ",", !quoted {
-                out.append(current)
-                current = ""
-            } else {
-                current.append(ch)
-            }
+    /// THE THREE RECIPIENT FIELDS, opened from the header line.
+    ///
+    /// Not shown until the derivation has landed, and that is a correctness rule
+    /// rather than a loading state: editing empty fields beforehand would make
+    /// this composer state an audience it never learned, and on a reply-all the
+    /// mail would go to one person instead of the room. The wait is one metadata
+    /// fetch, and it started when the composer opened.
+    @ViewBuilder
+    private func recipientEditor(_ compose: ComposeState) -> some View {
+        if compose.recipientsStated {
+            RecipientFields(
+                recipients: recipientsBinding, focus: $focusedField, field: { $0 },
+                // The one field with nothing to seed it says why it is empty,
+                // rather than reading as a value that got lost.
+                placeholder: { $0 == .bcc ? "nobody is blind-copied" : nil })
+                .padding(.bottom, 2)
+        } else {
+            Text("deriving recipients…")
+                .font(Typo.micro)
+                .foregroundStyle(Palette.inkFaintest)
         }
-        out.append(current)
-        return out.map { $0.trimmed }.filter { !$0.isEmpty }
     }
 
     private func editor(_ compose: ComposeState) -> some View {
@@ -268,7 +352,22 @@ struct InlineReply: View {
             // there if it cannot derive the set. Recipient rows are CAPPED —
             // a thirty-person Cc must not grow the pinned composer into the
             // mail it sits under.
-            if let recipients, !recipients.to.trimmed.isEmpty {
+            if compose.recipientsStated {
+                // The fields are the answer, so review reads them — including
+                // anything moved between them since the derivation landed.
+                ComposeSummaryRow("to", compose.to.trimmed.isEmpty ? "(none)" : compose.to)
+                    .lineLimit(3)
+                if !compose.cc.trimmed.isEmpty {
+                    ComposeSummaryRow("cc", compose.cc).lineLimit(3)
+                }
+                // THE ROW REVIEW EXISTS FOR. Everything else on this pane is
+                // also visible in the mail once it lands; a blind copy is
+                // visible nowhere, to nobody, ever again. This is the last
+                // screen that can say who it went to.
+                if !compose.bcc.trimmed.isEmpty {
+                    ComposeSummaryRow("bcc", compose.bcc).lineLimit(3)
+                }
+            } else if let recipients, !recipients.to.trimmed.isEmpty {
                 ComposeSummaryRow("to", recipients.to).lineLimit(3)
                 if let cc = recipients.cc, !cc.trimmed.isEmpty {
                     ComposeSummaryRow("cc", cc).lineLimit(3)
@@ -443,6 +542,20 @@ struct InlineReply: View {
                 // field it has, and it is bound through here.
                 guard store.inlineReply?[keyPath: keyPath] != value else { return }
                 patch { $0[keyPath: keyPath] = value }
+                DraftSaver.shared.noteChange(.inlineReply)
+            })
+    }
+
+    /// The three recipient fields as one binding. Writes go through
+    /// `stateRecipients` — touching a recipient field is the sender taking the
+    /// audience over from the daemon — and arm the autosave like any other
+    /// edit: a bcc added and then abandoned has to come back.
+    private var recipientsBinding: Binding<Recipients> {
+        Binding(
+            get: { store.inlineReply?.recipients ?? Recipients() },
+            set: { value in
+                guard store.inlineReply?.recipients != value else { return }
+                patch { $0.stateRecipients(value) }
                 DraftSaver.shared.noteChange(.inlineReply)
             })
     }

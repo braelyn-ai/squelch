@@ -283,3 +283,56 @@ extension View {
         if let text { help(text) } else { self }
     }
 }
+
+
+// MARK: - the pointing hand
+
+#if os(macOS)
+    /// Push/pop the pointing-hand cursor while the pointer is inside.
+    ///
+    /// Both halves are guarded and the disappear case is real, not defensive:
+    /// these sit on controls that VANISH under the cursor by design — the
+    /// cc/bcc toggles fold a field open and the layout moves, the pill move bar
+    /// closes the moment its pill is gone — and a view removed while hovered
+    /// never gets its exit callback. An unbalanced push leaves the pointing
+    /// hand stuck over the whole window.
+    private struct PointingHandCursor: ViewModifier {
+        @State private var pushed = false
+
+        func body(content: Content) -> some View {
+            content
+                .onHover { inside in
+                    if inside, !pushed {
+                        NSCursor.pointingHand.push()
+                        pushed = true
+                    } else if !inside, pushed {
+                        NSCursor.pop()
+                        pushed = false
+                    }
+                }
+                .onDisappear {
+                    if pushed {
+                        NSCursor.pop()
+                        pushed = false
+                    }
+                }
+        }
+    }
+#endif
+
+extension View {
+    /// THE POINTER SAYS IT IS A CONTROL. For the things that are clickable but
+    /// do not look like buttons — a text toggle, a pill, a header line that
+    /// unfolds — where the shape alone reads as a label and nothing else on
+    /// screen says otherwise. A control nobody knows is a control is not one.
+    ///
+    /// Inert off the Mac: a finger has no hover state to say it with.
+    @ViewBuilder
+    func pointingHand() -> some View {
+        #if os(macOS)
+            modifier(PointingHandCursor())
+        #else
+            self
+        #endif
+    }
+}

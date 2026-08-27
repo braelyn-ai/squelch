@@ -585,8 +585,8 @@ actor APIClient {
     /// the daemon derives `Re: <parent subject>`; pass "" only to mean it.
     @discardableResult
     func actionSend(
-        body: String, replyToMessageId: Int? = nil, to: String? = nil, bcc: String? = nil,
-        groupId: Int? = nil, subject: String? = nil,
+        body: String, replyToMessageId: Int? = nil, to: String? = nil, cc: String? = nil,
+        bcc: String? = nil, groupId: Int? = nil, subject: String? = nil,
         overrideGuard: Bool = false, draftId: Int? = nil, includeTracker: Bool = false,
         replyAll: Bool = false, forwardOfMessageId: Int? = nil
     ) async throws -> SendResult {
@@ -598,7 +598,15 @@ actor APIClient {
                 // never set beside `reply_to_message_id`: the daemon refuses a
                 // send that claims to be both an answer and a forward.
                 forward_of_message_id: forwardOfMessageId,
-                to: to, bcc: bcc,
+                to: to,
+                // NOT collapsed to nil when empty, unlike everything else here:
+                // `""` is this client saying "nobody, and I mean it", while
+                // absent hands the copy list back to the daemon's derivation.
+                // The caller decides which it means; see `ComposeSubmit`.
+                cc: cc,
+                // Nothing derives a blind copy, so empty and absent are the
+                // same thing and the caller may pass either.
+                bcc: bcc?.isEmpty == true ? nil : bcc,
                 // Attribution for an expanded group; the whole audience for a
                 // fan-out, whose membership the daemon reads itself.
                 group_id: groupId,
@@ -703,12 +711,13 @@ actor APIClient {
     /// sealed or unknown parent is a 404 and stores nothing.
     @discardableResult
     func putDraft(
-        replyToMessageId: Int?, to: String, bcc: String = "", subject: String, body: String
+        replyToMessageId: Int?, to: String, cc: String = "", bcc: String = "", subject: String,
+        body: String
     ) async throws -> DraftView {
         try await put(
             "/client/drafts",
             body: DraftBody(
-                reply_to_message_id: replyToMessageId, to: to, bcc: bcc, subject: subject,
+                reply_to_message_id: replyToMessageId, to: to, cc: cc, bcc: bcc, subject: subject,
                 body: body))
     }
 

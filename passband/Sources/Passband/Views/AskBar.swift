@@ -415,6 +415,12 @@ struct AskBar: View {
             // last resort, not the normal case: the whole point of the tap is
             // that the person can see who the mail goes to.
             ComposeSummaryRow("to", action.to ?? action.verifiedSender ?? Self.derivedRecipient)
+            // APPROVING A SEND MEANS SEEING EVERYONE IT REACHES. A copy list the
+            // card did not mention is a recipient the person authorized without
+            // knowing, and for a blind one this card is the only screen that
+            // will ever say so — the sent mail shows it to nobody.
+            if let cc = action.cc, !cc.trimmed.isEmpty { ComposeSummaryRow("cc", cc) }
+            if let bcc = action.bcc, !bcc.trimmed.isEmpty { ComposeSummaryRow("bcc", bcc) }
             ComposeSummaryRow(
                 "subject",
                 action.subject
@@ -450,6 +456,8 @@ struct AskBar: View {
             ComposeState(
                 replyToMessageId: action.replyToMessageId,
                 to: action.to ?? "",
+                cc: action.cc ?? "",
+                bcc: action.bcc ?? "",
                 subject: action.subject ?? "",
                 body: action.body ?? ""))
         session.resolve(action.id, .editedInComposer)

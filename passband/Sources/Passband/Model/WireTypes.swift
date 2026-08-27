@@ -989,7 +989,15 @@ struct SendBody: Codable, Sendable {
     /// your own is the ordinary case.
     var forward_of_message_id: Int?
     var to: String?
-    /// Blind recipients, comma-joined. Omitted when there are none. Filtered
+    /// PRESENT — `""` INCLUDED — means this client is stating the whole copy
+    /// list and the daemon does not consult the parent's. OMITTED means derive
+    /// it, which is what a composer that has not yet learned the derived set
+    /// must send: asserting an empty Cc it never had would silently narrow a
+    /// reply-all to one person. See `ComposeState.recipientsStated`.
+    var cc: String?
+    /// Blind recipients, comma-joined. Omitted when there are none — nothing
+    /// derives these, since no header of a parent records who was blind-copied
+    /// on it, so absent and `""` mean the same thing here unlike `cc`. Filtered
     /// server-side against `to` and `cc`, so a person on both lists is delivered
     /// once rather than twice.
     var bcc: String?
@@ -1118,9 +1126,12 @@ struct DraftView: Codable, Sendable, Identifiable, Hashable {
     /// The message this answers. nil = the account's single new-message draft.
     var reply_to_message_id: Int?
     var to: String
-    /// Blind recipients. Always present, `""` when there are none — a draft that
-    /// could not hold these would silently lose the audience of a bcc send.
-    var bcc: String
+    /// The other two lists. A draft that could not hold these would silently
+    /// lose the audience of a bcc send. OPTIONAL here for exactly one reason:
+    /// an older daemon sends neither field, and a decode that failed over it
+    /// would lose the whole draft rather than the two lists it could not carry.
+    var cc: String?
+    var bcc: String?
     var subject: String
     var body: String
     var created_at: String
@@ -1133,6 +1144,10 @@ struct DraftView: Codable, Sendable, Identifiable, Hashable {
 struct DraftBody: Codable, Sendable {
     var reply_to_message_id: Int?
     var to: String
+    /// Sent unconditionally, `""` and all: unlike the SEND route, absence has
+    /// no second meaning here — nothing is ever derived into a draft — and a
+    /// composer that cleared its Bcc has to be able to say so.
+    var cc: String
     var bcc: String
     var subject: String
     var body: String

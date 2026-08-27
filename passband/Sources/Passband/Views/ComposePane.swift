@@ -33,11 +33,8 @@ struct ComposePane: View {
     @Environment(AppStore.self) private var store
     @FocusState private var focusedField: FocusTarget?
 
-    private enum FocusTarget { case to, bcc, subject }
+    private enum FocusTarget: Hashable { case recipient(RecipientSlot), subject }
 
-    /// Whether the bcc row is on screen. A row you ask for: always-on it would be
-    /// a third empty field over every ordinary message.
-    @State private var showBcc = false
     @State private var groupPickerOpen = false
     /// The picked group's size, for the fan-out pill's "· 12 ·". Held here rather
     /// than on ComposeState because it is a display detail the daemon re-reads
@@ -82,7 +79,7 @@ struct ComposePane: View {
             #endif
             .keyContext(.modal)
             .keyBindings(.modal, bindings)
-            .onAppear { if !inReview { focusedField = .to } }
+            .onAppear { if !inReview { focusedField = .recipient(.to) } }
         }
     }
 
@@ -255,11 +252,6 @@ struct ComposePane: View {
     private func editPane(_ compose: ComposeState) -> some View {
         VStack(alignment: .leading, spacing: 12) {
             recipientRow(compose)
-            if showBcc || !compose.bcc.isEmpty {
-                RecipientField(
-                    text: bind(\.bcc), focus: $focusedField, field: FocusTarget.bcc,
-                    label: "bcc", placeholder: "nobody here sees the others")
-            }
             Field(label: "subject") {
                 // Left blank on a reply the daemon titles from the parent; the
                 // placeholder says so, because an empty field otherwise reads as
@@ -315,8 +307,13 @@ struct ComposePane: View {
     @ViewBuilder
     private func recipientRow(_ compose: ComposeState) -> some View {
         VStack(alignment: .leading, spacing: 4) {
-            RecipientField(
-                text: bind(\.to), focus: $focusedField, field: FocusTarget.to,
+            // `to`, with cc and bcc folded behind their own labels on its line
+            // — and unfolded on their own whenever they hold anybody. The group
+            // affordances belong to `to` alone: a group is an audience, and an
+            // audience is who the mail is TO. See `RecipientFields`.
+            RecipientFields(
+                recipients: recipientsBinding, focus: $focusedField,
+                field: FocusTarget.recipient,
                 suggestGroups: canAddressGroup,
                 onGroupPicked: { pick($0) },
                 resolvedGroup: compose.groupName.map {
@@ -341,15 +338,10 @@ struct ComposePane: View {
                             pick(group)
                         }
                     }
-                    // Bcc is a row you ASK for. Always-on it would be a third
-                    // empty field over every ordinary message; a bcc group opens
-                    // it on its own, which is the only time most people need it.
-                    if !showBcc && compose.bcc.isEmpty {
-                        Button("bcc") { showBcc = true }
-                            .buttonStyle(.plain)
-                            .font(Typo.micro)
-                            .foregroundStyle(Palette.inkFaint)
-                    }
+                    // The bcc toggle used to live here. It is on the `to`
+                    // field's own label row now, beside cc, where both fields
+                    // are unfolded from — and a bcc group still opens the row
+                    // on its own by filling it.
                     Spacer()
                 }
             }
@@ -385,8 +377,10 @@ struct ComposePane: View {
                 case .to:
                     state.to = merge(state.to, members)
                 case .bcc:
+                    // No reveal flag to set: `RecipientFields` unfolds any row
+                    // that holds somebody, which is the same rule that keeps a
+                    // restored draft's bcc from hiding itself.
                     state.bcc = merge(state.bcc, members)
-                    showBcc = true
                 case .individual:
                     // The token REPLACES whatever was in the field. A fan-out
                     // addresses one audience and nobody else: leaving a typed
@@ -479,7 +473,13 @@ struct ComposePane: View {
     private func reviewPane(_ compose: ComposeState) -> some View {
         VStack(alignment: .leading, spacing: 10) {
             ComposeSummaryRow("to", reviewTo(compose))
-            if !compose.bcc.isEmpty {
+            // Only when there is one, and BOTH when there are — review's whole
+            // job is stating what goes out, and a blind copy is the part of that
+            // the sent mail will not show anybody, including the sender.
+            if !compose.cc.trimmed.isEmpty {
+                ComposeSummaryRow("cc", compose.cc)
+            }
+            if !compose.bcc.trimmed.isEmpty {
                 ComposeSummaryRow("bcc", compose.bcc)
             }
             // THE SHAPE OF THE SEND, said out loud, and only when a group made it
@@ -634,6 +634,20 @@ struct ComposePane: View {
     }
 
     // MARK: - state helpers
+
+    /// The three recipient fields as one binding. Writes go through
+    /// `stateRecipients`, which records that this composer's fields ARE the
+    /// audience — see `ComposeState.recipientsStated`. Autosaves like every
+    /// other field: a Bcc typed and then abandoned has to come back.
+    private var recipientsBinding: Binding<Recipients> {
+        Binding(
+            get: { store.compose?.recipients ?? Recipients() },
+            set: { value in
+                guard store.compose?.recipients != value else { return }
+                patch { $0.stateRecipients(value) }
+                DraftSaver.shared.noteChange(.compose)
+            })
+    }
 
     private func bind(_ keyPath: WritableKeyPath<ComposeState, String>) -> Binding<String> {
         Binding(

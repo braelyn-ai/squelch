@@ -176,9 +176,16 @@ final class DraftSaver {
         guard state.forwardOfMessageId == nil else { return }
         // A body that is only the seeded signature counts as blank: saving it
         // would mint a draft of nothing, and every later `c` would restore it.
+        //
+        // ADDRESSING IS COMPOSING, so the recipients count too: a Cc typed and
+        // abandoned is something the sender said about who this mail reaches,
+        // and a Bcc doubly so — it is the one field nothing else on screen
+        // would show them missing later. Compared against the SEED rather than
+        // against empty, because a reply opens already holding the set the
+        // daemon derived: testing "is `to` empty" would make every abandoned
+        // `r` mint a draft of a message nobody wrote.
         let blank =
-            state.to.trimmed.isEmpty && state.bcc.trimmed.isEmpty
-            && state.subject.trimmed.isEmpty
+            state.recipients == state.seededRecipients && state.subject.trimmed.isEmpty
             && Prefs.shared.isBodyUntouched(state.body)
         if blank {
             // EMPTIED, not composed: a draft cleared back to nothing is discarded
@@ -191,8 +198,8 @@ final class DraftSaver {
         }
         do {
             let saved = try await APIClient.shared.putDraft(
-                replyToMessageId: state.replyToMessageId, to: state.to, bcc: state.bcc,
-                subject: state.subject, body: state.body)
+                replyToMessageId: state.replyToMessageId, to: state.to, cc: state.cc,
+                bcc: state.bcc, subject: state.subject, body: state.body)
             adopt(saved.id, slot: slot, key: state.id)
         } catch {
             // Silent, always. A 404 here is a parent sealed since the composer
