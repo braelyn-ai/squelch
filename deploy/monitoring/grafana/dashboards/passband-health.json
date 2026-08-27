@@ -3634,6 +3634,82 @@
      "sort": "desc"
     }
    }
+  },
+  {
+   "type": "timeseries",
+   "title": "Emails triaged, per tenant",
+   "id": 51,
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prometheus"
+   },
+   "description": "Model verdicts landed per hour, PER TENANT. Its neighbour \"Triage throughput\" is the same counter cut by stage and outcome across the whole fleet, which answers \"is triage working\"; this one answers \"is THIS mailbox getting anything\", and that is the question a single dark tenant hides inside a healthy fleet total. On 2026-08-25 three of four tenants had been triaging nothing for days while the fleet-wide line looked alive on the strength of the fourth.\n\noutcome=\"ok\" only, deliberately: a fallback kept its ingest heuristic and a stale_skip never asked the model, so counting either would report work the person did not get. A tenant sitting flat at zero while mail arrives is one whose mail is being filed by guesswork.\n\nBars over an hourly increase rather than a rate, so a quiet mailbox reads as a small bar rather than a noisy line near zero, and so the y axis is a countable number of emails. The counter is process-local and resets when a pod restarts; increase() accounts for that, which is why this is not a bare delta.",
+   "gridPos": {
+    "h": 8,
+    "w": 12,
+    "x": 0,
+    "y": 127
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prometheus"
+     },
+     "expr": "sum by (tenant) (increase(squelchd_triage_verdicts_total{outcome=\"ok\"}[1h]))",
+     "refId": "A",
+     "range": true,
+     "instant": false,
+     "legendFormat": "{{tenant}}"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "color": {
+      "mode": "palette-classic"
+     },
+     "unit": "short",
+     "min": 0,
+     "custom": {
+      "drawStyle": "bars",
+      "lineWidth": 1,
+      "fillOpacity": 70,
+      "showPoints": "never",
+      "pointSize": 5,
+      "spanNulls": false,
+      "axisBorderShow": false,
+      "gradientMode": "none",
+      "stacking": {
+       "mode": "normal"
+      }
+     },
+     "mappings": [],
+     "thresholds": {
+      "mode": "absolute",
+      "steps": [
+       {
+        "color": "green",
+        "value": null
+       }
+      ]
+     }
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "showLegend": true,
+     "displayMode": "list",
+     "placement": "bottom",
+     "calcs": [
+      "sum"
+     ]
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   }
   }
  ],
  "templating": {
