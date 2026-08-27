@@ -716,6 +716,20 @@ struct StoreStats: Codable, Sendable, Hashable {
     /// "connected": claiming a mailbox is fine on a daemon that cannot see is
     /// the failure this whole field exists to end.
     var gmail: GmailHealth?
+    /// A mailbox catch-up in flight. ABSENT is the normal state; presence is
+    /// the explanation for a triage queue that is not moving.
+    var catch_up: CatchUpProgress?
+}
+
+/// The 30-day re-walk the daemon falls back to when Gmail's history cursor
+/// expires, which is what happens to any mailbox that goes quiet for a week.
+///
+/// It is the sync loop's longest single call and triage cannot run until it
+/// finishes, so without this object a working mailbox is indistinguishable from
+/// a hung one — which is exactly how it looked the day it was added.
+struct CatchUpProgress: Codable, Sendable, Hashable {
+    var done: Int
+    var total: Int
 }
 
 /// The daemon's answer to "is this mailbox still connected".

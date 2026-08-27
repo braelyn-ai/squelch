@@ -1738,6 +1738,19 @@ pub async fn get_stats(State(state): State<ApiState>) -> Result<impl IntoRespons
         }
         body["gmail"] = gmail;
     }
+    // A CATCH-UP IN FLIGHT, and what it is a denominator of. When Gmail's
+    // history cursor expires the daemon re-walks a 30-day window, which is the
+    // sync loop's longest single call and blocks triage for the whole of it —
+    // so a client that does not know about it renders a working mailbox as a
+    // hung one. The re-triage modal is the sharp case: its own progress cannot
+    // move until this finishes, and without this field it has no way to say
+    // why.
+    //
+    // OMITTED when no catch-up is running, so absence is the normal state and
+    // presence is the explanation.
+    if let Some((done, total)) = state.sync_metrics().and_then(|m| m.catchup_progress()) {
+        body["catch_up"] = json!({ "done": done, "total": total });
+    }
     // Capability flag for the app: whether /client/assistant/messages will
     // relay (hosted, gateway configured) or 404 (self-host, BYOK in the app).
     // Always present so a client reads an answer, not absence.

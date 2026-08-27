@@ -190,6 +190,19 @@ pub struct SyncMetrics {
     /// failure, so it answers "is this broken NOW", not "how often".
     sync_consecutive_failures: AtomicU64,
 
+    /// A catch-up in flight: how many messages it has to re-fetch, and how many
+    /// it has done. BOTH ZERO means no catch-up is running.
+    ///
+    /// A catch-up is the loop's longest single call by orders of magnitude — a
+    /// 30-day re-walk of every message in the mailbox — and until this pair
+    /// existed it emitted NOTHING while it ran. Not a log line, not a counter,
+    /// not a stamp: `poll_once` had simply not returned yet. Most of the work
+    /// is upserts of mail already stored, so the message count and the database
+    /// size sit still too, and the only honest reading available from outside
+    /// was "indistinguishable from wedged". That is what these two numbers end.
+    catchup_total: AtomicU64,
+    catchup_done: AtomicU64,
+
     gmail_auth: AtomicU64,
     /// Unix seconds of the FIRST credential failure in the current outage, or 0
     /// while the mailbox is connected. A STATE, not a count, for the same
@@ -314,6 +327,39 @@ impl SyncMetrics {
                 Ordering::Relaxed,
                 Ordering::Relaxed,
             );
+        }
+    }
+
+    /// A catch-up is starting over `total` messages.
+    pub fn catchup_begin(&self, total: u64) {
+        self.catchup_total.store(total, Ordering::Relaxed);
+        self.catchup_done.store(0, Ordering::Relaxed);
+    }
+
+    /// Widen an in-flight catch-up's denominator without resetting its
+    /// progress: the SENT phase is more of the same wait, not a new one.
+    pub fn catchup_begin_extend(&self, total: u64) {
+        self.catchup_total.store(total, Ordering::Relaxed);
+    }
+
+    /// One more message of the catch-up is fetched and ingested.
+    pub fn catchup_step(&self) -> u64 {
+        self.catchup_done.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
+    /// The catch-up is over, whether it finished or bailed. Cleared on BOTH
+    /// paths: a pair left standing after an error would report a run that is
+    /// not happening, which is a worse lie than saying nothing.
+    pub fn catchup_end(&self) {
+        self.catchup_total.store(0, Ordering::Relaxed);
+        self.catchup_done.store(0, Ordering::Relaxed);
+    }
+
+    /// `(done, total)` of a catch-up in flight, or `None` when none is.
+    pub fn catchup_progress(&self) -> Option<(u64, u64)> {
+        match self.catchup_total.load(Ordering::Relaxed) {
+            0 => None,
+            total => Some((self.catchup_done.load(Ordering::Relaxed), total)),
         }
     }
 
@@ -1314,5 +1360,64 @@ mod gmail_auth_state_tests {
             m.record_gmail_error(kind);
         }
         assert_eq!(m.gmail_auth_failed_since(), None);
+    }
+}
+
+#[cfg(test)]
+mod catchup_progress_tests {
+    use super::*;
+
+    /// A catch-up has a denominator while it runs and none when it does not.
+    /// Absence is what lets every other caller treat the progress step as a
+    /// no-op on the ordinary incremental path.
+    #[test]
+    fn progress_exists_only_while_a_catch_up_is_running() {
+        let m = SyncMetrics::new();
+        assert_eq!(m.catchup_progress(), None, "no catch-up, no denominator");
+
+        m.catchup_begin(4500);
+        assert_eq!(m.catchup_progress(), Some((0, 4500)));
+        assert_eq!(m.catchup_step(), 1);
+        assert_eq!(m.catchup_step(), 2);
+        assert_eq!(m.catchup_progress(), Some((2, 4500)));
+
+        m.catchup_end();
+        assert_eq!(m.catchup_progress(), None, "and none once it is over");
+    }
+
+    /// The SENT phase widens the same run rather than starting a second one: to
+    /// anybody watching this is one wait, and a bar that reached the end and
+    /// restarted at zero would read as a loop rather than as two phases.
+    #[test]
+    fn the_sent_phase_widens_the_run_instead_of_restarting_it() {
+        let m = SyncMetrics::new();
+        m.catchup_begin(100);
+        for _ in 0..100 {
+            m.catchup_step();
+        }
+        assert_eq!(m.catchup_progress(), Some((100, 100)));
+
+        m.catchup_begin_extend(140);
+        assert_eq!(
+            m.catchup_progress(),
+            Some((100, 140)),
+            "done is carried, only the denominator moves"
+        );
+    }
+
+    /// A catch-up that dies halfway leaves nothing behind. The guard around it
+    /// clears on the error path too, because a denominator still standing would
+    /// report a run that is not happening — a worse lie than the silence this
+    /// whole pair replaced.
+    #[test]
+    fn an_abandoned_catch_up_leaves_no_ghost_denominator() {
+        let m = SyncMetrics::new();
+        m.catchup_begin(4500);
+        m.catchup_step();
+        m.catchup_end();
+        assert_eq!(m.catchup_progress(), None);
+        // And the next one starts clean rather than resuming the ghost.
+        m.catchup_begin(12);
+        assert_eq!(m.catchup_progress(), Some((0, 12)));
     }
 }

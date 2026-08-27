@@ -285,6 +285,22 @@ fn subtract_ids(ids: Vec<String>, claimed: &[String]) -> Vec<String> {
 // contracts. squelch-api's write path deserializes the same Gmail resources, so
 // the shared ones are `pub` here and defined exactly once.
 
+/// Clears the catch-up progress pair on the way out of `Syncer::catch_up`, on
+/// every path including the `?` returns.
+///
+/// A guard rather than a call at the end, because the end is the one place a
+/// catch-up reliably does NOT reach: it is a long walk over a network, and a
+/// Gmail hiccup halfway through leaves by `?`. A pair left standing then would
+/// report a run that is not happening, which is a worse lie than the silence
+/// this replaced.
+struct CatchUpGuard<'a>(&'a crate::metrics::SyncMetrics);
+
+impl Drop for CatchUpGuard<'_> {
+    fn drop(&mut self) {
+        self.0.catchup_end();
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct MessageRef {
     id: String,
@@ -1025,14 +1041,40 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
     /// Trimmed on the way out either way, for the reason [`Self::backfill`]
     /// gives: a catch-up that dies mid-window has already paid the peak.
     async fn catch_up(&self) -> Result<()> {
+        // THE PROGRESS PAIR IS SET UP FRONT AND CLEARED ON EVERY EXIT, including
+        // the `?` paths in the body below, which is what `_guard` is for. A
+        // catch-up is this loop's longest single call by orders of magnitude and
+        // it used to emit nothing at all while it ran: no log, no counter, no
+        // freshness stamp, because `poll_once` had not returned yet. Worse, most
+        // of its work is upserting mail already stored, so the message count and
+        // the database size sit still as well. On 2026-08-26 a tenant's mailbox
+        // spent half an hour in here and the only honest thing anybody could say
+        // from outside was that it was indistinguishable from wedged.
+        //
+        // It is held ACROSS the trim on purpose: handing the heap back is part
+        // of the catch-up as seen from outside, so progress clears when the
+        // whole thing is done rather than when the last fetch returns.
+        let _guard = CatchUpGuard(&self.metrics);
         let out = self.catch_up_inner().await;
         crate::mem::trim_off_runtime().await;
         out
     }
 
+    /// The catch-up body, split out so [`Self::catch_up`] can hold the progress
+    /// guard and run the trim across every exit path, `?` included.
     async fn catch_up_inner(&self) -> Result<()> {
         let q = format!("newer_than:{}d", self.config.sync.backfill_days);
         let ids = self.list_message_ids(LABEL_INBOX, Some(&q)).await?;
+        // BEFORE the first fetch, so the size of the job is known while it is
+        // still a job rather than after it is a result. This is the line that
+        // turns "silent for 30 minutes" into "re-fetching 4,500 messages".
+        eprintln!(
+            "squelch: catch-up re-fetching {} INBOX message(s) from the last {} days; \
+             triage waits for this to finish",
+            ids.len(),
+            self.config.sync.backfill_days
+        );
+        self.metrics.catchup_begin(ids.len() as u64);
         // A catch-up may carry genuinely new mail, so it is allowed to notify.
         // What keeps the whole-window re-scan from storming is the freshness
         // window in `triage::events` plus the one-event-per-message key.
@@ -1048,6 +1090,15 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
         // listings and its visible copy must win the unique-key race.
         let sent_ids = self.list_message_ids(LABEL_SENT, Some(&q)).await?;
         let sent_only = subtract_ids(sent_ids, &ids);
+        // EXTENDS the same run rather than starting a second one: from outside
+        // this is one wait, and a progress bar that reached the end and then
+        // restarted at zero would read as a loop rather than as two phases.
+        self.metrics
+            .catchup_begin_extend(ids.len() as u64 + sent_only.len() as u64);
+        eprintln!(
+            "squelch: catch-up re-fetching {} SENT message(s)",
+            sent_only.len()
+        );
         let sent_n = self
             .fetch_raw_and_ingest(&sent_only, true, IngestOrigin::Incremental)
             .await?;
@@ -1310,6 +1361,18 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
         let mut count = 0usize;
 
         for id in ids {
+            // Only a catch-up has a denominator, so this is a no-op on the
+            // ordinary incremental path — `catchup_step` moves a gauge that is
+            // zero unless `catch_up` set one up. A line every 250 messages
+            // rather than every message: enough to prove movement in a log
+            // somebody is tailing, few enough not to bury the lines that mean
+            // something.
+            if let Some((_, total)) = self.metrics.catchup_progress() {
+                let done = self.metrics.catchup_step();
+                if done.is_multiple_of(250) {
+                    eprintln!("squelch: catch-up {done}/{total} messages");
+                }
+            }
             let url = format!("{}/messages/{id}?format=raw", self.api_base);
             let msg: GmailMessage = self.get_json(&url).await?;
             let raw_b64 = match &msg.raw {
