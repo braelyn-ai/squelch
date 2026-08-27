@@ -10,11 +10,11 @@
 // three tabs on a screen you visit twice a month would have been the trade going
 // the other way.
 //
-// ACCOUNT SWITCHING WILL LAND HERE, and nothing below builds it yet. The Mac's
-// multi-account shell (one active world, N background ears, ⌘1..⌘9) has no phone
-// equivalent, and when it gets one this is the surface it appears on, above the
-// panes, which is why the Account row already sits first rather than last in the
-// Mac's order.
+// ACCOUNT SWITCHING LANDED HERE, above the panes — which is why the Account row
+// already sat first rather than last in the Mac's order. The Mac switches worlds
+// with ⌘1..⌘9 and a menu on the rail; a phone has neither a chord nor a rail, so
+// the list of mailboxes IS the control, and it sits at the top of the one screen
+// entered by tapping a person.
 //
 // The panes here hold THE SAME STRUCTS the Mac's Views/SettingsView.swift lays
 // out: ConnectionSection, SignatureSection, TriageBudgetSection and the rest are
@@ -49,10 +49,13 @@ struct AccountPage: View {
         .account, .general, .mail, .triage, .assistant, .privacy,
     ]
 
+    private var accounts: [AccountRecord] { AccountManager.shared.accounts }
+
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 16) {
                 masthead
+                switcher
                 index
             }
             .padding(.horizontal, 16)
@@ -79,6 +82,83 @@ struct AccountPage: View {
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(.top, 4)
+    }
+
+    /// WHICH MAILBOX THE PANES BELOW ARE ABOUT, and the tap that changes it.
+    ///
+    /// It renders for a single account too. One row is not a switcher, but it is
+    /// still the answer to "who am I signed in as" — and a control that appears
+    /// only once a second account exists is one nobody finds before they need
+    /// it. Adding is NOT here: it lives in the Account pane, one row down, where
+    /// removing and renaming already live. This surface answers which, not how
+    /// many.
+    private var switcher: some View {
+        VStack(spacing: 0) {
+            ForEach(accounts) { account in
+                let isActive = account.id == AccountManager.shared.activeId
+                Button {
+                    // `switchTo` declines the account already live, so a tap on
+                    // the checked row costs nothing — no flush, no epoch bump,
+                    // no world rebuilt to arrive where it started. Which is why
+                    // the row is not `.disabled`: dimming the ACTIVE account
+                    // would say the opposite of what the checkmark says.
+                    Task { await AccountManager.shared.switchTo(account.id) }
+                } label: {
+                    accountRow(account, isActive: isActive)
+                }
+                .buttonStyle(.plain)
+                if account.id != accounts.last?.id { Hairline() }
+            }
+        }
+        .padding(.vertical, 4)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .passbandGlass(.pane, cornerRadius: 18, tint: Palette.glassTint)
+    }
+
+    private func accountRow(_ account: AccountRecord, isActive: Bool) -> some View {
+        HStack(spacing: 12) {
+            // The same initial-in-a-circle the Mac's rail wears, so one person
+            // on both devices recognizes an account by the same mark.
+            Text(account.initial)
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundStyle(Palette.accent)
+                .frame(width: 26, height: 26)
+                .background(Circle().fill(Palette.accentSoft))
+            VStack(alignment: .leading, spacing: 2) {
+                Text(account.displayName)
+                    .font(Typo.rowSub)
+                    .foregroundStyle(Palette.ink)
+                    .lineLimit(1)
+                // Only when it would SAY something new: `displayName` already
+                // falls back to the host, and a row reading "baddiebox:8848"
+                // twice is noise dressed as detail.
+                if let host = subtitle(account) {
+                    Text(host)
+                        .font(Typo.micro)
+                        .foregroundStyle(Palette.inkFaintest)
+                        .lineLimit(1)
+                }
+            }
+            Spacer(minLength: 8)
+            if isActive {
+                Image(systemName: "checkmark")
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(Palette.accent)
+                    .accessibilityLabel("Active account")
+            }
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 11)
+        .contentShape(Rectangle())
+    }
+
+    /// The daemon behind a NAMED account. Nil when the name is already the host
+    /// (or when the host is not known yet, which is a record written before the
+    /// field existed — `noteDisplayHost` fills those in at boot).
+    private func subtitle(_ account: AccountRecord) -> String? {
+        let named = account.label.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !named.isEmpty, !account.displayHost.isEmpty else { return nil }
+        return account.displayHost
     }
 
     /// One glass pane, six rows, hairlines between: the inset-grouped shape,
