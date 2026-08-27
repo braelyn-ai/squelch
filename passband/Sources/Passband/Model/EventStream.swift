@@ -5,9 +5,11 @@
 // accounts that are NOT live, because being told about mail in a mailbox
 // nobody is looking at is the entire reason to hold a connection to it.
 // Everything an instance needs is fixed at construction: the account it posts
-// under and the credentials it connects with. Nothing in here reads
-// `AppStore.shared`, which is only ever the ACTIVE account's world and would
-// have every stream in the process dialling the same daemon.
+// under and the credentials it connects with. Nothing in here DECIDES anything
+// from `AppStore.shared`, which is only ever the ACTIVE account's world and
+// would have every stream in the process dialling the same daemon; the one
+// call into it hands over the account id and lets the store refuse a feed that
+// is not the one on screen.
 //
 // The daemon's events table is the truth; this client carries its OWN cursor
 // (`?after=<id>`, persisted in UserDefaults, per account — the ids are one
@@ -247,6 +249,16 @@ final class EventStream {
             let event = try? Self.decoder.decode(Event.self, from: data)
         {
             note(seen: event.id)
+            // THE THREAD ON SCREEN HEARS FIRST. Mail arriving in the email
+            // somebody is reading is the one event with somewhere to go besides
+            // a banner — and the banner is suppressed in exactly that case, so
+            // without this the reply lands silently and stays invisible until
+            // the 10s poll finds it. The account is HANDED OVER rather than
+            // read: the store takes it as an argument and refuses anything that
+            // is not the mailbox on screen (see AppStore.noteLiveEvent), which
+            // is what keeps this stream from having an opinion about which
+            // account is live.
+            AppStore.shared.noteLiveEvent(event, accountId: accountId)
             Notifier.shared.post(event, accountId: accountId)
         } else if let id = frame.id.flatMap({ Int($0) }) {
             // An undecodable frame still ADVANCES the cursor, mirroring the

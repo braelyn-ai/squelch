@@ -183,3 +183,11 @@ run_suite sender-identity \
 run_suite key-dispatch \
   Sources/Passband/Keys/KeyDispatch.swift \
   Tests/KeyDispatchTests.swift
+
+# The ledger between the live event feed, the 10s poll and the person reading
+# the thread they both have news about. Pure value logic — no store, no
+# network — because the rule it encodes ("ask again as often as you like, tell
+# them once") is the kind that is only ever wrong later.
+run_suite thread-arrivals \
+  Sources/Passband/Lib/ThreadArrivals.swift \
+  Tests/ThreadArrivalsTests.swift

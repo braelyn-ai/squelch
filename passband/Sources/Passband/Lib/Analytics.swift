@@ -86,7 +86,7 @@ enum Analytics {
         "email_archived", "email_done", "email_reopened", "email_labeled",
         "email_remind",
         "block_rule_created", "compose_opened", "compose_send",
-        "thread_opened", "undo_fired", "assistant_asked",
+        "thread_opened", "thread_live_arrival", "undo_fired", "assistant_asked",
         "triage_corrected", "triage_digest", "rule_created", "rule_deleted",
         "process_completed", "notification_opened", "sealed_revealed",
         "shipment_cleared", "shipments_poll_kicked",
@@ -105,6 +105,11 @@ enum Analytics {
     private static let minimalEvents: Set<String> = [
         "email_archived", "email_done", "email_reopened", "email_remind",
         "block_rule_created", "compose_send", "thread_opened",
+        // One bool: mail landed in the thread on screen, and whether the reader
+        // was at the end of it (carried to the new message) or up in the
+        // history (held in place, pointed at it). Anonymous, and it is the only
+        // measure of whether live-loading is worth the round trips.
+        "thread_live_arrival",
         "undo_fired", "assistant_asked",
         "triage_corrected", "triage_digest", "rule_created", "rule_deleted",
         "process_completed", "notification_opened", "sealed_revealed",
