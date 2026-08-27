@@ -417,13 +417,21 @@ private struct RecipientPill: View {
     /// Where this pill currently lives, so the menu offers the other two.
     let slot: RecipientSlot
 
-    /// A `Button`, and deliberately still one. It is also what keeps a click on
-    /// a pill from dragging the whole WINDOW: the app hides its titlebar and
-    /// moves by its background (see `Glass.WindowConfigurator`), so anything
-    /// AppKit reads as background is a window handle — and a bare SwiftUI shape
-    /// with a tap gesture is background. A Button is not.
+    /// A `Button`, and deliberately still one. It is what keeps a click on a
+    /// pill from dragging the whole WINDOW: the app hides its titlebar and moves
+    /// by its background (see `Glass.WindowConfigurator`), so anything AppKit
+    /// reads as background is a window handle — and a bare SwiftUI shape with a
+    /// tap gesture is background. A Button is not.
+    ///
+    /// It selects on PRESS rather than on release, which is not a nicety about
+    /// latency. A pill LOOKS draggable — it is a small object with a person's
+    /// name on it — and dragging one is the first thing people try. It does not
+    /// drag, so the reach that matters is the one that catches somebody
+    /// mid-attempt: press, and the move bar is already open under your hand
+    /// offering the thing you were reaching for. The gesture that fails teaches
+    /// the gesture that works, instead of doing nothing and reading as broken.
     var body: some View {
-        Button(action: onTap) {
+        Button(action: {}) {
             // Email-derived string: Text only, never markup.
             Text(addr)
                 .font(Typo.mono(11))
@@ -433,7 +441,7 @@ private struct RecipientPill: View {
                 .padding(.vertical, 3)
                 .contentShape(Capsule())
         }
-        .buttonStyle(.plain)
+        .buttonStyle(PressToSelect(onPress: onTap))
         .background(
             Capsule().fill(selected ? Palette.accent.opacity(0.38) : Palette.accentSoft)
         )
@@ -454,6 +462,28 @@ private struct RecipientPill: View {
             Divider()
             Button("Remove", role: .destructive, action: onRemove)
         }
+    }
+}
+
+/// A button style that fires on PRESS instead of on release, and draws nothing
+/// of its own — the pill paints its own capsule.
+///
+/// `Button`'s own action waits for mouse-up inside, which is correct for
+/// anything that should be abandonable by dragging away. A recipient pill is
+/// the opposite case: dragging away IS the gesture we want to catch, because
+/// somebody trying to drag a pill is somebody looking for the move verbs. See
+/// `RecipientPill`.
+private struct PressToSelect: ButtonStyle {
+    let onPress: () -> Void
+
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            // Only the leading edge: `isPressed` falls back to false on release
+            // (or on a drag away), and firing there would toggle the selection
+            // straight off again.
+            .onChange(of: configuration.isPressed) { _, pressed in
+                if pressed { onPress() }
+            }
     }
 }
 
