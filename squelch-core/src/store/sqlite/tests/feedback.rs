@@ -363,13 +363,14 @@ fn sealing_by_hand_discards_the_reply_draft() {
             acct,
             Some(id),
             "noreply@bank.com",
+            "",
             "Re: code",
             "was this you?",
             t0,
         )
         .unwrap();
     store
-        .upsert_draft(acct, None, "bob@example.com", "Hello", "hi", t0)
+        .upsert_draft(acct, None, "bob@example.com", "", "Hello", "hi", t0)
         .unwrap();
     assert_eq!(store.list_drafts(acct).unwrap().len(), 2);
 

@@ -17,8 +17,7 @@ use crate::types::{
     AccountId, AttachmentInfo, AttentionStatus, AttentionUpdate, AuditEntry, Banking,
     CalendarUpdate, Deadline, Disposition, Event, EventKind, FieldReasons, NewMessage, OpenRate,
     Receipt, RetriageProgress, SealedKind, SearchHit, SenderRule, Sensitivity, ShredCandidate,
-    StoreStats,
-    ThreadView, Tier, TriageAxis, TriageFeedback, UnsubscribeRecord, Update,
+    StoreStats, ThreadView, Tier, TriageAxis, TriageFeedback, UnsubscribeRecord, Update,
 };
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -100,6 +99,15 @@ pub struct TriagedMessage {
     /// own address is filtered out at ingest). Contacts come exclusively from
     /// recipients of sent mail, never from inbound senders.
     pub recipients: Vec<String>,
+    /// Sent mail only: the FAITHFUL To/Cc address set, lowercased and deduped,
+    /// which becomes the `message_recipients` index.
+    ///
+    /// Deliberately not `recipients`, which is filtered for contact seeding (the
+    /// account's own address and robot addresses dropped). This one answers "who
+    /// did this go to" — the question `messages.to_addrs` answers in display
+    /// form — so send-group history can join against it and still see a mail
+    /// that went to `support@` or to the user themselves. Empty on received mail.
+    pub recipient_addrs: Vec<String>,
     pub sensitivity: Sensitivity,
     pub sealed_kind: Option<SealedKind>,
     pub importance: u8,
@@ -393,6 +401,9 @@ pub struct Draft {
     /// The message this replies to; `None` is the new-message draft.
     pub reply_to_message_id: Option<i64>,
     pub to_addr: String,
+    /// Blind recipients, comma-joined. `""` when there are none, which is every
+    /// draft written before the column existed.
+    pub bcc_addr: String,
     pub subject: String,
     pub body: String,
     /// First save of this draft; an edit keeps it.

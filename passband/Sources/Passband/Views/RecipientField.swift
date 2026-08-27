@@ -28,6 +28,24 @@ struct RecipientField<F: Hashable>: View {
     @Binding var text: String
     var focus: FocusState<F?>.Binding
     let field: F
+    /// The caption over the well. Defaults to the composer's "to"; the group
+    /// editor reuses this whole field for its membership list and says so.
+    var label: String = "to"
+    /// Placeholder for the empty field, for the same reason.
+    var placeholder: String = "recipient@example.com"
+    /// Offer SEND GROUPS alongside contacts as you type. Opt-in: the group
+    /// editor reuses this field for its own membership list, and a group that
+    /// could contain a group is not a thing this feature means.
+    var suggestGroups: Bool = false
+    /// Called when a group is accepted from the menu. The composer owns what
+    /// happens next, because the answer depends on the group's mode — expand
+    /// into this field, expand into the bcc field, or mint one pill — and this
+    /// field knows about neither the other field nor the mode.
+    var onGroupPicked: ((SendGroup) -> Void)?
+    /// The group a `#slug` pill in this field stands for, when the composer has
+    /// resolved one. Absent for a token it could not resolve, which is what the
+    /// pill renders as a problem.
+    var resolvedGroup: (name: String, count: Int)?
 
     /// Committed recipients — the pills.
     @State private var pills: [String] = []
@@ -37,16 +55,23 @@ struct RecipientField<F: Hashable>: View {
     @State private var selectedPill: Int?
 
     @State private var hits: [ContactHit] = []
+    /// Group matches, always ABOVE the contacts: there are few of them, picking
+    /// one is the more deliberate act, and a group buried under eight addresses
+    /// would never be found by the person who made it.
+    @State private var groupHits: [SendGroup] = []
     @State private var index = 0
+
+    /// The menu as one flat list, which is what the arrow keys walk.
+    private var suggestionCount: Int { groupHits.count + hits.count }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
             VStack(alignment: .leading, spacing: 5) {
-                FieldLabel("to")
+                FieldLabel(label)
                 pillRow.fieldWell()
             }
 
-            if !hits.isEmpty {
+            if suggestionCount > 0 {
                 suggestions
             }
         }
@@ -63,6 +88,7 @@ struct RecipientField<F: Hashable>: View {
         .onChange(of: focus.wrappedValue) { _, now in
             if now != field {
                 hits = []
+                groupHits = []
                 selectedPill = nil
             }
         }
@@ -73,12 +99,15 @@ struct RecipientField<F: Hashable>: View {
     private var pillRow: some View {
         FlowLine(spacing: 5) {
             ForEach(Array(pills.enumerated()), id: \.offset) { i, addr in
-                RecipientPill(addr: addr, selected: i == selectedPill) {
+                RecipientPill(
+                    addr: addr, selected: i == selectedPill,
+                    group: GroupToken.isToken(addr) ? resolvedGroup : nil
+                ) {
                     selectedPill = (selectedPill == i) ? nil : i
                     focus.wrappedValue = field
                 }
             }
-            TextField(pills.isEmpty ? "recipient@example.com" : "", text: $fragment)
+            TextField(pills.isEmpty ? placeholder : "", text: $fragment)
                 .textFieldStyle(.plain)
                 .focused(focus, equals: field)
                 .frame(minWidth: 120)
@@ -152,6 +181,46 @@ struct RecipientField<F: Hashable>: View {
 
     private var suggestions: some View {
         VStack(alignment: .leading, spacing: 1) {
+            ForEach(Array(groupHits.enumerated()), id: \.element.id) { i, group in
+                Button {
+                    acceptGroup(group)
+                } label: {
+                    HStack(spacing: 8) {
+                        Image(systemName: group.mode.symbol)
+                            .font(.system(size: 9, weight: .semibold))
+                            .foregroundStyle(group.mode.tone)
+                            .frame(width: 12)
+                        Text(group.name)
+                            .font(.system(size: 11, weight: .medium))
+                            .foregroundStyle(Palette.ink)
+                            .lineLimit(1)
+                        // The mode is said in the MENU, not only after picking:
+                        // it decides whether these addresses are about to become
+                        // visible to each other, and finding that out afterwards
+                        // is finding out too late.
+                        Text(group.mode.blurb)
+                            .font(Typo.micro)
+                            .foregroundStyle(Palette.inkFaintest)
+                            .lineLimit(1)
+                        Spacer(minLength: 8)
+                        Text("\(group.member_count)")
+                            .font(Typo.num(10))
+                            .foregroundStyle(Palette.inkFaintest)
+                    }
+                    .padding(.horizontal, 9)
+                    .padding(.vertical, 5)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .background(
+                    RoundedRectangle(cornerRadius: 7, style: .continuous)
+                        .fill(i == index ? Palette.accentSoft : .clear)
+                )
+            }
+            if !groupHits.isEmpty && !hits.isEmpty {
+                Divider().overlay(Palette.hairline).padding(.vertical, 2)
+            }
             ForEach(Array(hits.enumerated()), id: \.element.id) { i, hit in
                 Button {
                     accept(hit)
@@ -167,7 +236,9 @@ struct RecipientField<F: Hashable>: View {
                         }
                         Text(hit.addr)
                             .font(Typo.mono(11))
-                            .foregroundStyle(i == index ? Palette.ink : Palette.inkDim)
+                            .foregroundStyle(
+                                i + groupHits.count == index ? Palette.ink : Palette.inkDim
+                            )
                             .lineLimit(1)
                         Spacer(minLength: 8)
                         Text("\(hit.sent_count)×")
@@ -182,7 +253,7 @@ struct RecipientField<F: Hashable>: View {
                 .buttonStyle(.plain)
                 .background(
                     RoundedRectangle(cornerRadius: 7, style: .continuous)
-                        .fill(i == index ? Palette.accentSoft : .clear)
+                        .fill(i + groupHits.count == index ? Palette.accentSoft : .clear)
                 )
             }
             HStack(spacing: 4) {
@@ -233,19 +304,16 @@ struct RecipientField<F: Hashable>: View {
     private var suggestionBindings: [KeyBinding] {
         [
             KeyBinding("ArrowDown", "next suggestion", allowInInput: true) {
-                index = min(hits.count - 1, index + 1)
+                index = min(suggestionCount - 1, index + 1)
             },
             KeyBinding("ArrowUp", "prev suggestion", allowInInput: true) {
                 index = max(0, index - 1)
             },
-            KeyBinding("Enter", "accept suggestion", allowInInput: true) {
-                if let hit = hits[safe: index] { accept(hit) }
-            },
-            KeyBinding("Tab", "accept suggestion", allowInInput: true) {
-                if let hit = hits[safe: index] { accept(hit) }
-            },
+            KeyBinding("Enter", "accept suggestion", allowInInput: true) { acceptSelected() },
+            KeyBinding("Tab", "accept suggestion", allowInInput: true) { acceptSelected() },
             KeyBinding("Escape", "dismiss suggestions", allowInInput: true) {
                 hits = []
+                groupHits = []
             },
         ]
     }
@@ -255,25 +323,55 @@ struct RecipientField<F: Hashable>: View {
     private func refresh() async {
         guard let searchFragment else {
             hits = []
+            groupHits = []
             return
         }
         // Debounce: a fresh keystroke cancels this task before the request.
         try? await Task.sleep(for: .milliseconds(120))
         guard !Task.isCancelled else { return }
-        let found = (try? await APIClient.shared.contacts(searchFragment)) ?? []
+        // Both lookups in flight together, so adding groups to the menu costs a
+        // round trip's latency rather than two.
+        async let contacts = APIClient.shared.contacts(searchFragment)
+        async let groups: [SendGroup] =
+            suggestGroups ? APIClient.shared.searchGroups(searchFragment, limit: 4) : []
+        let found = (try? await contacts) ?? []
+        let foundGroups = (try? await groups) ?? []
         guard !Task.isCancelled else { return }
         // Every already-committed pill is a done deal, not a suggestion.
         hits = found.filter { !pills.contains($0.addr) }
+        groupHits = foundGroups
         index = 0
+    }
+
+    /// Accept whatever the cursor is on, out of the flat list the arrows walk.
+    private func acceptSelected() {
+        if let group = groupHits[safe: index] {
+            acceptGroup(group)
+        } else if let hit = hits[safe: index - groupHits.count] {
+            accept(hit)
+        }
     }
 
     private func accept(_ hit: ContactHit) {
         commit(hit.addr)
         fragment = ""
         hits = []
+        groupHits = []
         sync()
         // The caret stays in the field: accepting one recipient is usually the
         // middle of addressing, not the end of it.
+        focus.wrappedValue = field
+    }
+
+    /// Hand the group up and clear the menu. What lands in which field is the
+    /// composer's call — it depends on the group's mode, and this field knows
+    /// about neither the mode nor the bcc row beside it.
+    private func acceptGroup(_ group: SendGroup) {
+        fragment = ""
+        hits = []
+        groupHits = []
+        sync()
+        onGroupPicked?(group)
         focus.wrappedValue = field
     }
 }
@@ -283,28 +381,66 @@ struct RecipientField<F: Hashable>: View {
 private struct RecipientPill: View {
     let addr: String
     let selected: Bool
+    /// The group this pill stands for, when it is one. Set only by the composer,
+    /// and only for a FAN-OUT group: `to`/`bcc` groups are expanded into ordinary
+    /// address pills at pick time, so they never reach here.
+    var group: (name: String, count: Int)?
     let onTap: () -> Void
+
+    /// A group pill whose token no longer resolves. Rendered as a PROBLEM rather
+    /// than silently dropped: the daemon refuses to send it, and the sender needs
+    /// to know which audience went missing rather than watch a send fail.
+    private var unresolved: Bool { group == nil && GroupToken.isToken(addr) }
 
     var body: some View {
         Button(action: onTap) {
-            // Email-derived string: Text only, never markup.
-            Text(addr)
-                .font(Typo.mono(11))
-                .foregroundStyle(Palette.ink)
-                .lineLimit(1)
-                .padding(.horizontal, 8)
-                .padding(.vertical, 3)
-                .contentShape(Capsule())
+            HStack(spacing: 5) {
+                if group != nil {
+                    Image(systemName: "person.2.fill").font(.system(size: 8, weight: .semibold))
+                } else if unresolved {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .font(.system(size: 8, weight: .semibold))
+                }
+                // Email-derived string: Text only, never markup.
+                Text(label)
+                    .font(group == nil ? Typo.mono(11) : .system(size: 11, weight: .medium))
+                    .lineLimit(1)
+                if let group {
+                    // The count is the whole point of a fan-out pill: one pill
+                    // stands for twelve emails, and the number is the only thing
+                    // on screen that says so.
+                    Text("· \(group.count) · will send individually")
+                        .font(Typo.micro)
+                        .opacity(0.75)
+                        .lineLimit(1)
+                }
+            }
+            .foregroundStyle(unresolved ? Palette.danger : Palette.ink)
+            .padding(.horizontal, 8)
+            .padding(.vertical, 3)
+            .contentShape(Capsule())
         }
         .buttonStyle(.plain)
-        .background(
-            Capsule().fill(selected ? Palette.accent.opacity(0.38) : Palette.accentSoft)
-        )
+        .background(Capsule().fill(fill))
         .overlay(
             Capsule().strokeBorder(
-                selected ? Palette.accent : Palette.accent.opacity(0.25),
-                lineWidth: selected ? 1.25 : 0.75)
+                unresolved
+                    ? Palette.danger
+                    : (selected ? Palette.accent : Palette.accent.opacity(0.25)),
+                lineWidth: selected || unresolved ? 1.25 : 0.75)
         )
+        .help(unresolved ? "this group could not be found; pick it again" : addr)
+    }
+
+    private var label: String {
+        if let group { return group.name }
+        if unresolved { return GroupToken.slug(addr) ?? addr }
+        return addr
+    }
+
+    private var fill: Color {
+        if unresolved { return Palette.danger.opacity(0.14) }
+        return selected ? Palette.accent.opacity(0.38) : Palette.accentSoft
     }
 }
 
@@ -313,7 +449,10 @@ private struct RecipientPill: View {
 /// Minimal wrapping row for the send line: pills flow left to right and wrap,
 /// and the LAST subview — the text field — stretches to the end of its line so
 /// a click anywhere in the well lands the caret.
-private struct FlowLine: Layout {
+///
+/// Not private: the Groups page flows member chips through the same layout, and
+/// two wrapping rows that disagreed by a point would be visible side by side.
+struct FlowLine: Layout {
     var spacing: CGFloat = 5
 
     func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {

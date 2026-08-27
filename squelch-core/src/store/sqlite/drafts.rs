@@ -9,10 +9,11 @@ fn map_draft(r: &rusqlite::Row<'_>) -> rusqlite::Result<Draft> {
         account_id: r.get(1)?,
         reply_to_message_id: r.get(2)?,
         to_addr: r.get(3)?,
-        subject: r.get(4)?,
-        body: r.get(5)?,
-        created_at: dt(r, 6)?,
-        updated_at: dt(r, 7)?,
+        bcc_addr: r.get(4)?,
+        subject: r.get(5)?,
+        body: r.get(6)?,
+        created_at: dt(r, 7)?,
+        updated_at: dt(r, 8)?,
     })
 }
 
@@ -20,11 +21,13 @@ impl SqliteStore {
     /// HUMAN-DOOR ONLY (`/client/drafts`): save the draft for one reply target,
     /// where `reply_to_message_id = None` addresses the account's single
     /// new-message draft. Returns the stored row.
+    #[allow(clippy::too_many_arguments)] // the columns of one draft row
     pub fn upsert_draft(
         &self,
         account_id: AccountId,
         reply_to_message_id: Option<i64>,
         to_addr: &str,
+        bcc_addr: &str,
         subject: &str,
         body: &str,
         now: DateTime<Utc>,
@@ -46,21 +49,23 @@ impl SqliteStore {
             // alone, only `updated_at` moves.
             Some(id) => {
                 conn.execute(
-                    "UPDATE drafts SET to_addr = ?2, subject = ?3, body = ?4, updated_at = ?5
+                    "UPDATE drafts SET to_addr = ?2, bcc_addr = ?3, subject = ?4, body = ?5,
+                         updated_at = ?6
                      WHERE id = ?1",
-                    params![id, to_addr, subject, body, now.to_rfc3339()],
+                    params![id, to_addr, bcc_addr, subject, body, now.to_rfc3339()],
                 )?;
                 id
             }
             None => {
                 conn.execute(
-                    "INSERT INTO drafts(account_id, reply_to_message_id, to_addr, subject, body,
-                         created_at, updated_at)
-                     VALUES(?1,?2,?3,?4,?5,?6,?6)",
+                    "INSERT INTO drafts(account_id, reply_to_message_id, to_addr, bcc_addr,
+                         subject, body, created_at, updated_at)
+                     VALUES(?1,?2,?3,?4,?5,?6,?7,?7)",
                     params![
                         account_id,
                         reply_to_message_id,
                         to_addr,
+                        bcc_addr,
                         subject,
                         body,
                         now.to_rfc3339(),
@@ -70,7 +75,7 @@ impl SqliteStore {
             }
         };
         let draft = conn.query_row(
-            "SELECT id, account_id, reply_to_message_id, to_addr, subject, body,
+            "SELECT id, account_id, reply_to_message_id, to_addr, bcc_addr, subject, body,
                     created_at, updated_at
              FROM drafts WHERE id = ?1",
             params![id],
@@ -91,7 +96,7 @@ impl SqliteStore {
         // `triage.message_id`, so the subquery matches nothing and NOT EXISTS
         // holds: it is never filtered.
         let mut stmt = conn.prepare(
-            "SELECT id, account_id, reply_to_message_id, to_addr, subject, body,
+            "SELECT id, account_id, reply_to_message_id, to_addr, bcc_addr, subject, body,
                     created_at, updated_at
              FROM drafts
              WHERE account_id = ?1

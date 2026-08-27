@@ -113,6 +113,83 @@ fn ship_stale_cutoff(now: DateTime<Utc>, carrier_max_age_days: u32) -> DateTime<
 const BACKOFF_START: Duration = Duration::from_secs(2);
 const BACKOFF_CAP: Duration = Duration::from_secs(5 * 60);
 
+/// The longest the FIRST backfill waits on the embedder gate before going ahead
+/// without it. The ceiling is not a deadline anybody is meant to hit, it is the
+/// guarantee that a gate nobody ever opens (an init task wedged on a hung
+/// download) degrades to exactly today's behaviour, an unembedded backfill the
+/// vector pass drains later, rather than to a daemon that never syncs at all.
+/// See [`SyncEngine::with_embedder_gate`].
+///
+/// THREE MINUTES, and short on purpose, because the wait is time a brand-new
+/// tenant's mailbox is EMPTY: nothing is on the wire until the backfill runs.
+/// A cached model loads in about a second and a cold download of the 126 MB
+/// model takes tens of seconds on a normal link, so past this the init is not
+/// coming back. Hosted makes that cost concrete today: readiness there is
+/// TCP-only and there is no models volume yet, so every new signup's first run
+/// IS the cold download, and a generous ceiling would show them an empty
+/// mailbox for all of it. 15 minutes, the first cut of this, was also exactly
+/// the documented sync-staleness alert threshold (900 s, see
+/// `deploy/monitoring/README.md`), which would park every first-run tenant on
+/// the alert line for the duration.
+///
+/// The trade against releasing early is bounded now: a backfill that starts
+/// unembedded costs one vector pass at `embed.backfill_batch`, about +123 MB
+/// at a batch of 8 under the shipped 256-token `embed.max_tokens` (+324 MB was
+/// the same batch at the model's 512-token ceiling, and +1.7 GB was a batch of
+/// 64 there). It is also paid AGAIN per retry, because a backfill that errors
+/// before the cursor is stored comes back through here on the next lifecycle.
+const EMBEDDER_GATE_CEILING: Duration = Duration::from_secs(3 * 60);
+
+/// How a wait on the embedder gate ended. Every variant but `Settled` says the
+/// same thing to a caller ("nothing more is coming, go ahead"); they are apart
+/// because they read differently in a log and only one of them is worth a
+/// metric.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EmbedderGate {
+    /// The embedder init resolved, whichever way it resolved.
+    Settled,
+    /// The sender is gone, so nothing is ever going to open this gate.
+    Dropped,
+    /// [`EMBEDDER_GATE_CEILING`] passed first.
+    TimedOut,
+}
+
+/// Park until the embedder gate opens, the ceiling passes, or whoever would have
+/// opened it goes away. Returns at once on a gate that is already open, so the
+/// steady state (a restart, model on disk) pays nothing.
+///
+/// Public because TWO callers wait on this one bit for two different reasons.
+/// The first backfill waits for memory ([`SyncEngine::with_embedder_gate`]). The
+/// daemon's one-time Sent sweeps wait for Gmail quota: their stagger is meant to
+/// sit past the startup sync burst, and the gate can now push the start of that
+/// burst minutes out, which would leave a metadata GET per Sent message racing a
+/// 30-day raw backfill on one credential.
+pub async fn wait_for_embedder_gate(gate: &mut tokio::sync::watch::Receiver<bool>) -> EmbedderGate {
+    let deadline = tokio::time::Instant::now() + EMBEDDER_GATE_CEILING;
+    wait_for_embedder_gate_until(gate, deadline).await
+}
+
+/// [`wait_for_embedder_gate`] against a FIXED deadline, for a caller that may
+/// have to park more than once (the sync engine re-enters after a shutdown
+/// wakeup that carried no shutdown). The deadline is computed once by that
+/// caller, so re-entering cannot re-arm the ceiling and turn a bounded wait
+/// into an unbounded one.
+pub async fn wait_for_embedder_gate_until(
+    gate: &mut tokio::sync::watch::Receiver<bool>,
+    deadline: tokio::time::Instant,
+) -> EmbedderGate {
+    if *gate.borrow() {
+        return EmbedderGate::Settled;
+    }
+    tokio::select! {
+        settled = gate.wait_for(|settled| *settled) => match settled {
+            Ok(_) => EmbedderGate::Settled,
+            Err(_) => EmbedderGate::Dropped,
+        },
+        _ = tokio::time::sleep_until(deadline) => EmbedderGate::TimedOut,
+    }
+}
+
 /// Collapse an untrusted header-derived string to printable ASCII before it
 /// reaches the log: control chars, ANSI escapes and log-forging newlines become
 /// `.`, and the result is capped so a pathological header can't flood the log.
@@ -207,6 +284,22 @@ fn subtract_ids(ids: Vec<String>, claimed: &[String]) -> Vec<String> {
 // These model the GMAIL API's own JSON, never squelch's client-facing wire
 // contracts. squelch-api's write path deserializes the same Gmail resources, so
 // the shared ones are `pub` here and defined exactly once.
+
+/// Clears the catch-up progress pair on the way out of `Syncer::catch_up`, on
+/// every path including the `?` returns.
+///
+/// A guard rather than a call at the end, because the end is the one place a
+/// catch-up reliably does NOT reach: it is a long walk over a network, and a
+/// Gmail hiccup halfway through leaves by `?`. A pair left standing then would
+/// report a run that is not happening, which is a worse lie than the silence
+/// this replaced.
+struct CatchUpGuard<'a>(&'a crate::metrics::SyncMetrics);
+
+impl Drop for CatchUpGuard<'_> {
+    fn drop(&mut self) {
+        self.0.catchup_end();
+    }
+}
 
 #[derive(Debug, Deserialize)]
 struct MessageRef {
@@ -381,6 +474,12 @@ pub struct SyncEngine<S: Store, C: CredentialStore + ?Sized> {
     /// back to the store's. Resolving per tick is what lets a LATE-attached
     /// embedder be picked up without a restart.
     embedder: Option<Arc<dyn crate::embed::Embedder>>,
+    /// "The embedder init has RESOLVED, whichever way it resolved", flipped by
+    /// the caller that builds the embedder in the background. The FIRST backfill
+    /// waits on it and nothing else does. `None` means never wait: sync-only
+    /// mode builds its embedder before the engine exists, and the tests have
+    /// nothing to wait for. See [`SyncEngine::with_embedder_gate`].
+    embedder_gate: Option<tokio::sync::watch::Receiver<bool>>,
     /// Manual-refresh signal: notifying it wakes the sleeping poll loop early.
     /// Coalescing is intentional — several pokes during one in-flight poll
     /// collapse into a single extra tick.
@@ -443,6 +542,7 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
             http,
             stage2_llm,
             embedder: None,
+            embedder_gate: None,
             refresh: Arc::new(tokio::sync::Notify::new()),
             warn_days: std::sync::Mutex::new(WarnDays::default()),
             unread_warned: AtomicBool::new(false),
@@ -492,6 +592,91 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
     /// is `None`, ingest skips the vector write, and the backfill pass fills in.
     fn embedder(&self) -> Option<Arc<dyn crate::embed::Embedder>> {
         self.embedder.clone().or_else(|| self.store.embedder())
+    }
+
+    /// Hold the FIRST backfill until `gate` reads true, meaning the caller's
+    /// embedder init has RESOLVED, whichever way it resolved. Nothing else in
+    /// the engine waits on it: the poll loop and the catch-up run whether or not
+    /// there is an embedder, exactly as they do today.
+    ///
+    /// Why it exists. `squelchd serve` builds the embedder on a background task
+    /// so both doors come up at once, and a brand-new tenant's first run starts
+    /// its 30-day backfill in that same instant. Without the gate the backfill
+    /// races the model download: thousands of rows ingest with no vector because
+    /// [`SyncEngine::embed_and_store`] no-ops when there is no embedder to call,
+    /// and [`SyncEngine::backfill_missing_vectors`] then has to drain all of them
+    /// in batches. A batch is what the memory cost scales with, and it is memory
+    /// the allocator does not give back (see `EmbedConfig::backfill_batch`), so
+    /// that race is how a tenant daemon ends up permanently over a 1 Gi pod
+    /// limit. Waiting turns it back into the cheap path: ingest writes each
+    /// vector as it goes, one message at a time, and the batch pass only ever
+    /// sees leftovers.
+    ///
+    /// The wait is bounded by [`EMBEDDER_GATE_CEILING`]; past it the backfill
+    /// proceeds exactly as it did before this existed.
+    pub fn with_embedder_gate(mut self, gate: tokio::sync::watch::Receiver<bool>) -> Self {
+        self.embedder_gate = Some(gate);
+        self
+    }
+
+    /// The wait [`SyncEngine::with_embedder_gate`] describes. `true` means "go
+    /// ahead with the backfill", which is every outcome except one: `false` says
+    /// shutdown arrived while we were parked, and there is no point starting a
+    /// 30-day backfill nobody will be around to finish.
+    ///
+    /// Returns at once, silently, with no gate or with one already open, so the
+    /// steady state (a restart, where the model is on disk and the init resolves
+    /// in well under the time it takes to reach here) logs nothing.
+    async fn wait_for_embedder(&self, shutdown: &mut tokio::sync::watch::Receiver<bool>) -> bool {
+        // Cloned because waiting needs `&mut` and the engine is shared.
+        let Some(mut gate) = self.embedder_gate.clone() else {
+            return true;
+        };
+        if *gate.borrow() {
+            return true;
+        }
+        eprintln!("squelch: waiting for the embedder before the first backfill");
+        // One deadline for the whole wait, however many times it parks: a
+        // wakeup on the shutdown watch that carries no shutdown re-enters the
+        // select below, and a ceiling armed per entry would be no ceiling.
+        let deadline = tokio::time::Instant::now() + EMBEDDER_GATE_CEILING;
+        loop {
+            tokio::select! {
+                how = wait_for_embedder_gate_until(&mut gate, deadline) => {
+                    match how {
+                        EmbedderGate::Settled => {
+                            eprintln!("squelch: embedder settled; starting the first backfill")
+                        }
+                        EmbedderGate::Dropped => eprintln!(
+                            "squelch: embedder gate dropped; the first backfill is running without the \
+                             embedder, and its vectors will be drained by the vector backfill pass"
+                        ),
+                        EmbedderGate::TimedOut => {
+                            self.metrics.record_embedder_gate_timeout();
+                            eprintln!(
+                                "squelch: embedder still not settled after {}m; the first backfill is \
+                                 running without the embedder, and its vectors will be drained by the \
+                                 vector backfill pass",
+                                EMBEDDER_GATE_CEILING.as_secs() / 60
+                            )
+                        }
+                    }
+                    return true;
+                }
+                _ = shutdown.changed() => {
+                    if *shutdown.borrow() {
+                        return false;
+                    }
+                    // A wakeup that did not carry a shutdown (a same-value send,
+                    // or the sender going away) is not permission to run the
+                    // backfill unembedded: the gate is still the thing being
+                    // waited on, and the deadline above still bounds it. Nothing
+                    // in production sends `false` today; this is what keeps a
+                    // future second signal on that watch from silently
+                    // reopening the 2026-08-19 memory profile.
+                }
+            }
+        }
     }
 
     /// Authenticated GET returning parsed JSON. A 404 surfaces as
@@ -544,11 +729,20 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
     /// included — so it is counted as `auth` on the typed variant here rather
     /// than string-matched out of an error chain later.
     async fn token_for_request(&self) -> Result<crate::credentials::OAuthToken> {
-        self.creds.token(self.account_id).await.inspect_err(|e| {
-            if matches!(e, CoreError::Credential(_)) {
-                self.metrics.record_gmail_error(GmailErrorKind::Auth);
-            }
-        })
+        self.creds
+            .token(self.account_id)
+            .await
+            // The SUCCESS half, and it is not decoration: the failure below sets
+            // a state a client renders as "your mailbox is disconnected", so
+            // something has to clear it when the credential works again. Without
+            // this the banner would latch on and send somebody who has already
+            // reconnected round the same loop a second time.
+            .inspect(|_| self.metrics.note_credential_ok())
+            .inspect_err(|e| {
+                if matches!(e, CoreError::Credential(_)) {
+                    self.metrics.record_gmail_error(GmailErrorKind::Auth);
+                }
+            })
     }
 
     async fn bearer_get(&self, url: &str, access_token: &str) -> Result<reqwest::Response> {
@@ -573,6 +767,14 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
         // First run (no history cursor) => full backfill + seed contacts.
         let cursor = self.load_history_cursor()?;
         if cursor.is_none() {
+            // BEFORE the backfill, and only before the FIRST one: every row it
+            // ingests gets its vector written at ingest, one message at a time,
+            // provided the embedder is there to write it. Start without one and
+            // the whole 30-day window lands unembedded, to be drained in batches
+            // afterwards instead. See [`SyncEngine::with_embedder_gate`].
+            if !self.wait_for_embedder(shutdown).await {
+                return Ok(());
+            }
             self.backfill().await?;
             // Stage-1, then Stage-2 over what Stage-1 escalated, then the
             // specialist extractors over each row's FINAL category.
@@ -588,7 +790,19 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
 
     /// First-run backfill: INBOX bodies over the window, then SENT headers to
     /// seed contacts, then persist the account's current historyId.
+    ///
+    /// The trim runs WHATEVER THE OUTCOME. A run that failed halfway through the
+    /// window still parsed and stored everything up to the failure, and that
+    /// peak is the highest watermark this process ever reaches; leaving it in
+    /// glibc's arenas because the last call errored would make a failed first
+    /// run the most expensive thing a pod ever does. See [`crate::mem`].
     async fn backfill(&self) -> Result<()> {
+        let out = self.backfill_inner().await;
+        crate::mem::trim_off_runtime().await;
+        out
+    }
+
+    async fn backfill_inner(&self) -> Result<()> {
         let since = self.backfill_since();
 
         // INBOX bodies.
@@ -823,9 +1037,44 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
     /// expired-history 404 — exactly the cases where the history walk cannot
     /// account for the gap, so the sent half has to be re-listed too or mail the
     /// user wrote from another client during it is lost for good.
+    ///
+    /// Trimmed on the way out either way, for the reason [`Self::backfill`]
+    /// gives: a catch-up that dies mid-window has already paid the peak.
     async fn catch_up(&self) -> Result<()> {
+        // THE PROGRESS PAIR IS SET UP FRONT AND CLEARED ON EVERY EXIT, including
+        // the `?` paths in the body below, which is what `_guard` is for. A
+        // catch-up is this loop's longest single call by orders of magnitude and
+        // it used to emit nothing at all while it ran: no log, no counter, no
+        // freshness stamp, because `poll_once` had not returned yet. Worse, most
+        // of its work is upserting mail already stored, so the message count and
+        // the database size sit still as well. On 2026-08-26 a tenant's mailbox
+        // spent half an hour in here and the only honest thing anybody could say
+        // from outside was that it was indistinguishable from wedged.
+        //
+        // It is held ACROSS the trim on purpose: handing the heap back is part
+        // of the catch-up as seen from outside, so progress clears when the
+        // whole thing is done rather than when the last fetch returns.
+        let _guard = CatchUpGuard(&self.metrics);
+        let out = self.catch_up_inner().await;
+        crate::mem::trim_off_runtime().await;
+        out
+    }
+
+    /// The catch-up body, split out so [`Self::catch_up`] can hold the progress
+    /// guard and run the trim across every exit path, `?` included.
+    async fn catch_up_inner(&self) -> Result<()> {
         let q = format!("newer_than:{}d", self.config.sync.backfill_days);
         let ids = self.list_message_ids(LABEL_INBOX, Some(&q)).await?;
+        // BEFORE the first fetch, so the size of the job is known while it is
+        // still a job rather than after it is a result. This is the line that
+        // turns "silent for 30 minutes" into "re-fetching 4,500 messages".
+        eprintln!(
+            "squelch: catch-up re-fetching {} INBOX message(s) from the last {} days; \
+             triage waits for this to finish",
+            ids.len(),
+            self.config.sync.backfill_days
+        );
+        self.metrics.catchup_begin(ids.len() as u64);
         // A catch-up may carry genuinely new mail, so it is allowed to notify.
         // What keeps the whole-window re-scan from storming is the freshness
         // window in `triage::events` plus the one-event-per-message key.
@@ -841,6 +1090,15 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
         // listings and its visible copy must win the unique-key race.
         let sent_ids = self.list_message_ids(LABEL_SENT, Some(&q)).await?;
         let sent_only = subtract_ids(sent_ids, &ids);
+        // EXTENDS the same run rather than starting a second one: from outside
+        // this is one wait, and a progress bar that reached the end and then
+        // restarted at zero would read as a loop rather than as two phases.
+        self.metrics
+            .catchup_begin_extend(ids.len() as u64 + sent_only.len() as u64);
+        eprintln!(
+            "squelch: catch-up re-fetching {} SENT message(s)",
+            sent_only.len()
+        );
         let sent_n = self
             .fetch_raw_and_ingest(&sent_only, true, IngestOrigin::Incremental)
             .await?;
@@ -1103,6 +1361,18 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
         let mut count = 0usize;
 
         for id in ids {
+            // Only a catch-up has a denominator, so this is a no-op on the
+            // ordinary incremental path — `catchup_step` moves a gauge that is
+            // zero unless `catch_up` set one up. A line every 250 messages
+            // rather than every message: enough to prove movement in a log
+            // somebody is tailing, few enough not to bury the lines that mean
+            // something.
+            if let Some((_, total)) = self.metrics.catchup_progress() {
+                let done = self.metrics.catchup_step();
+                if done.is_multiple_of(250) {
+                    eprintln!("squelch: catch-up {done}/{total} messages");
+                }
+            }
             let url = format!("{}/messages/{id}?format=raw", self.api_base);
             let msg: GmailMessage = self.get_json(&url).await?;
             let raw_b64 = match &msg.raw {
@@ -1332,7 +1602,8 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
                 break;
             }
             let n = missing.len();
-            // Flatten each message the SAME way ingest and query do.
+            // Flatten each message the SAME way ingest does. (Query text takes a
+            // different road: search embeds the query as typed, uncut.)
             let store = self.store.clone();
             let embedder = embedder.clone();
             let result = tokio::task::spawn_blocking(move || -> Result<()> {
@@ -1371,6 +1642,13 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
 
         if total > 0 {
             eprintln!("squelch: vector backfill embedded {total} message(s) for semantic recall");
+            // A batch pass is the single largest transient this process makes:
+            // ONNX arenas plus every flattened body, hundreds of MB on a first
+            // run, and glibc keeps all of it unless asked. Worth doing with the
+            // session still loaded (+324 MB to +290 MB on the measured pass),
+            // and gated on `total > 0` so it is at most once per poll tick. See
+            // [`crate::mem`].
+            crate::mem::trim_off_runtime().await;
         }
     }
 
@@ -4489,6 +4767,211 @@ mod tests {
         assert!(visible.contains(&"g-self".to_string()));
         assert_eq!(g.calls("get:g-self"), 1, "fetched once, not twice");
         assert_eq!(cursor_of(&store, acct), Some(900));
+    }
+
+    #[tokio::test]
+    async fn a_first_backfill_waits_for_the_embedder_gate() {
+        // A brand-new tenant: no cursor, so the very next thing `run_once` would
+        // do is the 30-day backfill. Behind a shut gate it does not do it, and
+        // "does not" is asserted on the WIRE rather than on a flag, because the
+        // failure this prevents is thousands of rows ingested with no vector.
+        let (store, acct) = store_at_cursor(None);
+        let g = MockGmail::default();
+        g.listing(LABEL_INBOX, &[]);
+        g.listing(LABEL_SENT, &[]);
+        g.profile(900);
+        let base = serve_mock(g.clone()).await;
+
+        // The sender is HELD for the length of the wait: dropping it says "the
+        // init task is gone, nothing will ever settle this", which is a reason
+        // to stop waiting, not to keep waiting.
+        let (_gate_tx, gate_rx) = tokio::sync::watch::channel(false);
+        let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+        // Sent before the call, but the receiver has not observed it, so its
+        // `changed()` fires the instant the engine parks on the gate. That is
+        // the shutdown-during-the-wait path, and it is what makes this test
+        // terminate rather than sit here for the ceiling.
+        shutdown_tx.send(true).unwrap();
+
+        engine(store.clone(), acct, &base)
+            .with_embedder_gate(gate_rx)
+            .run_once(&mut shutdown_rx)
+            .await
+            .unwrap();
+
+        assert!(
+            g.seen().is_empty(),
+            "a shut gate holds the first backfill off the wire, saw {:?}",
+            g.seen()
+        );
+        assert_eq!(
+            cursor_of(&store, acct),
+            None,
+            "and leaves no cursor, so the next start is still a first run"
+        );
+
+        // Same engine, same mailbox, one bit different: an OPEN gate is not
+        // waited on at all and the backfill goes straight out.
+        let (_open_tx, open_rx) = tokio::sync::watch::channel(true);
+        let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+        // This one lands after the (skipped) wait, on the poll loop's own
+        // shutdown check, so the backfill runs to completion first.
+        shutdown_tx.send(true).unwrap();
+
+        engine(store.clone(), acct, &base)
+            .with_embedder_gate(open_rx)
+            .run_once(&mut shutdown_rx)
+            .await
+            .unwrap();
+
+        assert!(g.at("list:INBOX") < g.at("list:SENT"), "{:?}", g.seen());
+        assert_eq!(
+            cursor_of(&store, acct),
+            Some(900),
+            "an open gate releases the first backfill"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_engine_with_no_embedder_gate_backfills_at_once() {
+        // Sync-only mode builds its embedder before the engine exists, and the
+        // rest of the tests have nothing to wait for. Absence of a gate must
+        // therefore mean "never wait", not "wait for something that will never
+        // arrive" — that reading would wedge `squelchd run` on startup.
+        let (store, acct) = store_at_cursor(None);
+        let g = MockGmail::default();
+        g.listing(LABEL_INBOX, &[]);
+        g.listing(LABEL_SENT, &[]);
+        g.profile(900);
+        let base = serve_mock(g.clone()).await;
+
+        let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+        shutdown_tx.send(true).unwrap();
+
+        engine(store.clone(), acct, &base)
+            .run_once(&mut shutdown_rx)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            cursor_of(&store, acct),
+            Some(900),
+            "no gate, no wait: the first backfill ran on this call"
+        );
+    }
+
+    /// An engine parked on the gate, for the three tests below. No mock: they
+    /// drive the WAIT, and the wait touches neither Gmail nor the store, so the
+    /// base is a port nothing is listening on and reaching it would be the bug.
+    fn gated_engine(
+        gate: tokio::sync::watch::Receiver<bool>,
+        metrics: Arc<SyncMetrics>,
+    ) -> SyncEngine<SqliteStore, FixedToken> {
+        let (store, acct) = store_at_cursor(None);
+        engine(store, acct, "http://127.0.0.1:1")
+            .with_metrics(metrics)
+            .with_embedder_gate(gate)
+    }
+
+    /// `changed()` fires on ANY send and on the last sender dropping, so the
+    /// value is the only thing that says a shutdown happened. Read the wakeup
+    /// alone as one and the cost is not a slow first backfill, it is no sync at
+    /// all: `run_once` returns `Ok` on a reported shutdown and `run` reads that
+    /// as "we are done" and stops the lifecycle.
+    ///
+    /// MUTATION 1: `_ = shutdown.changed() => return false`, dropping the value
+    /// check, the obvious reading: the wait reports "shut down" and the sync
+    /// lifecycle ends. MUTATION 2: the arm returning `true` instead of
+    /// re-parking: the backfill runs unembedded on a wakeup that asked for
+    /// nothing. This asserts both halves: the wait is still parked after the
+    /// wakeup, and it releases only when the gate opens.
+    #[tokio::test(start_paused = true)]
+    async fn a_shutdown_wakeup_carrying_false_is_not_a_shutdown() {
+        let (gate_tx, gate_rx) = tokio::sync::watch::channel(false);
+        let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+        // Unseen by this receiver, so `changed()` completes the instant the
+        // engine parks. The VALUE stays false: nobody asked for a shutdown.
+        shutdown_tx.send(false).unwrap();
+        let e = gated_engine(gate_rx, SyncMetrics::new());
+
+        let wait = e.wait_for_embedder(&mut shutdown_rx);
+        tokio::pin!(wait);
+        // Still parked after the wakeup: under the paused clock a one-second
+        // timeout elapses before the three-minute ceiling could.
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), &mut wait)
+                .await
+                .is_err(),
+            "a false shutdown wakeup released the first backfill"
+        );
+        gate_tx.send(true).unwrap();
+        let go_ahead = tokio::time::timeout(EMBEDDER_GATE_CEILING / 2, &mut wait)
+            .await
+            .expect("the gate opening releases the wait");
+        assert!(go_ahead, "false on the shutdown watch is not a shutdown");
+    }
+
+    /// The gate's sender dropping is the init task GONE. Nothing is ever going
+    /// to open it, so waiting the ceiling out would buy a brand-new tenant
+    /// minutes of empty mailbox for an answer that has already arrived.
+    ///
+    /// MUTATION: folding `Err` into the "keep waiting" side (an `Err` arm that
+    /// falls through to the sleep, or no `Err` arm at all). Under a paused clock
+    /// that runs to the ceiling, which this timeout is half of.
+    #[tokio::test(start_paused = true)]
+    async fn a_dropped_embedder_gate_releases_the_backfill_at_once() {
+        let (gate_tx, gate_rx) = tokio::sync::watch::channel(false);
+        drop(gate_tx);
+        // Never signalled: the shutdown arm must not be what ends this wait.
+        let (_shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+        let e = gated_engine(gate_rx, SyncMetrics::new());
+
+        let go_ahead = tokio::time::timeout(
+            EMBEDDER_GATE_CEILING / 2,
+            e.wait_for_embedder(&mut shutdown_rx),
+        )
+        .await
+        .expect("a gate nobody holds any more is not worth waiting on");
+        assert!(go_ahead, "a dropped gate releases the first backfill");
+    }
+
+    /// The ceiling arm: a gate whose sender is alive and never sends (an init
+    /// wedged on a hung download) degrades to the behaviour that predates the
+    /// gate — an unembedded backfill the vector pass drains later — rather than
+    /// to a daemon that never syncs. And it SAYS SO to the scrape, because this
+    /// is the one event that re-arms the memory the gate exists to avoid, and
+    /// nobody reads a tenant's stderr until something has already fallen over.
+    ///
+    /// Time is paused, so the ceiling is a fact here and not three real minutes.
+    ///
+    /// MUTATIONS: no ceiling arm at all (the outer timeout fires instead of the
+    /// wait returning); a ceiling that reports a shutdown (`go_ahead`); a
+    /// ceiling that does not wait, e.g. `Duration::ZERO` (`elapsed`); and the
+    /// counter left unrecorded (the exposition assert).
+    #[tokio::test(start_paused = true)]
+    async fn the_gate_ceiling_releases_the_backfill_and_says_so_to_the_scrape() {
+        let (_gate_tx, gate_rx) = tokio::sync::watch::channel(false);
+        let (_shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+        let metrics = SyncMetrics::new();
+        let e = gated_engine(gate_rx, metrics.clone());
+
+        let started = tokio::time::Instant::now();
+        let go_ahead = tokio::time::timeout(
+            EMBEDDER_GATE_CEILING * 2,
+            e.wait_for_embedder(&mut shutdown_rx),
+        )
+        .await
+        .expect("a wedged init must not wedge sync");
+        assert!(go_ahead, "the ceiling releases the backfill");
+        assert!(
+            started.elapsed() >= EMBEDDER_GATE_CEILING,
+            "and only after the ceiling, not instead of waiting"
+        );
+        assert!(
+            crate::metrics::render(&metrics, None)
+                .contains("squelchd_embedder_gate_timeouts_total 1\n"),
+            "a ceiling nobody can scrape is a ceiling nobody knows fired"
+        );
     }
 
     #[tokio::test]

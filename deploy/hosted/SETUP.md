@@ -52,7 +52,9 @@ re-consent with Google and costs nobody else anything.
   is a kernel with idmapped mounts (6.3+) for the user-namespace pods — trixie
   ships 6.12, Ubuntu 24.04 ships 6.8, both fine. 2 vCPU and 4 GB is a sensible
   floor for a handful of tenants; each tenant pod is a sync loop plus an ONNX
-  embedder.
+  embedder. Take the node's own share out of that 4 GB before you count
+  tenants: k3s, containerd and an uncapped journal want more than a gigabyte
+  between them, and §2b is how you stop the scheduler from spending it twice.
 - Two domains, on purpose. The tenant base domain (`passband.email` here) means
   exactly one thing: a wildcard subdomain is a tenant, full stop. Product and
   internal surfaces (signup, the warden) live on the product domain
@@ -218,6 +220,431 @@ path you choose here is the path that section scans, so pick it now and keep it.
 Read
 "Backups today, stated honestly" under Operating notes for what each of the two
 mechanisms does and does not cover.
+
+## 2b. Reserve the node's own memory
+
+**Nothing in this section is applied by reading it.** It is four changes to the
+host, three of which restart something, and applying them to a live box is a
+separate and deliberate ops step. `PRODUCTION.md` records which of them this box
+has actually taken. Do them in the order below, while you are watching, and do
+them before the box is full rather than after: a new ceiling binds the next
+tenant, not the ones already running.
+
+k3s installs believing the whole machine is yours to spend on pods, and on a
+fresh box nothing corrects it. `/etc/rancher/k3s/config.yaml` carries the
+storage path from the section above and nothing else, no reservation is set, and
+the pods cgroup gets the lot:
+
+```sh
+cat /sys/fs/cgroup/kubepods.slice/memory.max     # 3.72 GiB, on a 3814 MiB box
+```
+
+The box is also running the things that make it a box. Measured on carrier on
+2026-08-26, with four tenants on it:
+
+| | RSS |
+|---|---|
+| `k3s-server` (API server, scheduler, controllers, kubelet, one binary) | 803 MB |
+| k3s's embedded `containerd` | ~120 MB |
+| `systemd-journald` (725 MB of journal on disk, no `SystemMaxUse`) | 129 MB, of which ~30 MB is anonymous |
+| `litestream` | 67 MB |
+| sshd, systemd, the rest of the OS | ~100 MB |
+| a system `dockerd`/`containerd` pair nothing in the cluster uses | ~150 MB |
+
+1369 MB as measured. 1219 without the docker pair, which (c) below turns off.
+About 1120 if you also count journald honestly: it mmaps the journal files it
+serves, so most of that 129 MB is page cache the kernel drops under pressure
+rather than memory anybody holds, and counting it in full is counting
+reclaimable pages twice.
+
+There is also more of this box than any RSS column shows. `free -m` the same
+afternoon reported 743 MiB available of 3814. The host processes above plus the
+four tenant pods' ~1.1 GB account for roughly 2.5 GB of the ~3.1 GB in use; the
+rest is kernel, which is to say slab, page tables, kernel stacks and socket
+buffers. Most of that is reclaimable. The part that is not still has to come out
+of somebody's budget, and there is exactly one budget on this box that can hold
+it: the one that is set to zero.
+
+That gap is not a warning, it is an ambush, and it fired on 2026-08-19. At 21:13
+and again at 21:20 the kernel killed a tenant's `squelchd`:
+
+```sh
+journalctl -k | grep -i 'out of memory'
+# oom-kill:constraint=CONSTRAINT_NONE,...,global_oom,task_memcg=/kubepods.slice/...,task=squelchd
+```
+
+`constraint=CONSTRAINT_NONE` plus `global_oom` is the whole diagnosis. This was
+not a container exceeding its limit: that is a cgroup OOM, it names an
+`oom_memcg=`, and it kills inside the cgroup that asked for the memory. Nothing
+was over its limit. The machine ran out, and the kernel chose its victim by
+badness score, which on this box means largest RSS, which means a tenant daemon.
+The tenant whose mail stopped syncing was not the tenant who caused it: it was a
+coin flip, run twice. And it happened with four tenants on the box, which is the
+part worth sitting with. Nothing was near the ceiling the scheduler was working
+to. The ceiling was the wrong number.
+
+Four measures below. The first is the one that matters; the other three are what
+make its number affordable. The files they install live in
+`deploy/hosted/node/`, one per target path, so this is a copy rather than a
+retype.
+
+### a. Tell the kubelet what the node costs
+
+`systemReserved` is subtracted from the node's capacity before the scheduler
+ever sees it, and the hard eviction threshold is subtracted with it. Set both
+and allocatable becomes what is really spendable: 3814 minus 1200 minus 200, or
+about 2414Mi.
+
+**Where 1200Mi comes from**, because a reservation nobody can re-derive is a
+reservation nobody will maintain:
+
+- **~1068 MiB of host process RSS.** The table above with journald counted at
+  its anonymous size and the docker pair gone, so ~1120 MB, so ~1068 MiB. If you
+  decide to keep the docker pair, add 150Mi here and take a tenant off the count
+  below.
+- **~130 MiB for the kernel.** The slab, page tables, kernel stacks and socket
+  buffers that no process's RSS shows. It is the conservative end of the ~600
+  MiB the box could not attribute above, on the assumption that most of that is
+  reclaimable and this is the part that is not.
+
+1068 plus 130 is 1198, so **1200Mi**. `evictionHard`'s 200Mi comes out of
+allocatable as well, which makes 1400Mi withheld in total, and the second 200 is
+the margin if that kernel allowance turns out to be optimistic. The verify at
+the end of this subsection is how you find out whether it was, and it is worth
+actually running: a reserve that is too big has its own failure mode, below.
+
+Three things change, and only the first is the one you asked for:
+
+- **The scheduler stops overselling.** A tenant that does not fit is refused,
+  and a refused tenant is a provision that fails as `500 not_ready` (§7's
+  failure mode; `kubectl -n tenants describe replicaset` gives the real reason,
+  `Insufficient memory`). That is a bad afternoon for one signup instead of a
+  kill for two strangers.
+- **The host stops being an OOM candidate.** `kubepods.slice/memory.max` drops
+  to allocatable, because the kubelet enforces the pods cgroup by default, so
+  pods collectively hit a cgroup limit before the machine hits a global one.
+  Do not read more into that than it says. A memcg OOM in `kubepods.slice`
+  chooses its victim exactly the way the global one did: `kubepods.slice` is a
+  shared parent for every pod on the box, the kernel walks the subtree, and it
+  picks by badness, which is still largest RSS and still probably the wrong
+  tenant. What changes is who is *eligible*. `sshd`, `k3s-server`, `containerd`
+  and `journald` live outside that cgroup, so they stop being candidates at all,
+  and losing the API server or your way into the box stops being one of the
+  possible outcomes of a tenant that grows. The kill also arrives as a memcg
+  event naming `oom_memcg=/kubepods.slice` rather than a `global_oom`, which is
+  the difference between a triage that takes a minute and one that takes an
+  afternoon.
+- **The kubelet gets a chance to choose first.** At 200Mi of `memory.available`
+  it evicts, by QoS class and pod priority, in an order it publishes, with an
+  event that says why. An eviction is a choice. A badness score is not.
+
+**That third one only wins the race if the host actually spends its reserve.**
+`memory.available` is a whole-node number: the kubelet computes it from the
+node's memory, not from `kubepods.slice`. If the host rests well under 1200Mi,
+which is precisely what (b) and (c) are for, then pods can fill
+`kubepods.slice` to its own `memory.max` while the node still has several
+hundred megabytes free, the threshold never trips, and nothing is evicted. What
+happens instead is a memcg OOM inside `kubepods`, which is *quieter* than the
+global kill it replaced: no eviction event, no node condition, just a container
+that restarted. That is the honest shape of this trade, it is still a better
+trade than a global kill, and it is why the verify below reads
+`kubepods.slice/memory.events` rather than only the eviction log.
+
+**Pre-flight, before you restart anything.** On kubelet start every pod
+re-enters admission, and a pod whose requests no longer fit the shrunken
+allocatable is not left alone: it is rejected, with phase `Failed` and reason
+`OutOfmemory`, which on a tenant means a mailbox that stops. Check that what is
+running fits under the allocatable you are about to create:
+
+```sh
+# What is promised. Sum the memory column against the new allocatable.
+kubectl get pods -A \
+  -o custom-columns='NS:.metadata.namespace,POD:.metadata.name,MEM:.spec.containers[*].resources.requests.memory'
+kubectl describe node carrier | grep -A3 'Allocated resources'
+
+# What is actually held right now by everything in the pods cgroup.
+cat /sys/fs/cgroup/kubepods.slice/memory.current
+```
+
+If either number is above the new allocatable, do not proceed: lower
+`systemReserved`, or remove a tenant first. On carrier today neither is close.
+Four tenants at a 384Mi request is 1536Mi promised against 2414Mi of new
+allocatable, and the pods cgroup is holding about 1.1 GB.
+
+```sh
+install -d -m 0755 /var/lib/rancher/k3s/agent/etc/kubelet.conf.d
+install -m 0644 deploy/hosted/node/kubelet.yaml \
+  /var/lib/rancher/k3s/agent/etc/kubelet.conf.d/10-squelch.conf
+systemctl restart k3s
+```
+
+**A kubelet drop-in, and not a `kubelet-arg:` list in `config.yaml`.** k3s v1.32+
+writes its own kubelet defaults to `00-k3s-defaults.conf` in that directory and
+merges what it finds alongside them per key. That is what lets `evictionHard`
+add a memory threshold without dropping k3s's disk ones: `--eviction-hard` is a
+whole-map flag, so setting it to `memory.available` alone takes
+`imagefs.available` and `nodefs.available` with it, and nobody notices until the
+disk fills.
+
+That reason is sufficient on its own, which is just as well, because it is the
+only one that has been checked. **The flag route was not tested here.** k3s
+builds one kubelet command line as [config-file args][CLI args], and
+`pkg/configfilearg`'s own doc comment says the non-config flags "override, or if
+a slice append to, the config file values", so a `kubelet-arg:` list in
+`config.yaml` most likely *appends* to the `--kubelet-arg` this box's unit
+already passes (the `UserNamespacesSupport` gate from §2) rather than losing to
+it. Most likely is not verified. The drop-in is the route with a documented
+per-key merge, so it is the route this section takes, and
+`deploy/hosted/node/k3s-config.yaml` is the whole `config.yaml` this box ends up
+with.
+
+**What `systemctl restart k3s` restarts:** the k3s server process and its
+embedded containerd. Not the tenants. Each container's
+`containerd-shim-runc-v2` is a separate process, it survives, and containerd
+re-attaches to it on the way back up. `kubectl` fails for ten to thirty seconds
+while the API server returns, and a signup that lands in that window fails and
+gets retried. Running pods that still fit are left alone, which is a sentence
+the pre-flight above is what makes true rather than hopeful.
+
+Verify the config, then verify the box:
+
+```sh
+kubectl describe node carrier | grep -A6 Allocatable
+cat /sys/fs/cgroup/kubepods.slice/memory.max        # now allocatable, not 3.72 GiB
+kubectl get --raw /api/v1/nodes/carrier/proxy/configz \
+  | jq '.kubeletconfig | {systemReserved, evictionHard}'
+```
+
+`configz` is the only one of those that reports what the kubelet actually
+parsed, as opposed to what you meant. Read it after every change in this
+section. Then come back a day later and read the machine, which is the only
+thing that can tell you whether 1200Mi was the right guess:
+
+```sh
+free -m                                             # is the host really using ~1.2 GB?
+cat /sys/fs/cgroup/kubepods.slice/memory.current    # against memory.max above
+cat /sys/fs/cgroup/kubepods.slice/memory.events     # oom_kill > 0 is the quiet failure
+```
+
+`memory.current` pressed up against `memory.max` while `free -m` still shows
+hundreds of megabytes available is the case described further up: the reserve is
+larger than the host needs, eviction will never fire, and the next failure is an
+`oom_kill` in `memory.events` that nothing else announces. The fix then is a
+*smaller* `systemReserved`, not a larger one.
+
+### b. Cap the journal
+
+Uncapped, `systemd-journald` grows the journal to 10% of the filesystem and
+keeps it there: 725 MB on this box, and 129 MB of journald RSS to serve it,
+because journald mmaps the files it is holding open.
+
+This is the smallest of the four measures and it is worth being clear about
+that. Mapped file pages are page cache: the kernel drops them under pressure, so
+most of that 129 MB was never memory held against the box, which is why (a)
+counts journald at its ~30 MB of anonymous memory instead. Cap it anyway. The
+process does shrink, 725 MB of logs on an 80 GB root disk is not free either,
+and a smaller archive is a faster `journalctl` at 3am.
+
+```sh
+install -d -m 0755 /etc/systemd/journald.conf.d
+install -m 0644 deploy/hosted/node/journald-squelch.conf \
+  /etc/systemd/journald.conf.d/squelch.conf
+systemctl restart systemd-journald
+journalctl --vacuum-size=200M     # rotation is lazy; this is the one-time catch-up
+journalctl --disk-usage
+```
+
+A drop-in rather than an edit to `/etc/systemd/journald.conf`, because the main
+file belongs to the distribution and a release upgrade may replace it.
+Restarting journald loses no logs and restarts nothing else. 200 MB is roughly
+two weeks of this box, which is more history than it has ever needed: the 19 Aug
+kills were a week old when they were read, and they were still there.
+
+### c. The container runtime nothing uses
+
+Optional, reversible, and **check before you touch it**. k3s does not use the
+system `docker` or the system `containerd`: it runs its own containerd from
+`/var/lib/rancher/k3s/agent`, on its own socket, as a child of `k3s-server`
+rather than as a unit, and `crictl` (shipped with k3s) is what talks to it.
+Nothing below can be confused for it. So the pair is usually a leftover of the
+install, holding ~150 MB for nobody.
+
+```sh
+docker ps -a            # anything listed here is a reason to STOP
+docker images           # so is anything here, and this is the likelier hit
+systemctl is-enabled docker containerd
+crictl ps               # k3s's runtime: this is where the tenant containers are
+```
+
+`docker images` is the check that matters, and it is the one that is easy to
+skip. `PRODUCTION.md`'s open items note that the warden image on this node is
+still hand-built; if it was hand-built *here*, what that left behind is a cached
+image and a layer store, not a running container, so `docker ps -a` is empty and
+`docker images` is not. Disabling the daemon does not delete any of it, but it
+does take away the thing that can rebuild from it, and finding that out during
+the next rebuild is worse than finding it out now. If both are empty and no unit
+on the box depends on it:
+
+```sh
+systemctl disable --now docker.socket docker containerd
+```
+
+`docker.socket` goes first and is not optional: left enabled it starts `dockerd`
+again on the next connection, which is a 150 MB regression that reappears weeks
+later with no obvious cause. Undo is `systemctl enable --now docker`. If you
+decide to keep the pair, that is a legitimate choice: raise `systemReserved` by
+150Mi instead and let the scheduler know.
+
+### d. zram, and letting burstable pods reach it
+
+Measures (a) through (c) make the box honest about its size. They do not make it
+bigger, and an honest box that runs out still runs out. Swap is the net under
+that, and on a VPS the right swap device is zram: a compressed block device in
+RAM. The root disk is billed by the gigabyte and the tenant volume is mail, so
+swapping to either buys milliseconds of latency and I/O somebody invoices. A
+page pushed to zram costs a zstd round trip instead.
+
+**zram is not extra memory.** It is a discount on the memory already here and
+the discount is the compression ratio. A page that goes to zram leaves the
+process's RSS and comes back, compressed, as kernel memory: 300 MB of cold Rust
+heap at 3x becomes 100 MB, a net 200 MB returned. The same 300 MB of fp32 ONNX
+tensors compresses at about 1x, returns nothing, and adds a page fault. A tenant
+daemon holds both. The freed-but-retained allocator arenas of a heap that has
+been busy and now is not compress beautifully; the model weights do not, and
+they are the larger half. Size the expectation to that, not to the average
+someone quotes for zram.
+
+One precondition worth checking, because per-container swap ceilings are written
+to the cgroup:
+
+```sh
+stat -fc %T /sys/fs/cgroup/     # cgroup2fs. Per-container swap needs cgroup v2.
+```
+
+There is no feature gate to check. The kubelet's `NodeSwap` gate went GA in
+Kubernetes 1.34 and carrier runs k3s v1.36.3+k3s1, which is Kubernetes 1.36.
+
+The device:
+
+```sh
+apt-get install -y systemd-zram-generator
+install -m 0644 deploy/hosted/node/zram-generator.conf /etc/systemd/zram-generator.conf
+systemctl daemon-reload         # runs the generator, which writes the device units
+systemctl start /dev/zram0      # equivalently: systemctl start dev-zram0.swap
+swapon --show                   # /dev/zram0, 2G, prio 100
+zramctl                         # algorithm zstd, and the live compression ratio
+```
+
+**Start the swap unit, not the setup service.** `systemd-zram-setup@zram0.service`
+is a `Type=oneshot` that creates the device and runs `mkswap` on it. The
+`swapon` is not in it: it is in the generated `dev-zram0.swap` unit, which
+`Requires=` and `After=`s the setup service and orders itself
+`Before=swap.target`. `Requires` points downward, so starting the setup service
+by hand pulls in nothing above it and leaves a formatted device that is not
+swap. Starting `/dev/zram0` pulls the setup service in as its dependency and
+then swaps it on, which is why the upstream README's instructions are
+`systemctl daemon-reload` and `systemctl start /dev/zram0` and nothing else.
+`swapon --show` is what tells the two outcomes apart: on the wrong one it prints
+nothing at all while `zramctl` cheerfully shows the device, which reads exactly
+like a working install.
+
+A reboot needs none of this. The generator is invoked by systemd early in boot,
+writes the same units, and `swap.target` starts them. The manual step exists
+only so that you do not have to reboot the box to find out whether it worked.
+
+(On a distro that does not package the generator, `zram-tools` builds the same
+device from `/etc/default/zramswap`. The device is what matters, not which
+package made it.)
+
+Then the sysctls, which are not defaults worth keeping here:
+
+```sh
+cat >/etc/sysctl.d/60-zram.conf <<'EOF'
+vm.swappiness = 100
+vm.page-cluster = 0
+EOF
+sysctl --system
+```
+
+`vm.swappiness` defaults to 60, which is tuned for a device with a seek time.
+zram has neither seek nor queue, so evicting cold anonymous pages early is close
+to free, and on a box with no page cache to spare it is what you want; 100 says
+treat anonymous memory and file cache as equally cheap to reclaim.
+`vm.page-cluster` defaults to 3, meaning eight pages are read per swap-in to
+amortise a seek that does not exist here: on zram that is seven decompressions
+nobody asked for.
+
+The kubelet half is already in the drop-in from (a), inert until this point:
+`memorySwap: {swapBehavior: LimitedSwap}`, plus a `failSwapOn: false` that
+restates what k3s already sets for you in `00-k3s-defaults.conf`, so the drop-in
+reads as the whole swap decision rather than half of one. It needs the restart
+to pick up the device:
+
+```sh
+systemctl restart k3s
+kubectl get --raw /api/v1/nodes/carrier/proxy/configz \
+  | jq '.kubeletconfig | {failSwapOn, memorySwap}'
+
+# Ground truth: LimitedSwap writes a ceiling per container. configz reports what
+# the kubelet parsed; this is what it did with it. Zeroes here, with a device in
+# `swapon --show`, are a kubelet that read the setting and declined to act on
+# it, which is the failure that appears in no log.
+grep -h . /sys/fs/cgroup/kubepods.slice/kubepods-burstable.slice/*/*/memory.swap.max
+```
+
+**LimitedSwap rations swap by request rather than sharing it out.** A Burstable
+container may use at most (its memory request / node total memory) x total swap,
+so at a `SQUELCH_WARDEN_MEMORY_REQUEST` of 384Mi, on this 3814 MiB box, with 2 GB
+of zram, that is about 206 MB per tenant. Raising the request raises the ration
+in step, which is one more reason the request is the number that matters (§7).
+Guaranteed pods (request equal to limit) and BestEffort pods get none at all,
+which is the trap waiting for whoever "tidies up" a tenant's spec by setting its
+request equal to its limit: it would opt that tenant out of the net without
+changing anything anyone would think to look at. Tenant pods are Burstable
+because the warden requests less than it limits, and that is a property worth
+keeping on purpose.
+
+**Swap is a net, not a fix, and it is a quiet one.** It converts the 19 Aug
+kills into an afternoon of a slow tenant, which is a straight trade of a loud
+failure for a soft one, and soft failures are the kind nobody notices for four
+days around here. `node_memory_SwapFree_bytes` is already scraped by
+node-exporter (`PRODUCTION.md`, "Monitoring"); a box that is steadily consuming
+swap is a box that needs the daemon-side fix, not more zram.
+
+### What this does not fix
+
+An idle tenant daemon holds 250 to 300 MB, most of it cold ONNX heap it will not
+touch again until the next message it embeds. Four of those is most of this box.
+Reserving the node's own memory does not make a tenant smaller. What it does is
+make the box tell the truth about how many tenants it can hold, and on this
+hardware the truth is **five**:
+
+```
+  2414Mi  allocatable          (3814 total - 1200 systemReserved - 200 evictionHard)
+-  400Mi  pods that are not tenants
+= 2014Mi  / 384Mi per tenant   = 5   (SQUELCH_WARDEN_MEMORY_REQUEST, §7)
+```
+
+That 400Mi is everything the scheduler has already promised to something that is
+not a mailbox: prometheus-agent 128Mi, kube-state-metrics 48Mi, node-exporter
+24Mi, the warden 32Mi, the fleet roller's job 32Mi while a roll is running, and
+about 140Mi of k3s's own coredns and metrics-server. Leave the roller out and it
+is ~370Mi, which is still five. cert-manager sets no memory requests at all, so
+the scheduler reserves nothing for it, which is a different problem and not this
+one. **Divide allocatable by the tenant request and you get six, and six is
+wrong**: that arithmetic hands the monitoring stack's memory to a tenant twice.
+
+Two gates enforce the five, and they are not the same gate. The ResourceQuota on
+`tenants` (§7: 1920Mi, five times the 384Mi request) is the API server refusing
+to create the pod, and it is the readable failure. The scheduler is the second
+gate, and until this section is applied it is the broken one: it believes in
+3.72 GiB and would place a sixth tenant that the quota had already decided
+against. Apply (a) and the two agree, which is the whole point of applying it.
+
+The sixth tenant is a resize (RAM only, `PRODUCTION.md`) or the daemon-side work
+landing first: releasing the model when idle, and not holding two copies of it.
+That is what raises the number. This section only guarantees that until then the
+failure is a signup that is refused rather than a mailbox that stops.
 
 ## 3. cert-manager and the wildcard certificate
 
@@ -466,11 +893,14 @@ kubectl apply -f deploy/hosted/70-tenant-limits.yaml
 
 A LimitRange and a ResourceQuota on `tenants`. **Size them to your box before
 you apply them**; the shipped numbers assume the 2 vCPU / 4 GB floor above and
-are deliberately conservative.
+are deliberately conservative. Your box here means what §2b left spendable once
+the node's own memory is reserved, not the RAM on the invoice: this quota is the
+API server's gate and the node's allocatable is the scheduler's, and the two
+agree on the same tenant count only after §2b is applied.
 
 The warden already puts requests and limits on both containers of every tenant
 pod (`SQUELCH_WARDEN_CPU_REQUEST` and friends in `15-warden-config.yaml`,
-defaulting to 100m/256Mi requested and 1000m/1Gi allowed, plus a 512Mi cap on
+defaulting to 100m/384Mi requested and 1000m/1Gi allowed, plus a 512Mi cap on
 the pod's `/tmp` and an ephemeral-storage bound so a runaway tenant cannot fill
 the node's root filesystem). This file is the layer under that: defaults for
 anything that lands in the namespace without bounds of its own, and an aggregate
@@ -478,9 +908,29 @@ ceiling.
 
 Sizing, in the order that matters:
 
-- **`requests.cpu` and `requests.memory` are your tenant count.** The scheduler
-  reserves requests, so at the shipped 100m/256Mi a 2-vCPU box carries about 20
-  tenants and no more, whatever the quota says about pods.
+- **`requests.memory` is your tenant count, and the box picks it, not you.**
+  Subtract, do not wish. On the 4 GB floor (3814 MiB of it real): take off about
+  1200 MiB for k3s, containerd, journald and litestream, which live outside
+  every pod, and about 372 MiB for the pods that are not tenants (CoreDNS 70,
+  metrics-server 70, kube-state-metrics 48, node-exporter 24, the Prometheus
+  agent 128, the warden 32). That leaves about 2.2 GiB, which at the shipped
+  384Mi is **five** tenants and no more, whatever the quota says about pods. CPU
+  is the smaller problem (at 100m a 2-vCPU box carries twenty), and memory
+  refuses long before it.
+- **On a default k3s the quota is the only gate there is.** k3s reserves nothing
+  for itself, so the scheduler believes the whole machine is available to pods
+  and would admit a sixth tenant onto a box that cannot run one. The 1200 MiB
+  above is a fact about the machine, not something the scheduler knows. Making
+  it a second gate is a kubelet `systemReserved`, which is its own change (PR
+  #151 adds it here as §2b); until that is applied, this quota is the refusal.
+- **The request itself has to be true.** It is a promise about a daemon's
+  resting size and the scheduler has nothing else to go on. A daemon that has
+  embedded anything keeps its ONNX session resident and rests at roughly
+  300-500 MB, so 384Mi is about the p50 and not a comfortable number. While
+  this said 256Mi, four tenants ran a 4 GB box out of memory on 2026-08-19 and
+  the kernel OOM-killed two of them: tenant pods are burstable, so they are
+  what it picks. At 384Mi the signup that would not fit is refused instead
+  (below), which is the failure you want and the one you can read.
 - **Limits may oversubscribe.** Tenants are idle most of the time and a sync
   burst is seconds long. 4x requests is comfortable on one node; much past that
   and a few simultaneous backfills evict each other.
@@ -494,7 +944,11 @@ Sizing, in the order that matters:
 
 A tenant refused by the quota looks like a provision that times out
 (`500 not_ready`), with the real reason in
-`kubectl -n tenants describe replicaset`.
+`kubectl -n tenants describe replicaset`. A quota looser than the node fails one
+layer further down and looks much the same: the pod is created, never scheduled,
+and `kubectl -n tenants describe pod` says `Insufficient memory`. Either way a
+signup is refused, which is the outcome you want; a quota sized to the node just
+gives the refusal a reason an operator can read at 3am.
 
 ## 8. The warden
 
@@ -686,43 +1140,217 @@ kubectl -n tenants delete pvc test1-data secret/test1-identity secret/test1-cred
 
 ## 10. Embedding weights
 
-Each tenant's daemon downloads about 130 MB of ONNX weights the first time it
+Each tenant's daemon downloads about 126 MB of ONNX weights the first time it
 embeds a message, into `$HOME/.local/share/squelch/models`, and `HOME` is that
 tenant's own volume. Left alone, that is the same download once per tenant,
 inside a signup somebody is watching.
 
+It is worse than slow. The daemon binds its listeners and starts its 30-day
+initial mail backfill while the embedder is still fetching weights, so on a cold
+cache the backfill outruns the embedder and thousands of messages land with no
+vectors: search is keyword-only until the vector backfill catches up, on a
+mailbox whose owner just signed up. It is also the prerequisite for
+`SQUELCH_WARDEN_HTTP_READINESS`, which puts that download inside every readiness
+wait the warden makes (see PRODUCTION.md, "Turning on the HTTP readiness probe").
+
 **The chosen mechanism: one shared read-only volume, copied into each tenant's
 volume by its init container.** The warden mounts the shared PVC into the init
-container only, which copies the cache across if the tenant does not have one
-yet. It is a copy rather than a symlink because the daemon's root filesystem is
-read-only and fastembed expects to own its cache directory; the cost is ~130 MB
-of local disk per tenant, which is nothing next to a mail index.
+container only, which copies across any model directory the tenant does not
+already have. It is a copy rather than a symlink because the daemon's root
+filesystem is read-only and fastembed expects to own its cache directory; the
+cost is ~126 MB of local disk per tenant, which is nothing next to a mail index.
 
-Fill it once, from a tenant that has already downloaded them:
+### The exact layout the init container expects
+
+The PVC is mounted at `/models`, and the init container copies **each top-level
+entry of `/models`** to `/data/.local/share/squelch/models/<same name>`, skipping
+any that is already there. So the root of the volume is the cache directory: one
+directory per model, no wrapper.
+
+The seed pod in `60-models.yaml` mounts the same PVC at `/seed`, which means what
+you are building is:
+
+```
+/seed/models--Xenova--bge-small-en-v1.5/
+├── blobs/                      # the real files, content-addressed
+├── refs/main
+└── snapshots/<sha>/
+    ├── config.json             # a SYMLINK into ../../blobs/
+    ├── tokenizer.json
+    ├── tokenizer_config.json
+    ├── special_tokens_map.json
+    └── onnx/model.onnx         # a SYMLINK into ../../../blobs/
+```
+
+That is fastembed's Hugging Face cache layout, and the symlink line is the part
+that bites. The files under `snapshots/` are relative symlinks into `blobs/`;
+they resolve correctly only if `blobs/` came along with them.
+
+**Seed the Xenova directory and only that one.** `Xenova/bge-small-en-v1.5` is
+the pinned model. A box that has been running a while also has
+`models--Qdrant--bge-small-en-v1.5-onnx-Q` sitting beside it, 63 MB of a
+quantized build from back when the model choice was resolved by substring match
+and came out nondeterministically. It is dead weight. Copying it into the shared
+volume would hand every future tenant a copy of it too, forever.
+
+### Fill it once
+
+Two sources, in preference order. Both end at the same shape.
+
+**From a tenant already running on this box** (nothing to download, and the
+weights are known-good because a daemon loaded them):
 
 ```sh
 kubectl apply -f deploy/hosted/60-models.yaml
 kubectl -n tenants wait --for=condition=Ready pod/squelch-models-seed
 
-# From a tenant that has synced at least once:
-POD=$(kubectl -n tenants get pod -l app.kubernetes.io/instance=<first-label> -o name | head -1)
-kubectl -n tenants cp "${POD#pod/}:/data/.local/share/squelch/models" ./models
-kubectl -n tenants cp ./models squelch-models-seed:/seed
-
-# kubectl cp lands it one level deep; flatten it so the PVC root IS the cache.
-kubectl -n tenants exec squelch-models-seed -- sh -c 'mv /seed/models/* /seed/ && rmdir /seed/models'
-kubectl -n tenants exec squelch-models-seed -- ls /seed
-
-kubectl -n tenants delete pod squelch-models-seed
+POD=$(kubectl -n tenants get pod -l app.kubernetes.io/instance=<label> -o name | head -1)
+kubectl -n tenants exec "${POD#pod/}" -c squelchd -- \
+  tar -C /data/.local/share/squelch/models -cf - models--Xenova--bge-small-en-v1.5 \
+| kubectl -n tenants exec -i squelch-models-seed -- tar -C /seed -xf -
 ```
 
-Then uncomment the `SQUELCH_WARDEN_MODEL_PVC` entry in `15-warden-config.yaml`,
-re-apply it, and `kubectl -n warden rollout restart deploy/squelch-warden`. Every
-tenant provisioned after that skips the download; a tenant that already has its
-own copy keeps it, and the init container leaves it alone. The mount is part of a
-tenant's pod spec, so the roller reads it as drift and every existing tenant
-takes one pod restart for it within a tick or two — expected, and worth knowing
-before you watch the fleet cycle.
+**A tar stream through `exec` rather than `kubectl cp`, on purpose.** `kubectl
+cp` is a tar stream too, but it owns both ends of it, and which kubectl versions
+recreate a symlink, dereference it, or refuse the entry outright has changed more
+than once. Driving `tar` yourself is the same transfer with the behaviour
+written down: GNU tar stores a symlink as a symlink at both ends, so the tree
+lands byte-identical. If your tar does refuse, `tar -ch` on the sending side
+dereferences instead, which also works and costs a second full copy of the
+weights (~126 MB, since every blob arrives again under its snapshot name) on a
+2Gi volume; fastembed does not care which it gets.
+
+**From a laptop**, if there is no tenant to copy from yet. Run `squelchd` once
+against any mailbox, let it print `embedder ready`, then send the same stream:
+
+```sh
+tar -C ~/.local/share/squelch/models -cf - models--Xenova--bge-small-en-v1.5 \
+| kubectl -n tenants exec -i squelch-models-seed -- tar -C /seed -xf -
+```
+
+If the extract fails with `Permission denied`, the volume directory on the node
+is not writable by uid 10001. `local-path` creates it `0777` and normally is,
+and `fsGroup` does not help here because the kubelet does not manage ownership
+on host-path-backed volumes. Fix it on the box (`chown -R 10001:10001` under
+`/var/lib/rancher/k3s/storage/<pv>`), not by making the seed pod root: the
+`tenants` namespace enforces Pod Security Admission at `restricted` and will
+refuse a root pod outright.
+
+### Verify before you point the warden at it
+
+A `SQUELCH_WARDEN_MODEL_PVC` naming an empty volume is not a slow signup, it is
+every tenant with a cache directory that exists and has nothing in it. Check the
+volume first:
+
+```sh
+kubectl -n tenants exec squelch-models-seed -- ls /seed
+# models--Xenova--bge-small-en-v1.5      <- this, and nothing else
+
+# The symlinks resolve and the blob is really there: -L dereferences, so a
+# broken link is an error rather than a plausible-looking 60-byte listing.
+kubectl -n tenants exec squelch-models-seed -- \
+  find /seed -name '*.onnx' -exec ls -lL {} \;
+# ... 126 MB or so for model.onnx
+
+kubectl -n tenants exec squelch-models-seed -- du -sh /seed
+```
+
+Then delete the seed pod: `kubectl -n tenants delete pod squelch-models-seed`.
+Nothing references it afterwards, and leaving it running holds a
+`ReadWriteOnce` volume open for an hour for no reason.
+
+### Turn it on
+
+`SQUELCH_WARDEN_MODEL_PVC: "squelch-models"` ships COMMENTED OUT in
+`15-warden-config.yaml`, and this is the step that uncomments it. It has to be
+this way round: the warden renders that name straight into every tenant's pod
+spec and nothing checks the claim exists, so a knob set ahead of the volume
+leaves each new tenant pod Pending on a volume that will never bind. That is
+also why this step lives after step 9 rather than beside step 8: on a greenfield
+box the tenant you seed from is the one step 9 provisioned.
+
+Uncomment the line, apply, and restart the warden:
+
+```sh
+kubectl apply -f deploy/hosted/15-warden-config.yaml
+kubectl -n warden rollout restart deploy/squelch-warden
+kubectl -n warden exec deploy/squelch-warden -- printenv SQUELCH_WARDEN_MODEL_PVC
+# squelch-models
+```
+
+The mount is part of a tenant's pod spec, so the roller reads it as drift and
+every existing tenant takes one pod restart for it. The roller converges one
+tenant per run, so the fleet catches up at the CronJob schedule times the number
+of tenants: on the `*/5` schedule, four tenants is about twenty minutes. That is
+expected, and worth knowing before you watch the fleet cycle.
+
+If a tenant pod goes Pending instead, that is this knob, and the message says so
+outright:
+
+```sh
+kubectl -n tenants describe pod <pod> | grep -A2 FailedScheduling
+# persistentvolumeclaim "squelch-models" not found
+```
+
+The rollback is the line commented out again and another warden restart.
+
+### Verify on the next tenant
+
+Once the new tenant's pod is Ready, look at the cache the init container built.
+That is the check, because it is the only end of this that is observable today:
+
+```sh
+kubectl -n tenants exec deploy/<label> -c squelchd -- \
+  ls /data/.local/share/squelch/models
+# models--Xenova--bge-small-en-v1.5      <- this, and nothing else
+```
+
+Exactly that one directory, and no `models--Qdrant--bge-small-en-v1.5-onnx-Q`
+beside it, is what the seeded volume looks like once it has been copied across.
+It is not on its own proof that the tenant never called Hugging Face: nothing
+records a tenant's egress per host, the NetworkPolicy allows 443 out and does
+not count it, so there is no metric to go and read. What makes it convincing is
+the pair, the directory being the one from the volume and the pod reaching Ready
+in seconds rather than the minutes a 126 MB download takes.
+
+**Do not use the download notice as the check.** `squelch: downloading embedding
+model ... (first run only)` is gated on a "does the cache look populated" test
+that returns true when ANY subdirectory of the cache holds anything, so a cache
+seeded with the WRONG model suppresses the line and hf-hub goes to the network
+underneath it. Absence of the line proves the directory is not empty and nothing
+more.
+
+Once the model pin lands (`squelch-core`'s `resolve_model`), the daemon prints
+what it actually loaded after the session is up, and that line is the stronger
+check because it names the build rather than the config string:
+
+```sh
+kubectl -n tenants logs deploy/<label> -c squelchd | grep -E 'embedding model|embedder ready'
+# squelch: embedding model Xenova/bge-small-en-v1.5 (384-dim) loaded
+# squelchd: embedder ready — semantic + hybrid search now enabled
+```
+
+**A copy that fails does not take the pod down**, so a tenant with nothing in its
+cache is a log to read rather than a crash to find. The init container says so
+and exits 0:
+
+```sh
+kubectl -n tenants logs deploy/<label> -c seed
+# squelch-seed: could not copy models--Xenova--bge-small-en-v1.5, the daemon will download it
+```
+
+That is deliberate, and it is the difference between one slow tenant and a
+stopped fleet: the daemon can always fetch what it does not find, while an init
+container that exits 1 fails on EVERY tenant's next roll, and the roller reads a
+tenant that will not come up as a casualty and halts. The usual cause is the
+shared volume's ownership on the node, which is the `Permission denied` note
+under "Fill it once" above.
+
+Existing tenants keep whatever they already have. Their cache directory is
+already populated, and the init container only fills in entries that are missing,
+so seeding changes nothing for the tenants provisioned before the volume existed.
+That is correct: they have already paid the download, and the copy on their own
+volume is the same weights.
 
 The `ReadWriteOnce` volume is mounted by many pods, which is legal because they
 are all on the one node. **If you ever add a second node, this stops working.**

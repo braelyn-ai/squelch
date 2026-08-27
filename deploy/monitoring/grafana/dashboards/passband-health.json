@@ -415,7 +415,7 @@
     "type": "prometheus",
     "uid": "prometheus"
    },
-   "description": "Pods that are supposed to be serving and are not: not-ready pods owned by a Deployment, DaemonSet or StatefulSet. Job pods are excluded outright, not just the Succeeded ones. A Job pod ends every run not-ready and stays that way as a record: the roller exits 3 on every ordinary rollout (normal, the fleet is still converging), Kubernetes files that Job as Failed, and failedJobsHistoryLimit keeps the corpse for 24 of them, so counting them reads a rollout from yesterday as an outage now. Read the Daemon rollout row for the roller. Anything nonzero here deserves a look",
+   "description": "Pods that are supposed to be serving and are not: not-ready pods owned by a Deployment, DaemonSet or StatefulSet. Job pods are excluded outright, not just the Succeeded ones. A Job pod ends every run not-ready and stays that way as a record: the roller exits 3 on every ordinary rollout (normal, the fleet is still converging), Kubernetes files that Job as Failed, and failedJobsHistoryLimit keeps the corpse for 72 of them, so counting them reads a rollout from yesterday as an outage now. Read the Daemon rollout row for the roller. Anything nonzero here deserves a look",
    "gridPos": {
     "h": 4,
     "w": 3,
@@ -1342,7 +1342,7 @@
     "type": "prometheus",
     "uid": "prometheus"
    },
-   "description": "Both flat at zero when healthy",
+   "description": "All flat at zero when healthy. The third line is the collector itself: cadvisor and kubelet are allow-listed by metric name in 80-monitoring.yaml, so a keep regex that matches nothing is a live target contributing no samples, which every other panel would show as an empty graph rather than as a fault.",
    "gridPos": {
     "h": 8,
     "w": 12,
@@ -1371,6 +1371,17 @@
      "range": true,
      "instant": false,
      "legendFormat": "containers last killed by OOM"
+    },
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prometheus"
+     },
+     "expr": "sum(up{job=~\"cadvisor|kubelet\"} == bool 0) + sum(scrape_samples_post_metric_relabeling{job=~\"cadvisor|kubelet\"} == bool 0) OR on() vector(0)",
+     "refId": "C",
+     "range": true,
+     "instant": false,
+     "legendFormat": "cadvisor/kubelet targets down or serving nothing"
     }
    ],
    "fieldConfig": {
@@ -1904,6 +1915,101 @@
    }
   },
   {
+   "type": "state-timeline",
+   "title": "Embedder loaded",
+   "id": 51,
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prometheus"
+   },
+   "description": "One band per tenant, and the reader for the memory graph above it. The ONNX embedding session is 85-90% of a tenant daemon's RSS, so a sawtooth in Tenant memory should line up band for band with this one: loaded while a poll tick or a search is working, unloaded once the idle window passes. A tenant that never leaves loaded is a daemon whose reaper is not getting the session down.",
+   "gridPos": {
+    "h": 8,
+    "w": 8,
+    "x": 0,
+    "y": 57
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prometheus"
+     },
+     "expr": "squelchd_embedder_loaded",
+     "refId": "A",
+     "range": true,
+     "instant": false,
+     "legendFormat": "{{tenant}}"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "color": {
+      "mode": "thresholds"
+     },
+     "unit": "short",
+     "min": 0,
+     "max": 1,
+     "decimals": 0,
+     "custom": {
+      "lineWidth": 0,
+      "fillOpacity": 80,
+      "spanNulls": false,
+      "insertNulls": false,
+      "hideFrom": {
+       "tooltip": false,
+       "viz": false,
+       "legend": false
+      }
+     },
+     "mappings": [
+      {
+       "type": "value",
+       "options": {
+        "0": {
+         "text": "unloaded",
+         "color": "green",
+         "index": 0
+        },
+        "1": {
+         "text": "loaded",
+         "color": "blue",
+         "index": 1
+        }
+       }
+      }
+     ],
+     "thresholds": {
+      "mode": "absolute",
+      "steps": [
+       {
+        "color": "green",
+        "value": null
+       }
+      ]
+     },
+     "noValue": "NO DATA"
+    },
+    "overrides": []
+   },
+   "options": {
+    "showValue": "never",
+    "alignValue": "left",
+    "mergeValues": true,
+    "rowHeight": 0.9,
+    "legend": {
+     "showLegend": false,
+     "displayMode": "list",
+     "placement": "bottom",
+     "calcs": []
+    },
+    "tooltip": {
+     "mode": "single",
+     "sort": "none"
+    }
+   }
+  },
+  {
    "type": "bargauge",
    "title": "Tenant PVC usage",
    "id": 28,
@@ -1914,8 +2020,8 @@
    "description": "Per-tenant mailbox volumes on the shared 50 GB block volume",
    "gridPos": {
     "h": 8,
-    "w": 12,
-    "x": 0,
+    "w": 8,
+    "x": 8,
     "y": 57
    },
    "targets": [
@@ -1983,8 +2089,8 @@
    "description": "Empty is healthy. A restarting tenant daemon is a tenant not getting mail triaged",
    "gridPos": {
     "h": 8,
-    "w": 12,
-    "x": 12,
+    "w": 8,
+    "x": 16,
     "y": 57
    },
    "targets": [
@@ -2399,7 +2505,7 @@
     "type": "prometheus",
     "uid": "prometheus"
    },
-   "description": "The fleet is FROZEN: a roll exited 4, meaning a tenant carries today's render and is not serving it, so the run halted before writing to anyone and no tick will converge anything until a person acts. Suspend the CronJob and look at that tenant's pod. The exit code is not in any metric (kube-state-metrics only exports an exit code for a container that RESTARTED, and a Job pod runs once), so what this counts is the Job's failure reason: podFailurePolicy in 90-warden-roller.yaml gets exit 4 a Failed condition of its own, and kube-state-metrics files that reason under no label at all, which is what the negation matches. Windowed to an hour because a failed Job object lingers for 24 more failures, and a genuinely frozen fleet re-raises this every 15 minutes anyway. The code itself is in the pod's log: kubectl -n warden logs job/<name>",
+   "description": "The fleet is FROZEN: a roll exited 4, meaning a tenant carries today's render and is not serving it, so the run halted before writing to anyone and no tick will converge anything until a person acts. Suspend the CronJob and look at that tenant's pod. The exit code is not in any metric (kube-state-metrics only exports an exit code for a container that RESTARTED, and a Job pod runs once), so what this counts is the Job's failure reason: podFailurePolicy in 90-warden-roller.yaml gets exit 4 a Failed condition of its own, and kube-state-metrics files that reason under no label at all, which is what the negation matches. Windowed to an hour because a failed Job object lingers for 24 more failures, and a genuinely frozen fleet re-raises this every 5 minutes anyway. The code itself is in the pod's log: kubectl -n warden logs job/<name>",
    "gridPos": {
     "h": 5,
     "w": 6,
@@ -3522,6 +3628,82 @@
      "displayMode": "list",
      "placement": "bottom",
      "calcs": []
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   }
+  },
+  {
+   "type": "timeseries",
+   "title": "Emails triaged, per tenant",
+   "id": 51,
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prometheus"
+   },
+   "description": "Model verdicts landed per hour, PER TENANT. Its neighbour \"Triage throughput\" is the same counter cut by stage and outcome across the whole fleet, which answers \"is triage working\"; this one answers \"is THIS mailbox getting anything\", and that is the question a single dark tenant hides inside a healthy fleet total. On 2026-08-25 three of four tenants had been triaging nothing for days while the fleet-wide line looked alive on the strength of the fourth.\n\noutcome=\"ok\" only, deliberately: a fallback kept its ingest heuristic and a stale_skip never asked the model, so counting either would report work the person did not get. A tenant sitting flat at zero while mail arrives is one whose mail is being filed by guesswork.\n\nBars over an hourly increase rather than a rate, so a quiet mailbox reads as a small bar rather than a noisy line near zero, and so the y axis is a countable number of emails. The counter is process-local and resets when a pod restarts; increase() accounts for that, which is why this is not a bare delta.",
+   "gridPos": {
+    "h": 8,
+    "w": 12,
+    "x": 0,
+    "y": 127
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prometheus"
+     },
+     "expr": "sum by (tenant) (increase(squelchd_triage_verdicts_total{outcome=\"ok\"}[1h]))",
+     "refId": "A",
+     "range": true,
+     "instant": false,
+     "legendFormat": "{{tenant}}"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "color": {
+      "mode": "palette-classic"
+     },
+     "unit": "short",
+     "min": 0,
+     "custom": {
+      "drawStyle": "bars",
+      "lineWidth": 1,
+      "fillOpacity": 70,
+      "showPoints": "never",
+      "pointSize": 5,
+      "spanNulls": false,
+      "axisBorderShow": false,
+      "gradientMode": "none",
+      "stacking": {
+       "mode": "normal"
+      }
+     },
+     "mappings": [],
+     "thresholds": {
+      "mode": "absolute",
+      "steps": [
+       {
+        "color": "green",
+        "value": null
+       }
+      ]
+     }
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "showLegend": true,
+     "displayMode": "list",
+     "placement": "bottom",
+     "calcs": [
+      "sum"
+     ]
     },
     "tooltip": {
      "mode": "multi",

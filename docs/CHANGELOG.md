@@ -11,6 +11,33 @@ behind it. The two ship separately: the app updates itself, and the
 daemon is rolled onto hosted accounts or pulled as an image on a
 self-host box, so every note says which one it landed in.
 
+## 0.0.5 (2026-08-25)
+
+Groups you can address as one, and a mailbox that says so when it stops working.
+
+### App
+
+- Address a group by name. Groups sits at the bottom of the rail on Cmd-6, holds a named audience, and a Groups button beside the To line puts one into an email.
+- How a group is addressed is settled once, when you make it: everybody on the To line, everybody blind, or one separate email per person. The review before you send says which of the three you are about to do.
+- A group shows what has already gone to it, including the mail you sent those people before the group existed.
+- The composer has a Bcc row, on the messages you want one on.
+- When your mailbox stops working, Passband says so. An expired Google sign-in used to look exactly like nobody writing to you; now a banner says what broke and since when, and on a hosted account it carries the link that repairs it.
+- Re-triage runs in front of you with the queue counting down, instead of a toast over a board still showing the old verdicts.
+- One click on a row in Auth opens the mail the code arrived in.
+- Shipment cards read as one line, and asking one to check now no longer takes the app down with it.
+- The assistant's Opus setting is Opus 5, and a preference saved on the older model moves forward by itself.
+- Inviting a friend hands them the waitlist for now. An invite cannot be redeemed until Google's review clears, so the sheet says so rather than minting a code that would bounce.
+
+### Daemon
+
+- Sending to a group one person at a time happens in the background, so a twelve person list goes out without the send timing out, and the Groups page watches it happen.
+- A send that reached some of a group and not the rest says so, and says how many of each.
+- Blind copies go out blind and are still recorded, so a bcc-only send lists in your sent mail with everyone it actually reached.
+- A model outage no longer costs you the rest of the day. A call the gateway turns away for free is refunded to your triage budget, instead of burning the day's allowance in minutes and leaving mail unjudged until midnight.
+- The assistant answers again on hosted accounts, whichever model you picked for it.
+- A hosted mailbox that lost its Google consent is reconnected by the person who owns it, from the banner, rather than by somebody reaching into the cluster on their behalf.
+- Your daemon notices the moment a mailbox loses its sign-in and remembers since when, which is what the banner in the app is reading.
+
 ## 0.0.4 (2026-08-24)
 
 Forwarding, reminders, invites, and mail that renders like its sender meant it to.

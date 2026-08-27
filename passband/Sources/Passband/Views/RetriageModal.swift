@@ -52,6 +52,11 @@ struct RetriageModal: View {
     private var title: String {
         if run.failure != nil { return "Re-triage: lost track" }
         if run.unsupported { return "Re-triage running" }
+        // A CATCH-UP OUTRANKS "not moving", because it is the REASON it is not
+        // moving. Triage cannot run until the mailbox finishes its re-walk, so
+        // telling somebody the counter is stuck while the daemon is visibly
+        // working is the wrong half of the truth.
+        if store.catchUp != nil { return "Waiting for your mailbox" }
         if run.stalled { return "Re-triage: not moving" }
         return "Re-triage in progress"
     }
@@ -113,6 +118,16 @@ struct RetriageModal: View {
             note(
                 "this daemon can't report progress — update squelchd to watch it. "
                     + "The re-triage itself is running.", tone: Palette.warn)
+            closeButton("Close")
+        } else if let sync = store.catchUp {
+            // The numbers are the point: "not moving" and "1,240 of 4,500 and
+            // climbing" are the same screen otherwise, and only one of them is
+            // worth waiting through.
+            note(
+                "your mailbox is catching up after being disconnected "
+                    + "(\(sync.done) of \(sync.total) messages). Triage starts when it "
+                    + "finishes, and this re-triage is queued behind it, not lost.",
+                tone: Palette.inkFaintest)
             closeButton("Close")
         } else if run.stalled {
             // Still polling — the run may simply be behind a slow cycle — but

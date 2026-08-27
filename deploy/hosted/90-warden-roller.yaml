@@ -57,7 +57,7 @@
 # at machine speed and exit converged.
 #
 # So the run does not try to know. It converges one tenant and leaves, and what
-# stands between a bad render and the second mailbox is fifteen minutes of a
+# stands between a bad render and the second mailbox is five minutes of a
 # real daemon doing real work - plus the read pass on the next tick, which finds
 # a tenant carrying today's render and not serving it, calls it a casualty, and
 # refuses to roll anything at all.
@@ -71,9 +71,11 @@
 #     on every ordinary image bump. What makes the one failure that matters
 #     tellable from those is `podFailurePolicy` in the jobTemplate below, which
 #     gets exit 4 a Failed condition of its own; PRODUCTION.md has the query.
-#   - **Convergence time is the schedule times the fleet.** Raising the schedule
-#     below is the lever, and it trades directly against how long a bad render
-#     has to be noticed in. Fifteen minutes was chosen when the fleet was small.
+#   - **Convergence time is the schedule times the fleet.** The schedule below
+#     is the lever, and it trades directly against how long a bad render has to
+#     be noticed in. It was fifteen minutes while the fleet was small and is
+#     five now: a release reaches every mailbox in a third of the time, and so
+#     does a bad one.
 #
 # ## Levers, and what each one does not do
 #
@@ -129,10 +131,10 @@
 #     goes and looks at it.
 #   - A tenant whose APPLY was rejected received nothing, so it is still drifted,
 #     so it is first in the queue again on the next tick and is rejected again.
-#     ~96 failed Jobs a day and not one tenant converged in any of them, at the
+#     ~288 failed Jobs a day and not one tenant converged in any of them, at the
 #     same label every time. Under one-per-tick pacing this is a FLEET STALL and
 #     not just a noisy tenant: the run spends its single attempt on the same
-#     label every quarter hour, so nothing behind it in fleet order ever moves.
+#     label every five minutes, so nothing behind it in fleet order ever moves.
 #     The summary's `still behind, one per run: N more` line staying at the same
 #     N across runs is the signature.
 #
@@ -161,21 +163,30 @@ metadata:
   labels:
     app.kubernetes.io/name: squelch-warden-roll
 spec:
-  # Every 15 minutes. The two things this is trading off: a human who bumps
+  # Every 5 minutes. The two things this is trading off: a human who bumps
   # `SQUELCH_WARDEN_IMAGE` and applies `15-warden-config.yaml` should not have to
   # remember a second command afterwards, and a converged fleet should cost
-  # nothing. Fifteen minutes bounds the wait after a deliberate bump, and a run
+  # nothing. Five minutes bounds the wait after a deliberate bump, and a run
   # with nothing to do is one short-lived pod plus a handful of reads per tenant
   # (a status, a drift report - and a drift report's apply is `dryRun=All`, which
   # the API server merges and throws away). If you want it sooner than the next
   # tick, use the `create job --from=cronjob` line in the header.
   #
-  # It also bounds how long a bump takes, because a run converges one tenant:
-  # a fleet with N behind needs N ticks, so fifteen minutes is also "a quarter
-  # hour per tenant". Shortening it converges faster and gives a bad render
-  # less time to be noticed in before the next mailbox takes it; that trade is
-  # the whole content of this number.
-  schedule: "*/15 * * * *"
+  # It also bounds how long a bump takes, because a run converges one tenant: a
+  # fleet with N behind needs N ticks, so this is also "five minutes per tenant",
+  # and a four-tenant fleet is current twenty minutes after the bump.
+  #
+  # IT WAS FIFTEEN. The number came down because a release that takes an hour to
+  # reach four mailboxes is one nobody waits for, and an operator who does not
+  # wait rolls tenants by hand, which is the `create job --from=cronjob` path
+  # that `Forbid` does not cover - so the slow schedule bought its safety back
+  # in unsupervised manual runs. What the shortening COSTS is the only safety
+  # property this timer has: a bad render now gets five minutes of a real daemon
+  # serving real mail to be noticed in rather than fifteen, and the next mailbox
+  # takes it after that. Nothing inside a run checks health (see "One tenant per
+  # tick" in the header), so this number IS the check. Do not shorten it again
+  # without giving the run something better to trust than the clock.
+  schedule: "*/5 * * * *"
   # Two rollers walking one fleet is two writers on one mailbox. Forbid means a
   # run that overruns its schedule skips the next tick rather than doubling up.
   # It counts the Jobs this CronJob OWNS and nothing else, so it is no defence
@@ -185,23 +196,34 @@ spec:
   # on once, not stampeding. Bounded rather than unset: with no deadline the
   # controller counts every missed start since the last one and stops scheduling
   # entirely past a hundred of them, which is a timer that silently retires.
-  startingDeadlineSeconds: 300
+  #
+  # A FRACTION of the period, which is why this moved when the schedule did. At
+  # fifteen minutes, 300s was a fifth of a tick; left there against a five-minute
+  # schedule it would be the WHOLE period, so a late start would run into the
+  # next scheduled one. Survivable - `Forbid` skips it - but it turns a catch-up
+  # into a skipped tick for no reason.
+  startingDeadlineSeconds: 120
   # A failed roll is the one somebody reads tomorrow; a successful one is a line
   # in a log nobody needs twice.
   #
-  # Twenty-four failures kept, because the failure that matters most is the one
-  # that repeats: a roll the cluster refuses fails identically every 15 minutes,
-  # which is 96 Jobs a day, and a handful of slots means the evidence is gone
-  # within the hour and long before anyone reads it. Twenty-four is six hours of
-  # ticks. Each one is a completed pod holding a few kilobytes of log on a node
-  # that carries tenants, which is what stops this being a much larger number.
+  # Seventy-two failures kept, because the failure that matters most is the one
+  # that repeats: a roll the cluster refuses fails identically every 5 minutes,
+  # which is 288 Jobs a day, and a handful of slots means the evidence is gone
+  # within the hour and long before anyone reads it.
+  #
+  # What this is really denominated in is HOURS OF EVIDENCE, not ticks, so it
+  # moved with the schedule: 72 ticks at five minutes is the same six hours that
+  # 24 bought at fifteen. It is also three times the corpses, each a completed
+  # pod holding a few kilobytes of log on a node that carries tenants - which is
+  # what stops this being larger still, and makes it the first number to cut if
+  # those pods ever start mattering.
   #
   # These corpses are counted by nothing, and that is deliberate: a Job pod ends
   # every run not-ready and stays that way forever, so any pod-health query has
   # to exclude Job-owned pods outright rather than by phase. The dashboard's
   # "Pods not ready" read 3 for a day over three of them before it learned that.
   successfulJobsHistoryLimit: 3
-  failedJobsHistoryLimit: 24
+  failedJobsHistoryLimit: 72
   jobTemplate:
     spec:
       # A halted roll wants a human, not a retry loop. Whatever stopped it -
@@ -210,7 +232,10 @@ spec:
       # next scheduled tick is a retry anyway once somebody has looked.
       backoffLimit: 0
       # The ceiling on one pass, so a wedged run cannot hold the `Forbid` lock
-      # forever and quietly stop the fleet converging at all.
+      # forever and quietly stop the fleet converging at all. At the schedule
+      # above an hour is twelve ticks, so this is also "a wedged run costs the
+      # fleet an hour of convergence" - the price of not cutting off a run that
+      # is slow but still alive.
       #
       # It does NOT scale with the fleet. A run converges AT MOST ONE tenant, so
       # what it has to cover is the read pass over every tenant (a handful of
@@ -306,7 +331,7 @@ spec:
               # 1. EDIT ME. The SAME warden image as `20-warden.yaml`, always.
               # This binary is the renderer; a roller on an older image renders
               # older tenants.
-              image: ghcr.io/braelyn-ai/squelch-warden:daemon-0.0.3
+              image: ghcr.io/braelyn-ai/squelch-warden:daemon-0.0.4
               imagePullPolicy: IfNotPresent
               # The image's entrypoint IS the binary, so this is the whole
               # command line. Add `--dry-run` to make the timer report what it
@@ -319,7 +344,7 @@ spec:
               # cluster rather than of an operator diffing two files. Nearly
               # every value in it is an input to the tenant Deployment this
               # process renders, and two copies that disagree take turns
-              # rewriting the same tenant every quarter hour with each half
+              # rewriting the same tenant every five minutes with each half
               # behaving correctly. Nothing is restated below: a container `env:`
               # name outranks the same name from `envFrom`, silently, and one
               # override here is that divergence with extra steps.

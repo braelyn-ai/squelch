@@ -1,0 +1,39 @@
+# INSTALL AS /etc/rancher/k3s/config.yaml
+#
+# The whole file, not a fragment: this is what the box ends up with after
+# SETUP.md's "Tenant data on a block volume" and §2b. k3s reads server flags
+# from here durably, which is the point of the file: it survives upgrades and
+# re-runs of the install script, both of which rewrite the systemd unit.
+#
+#   install -d -m 0755 /etc/rancher/k3s
+#   install -m 0644 deploy/hosted/node/k3s-config.yaml /etc/rancher/k3s/config.yaml
+#   systemctl restart k3s
+#
+# EDIT ME: the storage path below is the block-volume mount. If you never
+# repointed local-path, delete the line rather than guessing at it.
+
+# Where the local-path provisioner carves tenant PVCs. See SETUP.md, "Tenant
+# data on a block volume". Only affects NEW claims.
+default-local-storage-path: /mnt/tenant-data
+
+# THE MEMORY RESERVATION IS NOT HERE, AND THAT IS DELIBERATE.
+#
+# systemReserved, evictionHard and the swap settings live in a kubelet drop-in
+# at /var/lib/rancher/k3s/agent/etc/kubelet.conf.d/10-squelch.conf
+# (deploy/hosted/node/kubelet.yaml), because the drop-in MERGES with k3s's own
+# 00-k3s-defaults.conf PER KEY. That is what lets evictionHard add a memory
+# threshold without dropping k3s's imagefs/nodefs ones. The equivalent
+# --eviction-hard flag replaces the whole map, and the disk thresholds leave
+# with it.
+#
+# A `kubelet-arg:` list here would probably have worked too, and was not tried:
+# k3s builds one kubelet command line as [config-file args][CLI args], and
+# pkg/configfilearg's doc comment says the non-config flags "override, or if a
+# slice append to, the config file values", so a list here most likely appends
+# to the --kubelet-arg this box's unit already passes (the UserNamespacesSupport
+# feature gate, SETUP.md §2) rather than losing to it. Untested is untested.
+# The per-key merge above is the reason the drop-in wins on its own.
+#
+# What the unit passes, if you want to see it:
+#
+#   grep kubelet-arg /etc/systemd/system/k3s.service

@@ -81,7 +81,7 @@ const EXIT_CONVERGED: u8 = 0;
 ///
 /// Several of these are PERMANENT until somebody acts - a stranded mailbox and
 /// a tenant whose credential is gone both persist across every tick - so a
-/// fleet holding one raises this code every fifteen minutes forever. That is
+/// fleet holding one raises this code on every tick, forever. That is
 /// exactly why the casualty is no longer among them.
 const EXIT_NOT_CONVERGED: u8 = 1;
 /// Everything this run could converge did, and at least one tenant is left that
