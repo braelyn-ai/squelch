@@ -159,7 +159,7 @@ enum AgentTools {
         guard let threadId = string(input, "thread_id") else {
             return .refused(
                 failure(
-                    "missing thread_id — pass the thread_id this message came back with",
+                    "missing thread_id: pass the thread_id this message came back with",
                     summary: summary))
         }
         return await verify(messageId: messageId, threadId: threadId, summary: summary)
@@ -179,7 +179,7 @@ enum AgentTools {
         guard let message = view.messages.first(where: { $0.id == messageId }) else {
             return .refused(
                 failure(
-                    "message \(messageId) is not in thread \(threadId) — re-read the thread "
+                    "message \(messageId) is not in thread \(threadId); re-read the thread "
                         + "and use a message_id it returned",
                     summary: summary))
         }
@@ -315,7 +315,7 @@ enum AgentTools {
             info = try await APIClient.shared.getTriageDebug(messageId)
         } catch let error as APIError where error.kind == .notFound {
             return failure(
-                "no triage record for message \(messageId) — either that id isn't one of the "
+                "no triage record for message \(messageId): either that id isn't one of the "
                     + "user's messages, or it is mail Passband keeps sealed (auth codes and the "
                     + "like), which never reaches this door at all",
                 summary: "no triage record")
@@ -381,7 +381,7 @@ enum AgentTools {
         let ids = strings(input, "thread_ids")
         guard !ids.isEmpty else {
             return failure(
-                "missing thread_ids — pass thread_ids from an earlier search or updates result",
+                "missing thread_ids: pass thread_ids from an earlier search or updates result",
                 summary: "nothing to show")
         }
         var seen = Set<String>()
@@ -410,7 +410,7 @@ enum AgentTools {
         }
         guard !cards.isEmpty else {
             return failure(
-                "none of those thread_ids resolved — use thread_ids exactly as an earlier "
+                "none of those thread_ids resolved: use thread_ids exactly as an earlier "
                     + "result returned them",
                 summary: "nothing to show")
         }
@@ -589,7 +589,7 @@ enum AgentTools {
                 // The daemon's own verdict, which is the only place the caller
                 // can learn what inference chose.
                 "disposition": created.disposition?.rawValue ?? "unspecified",
-                "scope": "passband triage only — no mail was moved",
+                "scope": "passband triage only, no mail was moved",
             ],
             summary: "wrote a triage rule")
     }
@@ -907,8 +907,8 @@ enum AgentTools {
             name: Tool.searchMail.rawValue,
             description: """
                 Search the user's mailbox by meaning AND keyword (hybrid recall). \
-                Returns summaries only — sender, subject, date, a snippet, and a \
-                thread_id — never full bodies. Auth/2FA messages are excluded. Reach \
+                Returns summaries only (sender, subject, date, a snippet, and a \
+                thread_id), never full bodies. Auth/2FA messages are excluded. Reach \
                 for this first when the question is about a specific message.
                 """,
             input_schema: .init(
@@ -924,7 +924,7 @@ enum AgentTools {
                 Read one thread's messages by thread_id (from a search or updates \
                 result) when the snippet isn't enough. Returns the subject and each \
                 message's id, sender, date, and text. The message ids it returns are \
-                what the acting tools take — always pass a message_id together with \
+                what the acting tools take: always pass a message_id together with \
                 the thread_id it came from.
                 """,
             input_schema: .init(
@@ -937,7 +937,7 @@ enum AgentTools {
         Wire.ToolDef(
             name: Tool.getUpdates.rawValue,
             description: """
-                The triaged attention list — what Passband decided is worth the user's \
+                The triaged attention list: what Passband decided is worth the user's \
                 time, newest first, with each row's tier, importance, deadline and \
                 status. Use this for "what needs me", "what's overdue", "what came in \
                 today"; use search_mail when looking for one particular message. \
@@ -964,7 +964,7 @@ enum AgentTools {
             description: """
                 Why Passband triaged ONE message the way it did. Returns that \
                 message's tier, importance, category, deadline and status, the \
-                one-line summary, and the reasoning behind each of them — plus the \
+                one-line summary, and the reasoning behind each of them, plus the \
                 sender rule that decided it, if one did. This is the tool for "why \
                 is this in my inbox", "why was this flagged past due", "why did you \
                 call this noise". Takes a message_id (the newest message of the \
@@ -1024,8 +1024,8 @@ enum AgentTools {
             name: Tool.showEmails.rawValue,
             description: """
                 Show email threads to the user as clickable cards right in the chat. \
-                Use it whenever the answer IS a set of emails — "show me", "which \
-                emails", "find the ones" — after locating them with search_mail or \
+                Use it whenever the answer IS a set of emails ("show me", "which \
+                emails", "find the ones"), after locating them with search_mail or \
                 get_updates. Pass thread_ids from those results, in the order to \
                 show them (max 8). The app renders each card from its own data, so \
                 don't also describe the emails in text; one line of framing is \
@@ -1044,7 +1044,7 @@ enum AgentTools {
             name: Tool.setStatus.rawValue,
             description: """
                 Mark one attention row open or done. Local to Passband and reversible \
-                from the app — it changes what the user's sitrep shows, it does not \
+                from the app: it changes what the user's sitrep shows, it does not \
                 touch Gmail and moves no mail.
                 """,
             input_schema: .init(
@@ -1061,8 +1061,8 @@ enum AgentTools {
             description: """
                 Write a triage rule in the user's own words: which senders it matches, \
                 and what they want to happen with them. Passband decides from `want` \
-                whether that means always surface, mute, or filter. LOCAL TRIAGE ONLY \
-                — it shapes what gets surfaced from now on, never the mailbox, and \
+                whether that means always surface, mute, or filter. LOCAL TRIAGE ONLY: \
+                it shapes what gets surfaced from now on, never the mailbox, and \
                 nothing already delivered moves. Reversible on the Rules screen. \
                 Creates only: if a rule for that pattern exists, this reports so rather \
                 than changing it, and the user edits theirs in Settings.
@@ -1087,7 +1087,7 @@ enum AgentTools {
             description: """
                 Save a draft for the user to finish. Local to Passband, never a Gmail \
                 draft, never sent. THIS IS THE TOOL for "write me a reply to…" or \
-                "draft something that says…" — send_email is only for when they \
+                "draft something that says…". send_email is only for when they \
                 explicitly ask you to send. Each draft slot holds one draft: if one is \
                 already saved there, this reports so rather than replacing it, and you \
                 should ask the user before overwriting their own writing.
@@ -1154,7 +1154,7 @@ enum AgentTools {
                 card first and sends nothing until they approve it. Only use this when \
                 the user asked you to SEND; when they asked you to write, use \
                 save_draft. On a reply, pass reply_to_message_id AND \
-                reply_to_thread_id, and leave `to` and `subject` out — the recipient \
+                reply_to_thread_id, and leave `to` and `subject` out: the recipient \
                 and Re: line are derived from the parent, and the card shows the user \
                 the recipient Passband reads back from it. An outbound guard may refuse \
                 a body carrying credentials; if it does, rewrite without them rather \
