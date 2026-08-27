@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- THE APP'S group, not this extension's own. An extension's default
+	     keychain group is its own bundle id, which would be an empty keychain;
+	     naming the app's here is the entire mechanism by which a push can be
+	     answered with what the mail actually says. Read-only in practice: this
+	     process reads a bearer and writes nothing back. -->
+	<key>keychain-access-groups</key>
+	<array>
+		<string>$(AppIdentifierPrefix)app.passband.client.ios</string>
+	</array>
+</dict>
+</plist>

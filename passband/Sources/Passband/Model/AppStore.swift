@@ -731,6 +731,9 @@ final class AppStore {
                 settings = stored
                 connStatus = .connected
                 connError = nil
+                #if os(iOS)
+                    await PushRegistration.shared.registerAndSync()
+                #endif
                 // A link that arrived during boot (the app was LAUNCHED by one)
                 // races the keychain read and finds no Connect gate to land on.
                 // On the Mac it is not dropped for that: this install having an
@@ -848,6 +851,9 @@ final class AppStore {
             settings = fresh
             connStatus = .connected
             connError = nil
+            #if os(iOS)
+                await PushRegistration.shared.registerAndSync()
+            #endif
             Analytics.capture("connect_succeeded")
             // Fresh connection = fresh sync history; a stale lastRefresh from a
             // prior session must not make a failing daemon look recently synced.
@@ -887,6 +893,9 @@ final class AppStore {
             // — streams take their credentials at construction and keep them.
             AccountManager.shared.restartFeeds(account.id, with: fresh)
             settings = fresh
+            #if os(iOS)
+                await PushRegistration.shared.registerAndSync()
+            #endif
             return (true, nil)
         } catch {
             // Restore the prior working client — a fat-fingered token must not
@@ -983,6 +992,9 @@ final class AppStore {
         guard await performSwitch(to: record) else {
             return (false, "account added, but the keychain refused its credentials; pick it from the account switcher to retry")
         }
+        #if os(iOS)
+            await PushRegistration.shared.registerAndSync()
+        #endif
         return (true, nil)
     }
 

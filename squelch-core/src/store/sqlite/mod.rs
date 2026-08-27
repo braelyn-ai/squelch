@@ -957,8 +957,14 @@ impl Store for SqliteStore {
         self.latest_event_id(account_id)
     }
 
-    fn upsert_device(&self, account_id: AccountId, token: &str, platform: &str) -> Result<Device> {
-        self.upsert_device(account_id, token, platform)
+    fn upsert_device(
+        &self,
+        account_id: AccountId,
+        token: &str,
+        platform: &str,
+        tag: Option<&str>,
+    ) -> Result<Device> {
+        self.upsert_device(account_id, token, platform, tag)
     }
 
     fn list_devices(&self, account_id: AccountId) -> Result<Vec<Device>> {

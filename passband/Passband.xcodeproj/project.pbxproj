@@ -17,11 +17,13 @@
 		0942E5062DD260DCC44FFEA0 /* TrackerToggle.swift in Sources */ = {isa = PBXBuildFile; fileRef = B2556C9BFD81BFC2EEAFB3B0 /* TrackerToggle.swift */; };
 		0A10F1733FF17A416C100485 /* WhatsNew.swift in Sources */ = {isa = PBXBuildFile; fileRef = 22634771F8C0BE048B034866 /* WhatsNew.swift */; };
 		0A7C428163BED54C681D2CD8 /* newsreader-var.ttf in Resources */ = {isa = PBXBuildFile; fileRef = 7AC123D7E906293F404D8353 /* newsreader-var.ttf */; };
+		0AC78BDC00C6025955560AB5 /* NotificationService.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5742B0429B8EF9B69ABDEB27 /* NotificationService.swift */; };
 		0C61CFFF1751AC0250DBE8C8 /* AppStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6D18C66DBE79E1F7D55CD6DD /* AppStore.swift */; };
 		0D05989412C01C429266CDBA /* ThreadStyle.swift in Sources */ = {isa = PBXBuildFile; fileRef = A5B25E3187C89277DBE8DEF3 /* ThreadStyle.swift */; };
 		0D35FE1914DBB68CAB817177 /* TriageTargets.swift in Sources */ = {isa = PBXBuildFile; fileRef = 74A0D0F666787312F4991788 /* TriageTargets.swift */; };
 		0FE1B2AACB4D13002E0F5381 /* GroupEditor.swift in Sources */ = {isa = PBXBuildFile; fileRef = F8FF235DC1DB2B57F7C06220 /* GroupEditor.swift */; };
 		120F38E19705221A8EAA5ECF /* SidePanel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 992EA99CCF93A2EA929D6E3B /* SidePanel.swift */; };
+		13068136E70BA1E4AD4A9709 /* PushRegistration.swift in Sources */ = {isa = PBXBuildFile; fileRef = 083E104C0BABF65C4BB44673 /* PushRegistration.swift */; };
 		1627BFF43F50B50F6F5C606A /* ThreadStyleLedger.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9C92A36DDD1B4FF9A1BD99B0 /* ThreadStyleLedger.swift */; };
 		16B0C0F30C085FB37AB94D2A /* APIError.swift in Sources */ = {isa = PBXBuildFile; fileRef = 37716282CFABFF5910677BBC /* APIError.swift */; };
 		16E483911006F01000C2CEC8 /* ConnectView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4D6D7D083F3A7242DB7EB186 /* ConnectView.swift */; };
@@ -30,6 +32,7 @@
 		1CE21E966B1C0068BBAE7178 /* ThreadArrivals.swift in Sources */ = {isa = PBXBuildFile; fileRef = CB8DC0D632309B6B97130426 /* ThreadArrivals.swift */; };
 		1D4DC0356DE1A699763FBFB0 /* UsageView.swift in Sources */ = {isa = PBXBuildFile; fileRef = E8D7384FAFC16891C369CFA8 /* UsageView.swift */; };
 		1E07DF0006E501D0B7C3228A /* Ranking.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7079893CCCC8806D2B5099D8 /* Ranking.swift */; };
+		1E3D3435F491C658C93127B4 /* Format.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5883BA424612265657845246 /* Format.swift */; };
 		217F91C35460C7286C88712C /* WebKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = BBC8D81B089AFD24BD4AC367 /* WebKit.framework */; };
 		22511E51CB7D38C82320FE21 /* SitrepView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2B0750416DB37BFF3B78457B /* SitrepView.swift */; };
 		22E02ADE42C027FF43AC6665 /* AttachmentStrip.swift in Sources */ = {isa = PBXBuildFile; fileRef = 15D14DE02E72E63FE53D5C8D /* AttachmentStrip.swift */; };
@@ -38,6 +41,7 @@
 		2530ADC217749D5FEEFFA4D9 /* DraftSaver.swift in Sources */ = {isa = PBXBuildFile; fileRef = 06A50E65F84872DFA0504B96 /* DraftSaver.swift */; };
 		26C5B834CA3DF63D12F9AAC4 /* Avatar.swift in Sources */ = {isa = PBXBuildFile; fileRef = BC0ADC18AA758296235E8F59 /* Avatar.swift */; };
 		2785F1AA75B655313673E0D0 /* Trackers.swift in Sources */ = {isa = PBXBuildFile; fileRef = EEFA34554013DFB615774309 /* Trackers.swift */; };
+		28FB2FCE96AB7D2BF0794632 /* EventBanner.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9D952F37AD4DF7C050902B19 /* EventBanner.swift */; };
 		2AE0CB107FAB86784BE5C0F4 /* Updater.swift in Sources */ = {isa = PBXBuildFile; fileRef = D179CAC9853B13A5FBFD968E /* Updater.swift */; };
 		2B851E8B41A22C1E6FA86CC4 /* SitrepWindow.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5B7D3E42C4E6495943239602 /* SitrepWindow.swift */; };
 		2D0D09F90F44A946AC7286C3 /* ThreadStyle.swift in Sources */ = {isa = PBXBuildFile; fileRef = A5B25E3187C89277DBE8DEF3 /* ThreadStyle.swift */; };
@@ -46,6 +50,7 @@
 		2F363EB80C61955DE11D0702 /* TourOverlay.swift in Sources */ = {isa = PBXBuildFile; fileRef = 627B000AA2D3694B771F50B0 /* TourOverlay.swift */; };
 		3036D5EBC31C8F05D10AAC8E /* MinimapGeometry.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EF8CFFF47055FF070BD9E8F /* MinimapGeometry.swift */; };
 		30B0B95981F83062CAD29D3F /* ReadReceipt.swift in Sources */ = {isa = PBXBuildFile; fileRef = 759702EBD03C1CECFD041E57 /* ReadReceipt.swift */; };
+		313EE9BEC5B91F65DD29AA0B /* AsyncMemo.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA0089253391F9BC0AE4818B /* AsyncMemo.swift */; };
 		331C84737DCE609E6D6C6980 /* ListRow.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4A52E20474A0D6F31073DA61 /* ListRow.swift */; };
 		334AB5C57D2B2C941C5EEA02 /* Resources in Resources */ = {isa = PBXBuildFile; fileRef = 168312D5219614E1F658480C /* Resources */; };
 		334CF29FAF59FE56B41E581B /* ProcessMode.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3484EC544E0909F3D7A88E26 /* ProcessMode.swift */; };
@@ -88,6 +93,7 @@
 		50E69A11AB542FBC85149FDE /* ShareNudge.swift in Sources */ = {isa = PBXBuildFile; fileRef = DEACCDDABDFBD619EB070CEB /* ShareNudge.swift */; };
 		513F475DB3A83BED4F68A57D /* Newsletters.swift in Sources */ = {isa = PBXBuildFile; fileRef = 47779240FEC7579D6A0072CB /* Newsletters.swift */; };
 		51B35B5F4D9B0D7D61BC44B9 /* BackgroundAuthWatch.swift in Sources */ = {isa = PBXBuildFile; fileRef = 568C9AF22D9B24934BF2B39D /* BackgroundAuthWatch.swift */; };
+		521C6B71EEF0E5C03EF7AF89 /* SubjectText.swift in Sources */ = {isa = PBXBuildFile; fileRef = E645BA6EC9A8686D95460095 /* SubjectText.swift */; };
 		526581101F846DEC04813704 /* ReleaseNotes.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1964D381D25BBC803E490328 /* ReleaseNotes.swift */; };
 		542F16866D729BD1E30B6AA6 /* AccountPage.swift in Sources */ = {isa = PBXBuildFile; fileRef = FA2F8E5310BCCF203247E428 /* AccountPage.swift */; };
 		553D7088D2A4B65FCAA59E61 /* ImageWarmer.swift in Sources */ = {isa = PBXBuildFile; fileRef = 582A0094F147273BA003C4B6 /* ImageWarmer.swift */; };
@@ -100,12 +106,14 @@
 		5F421A4FF82900BB9033520E /* Sparkle.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 82CD5D3AEF359995F968DB53 /* Sparkle.framework */; };
 		60753017D3F0F1ACA0080D4B /* RevealPanel.swift in Sources */ = {isa = PBXBuildFile; fileRef = AE10D75BA4192F5F1B8977E9 /* RevealPanel.swift */; };
 		618C4DEC49021D6608427CB1 /* ComposeSubmit.swift in Sources */ = {isa = PBXBuildFile; fileRef = 35991F651C60388C6D9BBEDF /* ComposeSubmit.swift */; };
+		61BEF9F9DC9E4194AF36DA10 /* WireTypes.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6C9F46E8DA615783DD2BEAF6 /* WireTypes.swift */; };
 		61C6647BAE622BF233B599EF /* GroupPicker.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0119D99E10BB97CC572DCA69 /* GroupPicker.swift */; };
 		61E6D7AA7EB53F8AEE04063C /* SitrepZones.swift in Sources */ = {isa = PBXBuildFile; fileRef = 22B6CF4EF83BEF15EB372184 /* SitrepZones.swift */; };
 		6277F73C5576C9955C6B0656 /* RecipientField.swift in Sources */ = {isa = PBXBuildFile; fileRef = 327BC236C39F192198AFEF7D /* RecipientField.swift */; };
 		647DD68EDE188660654C0D27 /* RootView.swift in Sources */ = {isa = PBXBuildFile; fileRef = FDDBA0B71BDDC46E844D2856 /* RootView.swift */; };
 		64BC88FBDA98D7C9C4F3AAF3 /* GroupEditor.swift in Sources */ = {isa = PBXBuildFile; fileRef = F8FF235DC1DB2B57F7C06220 /* GroupEditor.swift */; };
 		65404ACF0C3CD7B16721D3E8 /* RelayProxy.swift in Sources */ = {isa = PBXBuildFile; fileRef = A07093A9D416AD79A642B3A3 /* RelayProxy.swift */; };
+		65479129B186D557C3F9BC50 /* Sessions.swift in Sources */ = {isa = PBXBuildFile; fileRef = DA80DD18A355200FB6274585 /* Sessions.swift */; };
 		6600E4461801FE513807F25F /* SentRow.swift in Sources */ = {isa = PBXBuildFile; fileRef = EA2D959F49735AD9EDD13910 /* SentRow.swift */; };
 		67346BF359F4EC51B15E6C27 /* AskBar.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4D74815E3375EAC96A4841CF /* AskBar.swift */; };
 		67BAF2D0252EDA5EB6767C8B /* SettingsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3BE1E84810E523707C4E2CC5 /* SettingsView.swift */; };
@@ -120,6 +128,7 @@
 		7362D6064FE828BD80A2AEDA /* ProcessView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 639F5C0DB9AE5A1AE8DF69A1 /* ProcessView.swift */; };
 		7379C8366D649A8F25C27826 /* Prefs.swift in Sources */ = {isa = PBXBuildFile; fileRef = 163BEF63DE1359294AD2ADD8 /* Prefs.swift */; };
 		73E0BC73D984621141CA2296 /* Security.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 78527CBD27E00907F26B9E79 /* Security.framework */; };
+		744EFAB82584FDDF3ABBB60C /* UserNotifications.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = F2064377C33D5ECB0B915EAF /* UserNotifications.framework */; };
 		74ED2BA3B2637248FED78E13 /* Recipients.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2813765FA68F26095C18AE01 /* Recipients.swift */; };
 		7613233831674BFA6CE84C42 /* RevealPanel.swift in Sources */ = {isa = PBXBuildFile; fileRef = AE10D75BA4192F5F1B8977E9 /* RevealPanel.swift */; };
 		764A73259735A815192E7EE0 /* ThreadViewer.swift in Sources */ = {isa = PBXBuildFile; fileRef = F2BD37CBEFEA8CEB215E3247 /* ThreadViewer.swift */; };
@@ -144,6 +153,7 @@
 		837D6250A05319ED273F3C1F /* ImageStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2569BA5D1461BBA2A95D77F3 /* ImageStore.swift */; };
 		84F6860CDCC32C143703EF41 /* MarkdownStyle.swift in Sources */ = {isa = PBXBuildFile; fileRef = A77BC580144CC1AF7B5B8AEF /* MarkdownStyle.swift */; };
 		85057E3EAED4D8F071ECD75B /* RulesView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EE9B2C6A8850905B874A1ED /* RulesView.swift */; };
+		855A54E7930F797CE7533FBF /* AssistantKey.swift in Sources */ = {isa = PBXBuildFile; fileRef = BBA1338A4CA4B001850F8140 /* AssistantKey.swift */; };
 		855CB19B7AB6123C95C74025 /* TriageTargets.swift in Sources */ = {isa = PBXBuildFile; fileRef = 74A0D0F666787312F4991788 /* TriageTargets.swift */; };
 		8584D208439539843BAE4481 /* AgentTools.swift in Sources */ = {isa = PBXBuildFile; fileRef = F1E7DFB379AF677D44E393FF /* AgentTools.swift */; };
 		85A1CC563396C7890FB07C1F /* HTMLImg.swift in Sources */ = {isa = PBXBuildFile; fileRef = 579ABC2B7707848B4AED6F18 /* HTMLImg.swift */; };
@@ -174,6 +184,7 @@
 		9B3E18E0184901FAE39CB499 /* ThreadMinimap.swift in Sources */ = {isa = PBXBuildFile; fileRef = 06AB2FB92191FC4913C38FFF /* ThreadMinimap.swift */; };
 		9EA7C093CFE335E233A6411C /* AuthCodeModal.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A47FA6986F50A4E81628452 /* AuthCodeModal.swift */; };
 		9F54901230BBCD7044B85B48 /* Haptics.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1DBFA0EDE4D57FC2CB095671 /* Haptics.swift */; };
+		A137B52A5F6BC3F6ACC2C0F8 /* Keychain.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1D19065EB7E9BFE9E846675B /* Keychain.swift */; };
 		A19640E9DA24D6C6F85E215C /* RelayProxy.swift in Sources */ = {isa = PBXBuildFile; fileRef = A07093A9D416AD79A642B3A3 /* RelayProxy.swift */; };
 		A252756AF0D9655F2C1477B7 /* Ranking.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7079893CCCC8806D2B5099D8 /* Ranking.swift */; };
 		A32CA97991D874737EE663DA /* CidImages.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9C9C77BCE41A573ED04E49AA /* CidImages.swift */; };
@@ -186,8 +197,10 @@
 		AB169C9A19D62418DBAD4C3D /* ThreadPrefetch.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5F62561CEB4911BA0E72FEDD /* ThreadPrefetch.swift */; };
 		AD2A4B8AAC3EEEA381980AEE /* UserNotifications.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = F2064377C33D5ECB0B915EAF /* UserNotifications.framework */; };
 		ADCD91460923247021793032 /* Analytics.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2A46105028AEB554882E2D72 /* Analytics.swift */; };
+		AEC2A5C751D79A22E98CBA4A /* EventBanner.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9D952F37AD4DF7C050902B19 /* EventBanner.swift */; };
 		AF6A48690B292EB49959206C /* SenderIdentity.swift in Sources */ = {isa = PBXBuildFile; fileRef = E4C2C545E14D926E28E48DE6 /* SenderIdentity.swift */; };
 		B09D9943663FA2E8ECBE1933 /* ImageProxy.swift in Sources */ = {isa = PBXBuildFile; fileRef = 39D5C019641DC37B55D7D922 /* ImageProxy.swift */; };
+		B17EE2D75B244234D57E7679 /* Security.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 78527CBD27E00907F26B9E79 /* Security.framework */; };
 		B220A3270FA5DC1638A76085 /* Raster.swift in Sources */ = {isa = PBXBuildFile; fileRef = D4382469FC056D0CD54B22F3 /* Raster.swift */; };
 		B2DCDDC65C633129F7E17471 /* UpdateRow.swift in Sources */ = {isa = PBXBuildFile; fileRef = 92398A24BE2068AEBF3FA312 /* UpdateRow.swift */; };
 		B2EE10EBD8C634AC7069FB8B /* ImageWarmer.swift in Sources */ = {isa = PBXBuildFile; fileRef = 582A0094F147273BA003C4B6 /* ImageWarmer.swift */; };
@@ -203,6 +216,7 @@
 		BDE91DE1BD59B4CD5D50F21D /* Chrome.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1F0E547B2A7CA1DA951D255C /* Chrome.swift */; };
 		BE9C340C64913DE9154BDCF0 /* MobileAgentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 35C12A5AFBCED3C55DA7A5D8 /* MobileAgentView.swift */; };
 		BF2AD4F3EB9857AB051753D0 /* Typography.swift in Sources */ = {isa = PBXBuildFile; fileRef = B1E784321EA909951CA347A7 /* Typography.swift */; };
+		BF413E0D130FA4E7505BC080 /* PassbandiOSNotify.appex in Embed Foundation Extensions */ = {isa = PBXBuildFile; fileRef = A1F7E100AE7B49F14F812A13 /* PassbandiOSNotify.appex */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
 		BF8200741E7C70B75C705CF5 /* Keychain.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1D19065EB7E9BFE9E846675B /* Keychain.swift */; };
 		BFBC16B9E116B690313D1B5C /* APIClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = 613B9741AD84024778FA8204 /* APIClient.swift */; };
 		C0A7430CA6A5C39AB995DD4E /* NotificationIcon.swift in Sources */ = {isa = PBXBuildFile; fileRef = 88151BD4CF9D97EE43150B72 /* NotificationIcon.swift */; };
@@ -219,6 +233,7 @@
 		C8B62E16CC9F5AE6DA3B774E /* RemindTimes.swift in Sources */ = {isa = PBXBuildFile; fileRef = CDDAB6C380027F87A19022BF /* RemindTimes.swift */; };
 		C8FCFA76D21B9E6DC3093D18 /* SwipeRow.swift in Sources */ = {isa = PBXBuildFile; fileRef = C465B24E00D0436CD5704294 /* SwipeRow.swift */; };
 		CDD154C0CEFB4D530E29DD34 /* Format.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5883BA424612265657845246 /* Format.swift */; };
+		CDE77DF3DD16A78A9192624E /* EventBanner.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9D952F37AD4DF7C050902B19 /* EventBanner.swift */; };
 		CF0065AF30C9FC626811FF50 /* RetriageModal.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA00E655EE0625FDF367DA22 /* RetriageModal.swift */; };
 		CF34A69E15DFE9980A622162 /* WhatsNewCard.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0AFCAEC0D83E0E01D0074CE7 /* WhatsNewCard.swift */; };
 		D026185D5848A86409FAE120 /* Sessions.swift in Sources */ = {isa = PBXBuildFile; fileRef = DA80DD18A355200FB6274585 /* Sessions.swift */; };
@@ -233,6 +248,7 @@
 		D5D9F05E11B3B8383ED792EB /* EmailWebView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 49697D28E02B833310EE2C12 /* EmailWebView.swift */; };
 		D5DB123B615F58369EAE3B7F /* AsyncMemo.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA0089253391F9BC0AE4818B /* AsyncMemo.swift */; };
 		D6C1F985EFED5530B73C27B8 /* Motion.swift in Sources */ = {isa = PBXBuildFile; fileRef = 30406C6A67318CD0CE71C1FF /* Motion.swift */; };
+		D6FF1451D38370E6611C5BC2 /* AssistantKey.swift in Sources */ = {isa = PBXBuildFile; fileRef = BBA1338A4CA4B001850F8140 /* AssistantKey.swift */; };
 		D71AFB170CE49A2A793EA34F /* FrameMeasurer.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7C0E91220FC27E7EC297FB40 /* FrameMeasurer.swift */; };
 		D83D2EEAF55EE8AC5B9EBEAE /* Concurrency.swift in Sources */ = {isa = PBXBuildFile; fileRef = E1C033DDA02DD344F437F943 /* Concurrency.swift */; };
 		D8A8B48374E30D8B95BAE9D2 /* ShareWaitlistPanel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 33EF8FAB871B43DBF883FDEE /* ShareWaitlistPanel.swift */; };
@@ -254,6 +270,7 @@
 		E3F69438A22E2036CD7742D2 /* ImageFill.swift in Sources */ = {isa = PBXBuildFile; fileRef = CE514B2862480E62EB8936A3 /* ImageFill.swift */; };
 		E4B1EE75A584D999AA58B0E2 /* MarkdownTextViewiOS.swift in Sources */ = {isa = PBXBuildFile; fileRef = A9FAE568A595DDCE359FFA33 /* MarkdownTextViewiOS.swift */; };
 		E5DC83A762609363C2ED15CB /* Actions.swift in Sources */ = {isa = PBXBuildFile; fileRef = 10544C7DF8CDBA851AF0D9D8 /* Actions.swift */; };
+		E6A6870A7762EF9E762E1B5A /* SenderIdentity.swift in Sources */ = {isa = PBXBuildFile; fileRef = E4C2C545E14D926E28E48DE6 /* SenderIdentity.swift */; };
 		E796A08FD35B6AFC987CF6A6 /* HTMLImg.swift in Sources */ = {isa = PBXBuildFile; fileRef = 579ABC2B7707848B4AED6F18 /* HTMLImg.swift */; };
 		E96078DC56E87F722CEBEDE8 /* Accounts.swift in Sources */ = {isa = PBXBuildFile; fileRef = D4806E9349EDC2C9EF8520C5 /* Accounts.swift */; };
 		EA0F7FADC742BF00778433BF /* SubjectText.swift in Sources */ = {isa = PBXBuildFile; fileRef = E645BA6EC9A8686D95460095 /* SubjectText.swift */; };
@@ -281,7 +298,28 @@
 		FE1D72F2A5B29E3F9DB0B1BC /* ComposeSubmit.swift in Sources */ = {isa = PBXBuildFile; fileRef = 35991F651C60388C6D9BBEDF /* ComposeSubmit.swift */; };
 /* End PBXBuildFile section */
 
+/* Begin PBXContainerItemProxy section */
+		5A782DF219C29A7F5E24A736 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = 2729A7B7570755CB6E9A61D9 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = 1930AE6419F0EC6659F292AA;
+			remoteInfo = PassbandiOSNotify;
+		};
+/* End PBXContainerItemProxy section */
+
 /* Begin PBXCopyFilesBuildPhase section */
+		3B2DF976DE728ECE2DB19A44 /* Embed Foundation Extensions */ = {
+			isa = PBXCopyFilesBuildPhase;
+			buildActionMask = 2147483647;
+			dstPath = "";
+			dstSubfolderSpec = 13;
+			files = (
+				BF413E0D130FA4E7505BC080 /* PassbandiOSNotify.appex in Embed Foundation Extensions */,
+			);
+			name = "Embed Foundation Extensions";
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 		723D910C6FA45823F72C74CA /* Embed Frameworks */ = {
 			isa = PBXCopyFilesBuildPhase;
 			buildActionMask = 2147483647;
@@ -302,6 +340,8 @@
 		06A50E65F84872DFA0504B96 /* DraftSaver.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DraftSaver.swift; sourceTree = "<group>"; };
 		06AB2FB92191FC4913C38FFF /* ThreadMinimap.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ThreadMinimap.swift; sourceTree = "<group>"; };
 		070286D5016F78C93DC49070 /* Opener.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Opener.swift; sourceTree = "<group>"; };
+		083E104C0BABF65C4BB44673 /* PushRegistration.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PushRegistration.swift; sourceTree = "<group>"; };
+		09298B50527CD0E9872F345B /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = Info.plist; sourceTree = "<group>"; };
 		0AFCAEC0D83E0E01D0074CE7 /* WhatsNewCard.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WhatsNewCard.swift; sourceTree = "<group>"; };
 		10544C7DF8CDBA851AF0D9D8 /* Actions.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Actions.swift; sourceTree = "<group>"; };
 		12468DFB107CC662204BCE84 /* MobileRootView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MobileRootView.swift; sourceTree = "<group>"; };
@@ -357,6 +397,7 @@
 		54C5FAF93A0E521B9AA4DB60 /* PassbandiOS.app */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.application; path = PassbandiOS.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		5512C13F456F49B6DF7B182B /* Pairing.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Pairing.swift; sourceTree = "<group>"; };
 		568C9AF22D9B24934BF2B39D /* BackgroundAuthWatch.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BackgroundAuthWatch.swift; sourceTree = "<group>"; };
+		5742B0429B8EF9B69ABDEB27 /* NotificationService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NotificationService.swift; sourceTree = "<group>"; };
 		579ABC2B7707848B4AED6F18 /* HTMLImg.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HTMLImg.swift; sourceTree = "<group>"; };
 		582A0094F147273BA003C4B6 /* ImageWarmer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ImageWarmer.swift; sourceTree = "<group>"; };
 		5883BA424612265657845246 /* Format.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Format.swift; sourceTree = "<group>"; };
@@ -379,6 +420,7 @@
 		7C0E91220FC27E7EC297FB40 /* FrameMeasurer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FrameMeasurer.swift; sourceTree = "<group>"; };
 		82CD5D3AEF359995F968DB53 /* Sparkle.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Sparkle.framework; path = vendor/Sparkle/Sparkle.framework; sourceTree = "<group>"; };
 		83BF084E665545489EDF2D5E /* newsreader-italic-var.ttf */ = {isa = PBXFileReference; lastKnownFileType = file; path = "newsreader-italic-var.ttf"; sourceTree = "<group>"; };
+		84043CEC5CA50FFDDB4CC2DC /* PassbandiOSNotify.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = PassbandiOSNotify.entitlements; sourceTree = "<group>"; };
 		88151BD4CF9D97EE43150B72 /* NotificationIcon.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NotificationIcon.swift; sourceTree = "<group>"; };
 		8860DE0FE5AA0366C7BE9922 /* JSONValue.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = JSONValue.swift; sourceTree = "<group>"; };
 		89A44DCD12D99794B8DF43B0 /* AuthView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AuthView.swift; sourceTree = "<group>"; };
@@ -391,9 +433,11 @@
 		9C92A36DDD1B4FF9A1BD99B0 /* ThreadStyleLedger.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ThreadStyleLedger.swift; sourceTree = "<group>"; };
 		9C9C77BCE41A573ED04E49AA /* CidImages.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CidImages.swift; sourceTree = "<group>"; };
 		9CC257E1C6D252919F11B337 /* GroupsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GroupsView.swift; sourceTree = "<group>"; };
+		9D952F37AD4DF7C050902B19 /* EventBanner.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EventBanner.swift; sourceTree = "<group>"; };
 		9E5E8356451742599F7D7A2A /* MobileAuthView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MobileAuthView.swift; sourceTree = "<group>"; };
 		A07093A9D416AD79A642B3A3 /* RelayProxy.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RelayProxy.swift; sourceTree = "<group>"; };
 		A1DD819E65C2460A88F79805 /* TriageFixPalette.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TriageFixPalette.swift; sourceTree = "<group>"; };
+		A1F7E100AE7B49F14F812A13 /* PassbandiOSNotify.appex */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = "wrapper.app-extension"; path = PassbandiOSNotify.appex; sourceTree = BUILT_PRODUCTS_DIR; };
 		A31EE886D87910F0348A94AB /* SitrepPoller.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SitrepPoller.swift; sourceTree = "<group>"; };
 		A5B25E3187C89277DBE8DEF3 /* ThreadStyle.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ThreadStyle.swift; sourceTree = "<group>"; };
 		A77BC580144CC1AF7B5B8AEF /* MarkdownStyle.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MarkdownStyle.swift; sourceTree = "<group>"; };
@@ -409,6 +453,7 @@
 		B97BB8DF0B7CB3C4E9EC791B /* ComposePane.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ComposePane.swift; sourceTree = "<group>"; };
 		BB2FD6FC0F4BAE985E3E8E70 /* SidebarRail.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SidebarRail.swift; sourceTree = "<group>"; };
 		BB5FEFF987265DA1E7F85007 /* AuthCode.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AuthCode.swift; sourceTree = "<group>"; };
+		BBA1338A4CA4B001850F8140 /* AssistantKey.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AssistantKey.swift; sourceTree = "<group>"; };
 		BBC8D81B089AFD24BD4AC367 /* WebKit.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = WebKit.framework; path = System/Library/Frameworks/WebKit.framework; sourceTree = SDKROOT; };
 		BC0ADC18AA758296235E8F59 /* Avatar.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Avatar.swift; sourceTree = "<group>"; };
 		BE74212A3CE62E8F28EC8D7E /* Markdown.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Markdown.swift; sourceTree = "<group>"; };
@@ -476,6 +521,15 @@
 				217F91C35460C7286C88712C /* WebKit.framework in Frameworks */,
 				F364D1469A2AA0C9E4B38DED /* Security.framework in Frameworks */,
 				DD7CC52EA072C871C8E8BA1F /* UserNotifications.framework in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		BEE0E779FB28A80332E09DFD /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				B17EE2D75B244234D57E7679 /* Security.framework in Frameworks */,
+				744EFAB82584FDDF3ABBB60C /* UserNotifications.framework in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -609,12 +663,14 @@
 				613B9741AD84024778FA8204 /* APIClient.swift */,
 				37716282CFABFF5910677BBC /* APIError.swift */,
 				6D18C66DBE79E1F7D55CD6DD /* AppStore.swift */,
+				BBA1338A4CA4B001850F8140 /* AssistantKey.swift */,
 				9369773169CED1C1EFD48EB0 /* AttachmentFiles.swift */,
 				BE85FBF58B14F2DC27FC16FB /* AttachmentThumbs.swift */,
 				FE241E317BA5B3B4D25B892E /* AuthArrival.swift */,
 				568C9AF22D9B24934BF2B39D /* BackgroundAuthWatch.swift */,
 				35991F651C60388C6D9BBEDF /* ComposeSubmit.swift */,
 				06A50E65F84872DFA0504B96 /* DraftSaver.swift */,
+				9D952F37AD4DF7C050902B19 /* EventBanner.swift */,
 				CE462B9CE6C195F53B48B801 /* EventStream.swift */,
 				7C0E91220FC27E7EC297FB40 /* FrameMeasurer.swift */,
 				4EE5AF3E60001C29040AFCF5 /* GroupToken.swift */,
@@ -690,6 +746,7 @@
 			children = (
 				B632232EEEAF2906A8A83C39 /* Passband */,
 				B2BB7364B42C3BFE24DA34A2 /* PassbandiOS */,
+				BCD1C4C1B751E3697AD2251D /* PassbandiOSNotify */,
 			);
 			path = Sources;
 			sourceTree = "<group>";
@@ -711,6 +768,7 @@
 			children = (
 				E5B07DD7DA6133E705610323 /* Passband.app */,
 				54C5FAF93A0E521B9AA4DB60 /* PassbandiOS.app */,
+				A1F7E100AE7B49F14F812A13 /* PassbandiOSNotify.appex */,
 			);
 			name = Products;
 			sourceTree = "<group>";
@@ -731,6 +789,16 @@
 				168312D5219614E1F658480C /* Resources */,
 			);
 			path = Passband;
+			sourceTree = "<group>";
+		};
+		BCD1C4C1B751E3697AD2251D /* PassbandiOSNotify */ = {
+			isa = PBXGroup;
+			children = (
+				09298B50527CD0E9872F345B /* Info.plist */,
+				5742B0429B8EF9B69ABDEB27 /* NotificationService.swift */,
+				84043CEC5CA50FFDDB4CC2DC /* PassbandiOSNotify.entitlements */,
+			);
+			path = PassbandiOSNotify;
 			sourceTree = "<group>";
 		};
 		C7309193114201DF62A11D3D /* Assistant */ = {
@@ -770,6 +838,7 @@
 			children = (
 				12468DFB107CC662204BCE84 /* MobileRootView.swift */,
 				F714235A8E6F4742ABF772B3 /* PassbandiOSApp.swift */,
+				083E104C0BABF65C4BB44673 /* PushRegistration.swift */,
 			);
 			path = App;
 			sourceTree = "<group>";
@@ -777,6 +846,24 @@
 /* End PBXGroup section */
 
 /* Begin PBXNativeTarget section */
+		1930AE6419F0EC6659F292AA /* PassbandiOSNotify */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 9A30CEEB26BF6796625DD9B1 /* Build configuration list for PBXNativeTarget "PassbandiOSNotify" */;
+			buildPhases = (
+				CE9DB8AD1B75445E6BF835CF /* Sources */,
+				BEE0E779FB28A80332E09DFD /* Frameworks */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = PassbandiOSNotify;
+			packageProductDependencies = (
+			);
+			productName = PassbandiOSNotify;
+			productReference = A1F7E100AE7B49F14F812A13 /* PassbandiOSNotify.appex */;
+			productType = "com.apple.product-type.app-extension";
+		};
 		280FE723801466ACE268726B /* PassbandiOS */ = {
 			isa = PBXNativeTarget;
 			buildConfigurationList = 00783E699AFFDB7557D01E37 /* Build configuration list for PBXNativeTarget "PassbandiOS" */;
@@ -784,10 +871,12 @@
 				C68FB88EE232445A45D7DD2B /* Sources */,
 				18001285A88741D68A1411E2 /* Resources */,
 				A44C7CCD5283B24284C0542B /* Frameworks */,
+				3B2DF976DE728ECE2DB19A44 /* Embed Foundation Extensions */,
 			);
 			buildRules = (
 			);
 			dependencies = (
+				A0E9DE882226BF2B2E3CA1B6 /* PBXTargetDependency */,
 			);
 			name = PassbandiOS;
 			packageProductDependencies = (
@@ -825,6 +914,10 @@
 				BuildIndependentTargetsInParallel = YES;
 				LastUpgradeCheck = 1430;
 				TargetAttributes = {
+					1930AE6419F0EC6659F292AA = {
+						DevelopmentTeam = AAT39BQ9LV;
+						ProvisioningStyle = Automatic;
+					};
 					280FE723801466ACE268726B = {
 						DevelopmentTeam = AAT39BQ9LV;
 						ProvisioningStyle = Automatic;
@@ -850,6 +943,7 @@
 			targets = (
 				7F9441F4F38B8847FF4BC62A /* Passband */,
 				280FE723801466ACE268726B /* PassbandiOS */,
+				1930AE6419F0EC6659F292AA /* PassbandiOSNotify */,
 			);
 		};
 /* End PBXProject section */
@@ -893,6 +987,7 @@
 				7C8814F30F405C284EF16A86 /* AppStore.swift in Sources */,
 				67346BF359F4EC51B15E6C27 /* AskBar.swift in Sources */,
 				F38B78086DC5EBF798FFE3A1 /* Assistant.swift in Sources */,
+				855A54E7930F797CE7533FBF /* AssistantKey.swift in Sources */,
 				D5DB123B615F58369EAE3B7F /* AsyncMemo.swift in Sources */,
 				3D971F09C7234C3DDB9B4534 /* AttachmentFiles.swift in Sources */,
 				F4D434105490FF1F19B89986 /* AttachmentKinds.swift in Sources */,
@@ -916,6 +1011,7 @@
 				918EB3663E912FF4F36229C2 /* EmailWebCore.swift in Sources */,
 				D5D9F05E11B3B8383ED792EB /* EmailWebView.swift in Sources */,
 				D559CB25DC210A5DDEAA0D51 /* EmailsView.swift in Sources */,
+				AEC2A5C751D79A22E98CBA4A /* EventBanner.swift in Sources */,
 				88A8F0598E0AD01532B11B24 /* EventStream.swift in Sources */,
 				BD58A1B90A390D639D6D0AEB /* Format.swift in Sources */,
 				D71AFB170CE49A2A793EA34F /* FrameMeasurer.swift in Sources */,
@@ -1026,6 +1122,7 @@
 				7D06A833C919C4053C84351D /* AnthropicStream.swift in Sources */,
 				0C61CFFF1751AC0250DBE8C8 /* AppStore.swift in Sources */,
 				41353103B9D24E161228B692 /* Assistant.swift in Sources */,
+				D6FF1451D38370E6611C5BC2 /* AssistantKey.swift in Sources */,
 				DD6D172FDE2BDF162F554498 /* AsyncMemo.swift in Sources */,
 				690907684E5BA64D7992F2C1 /* AttachmentFiles.swift in Sources */,
 				4E721B91AEB73F8E8B0AAFE8 /* AttachmentKinds.swift in Sources */,
@@ -1049,6 +1146,7 @@
 				903D181BC549637A0AEEB564 /* EmailWebCore.swift in Sources */,
 				4D885CFF844970680B6C93DA /* EmailWebViewiOS.swift in Sources */,
 				4E260638B2736F4A91E83841 /* EmailsView.swift in Sources */,
+				CDE77DF3DD16A78A9192624E /* EventBanner.swift in Sources */,
 				D52ECED560FD5574D03D0A08 /* EventStream.swift in Sources */,
 				CDD154C0CEFB4D530E29DD34 /* Format.swift in Sources */,
 				D573F38D0D9CD3402667A0F2 /* FrameMeasurer.swift in Sources */,
@@ -1097,6 +1195,7 @@
 				7379C8366D649A8F25C27826 /* Prefs.swift in Sources */,
 				334CF29FAF59FE56B41E581B /* ProcessMode.swift in Sources */,
 				7362D6064FE828BD80A2AEDA /* ProcessView.swift in Sources */,
+				13068136E70BA1E4AD4A9709 /* PushRegistration.swift in Sources */,
 				822AC7C019AE85919C9B4181 /* QuickLookPanel.swift in Sources */,
 				79BB8595545903AE279A319C /* Quotes.swift in Sources */,
 				A252756AF0D9655F2C1477B7 /* Ranking.swift in Sources */,
@@ -1149,12 +1248,63 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
+		CE9DB8AD1B75445E6BF835CF /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				313EE9BEC5B91F65DD29AA0B /* AsyncMemo.swift in Sources */,
+				28FB2FCE96AB7D2BF0794632 /* EventBanner.swift in Sources */,
+				1E3D3435F491C658C93127B4 /* Format.swift in Sources */,
+				A137B52A5F6BC3F6ACC2C0F8 /* Keychain.swift in Sources */,
+				0AC78BDC00C6025955560AB5 /* NotificationService.swift in Sources */,
+				E6A6870A7762EF9E762E1B5A /* SenderIdentity.swift in Sources */,
+				65479129B186D557C3F9BC50 /* Sessions.swift in Sources */,
+				521C6B71EEF0E5C03EF7AF89 /* SubjectText.swift in Sources */,
+				61BEF9F9DC9E4194AF36DA10 /* WireTypes.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 /* End PBXSourcesBuildPhase section */
 
+/* Begin PBXTargetDependency section */
+		A0E9DE882226BF2B2E3CA1B6 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = 1930AE6419F0EC6659F292AA /* PassbandiOSNotify */;
+			targetProxy = 5A782DF219C29A7F5E24A736 /* PBXContainerItemProxy */;
+		};
+/* End PBXTargetDependency section */
+
 /* Begin XCBuildConfiguration section */
+		2A32DE4596C74E75D7C901DA /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_ENTITLEMENTS = Sources/PassbandiOSNotify/PassbandiOSNotify.entitlements;
+				CODE_SIGN_IDENTITY = "-";
+				"CODE_SIGN_IDENTITY[config=Release]" = "-";
+				"CODE_SIGN_IDENTITY[config=Release][sdk=iphoneos*]" = "Apple Development";
+				"CODE_SIGN_IDENTITY[sdk=iphoneos*]" = "Apple Development";
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = AAT39BQ9LV;
+				ENABLE_HARDENED_RUNTIME = NO;
+				"ENABLE_HARDENED_RUNTIME[config=Release]" = NO;
+				INFOPLIST_FILE = Sources/PassbandiOSNotify/Info.plist;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@executable_path/../../Frameworks",
+				);
+				MARKETING_VERSION = 0.0.2;
+				PRODUCT_BUNDLE_IDENTIFIER = app.passband.client.ios.notify;
+				SDKROOT = iphoneos;
+				TARGETED_DEVICE_FAMILY = 1;
+			};
+			name = Debug;
+		};
 		4C262313ABCF23A19F63DCDE /* Release */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
+				APS_ENVIRONMENT = development;
+				"APS_ENVIRONMENT[config=Release]" = production;
 				ASSETCATALOG_COMPILER_APPICON_NAME = Passband;
 				CODE_SIGN_ENTITLEMENTS = Sources/PassbandiOS/PassbandiOS.entitlements;
 				CODE_SIGN_IDENTITY = "-";
@@ -1275,6 +1425,8 @@
 		BCFB8BCC8F084F480F8E5C00 /* Debug */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
+				APS_ENVIRONMENT = development;
+				"APS_ENVIRONMENT[config=Release]" = production;
 				ASSETCATALOG_COMPILER_APPICON_NAME = Passband;
 				CODE_SIGN_ENTITLEMENTS = Sources/PassbandiOS/PassbandiOS.entitlements;
 				CODE_SIGN_IDENTITY = "-";
@@ -1297,6 +1449,31 @@
 				TARGETED_DEVICE_FAMILY = 1;
 			};
 			name = Debug;
+		};
+		C36AD633940F682957EFB829 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_ENTITLEMENTS = Sources/PassbandiOSNotify/PassbandiOSNotify.entitlements;
+				CODE_SIGN_IDENTITY = "-";
+				"CODE_SIGN_IDENTITY[config=Release]" = "-";
+				"CODE_SIGN_IDENTITY[config=Release][sdk=iphoneos*]" = "Apple Development";
+				"CODE_SIGN_IDENTITY[sdk=iphoneos*]" = "Apple Development";
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = AAT39BQ9LV;
+				ENABLE_HARDENED_RUNTIME = NO;
+				"ENABLE_HARDENED_RUNTIME[config=Release]" = NO;
+				INFOPLIST_FILE = Sources/PassbandiOSNotify/Info.plist;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@executable_path/../../Frameworks",
+				);
+				MARKETING_VERSION = 0.0.2;
+				PRODUCT_BUNDLE_IDENTIFIER = app.passband.client.ios.notify;
+				SDKROOT = iphoneos;
+				TARGETED_DEVICE_FAMILY = 1;
+			};
+			name = Release;
 		};
 		D113BDA9882FBC95CECAB874 /* Debug */ = {
 			isa = XCBuildConfiguration;
@@ -1412,6 +1589,15 @@
 			buildConfigurations = (
 				A880E51555F2BFCD45855643 /* Debug */,
 				EBF55E456BA992CB61E1F44E /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
+		9A30CEEB26BF6796625DD9B1 /* Build configuration list for PBXNativeTarget "PassbandiOSNotify" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				2A32DE4596C74E75D7C901DA /* Debug */,
+				C36AD633940F682957EFB829 /* Release */,
 			);
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Debug;
