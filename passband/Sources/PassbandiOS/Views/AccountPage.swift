@@ -143,6 +143,7 @@ struct AccountPage: View {
                     YouSection()
                 case .mail:
                     MailSection()
+                    SearchSection()
                     SignatureSection()
                     ReadTrackingSection()
                 case .triage:
@@ -183,11 +184,33 @@ struct AccountPage: View {
     private func blurb(_ section: SettingsSection) -> String {
         switch section {
         case .general: "connection, theme, chime, your name"
-        case .mail: "images, signature, read tracking"
+        case .mail: "images, search order, signature, read tracking"
         case .triage: "how it works, daily caps, ranking"
         case .assistant: "your own api key, and which model"
         case .privacy: "what telemetry leaves the app"
         case .account: "the mailboxes this install knows"
+        }
+    }
+}
+
+/// THE SEARCH ORDER, on the phone. The Mac hangs the same control in the
+/// settings header, top right beside the title (SettingsView), where it is
+/// reachable from every tab. This screen has no header to hang it from, so it
+/// becomes a card like every other preference here — filed under Mail, next to
+/// the rest of what searching turns up.
+///
+/// Lives in the iOS shell rather than beside the shared section cards because
+/// it is PACKAGING, not the setting: the control and the preference are both
+/// shared, and only the frame around them is a phone decision.
+struct SearchSection: View {
+    @Environment(Prefs.self) private var prefs
+
+    var body: some View {
+        SectionCard(label: "Search") {
+            InlineRow(key: "order") { SearchSortPicker() }
+            SettingsHint(
+                "Recent ranks newer mail higher when two matches are close, which is usually the one you meant. Best match ignores the date and ranks on the words alone, for a thread you can quote but cannot place. Either way the search itself is unchanged: this is the order results come back in, not which mail is found."
+            )
         }
     }
 }

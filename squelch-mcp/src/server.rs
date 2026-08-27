@@ -18,7 +18,7 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use squelch_core::config::ShipmentListPolicy;
 use squelch_core::error::CoreError;
-use squelch_core::store::{NewAuditEntry, SqliteStore, Store};
+use squelch_core::store::{NewAuditEntry, SearchSort, SqliteStore, Store};
 use squelch_core::types::{AccountId, Disposition, ThreadView, Update};
 
 /// The squelch MCP server. Single-account: the account is resolved once at
@@ -69,6 +69,12 @@ pub struct SearchMailParams {
     /// Max number of summaries to return (1-50). Defaults to 10.
     #[serde(default)]
     pub k: Option<u8>,
+    /// Result order. "recent" (the default) ranks by relevance with a tilt
+    /// toward mail that arrived recently. "best_match" turns that tilt off and
+    /// ranks on relevance alone — use it when the words matter more than the
+    /// date, such as an old thread you can quote but cannot place.
+    #[serde(default)]
+    pub sort: Option<String>,
 }
 
 /// One `search_mail` result: a SUMMARY ONLY, never a body.
@@ -81,7 +87,9 @@ pub struct SearchMailHit {
     pub received_at: DateTime<Utc>,
     /// The id to pass to `get_thread` to read the full thread.
     pub thread_id: String,
-    /// Rank position (1 = most relevant) from the fused hybrid search.
+    /// Rank position (1 = best) in the fused hybrid search, under whichever
+    /// `sort` ran. NOT "most textually similar" under the default sort, which
+    /// blends recency in.
     pub relevance: u32,
 }
 
@@ -413,10 +421,10 @@ impl SquelchServer {
     /// bodies. `get_thread` remains the escalation to read full content: pass a
     /// result's `thread_id` to it.
     ///
-    /// RECENCY IS PART OF THE RANK. The fused order tilts toward mail that
-    /// landed recently, so `relevance: 1` means "best answer", not "most
-    /// textually similar" — an agent looking for the OLD instance of something
-    /// should say so in the query rather than reading down the list.
+    /// RECENCY IS PART OF THE RANK, and the agent can turn it off. The default
+    /// order tilts toward mail that landed recently, so `relevance: 1` means
+    /// "best answer", not "most textually similar". An agent hunting an OLD
+    /// thread passes `sort: "best_match"` rather than reading down the list.
     ///
     /// SEALED: auth/verification mail is never embedded and is excluded in SQL by
     /// both the keyword and semantic legs, so it can never appear here. A
@@ -424,12 +432,14 @@ impl SquelchServer {
     /// thread before serialization, mirroring `get_inbox_updates`.
     #[tool(
         name = "search_mail",
-        description = "Search the mailbox (hybrid keyword + semantic recall, \
-                       ranked with a tilt toward recent mail). Returns SUMMARIES \
-                       ONLY (sender, one-line subject, received_at, thread_id, \
-                       relevance) — never message bodies. To read a result, pass \
-                       its `thread_id` to get_thread. Auth/verification emails \
-                       are structurally absent."
+        description = "Search the mailbox (hybrid keyword + semantic recall). \
+                       Ranked with a tilt toward recent mail by default; pass \
+                       sort=\"best_match\" to rank on relevance alone when \
+                       hunting an older thread. Returns SUMMARIES ONLY (sender, \
+                       one-line subject, received_at, thread_id, relevance) — \
+                       never message bodies. To read a result, pass its \
+                       `thread_id` to get_thread. Auth/verification emails are \
+                       structurally absent."
     )]
     async fn search_mail(
         &self,
@@ -442,13 +452,23 @@ impl SquelchServer {
         // Default 10, clamp to 1..=50 (u8 default `10` when omitted).
         let k = params.k.unwrap_or(10).clamp(1, 50) as usize;
 
+        // An unreadable sort is the agent's mistake to see, not one to paper
+        // over: silently serving `recent` for a `sort` the model invented would
+        // teach it that the argument works.
+        let sort = match params.sort.as_deref() {
+            Some(s) => SearchSort::parse(s).ok_or_else(|| {
+                ErrorData::invalid_params("sort must be one of: recent, best_match", None)
+            })?,
+            None => SearchSort::default(),
+        };
+
         // hybrid_search excludes sealed rows in BOTH the keyword and vector legs
         // (and never embedded sealed mail in the first place). Degrades to
         // keyword-only when no embedder is attached. No operator filter and no
         // window-fullness on this door: the agent asks for top-k, not pages.
         let (hits, _window_full) = self
             .store
-            .hybrid_search(self.account_id, query, &Default::default(), k)
+            .hybrid_search(self.account_id, query, &Default::default(), sort, k)
             .map_err(Self::map_err)?;
 
         // Defense in depth: drop any hit whose thread overlaps a sealed thread,
@@ -656,6 +676,51 @@ mod tests {
         id
     }
 
+    /// [`seed_msg`] with an explicit body and arrival time, for the tests that
+    /// are about RANKING rather than about what a message contains.
+    fn seed_dated(
+        store: &SqliteStore,
+        acct: AccountId,
+        gmail: &str,
+        thread: &str,
+        subject: &str,
+        body: &str,
+        received_at: DateTime<Utc>,
+    ) -> i64 {
+        let msg = squelch_core::types::NewMessage {
+            account_id: acct,
+            gmail_msg_id: gmail.into(),
+            thread_id: thread.into(),
+            from_addr: "alice@example.com".into(),
+            from_name: Some("Alice".into()),
+            subject: subject.into(),
+            received_at,
+            snippet: subject.into(),
+            body: body.into(),
+            body_html: None,
+            is_sent: false,
+            to_addrs: None,
+            list_unsubscribe: None,
+            list_unsub_one_click: false,
+            auth_pass: None,
+        };
+        let id = store.upsert_message(&msg).unwrap();
+        store
+            .set_triage(
+                id,
+                acct,
+                80,
+                Tier::Signal,
+                Sensitivity::Normal,
+                None,
+                "",
+                "",
+                None,
+            )
+            .unwrap();
+        id
+    }
+
     /// search_mail returns SUMMARIES ONLY, excludes sealed mail, and its
     /// thread_id round-trips to get_thread.
     #[tokio::test]
@@ -687,6 +752,7 @@ mod tests {
             .search_mail(Parameters(SearchMailParams {
                 query: "acme".into(),
                 k: None,
+                sort: None,
             }))
             .await
             .unwrap();
@@ -711,6 +777,80 @@ mod tests {
             hit.get("body").is_none(),
             "search_mail must never emit a body"
         );
+    }
+
+    /// The agent can turn the recency tilt off, and cannot invent a third order.
+    #[tokio::test]
+    async fn search_mail_takes_a_sort_and_refuses_an_invented_one() {
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let acct = store.ensure_account("me@localhost").unwrap();
+
+        // A stronger match from long ago against a weaker one from today, so
+        // the two orders genuinely disagree about which comes first. Seeded
+        // through `upsert_message` rather than by UPDATE: `messages_fts` is a
+        // plain fts5 table written by the upsert, so a raw UPDATE would leave
+        // the index holding the old text.
+        seed_dated(
+            &store,
+            acct,
+            "g-old",
+            "t-old",
+            "contract",
+            "contract",
+            Utc::now() - chrono::Duration::days(500),
+        );
+        seed_dated(
+            &store,
+            acct,
+            "g-new",
+            "t-new",
+            "weekly digest",
+            "A stray mention of a contract sits far down this roundup of newsletter \
+             items, among gardening tips, local events, recipes, and a reader letter \
+             about compost.",
+            Utc::now(),
+        );
+
+        let server = SquelchServer::new(store.clone(), "me@localhost").unwrap();
+        let top = |res: CallToolResult| -> String {
+            let text = res.content[0].as_text().unwrap().text.clone();
+            let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+            value.as_array().unwrap()[0]["thread_id"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+
+        let recent = server
+            .search_mail(Parameters(SearchMailParams {
+                query: "contract".into(),
+                k: None,
+                sort: None,
+            }))
+            .await
+            .unwrap();
+        assert_eq!(top(recent), "t-new", "the default tilts toward recent mail");
+
+        let best = server
+            .search_mail(Parameters(SearchMailParams {
+                query: "contract".into(),
+                k: None,
+                sort: Some("best_match".into()),
+            }))
+            .await
+            .unwrap();
+        assert_eq!(top(best), "t-old", "best_match ranks on relevance alone");
+
+        // An invented value is an error the model can see and correct, never a
+        // silent fallback that teaches it the argument works.
+        let bad = server
+            .search_mail(Parameters(SearchMailParams {
+                query: "contract".into(),
+                k: None,
+                sort: Some("newest".into()),
+            }))
+            .await;
+        assert!(bad.is_err(), "an unknown sort must be invalid_params");
     }
 
     /// get_thread forgiveness: a MESSAGE id resolves to its thread; a sealed

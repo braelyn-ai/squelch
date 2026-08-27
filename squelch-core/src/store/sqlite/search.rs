@@ -141,18 +141,20 @@ fn recency_vote(received_at: DateTime<Utc>, now: DateTime<Utc>) -> f32 {
 }
 
 /// Fuse ranked candidate lists into one order, best first: Reciprocal Rank
-/// Fusion across the lists a candidate appears in, plus its recency vote.
+/// Fusion across the lists a candidate appears in, plus its recency vote when
+/// `sort` asks for one.
 ///
 /// One list in is legal and useful — that is the semantic leg, where RRF is a
 /// monotone restatement of the KNN order and the vote is the only thing that
-/// can move a row.
+/// can move a row. Under [`SearchSort::BestMatch`] that leg therefore returns
+/// the KNN order untouched, which is the honest answer to "no time decay".
 ///
 /// TIES BREAK by `received_at DESC, id DESC`, and that is not decoration. The
 /// fused order is the sequence the door's cursor indexes into, while the score
 /// map is a `HashMap` whose iteration order is not stable between calls — with
 /// no explicit tiebreaker, equal scores could reshuffle between one page and
 /// the next and drop or repeat rows across the boundary.
-fn fuse_ranked(lists: &[&[Candidate]], now: DateTime<Utc>) -> Vec<Candidate> {
+fn fuse_ranked(lists: &[&[Candidate]], sort: SearchSort, now: DateTime<Utc>) -> Vec<Candidate> {
     let mut score: HashMap<i64, f32> = HashMap::new();
     let mut seen: HashMap<i64, Candidate> = HashMap::new();
     for list in lists {
@@ -165,7 +167,12 @@ fn fuse_ranked(lists: &[&[Candidate]], now: DateTime<Utc>) -> Vec<Candidate> {
         .into_iter()
         .map(|(id, s)| {
             let c = seen[&id];
-            (c, s + recency_vote(c.received_at, now))
+            let vote = if sort.considers_recency() {
+                recency_vote(c.received_at, now)
+            } else {
+                0.0
+            };
+            (c, s + vote)
         })
         .collect();
     ranked.sort_by(|a, b| {
@@ -296,6 +303,7 @@ impl SqliteStore {
         account_id: AccountId,
         query_text: &str,
         filter: &SearchFilter,
+        sort: SearchSort,
         k: usize,
     ) -> Result<(Vec<SearchHit>, bool)> {
         // ONE clock for both legs of one search.
@@ -316,7 +324,7 @@ impl SqliteStore {
         // FTS ranks over the SAME query text, sent mail included.
         let fts_hits = self.fts_recall(account_id, query_text, k)?;
 
-        let mut ranked = fuse_ranked(&[&vec_hits, &fts_hits], now);
+        let mut ranked = fuse_ranked(&[&vec_hits, &fts_hits], sort, now);
         ranked.truncate(k);
         // Judged BEFORE the filter drops anything: fullness is a property of
         // the recall window, not of what survived the operators.
@@ -410,12 +418,13 @@ impl SqliteStore {
         account_id: AccountId,
         query_text: &str,
         filter: &SearchFilter,
+        sort: SearchSort,
         k: usize,
     ) -> Result<(Vec<SearchHit>, bool)> {
         let knn = self.semantic_knn(account_id, query_text, k)?;
         let window_full = knn.len() == k;
         let candidates: Vec<Candidate> = knn.into_iter().map(|(c, _dist)| c).collect();
-        let ranked = fuse_ranked(&[&candidates], Utc::now());
+        let ranked = fuse_ranked(&[&candidates], sort, Utc::now());
         let mut out = Vec::with_capacity(ranked.len());
         for c in ranked {
             if let Some(hit) = self.search_hit_by_id(account_id, c.id)?
@@ -503,23 +512,31 @@ impl SqliteStore {
         limit: u32,
         offset: u32,
     ) -> Result<Vec<SearchHit>> {
-        self.search_filtered(account_id, query, &SearchFilter::default(), limit, offset)
+        self.search_filtered(
+            account_id,
+            query,
+            &SearchFilter::default(),
+            SearchSort::default(),
+            limit,
+            offset,
+        )
     }
 
     /// KEYWORD PATH with the operator half applied in SQL. `text` is already
     /// parsed (see [`crate::store::parse_search_query`]); empty text plus a
     /// filter routes to [`filter_only_listing`](Self::filter_only_listing).
     ///
-    /// Ranked by bm25 SCALED BY RECENCY ([`crate::store::recency`]), which is
-    /// why the ORDER BY is an expression rather than the bare `rank` FTS5
-    /// optimises for. Pagination stays exact: the blend happens in SQL, so
-    /// LIMIT/OFFSET still cut a page out of the true ordering instead of out of
-    /// a fetched window.
+    /// Ranked by bm25, SCALED BY RECENCY under [`SearchSort::Recent`] (see
+    /// [`crate::store::recency`]) and left alone under
+    /// [`SearchSort::BestMatch`]. Pagination stays exact either way: the blend
+    /// happens in SQL, so LIMIT/OFFSET still cut a page out of the true
+    /// ordering instead of out of a fetched window.
     pub(super) fn search_filtered(
         &self,
         account_id: AccountId,
         text: &str,
         filter: &SearchFilter,
+        sort: SearchSort,
         limit: u32,
         offset: u32,
     ) -> Result<Vec<SearchHit>> {
@@ -555,26 +572,36 @@ impl SqliteStore {
         );
         let mut args = vec![Value::Integer(account_id), Value::Text(text.to_string())];
         push_filter_clauses(&mut sql, &mut args, filter);
-        // RECENCY, IN SQL. This leg paginates with LIMIT/OFFSET and must keep
-        // doing that exactly, so the blend has to happen inside the ORDER BY —
-        // re-ranking a fetched window in Rust would turn exact pagination into
-        // the recall legs' over-fetch approximation for no reason.
+        // THE SORT KEY. Both branches are BIGGEST FIRST — `rank` is bm25 and
+        // NEGATIVE (more negative = better), so `-f.rank` is the relevance —
+        // which is what lets the tiebreakers below read the same way under
+        // either one.
         //
-        // MULTIPLICATIVE, not additive. `rank` is bm25 and NEGATIVE (more
-        // negative = better), and its magnitude swings by orders of magnitude
-        // with how many terms the reader typed and how rare they are — the
-        // scores in one result set are comparable only to each other. An
+        // RECENCY IS BLENDED IN SQL, not in Rust. This leg paginates with
+        // LIMIT/OFFSET and must keep doing that exactly; re-ranking a fetched
+        // window would turn exact pagination into the recall legs' over-fetch
+        // approximation for no reason.
+        //
+        // MULTIPLICATIVE, not additive. bm25's magnitude swings by orders of
+        // magnitude with how many terms the reader typed and how rare they are
+        // — the scores in one result set are comparable only to each other. An
         // additive recency bonus would therefore drown one query and vanish
         // under the next; a factor means the same thing at every scale.
-        //
-        // The bound clock sits BETWEEN the filter's parameters and LIMIT/OFFSET
-        // because anonymous `?` are numbered in the order they appear in the
-        // SQL TEXT, and ORDER BY is parsed after WHERE.
+        let relevance = if sort.considers_recency() {
+            format!("(-f.rank) * {}", recency::boost_sql("m.received_at", "?"))
+        } else {
+            "(-f.rank)".to_string()
+        };
         sql.push_str(&format!(
-            " ORDER BY (-f.rank) * {} DESC, m.received_at DESC, m.id DESC LIMIT ? OFFSET ?",
-            recency::boost_sql("m.received_at", "?")
+            " ORDER BY {relevance} DESC, m.received_at DESC, m.id DESC LIMIT ? OFFSET ?"
         ));
-        args.push(Value::Text(Utc::now().to_rfc3339()));
+        // The clock is pushed HERE, after the filter's parameters and before
+        // LIMIT/OFFSET, because anonymous `?` are numbered in the order they
+        // appear in the SQL TEXT and ORDER BY is parsed after WHERE. Under
+        // BestMatch the expression has no placeholder, so neither may the args.
+        if sort.considers_recency() {
+            args.push(Value::Text(Utc::now().to_rfc3339()));
+        }
         args.push(Value::Integer(limit as i64));
         args.push(Value::Integer(offset as i64));
 

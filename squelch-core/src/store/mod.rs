@@ -8,7 +8,7 @@ pub mod recency;
 pub mod search_query;
 pub mod sqlite;
 
-pub use search_query::{SearchFilter, parse_search_query};
+pub use search_query::{SearchFilter, SearchSort, parse_search_query};
 pub use sqlite::SqliteStore;
 
 use crate::error::Result;
@@ -1384,7 +1384,8 @@ pub trait Store: Send + Sync {
     ///
     /// Ranked by relevance TILTED TOWARD RECENT MAIL ([`recency`]) — the same
     /// curve the semantic and hybrid legs blend in, so one query does not mean
-    /// two different things depending on which mode served it.
+    /// two different things depending on which mode served it. Use
+    /// [`Store::search_filtered`] to rank on relevance alone.
     ///
     /// SECURITY: sealed rows are excluded in SQL, exactly like `ranked_updates`.
     fn search(
@@ -1403,11 +1404,17 @@ pub trait Store: Send + Sync {
     /// When `text` is empty and `filter` is not, this is a FILTER-ONLY LISTING:
     /// newest-first over `messages` with no FTS MATCH at all. Both shapes keep
     /// `search`'s guarantees — sealed rows excluded, sent mail excluded.
+    ///
+    /// `sort` decides whether the recency curve applies. It is the READER'S
+    /// standing preference rather than part of the query, which is why it
+    /// arrives beside `filter` instead of inside it: a filter says which mail
+    /// counts, a sort says how to order whatever did.
     fn search_filtered(
         &self,
         account_id: AccountId,
         text: &str,
         filter: &SearchFilter,
+        sort: SearchSort,
         limit: u32,
         offset: u32,
     ) -> Result<Vec<SearchHit>>;

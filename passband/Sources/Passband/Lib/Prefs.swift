@@ -21,6 +21,33 @@ enum SettingsSection: String, CaseIterable, Sendable {
     }
 }
 
+/// HOW SEARCH ORDERS ITS RESULTS, and the reader's standing answer to it.
+/// Sent on every search as `sort=`; the daemon ranks accordingly.
+///
+/// A preference rather than a control on the search bar itself. Somebody who
+/// wants one of these wants it every time, and a per-search picker is a
+/// decision re-asked on every keystroke. `recent` is the default because mail
+/// is not a document corpus: the thread you are looking for is usually the one
+/// that moved.
+enum SearchSortChoice: String, CaseIterable, Sendable {
+    case recent, bestMatch = "best_match"
+
+    var label: String {
+        switch self {
+        case .recent: "Recent"
+        case .bestMatch: "Best match"
+        }
+    }
+
+    /// What the setting actually promises, in one line, under the picker.
+    var blurb: String {
+        switch self {
+        case .recent: "Newer mail ranks higher when matches are close."
+        case .bestMatch: "Rank on the words alone, however old the mail is."
+        }
+    }
+}
+
 /// How much developer telemetry (PostHog) leaves the app. Opt-out: `full` is
 /// the default. `minimal` keeps sessions, screen views, and the anonymous
 /// counter events (sends, triage volume, corrections, connection health — see
@@ -110,6 +137,7 @@ final class Prefs {
         static let lastSeenReleaseNotes = "passband.pref.lastSeenReleaseNotes"
         static let theme = "passband.pref.theme"
         static let threadStyle = "passband.pref.threadStyle"
+        static let searchSort = "passband.pref.searchSort"
         static let notificationSound = "passband.pref.notificationSound"
         static let userName = "passband.name"
         static let signature = "passband.pref.signature"
@@ -127,6 +155,7 @@ final class Prefs {
             Key.tourCompleted: false,
             Key.theme: ThemeChoice.system.rawValue,
             Key.threadStyle: ThreadStyleDefault.auto.rawValue,
+            Key.searchSort: SearchSortChoice.recent.rawValue,
             Key.notificationSound: NotificationSound.system.rawValue,
             Key.telemetry: TelemetryLevel.full.rawValue,
         ])
@@ -141,6 +170,8 @@ final class Prefs {
         _theme = ThemeChoice(rawValue: defaults.string(forKey: Key.theme) ?? "") ?? .system
         _threadStyle =
             ThreadStyleDefault(rawValue: defaults.string(forKey: Key.threadStyle) ?? "") ?? .auto
+        _searchSort =
+            SearchSortChoice(rawValue: defaults.string(forKey: Key.searchSort) ?? "") ?? .recent
         _notificationSound =
             NotificationSound(rawValue: defaults.string(forKey: Key.notificationSound) ?? "")
             ?? .system
@@ -184,6 +215,18 @@ final class Prefs {
         set {
             _rankWeight = newValue
             defaults.set(newValue, forKey: Key.rankWeight)
+        }
+    }
+
+    /// How search orders its results. Read at FETCH time rather than captured
+    /// when a panel opens, so changing it in Settings is in force on the very
+    /// next search without anything having to observe anything.
+    private var _searchSort: SearchSortChoice
+    var searchSort: SearchSortChoice {
+        get { _searchSort }
+        set {
+            _searchSort = newValue
+            defaults.set(newValue.rawValue, forKey: Key.searchSort)
         }
     }
 

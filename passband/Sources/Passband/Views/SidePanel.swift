@@ -74,6 +74,7 @@ struct SidePanel: View {
 /// in-flight flags, which die with the panel, are local.
 struct SearchView: View {
     @Environment(AppStore.self) private var store
+    @Environment(Prefs.self) private var prefs
     @State private var loading = false
     /// A page append is in flight. SEPARATE from `loading`: that one blanks the
     /// list behind "searching…", and an append must leave the read hits alone.
@@ -214,17 +215,23 @@ struct SearchView: View {
 
     private func runSearch() async {
         let term = store.search.query.trimmed
+        // Read at fetch time, not captured on mount: the panel is often built
+        // before a trip to Settings and rebuilt after one.
+        let sort = prefs.searchSort
         guard !term.isEmpty else {
             store.search.hits = []
             store.search.error = nil
             store.search.fetchedQuery = nil
+            store.search.fetchedSort = nil
             store.search.nextCursor = nil
             loading = false
             return
         }
-        // Already holding this term's results: reopening must not re-fetch and
-        // flash, which is the point of hoisting the session into the store.
-        guard term != store.search.fetchedQuery else { return }
+        // Already holding this term's results UNDER THIS ORDER: reopening must
+        // not re-fetch and flash, which is the point of hoisting the session
+        // into the store. The sort is half of that test — same words ranked by
+        // different rules is a different answer.
+        guard term != store.search.fetchedQuery || sort != store.search.fetchedSort else { return }
         loading = true
         // Debounce: a fresh keystroke cancels this task before the request.
         try? await Task.sleep(for: .milliseconds(220))
@@ -237,7 +244,7 @@ struct SearchView: View {
             return
         }
         do {
-            let page = try await APIClient.shared.search(term, limit: 50)
+            let page = try await APIClient.shared.search(term, limit: 50, sort: sort)
             store.search.hits = page.items
             store.search.nextCursor = page.next_cursor
             // Fresh results land un-armed: Enter straight from the bar means
@@ -245,6 +252,7 @@ struct SearchView: View {
             store.search.index = -1
             store.search.error = nil
             store.search.fetchedQuery = term
+            store.search.fetchedSort = sort
             // Warm the head of the page only. Search rows are read and chosen
             // from, not swept, so the rest can wait for a real click — and the
             // whole 50 would be a stampede for one open.
@@ -263,6 +271,7 @@ struct SearchView: View {
             // Leave `fetchedQuery` nil so reopening RETRIES rather than
             // resurrecting a stale error over stale hits.
             store.search.fetchedQuery = nil
+            store.search.fetchedSort = nil
             // And drop the cursor with it: it belongs to a page set this view
             // is no longer showing.
             store.search.nextCursor = nil
@@ -279,10 +288,17 @@ struct SearchView: View {
         guard !loading, !loadingMore, let cursor = store.search.nextCursor else { return }
         let term = store.search.query.trimmed
         guard !term.isEmpty, term == store.search.fetchedQuery else { return }
+        // The cursor is an OFFSET INTO ONE RANKING, so the page after it has to
+        // be asked for under the sort the hits on screen were ranked by — not
+        // under whatever the preference says now. A sort changed mid-scroll
+        // re-ranks from the top through `runSearch`, which is the only honest
+        // way to serve it.
+        let sort = store.search.fetchedSort
         loadingMore = true
         defer { loadingMore = false }
         do {
-            let page = try await APIClient.shared.search(term, limit: 50, cursor: cursor)
+            let page = try await APIClient.shared.search(
+                term, limit: 50, cursor: cursor, sort: sort)
             guard term == store.search.fetchedQuery, store.search.nextCursor == cursor else {
                 return
             }

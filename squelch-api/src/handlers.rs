@@ -18,7 +18,8 @@ use serde_json::json;
 use squelch_core::CoreError;
 use squelch_core::config::{CACHE_READ_INPUT_MULT, CACHE_WRITE_INPUT_MULT};
 use squelch_core::store::{
-    ActionMessageRef, Draft, NewAuditEntry, SearchFilter, SitrepBand, SqliteStore, Store,
+    ActionMessageRef, Draft, NewAuditEntry, SearchFilter, SearchSort, SitrepBand, SqliteStore,
+    Store,
 };
 use squelch_core::sync::{decode_raw_b64url, parse_internal_date};
 use squelch_core::triage::llm::Usage;
@@ -651,6 +652,10 @@ pub struct SearchQuery {
     /// Retrieval mode: keyword|semantic|hybrid. Omitted => hybrid when a vector
     /// index is available (an embedder is attached), else keyword.
     mode: Option<String>,
+    /// Result order: recent|best_match. Omitted => recent, which is the ranking
+    /// with recency blended in. This is the READER'S standing preference, held
+    /// by the client and sent on every search, not something parsed out of `q`.
+    sort: Option<String>,
 }
 
 /// The three retrieval modes for `/client/search`.
@@ -681,11 +686,15 @@ impl SearchMode {
     }
 }
 
-/// Search response envelope: a page of hits plus the mode actually run.
+/// Search response envelope: a page of hits plus the mode and order actually
+/// run. Both are echoed rather than assumed: a mode can DEGRADE (semantic
+/// without a vector index falls back to keyword), and a client that cannot see
+/// which order it got cannot tell a bad ranking from a bad request.
 #[derive(Debug, Serialize)]
 struct SearchPage<T> {
     items: Vec<T>,
     match_kind: &'static str,
+    sort: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     next_cursor: Option<String>,
 }
@@ -728,6 +737,14 @@ pub async fn search(
     }
     let (limit, offset) = paginate(query.limit, query.cursor.as_deref())?;
 
+    // Unknown values 400 rather than falling back to the default: a client that
+    // sends `sort=newest` and silently gets `recent` has a bug it cannot see.
+    let sort = match query.sort.as_deref() {
+        Some(s) => SearchSort::parse(s)
+            .ok_or_else(|| ApiError::bad_request("sort must be one of: recent, best_match"))?,
+        None => SearchSort::default(),
+    };
+
     // An attached embedder means vectors are being written; that gates
     // semantic/hybrid and drives the default mode.
     let have_vectors = state.store.embedder().is_some();
@@ -766,11 +783,11 @@ pub async fn search(
     // below); the keyword leg paginates exactly, so it never needs one.
     let (items, window_full) = store_call(&state, move |store, account_id| match effective {
         SearchMode::Keyword => store
-            .search_filtered(account_id, &term, &filter, limit, offset)
+            .search_filtered(account_id, &term, &filter, sort, limit, offset)
             .map(|hits| (hits, false)),
         SearchMode::Semantic => {
             let (mut hits, window_full) =
-                store.semantic_search_hits(account_id, &term, &filter, k)?;
+                store.semantic_search_hits(account_id, &term, &filter, sort, k)?;
             let page: Vec<_> = hits
                 .drain(..)
                 .skip(offset as usize)
@@ -779,7 +796,8 @@ pub async fn search(
             Ok((page, window_full))
         }
         SearchMode::Hybrid => {
-            let (mut hits, window_full) = store.hybrid_search(account_id, &term, &filter, k)?;
+            let (mut hits, window_full) =
+                store.hybrid_search(account_id, &term, &filter, sort, k)?;
             let page: Vec<_> = hits
                 .drain(..)
                 .skip(offset as usize)
@@ -807,6 +825,7 @@ pub async fn search(
     Ok(Json(SearchPage {
         items,
         match_kind: effective.as_str(),
+        sort: sort.as_str(),
         next_cursor: next,
     }))
 }
