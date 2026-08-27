@@ -1196,4 +1196,98 @@ mod tests {
         // expired one: the subtraction must not read as negative-is-old.
         assert!(retriage_forced(Some(t + Duration::hours(1)), t));
     }
+
+    // ---- prompt copy: no dashes, in either direction ---------------------
+
+    /// Every system prompt the daemon sends, paired with whether it asks the
+    /// model for PROSE THE USER READS (a one-liner, a reason, an offer, an item
+    /// name) rather than only enums and numbers.
+    fn every_system_prompt() -> Vec<(&'static str, &'static str, bool)> {
+        vec![
+            ("stage1_llm", stage1_llm::build_system_prompt(), true),
+            ("stage2", stage2::build_system_prompt(), true),
+            (
+                "extract::marketing",
+                extract::marketing::build_system_prompt(),
+                true,
+            ),
+            (
+                "extract::shipments",
+                extract::shipments::build_system_prompt(),
+                true,
+            ),
+            // Extracts a name it copies, and a masked tail: nothing composed.
+            (
+                "extract::banking",
+                extract::banking::build_system_prompt(),
+                false,
+            ),
+            // Emits one closed enum, no text at all.
+            ("rule_infer", rule_infer::build_system_prompt(), false),
+        ]
+    }
+
+    /// Passband's user-visible copy carries no em or en dashes, so every prompt
+    /// that asks for prose has to say so. The prompts must also not USE one
+    /// themselves: a prompt that dashes while forbidding dashes is a style the
+    /// model reads far more of than the one sentence telling it otherwise.
+    #[test]
+    fn every_prompt_writing_user_copy_forbids_dashes_and_none_models_one() {
+        for (name, prompt, writes_user_prose) in every_system_prompt() {
+            assert!(
+                !prompt.contains('\u{2014}'),
+                "{name}'s prompt uses an em dash"
+            );
+            assert!(
+                !prompt.contains('\u{2013}'),
+                "{name}'s prompt uses an en dash"
+            );
+            if writes_user_prose {
+                assert!(
+                    prompt.contains("em dash or en dash"),
+                    "{name} writes copy the user reads but never forbids dashes"
+                );
+            }
+        }
+    }
+
+    /// The list above is hand-written, so a prompt added in a new file could
+    /// quietly skip the check. This walks `src/triage` and fails when a module
+    /// declaring a system prompt is not on it.
+    #[test]
+    fn no_system_prompt_in_the_tree_escapes_the_list() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/triage");
+        let listed: Vec<&str> = every_system_prompt().iter().map(|(n, _, _)| *n).collect();
+        // Assembled rather than written out, so this file does not match itself.
+        let declaration = format!("{}: &str", "SYSTEM_PROMPT");
+        let mut dirs = vec![root.clone()];
+        while let Some(dir) = dirs.pop() {
+            for entry in std::fs::read_dir(&dir).expect("triage sources are readable") {
+                let path = entry.expect("a directory entry").path();
+                if path.is_dir() {
+                    dirs.push(path);
+                    continue;
+                }
+                if path.extension().is_none_or(|ext| ext != "rs") {
+                    continue;
+                }
+                let src = std::fs::read_to_string(&path).expect("a source file is readable");
+                if !src.contains(&declaration) {
+                    continue;
+                }
+                let module = path
+                    .strip_prefix(&root)
+                    .expect("under src/triage")
+                    .with_extension("")
+                    .components()
+                    .map(|c| c.as_os_str().to_string_lossy().into_owned())
+                    .collect::<Vec<_>>()
+                    .join("::");
+                assert!(
+                    listed.contains(&module.as_str()),
+                    "{module} declares a system prompt but is missing from every_system_prompt()"
+                );
+            }
+        }
+    }
 }
