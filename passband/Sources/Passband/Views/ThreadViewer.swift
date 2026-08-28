@@ -201,6 +201,32 @@ struct ThreadViewer: View {
         }
         .keyContext(.thread)
         .keyBindings(.thread, bindings)
+        // THE PHONE'S `e`. Done is the verb this reader exists to end on, and
+        // until now the only way to say it on a phone was to back out and swipe
+        // the row you had just been reading — leave the thread, find it again,
+        // then finish it. The bar's other corner already holds the way OUT; this
+        // is the way DONE, in the corner a thumb reaches, and it closes the
+        // reader itself so the two chevrons never both mean "go back".
+        //
+        // It keeps the toolbar's own glass capsule (no
+        // `sharedBackgroundVisibility(.hidden)` here, unlike the dashboard's
+        // bare door glyphs): this one COMMITS something, and it should look like
+        // the back button it sits opposite rather than like a label.
+        #if !os(macOS)
+            .toolbar {
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button { Task { await doneFromBar() } } label: {
+                        Image(systemName: "checkmark")
+                            .foregroundStyle(Palette.accent)
+                    }
+                    // Every path through it needs the thread: the queue row is
+                    // looked up by id and the fallback resolves the newest
+                    // message, and there is no newest message until it loads.
+                    .disabled(thread == nil)
+                    .accessibilityLabel("Mark done")
+                }
+            }
+        #endif
         .task(id: threadId) {
             await load()
             // Only once the thread is HERE: the hand-off names a message, and
@@ -351,9 +377,25 @@ struct ThreadViewer: View {
         #else
             VStack(alignment: .leading, spacing: 10) {
                 titleBlock
-                HStack(spacing: 16) {
-                    actions
-                    Spacer(minLength: 0)
+                HStack(spacing: 12) {
+                    // THE VERBS SCROLL, THE SWITCH DOES NOT. Four text buttons
+                    // and a control do not fit across a phone, and the ones that
+                    // come and go — the attention jump chip, the two developer
+                    // buttons, an unsubscribe that grows into a whole sentence
+                    // once it has been requested — are exactly the ones that
+                    // decide whether they fit. Left in a plain HStack the row
+                    // answers that by squeezing every verb into an ellipsis at
+                    // once. Here the sentence keeps its own width and runs off
+                    // the edge, and the switch keeps the right edge it is always
+                    // found at.
+                    ScrollView(.horizontal) {
+                        HStack(spacing: 16) { actions }
+                    }
+                    .scrollIndicators(.hidden)
+                    .scrollBounceBehavior(.basedOnSize, axes: .horizontal)
+                    StyleRadio(style: style, ready: styleReady, axis: .horizontal) {
+                        chooseStyle($0)
+                    }
                 }
             }
             .padding(.horizontal, 18)
@@ -739,14 +781,23 @@ struct ThreadViewer: View {
                 // it, because it is about the thread and not about any one
                 // message in it.
                 .overlay(alignment: .bottom) { arrivalPill }
-                // The style radio rides the mail's own top-right corner rather
-                // than the header row: it is a verdict about the mail below it,
-                // and the header is already a sentence of verbs.
-                .overlay(alignment: .topTrailing) {
-                    StyleRadio(style: style, ready: styleReady) { chooseStyle($0) }
-                        .padding(.top, 10)
-                        .padding(.trailing, 12)
-                }
+                // THE MAC ONLY. Here the radio rides the mail's own top-right
+                // corner rather than the header row: it is a verdict about the
+                // mail below it, the header is already a sentence of verbs, and
+                // a window that wide loses nothing to a control floating in it.
+                //
+                // A phone loses the top-right corner of the FIRST MESSAGE to it
+                // — over a 390pt column that corner is the sender's name and the
+                // tier chip, which is the one line of a card worth reading — so
+                // the phone puts the same control in the header, running across.
+                // See `header`.
+                #if os(macOS)
+                    .overlay(alignment: .topTrailing) {
+                        StyleRadio(style: style, ready: styleReady) { chooseStyle($0) }
+                            .padding(.top, 10)
+                            .padding(.trailing, 12)
+                    }
+                #endif
             }
         }
     }
@@ -1496,6 +1547,30 @@ struct ThreadViewer: View {
         }
     }
 
+    #if !os(macOS)
+        /// The bar's checkmark — `doneAndClose` for a thumb, minus the flight.
+        ///
+        /// NO DEPARTURE ANIMATION, because on a phone there is nothing to
+        /// animate: the lift-and-fly is drawn by the Mac's overlay host
+        /// (RootView reads `store.threadFlight`), and the phone's reader is a
+        /// NavigationStack push whose own pop IS the animation. Calling the
+        /// shared verb here would spend `Motion.departTime` waiting for a
+        /// motion nobody is drawing, which on a phone reads as a button that
+        /// took a beat to notice it was pressed.
+        ///
+        /// The haptic stands in for it. It is the same confirmation a committed
+        /// swipe gets on a list row, which is the other way this app says done.
+        private func doneFromBar() async {
+            Haptics.commit()
+            await resolveOpenThread()
+            // Same outlived-its-reader guard the other two verbs take: a resolve
+            // that finished after the reader moved on must not close the thread
+            // that moved in.
+            guard store.threadId == threadId else { return }
+            store.closeThread()
+        }
+    #endif
+
     /// E/D — "done + next": mark the current thread's update done (keeping its
     /// 5s undo), then advance to the NEXT queued update in place; if none
     /// remain — or if this reader never had a queue behind it — close the
@@ -2141,27 +2216,48 @@ private struct BubbleTail: Shape {
     }
 }
 
-/// The style switch, riding the mail's own top-right corner: two icon slots —
-/// text above, talk below — and one highlight that travels between them. A
-/// radio rather than a flip because two icons can SAY both answers where the
-/// old header button could only name the other one. Same crossing time as
-/// GlassSegmented, so every selector in the app moves at one speed.
+/// The style switch: two icon slots — text and talk — and one highlight that
+/// travels between them. A radio rather than a flip because two icons can SAY
+/// both answers where the old header button could only name the other one. Same
+/// crossing time as GlassSegmented, so every selector in the app moves at one
+/// speed.
+///
+/// THE AXIS IS THE PLATFORM'S CALL, and it goes with where the control sits. A
+/// Mac floats it over the mail's own top-right corner, where a column two slots
+/// wide costs the reader nothing; a phone has no room to float anything over a
+/// 390pt column, so it rides the header's action row and runs ACROSS, which is
+/// also the shape every other selector on a phone has. One control either way —
+/// a second implementation would be a second set of answers about a highlight
+/// that has to land exactly on a slot.
 private struct StyleRadio: View {
     let style: ThreadStyle
     let ready: Bool
+    var axis: Axis = .vertical
     let choose: (ThreadStyle) -> Void
 
-    private static let slot: CGFloat = 26
-    private static let gap: CGFloat = 2
-    private static let pad: CGFloat = 3
+    /// A thumb needs more than a pointer does, and the header row it sits in is
+    /// taller than a floating corner control has to be.
+    private var slot: CGFloat { axis == .horizontal ? 30 : 26 }
+    private var gap: CGFloat { 2 }
+    private var pad: CGFloat { 3 }
+
+    /// ONE layout, chosen per axis. `AnyLayout` rather than an `if` around two
+    /// stacks on purpose: an `if` is two view identities, and the slots would
+    /// then be re-created — with the highlight snapping rather than travelling
+    /// — every time the control is asked to change direction.
+    private var layout: AnyLayout {
+        axis == .vertical
+            ? AnyLayout(VStackLayout(spacing: gap))
+            : AnyLayout(HStackLayout(spacing: gap))
+    }
 
     var body: some View {
-        VStack(spacing: Self.gap) {
+        layout {
             option(.classic, icon: "text.alignleft", help: "read this thread as email cards")
             option(.bubbles, icon: "bubble.left", help: "read this thread as chat bubbles")
         }
-        .padding(Self.pad)
-        .background(alignment: .top) { highlight }
+        .padding(pad)
+        .background(alignment: axis == .vertical ? .top : .leading) { highlight }
         .animation(.smooth(duration: 0.32), value: style)
         .background(
             RoundedRectangle(cornerRadius: 9, style: .continuous)
@@ -2175,20 +2271,23 @@ private struct StyleRadio: View {
     private func option(_ value: ThreadStyle, icon: String, help: String) -> some View {
         Button { choose(value) } label: {
             Image(systemName: icon)
-                .font(.system(size: 12, weight: .semibold))
+                .font(.system(size: axis == .horizontal ? 13 : 12, weight: .semibold))
                 .foregroundStyle(style == value ? .white : Palette.inkDim)
-                .frame(width: Self.slot, height: Self.slot)
+                .frame(width: slot, height: slot)
                 .contentShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
         }
         .buttonStyle(.plain)
         .help(help)
+        .accessibilityLabel(value.label)
+        .accessibilityAddTraits(style == value ? [.isSelected] : [])
     }
 
     /// The travelling pane, one view for the life of the control — the slots
     /// are fixed squares, so the offset is arithmetic rather than measurement.
     private var highlight: some View {
-        Color.clear
-            .frame(width: Self.slot, height: Self.slot)
+        let travel = pad + (style == .bubbles ? slot + gap : 0)
+        return Color.clear
+            .frame(width: slot, height: slot)
             .glassEffect(
                 .regular.tint(Palette.accent.opacity(0.55)),
                 in: RoundedRectangle(cornerRadius: 6, style: .continuous)
@@ -2196,7 +2295,9 @@ private struct StyleRadio: View {
             // Sits over the active slot — an interactive material would eat
             // that option's clicks.
             .allowsHitTesting(false)
-            .offset(y: Self.pad + (style == .bubbles ? Self.slot + Self.gap : 0))
+            .offset(
+                x: axis == .horizontal ? travel : 0,
+                y: axis == .vertical ? travel : 0)
     }
 }
 
