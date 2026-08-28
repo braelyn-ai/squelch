@@ -805,6 +805,7 @@ async fn a_cookie_that_claims_an_invite_cannot_drive_a_console_session() {
             label: LABEL.to_string(),
             invite: Some(1),
             app: false,
+            reconnect: false,
             iat: chrono::Utc::now().timestamp(),
         },
     );
@@ -1186,6 +1187,7 @@ async fn a_cookie_cannot_change_which_login_a_session_is() {
             label: String::new(),
             invite: None,
             app: false,
+            reconnect: false,
             iat: chrono::Utc::now().timestamp(),
         },
     );

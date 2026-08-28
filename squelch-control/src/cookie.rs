@@ -124,6 +124,23 @@ pub struct SessionClaim {
     /// exactly what they were before app logins existed.
     #[serde(default, skip_serializing_if = "is_false")]
     pub app: bool,
+    /// Whether this is a RECONNECT rather than an app login. Same role and same
+    /// narrow reach as [`SessionClaim::app`]: both spend no invite and carry an
+    /// empty label, so neither is distinguishable from the cookie alone, and
+    /// this field exists only so a refusal can be worded in the flow the person
+    /// was actually in.
+    ///
+    /// ONLY THE REFUSAL COPY TURNS ON IT, for the same reason: the server-side
+    /// session is the authority wherever it survives, and this is read exactly
+    /// when it is gone. A forged `true` buys a stranger a differently worded
+    /// refusal and nothing else — in particular it cannot aim a credential,
+    /// because the mailbox a reconnect installs to comes from Google's verified
+    /// answer and never from anything the client sent.
+    ///
+    /// Skipped when false, so every flow that predates reconnect keeps exactly
+    /// the payload bytes it had.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub reconnect: bool,
     /// Issued-at, unix seconds. The TTL is enforced on the server, so this is
     /// signed rather than trusted.
     pub iat: i64,
@@ -354,6 +371,7 @@ mod tests {
             label: "ada".into(),
             invite: Some(7),
             app: false,
+            reconnect: false,
             iat: 1_000_000,
         }
     }
@@ -421,6 +439,7 @@ mod tests {
             label: String::new(),
             invite: None,
             app: true,
+            reconnect: false,
             ..claim()
         };
         let json = payload(&app);

@@ -354,6 +354,13 @@ struct Shipment: Codable, Sendable, Identifiable, Hashable {
     /// Rate limits and transport errors never count, which is what makes a
     /// nonzero value evidence about the NUMBER rather than about the network.
     var poll_failures: Int?
+
+    /// The item name as a LABEL: emoji dropped, whitespace collapsed. The
+    /// daemon lifts this out of a subject line and its strip leaves pictographs
+    /// standing, so "🚚 Your order from X" reaches us with the truck attached.
+    /// Empty when nothing survives (a name that was only decoration), which is
+    /// each caller's cue to use its own fallback.
+    var displayItem: String { item_name.withoutEmoji }
 }
 
 /// What `POST /client/shipments/poll` answers. `kicked` is false, with an empty
@@ -432,6 +439,127 @@ struct BankingRecord: Codable, Sendable, Identifiable, Hashable {
     var currency: String?
     var account_hint: String?
     var received_at: String
+}
+
+// MARK: - send groups
+
+/// How a group addresses its members. A property of the AUDIENCE, chosen when
+/// the group is made rather than per message: an investor list is
+/// individually-addressed every time or it is not one.
+enum GroupMode: String, Codable, Sendable, CaseIterable, Hashable {
+    /// One message, everyone in To. They see each other.
+    case to
+    /// One message, everyone in Bcc. They do not.
+    case bcc
+    /// One message PER member. Replies come back as private threads and read
+    /// receipts are per recipient.
+    case individual
+
+    var label: String {
+        switch self {
+        case .to: "To"
+        case .bcc: "Bcc"
+        case .individual: "Individually"
+        }
+    }
+
+    /// What picking this mode does to the composer, said in the one line the
+    /// picker has room for. No em dashes: user-facing copy.
+    var blurb: String {
+        switch self {
+        case .to: "everyone sees the whole list"
+        case .bcc: "nobody sees anyone else"
+        case .individual: "one separate email each"
+        }
+    }
+
+    var symbol: String {
+        switch self {
+        case .to: "person.2"
+        case .bcc: "eye.slash"
+        case .individual: "arrow.triangle.branch"
+        }
+    }
+}
+
+/// One mailbox in a group.
+struct GroupMember: Codable, Sendable, Hashable, Identifiable {
+    var addr: String
+    var display_name: String?
+
+    var id: String { addr }
+
+    /// What a pill or a member row shows: the name when the daemon has one,
+    /// the address otherwise.
+    var label: String {
+        guard let name = display_name, !name.isEmpty else { return addr }
+        return name
+    }
+}
+
+/// GET /client/groups. `members` is EMPTY on the list read and populated on the
+/// single-group read, so a sidebar listing is never a contacts dump.
+struct SendGroup: Codable, Sendable, Identifiable, Hashable {
+    var id: Int
+    var name: String
+    var slug: String
+    var mode: GroupMode
+    var note: String
+    var member_count: Int
+    var members: [GroupMember]?
+    var last_sent_at: String?
+    var created_at: String
+    var updated_at: String
+}
+
+struct GroupBody: Codable, Sendable {
+    var name: String
+    var mode: GroupMode
+    var note: String
+    var members: [GroupMember]
+}
+
+/// GET /client/groups/{id}/history — one entry, from either source. A RECORDED
+/// send names `group_send_id`; a DERIVED one (mail matched against the current
+/// membership, which is what lets a new group show the year that preceded it)
+/// names only the message.
+struct GroupHistoryEntry: Codable, Sendable, Identifiable, Hashable {
+    var group_send_id: Int?
+    var message_id: Int?
+    var thread_id: String?
+    var subject: String
+    var snippet: String
+    var sent_at: String
+    var mode: GroupMode
+    /// How many of the group this reached.
+    var reached: Int
+    /// The denominator: the snapshot taken at send time for a recorded entry,
+    /// the CURRENT membership for a derived one.
+    var group_size: Int
+    /// Recipients a fan-out never reached. Always 0 for a derived entry.
+    var failed: Int
+    var opens: Int
+
+    /// Stable across the two sources: a recorded entry is keyed by its send, a
+    /// derived one by its message. Both can be absent in principle, so the date
+    /// backs them up.
+    var id: String {
+        if let sendId = group_send_id { return "s\(sendId)" }
+        if let messageId = message_id { return "m\(messageId)" }
+        return "t\(sent_at)"
+    }
+
+    /// True when this went to every member it was measured against.
+    var reachedEveryone: Bool { group_size > 0 && reached >= group_size }
+}
+
+struct GroupHistoryPage: Codable, Sendable {
+    var items: [GroupHistoryEntry]
+    var next_offset: Int?
+}
+
+struct GroupLimits: Codable, Sendable {
+    var max_members: Int
 }
 
 // MARK: - rules
@@ -582,6 +710,47 @@ struct StoreStats: Codable, Sendable, Hashable {
     /// to catch and no undo for a send, so the only place to stop it is before
     /// the composer opens. See `AppStore.forwardingAvailable`.
     var forwarding: Bool?
+    /// Whether Gmail still opens for this mailbox, and what to do if it does
+    /// not. ABSENT on a daemon too old to say and on any door wired without a
+    /// metrics registry, and nil must read as "we do not know" rather than as
+    /// "connected": claiming a mailbox is fine on a daemon that cannot see is
+    /// the failure this whole field exists to end.
+    var gmail: GmailHealth?
+    /// A mailbox catch-up in flight. ABSENT is the normal state; presence is
+    /// the explanation for a triage queue that is not moving.
+    var catch_up: CatchUpProgress?
+}
+
+/// The 30-day re-walk the daemon falls back to when Gmail's history cursor
+/// expires, which is what happens to any mailbox that goes quiet for a week.
+///
+/// It is the sync loop's longest single call and triage cannot run until it
+/// finishes, so without this object a working mailbox is indistinguishable from
+/// a hung one — which is exactly how it looked the day it was added.
+struct CatchUpProgress: Codable, Sendable, Hashable {
+    var done: Int
+    var total: Int
+}
+
+/// The daemon's answer to "is this mailbox still connected".
+///
+/// A dead refresh token is invisible from everywhere a person looks: mail
+/// simply stops arriving, which is indistinguishable from a quiet week. The
+/// daemon has always detected it exactly and, until this field, told only
+/// Prometheus — so an operator could find out and the person with the empty
+/// mailbox could not.
+struct GmailHealth: Codable, Sendable, Hashable {
+    /// False while the refresh token is dead. The only field that is always
+    /// present when this object is.
+    var connected: Bool
+    /// RFC3339, when the current outage began. Present only while disconnected,
+    /// and it is when the mailbox went dark rather than when it last retried.
+    var disconnected_since: String?
+    /// Where to re-consent. Present only while disconnected AND only on hosted:
+    /// a self-host mailbox is repaired with `squelchd auth` at a shell, which is
+    /// not a link anything can offer. Nil is therefore the self-host branch, not
+    /// an error.
+    var reconnect_url: String?
 }
 
 // MARK: - invites
@@ -820,6 +989,23 @@ struct SendBody: Codable, Sendable {
     /// your own is the ordinary case.
     var forward_of_message_id: Int?
     var to: String?
+    /// PRESENT — `""` INCLUDED — means this client is stating the whole copy
+    /// list and the daemon does not consult the parent's. OMITTED means derive
+    /// it, which is what a composer that has not yet learned the derived set
+    /// must send: asserting an empty Cc it never had would silently narrow a
+    /// reply-all to one person. See `ComposeState.recipientsStated`.
+    var cc: String?
+    /// Blind recipients, comma-joined. Omitted when there are none — nothing
+    /// derives these, since no header of a parent records who was blind-copied
+    /// on it, so absent and `""` mean the same thing here unlike `cc`. Filtered
+    /// server-side against `to` and `cc`, so a person on both lists is delivered
+    /// once rather than twice.
+    var bcc: String?
+    /// ADDRESS A SEND GROUP. What it does is the GROUP's mode, not this
+    /// message's: `to`/`bcc` groups are already expanded into the fields above,
+    /// so this is attribution; an `individual` group makes the daemon fan out and
+    /// answer with a batch id instead of a sent message.
+    var group_id: Int?
     /// Omitted (not "") on a reply: the daemon derives `Re: <parent subject>`
     /// only when the field is absent — `Some("")` is an explicit empty subject.
     var subject: String?
@@ -911,7 +1097,13 @@ struct StatusResult: Codable, Sendable {
 }
 
 struct SendResult: Codable, Sendable {
+    /// `"sent"` for an ordinary send; `"sending"` for a fan-out, which has left
+    /// with a batch to watch rather than a message to open.
     var status: String
+    /// The `group_sends` row a fan-out started. Present only on `"sending"`.
+    var group_send_id: Int?
+    /// How many people that fan-out is going to.
+    var recipients: Int?
     /// The sent copy as it landed in the local store, and its thread — both null
     /// when the send succeeded but the echo has not been ingested yet.
     var echo_message_id: Int?
@@ -934,6 +1126,12 @@ struct DraftView: Codable, Sendable, Identifiable, Hashable {
     /// The message this answers. nil = the account's single new-message draft.
     var reply_to_message_id: Int?
     var to: String
+    /// The other two lists. A draft that could not hold these would silently
+    /// lose the audience of a bcc send. OPTIONAL here for exactly one reason:
+    /// an older daemon sends neither field, and a decode that failed over it
+    /// would lose the whole draft rather than the two lists it could not carry.
+    var cc: String?
+    var bcc: String?
     var subject: String
     var body: String
     var created_at: String
@@ -946,6 +1144,11 @@ struct DraftView: Codable, Sendable, Identifiable, Hashable {
 struct DraftBody: Codable, Sendable {
     var reply_to_message_id: Int?
     var to: String
+    /// Sent unconditionally, `""` and all: unlike the SEND route, absence has
+    /// no second meaning here — nothing is ever derived into a draft — and a
+    /// composer that cleared its Bcc has to be able to say so.
+    var cc: String
+    var bcc: String
     var subject: String
     var body: String
 }
@@ -974,6 +1177,18 @@ struct TriageDebug: Codable, Sendable, Hashable {
     /// Optional so a client pointed at a daemon older than the field still
     /// decodes the page rather than failing the whole read.
     var thread_id: String?
+}
+
+/// What `GET /client/retriage` answers: how far the live dev re-triage has got.
+/// `total == 0` means no run is in flight. A daemon too old to serve the route
+/// 404s, which is NOT zero — the modal has to say "no counter" rather than
+/// "finished". See `RetriageRun`.
+struct RetriageProgress: Codable, Sendable, Hashable {
+    var total: Int
+    var done: Int
+    /// The oldest live stamp: when the counted run began. Absent exactly when
+    /// `total` is 0.
+    var started_at: String?
 }
 
 struct ShredStats: Codable, Sendable, Hashable {

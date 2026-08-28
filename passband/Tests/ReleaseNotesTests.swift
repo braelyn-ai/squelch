@@ -115,9 +115,11 @@ struct ReleaseNotesTests {
 
         // The stamp follows what was SHOWN, so a build carrying no note for the
         // release it is running leaves that release unstamped and a later build
-        // can still announce it.
+        // can still announce it. Both ends are written against the table rather
+        // than as literals: spelled as the next version up, this assertion goes
+        // red the day that version is written down, which it already did once.
         expect(
-            ReleaseNotes.unseen(lastSeen: "0.0.4", running: "0.0.5").isEmpty,
+            ReleaseNotes.unseen(lastSeen: table.first?.version, running: "999.0.0").isEmpty,
             "a build past the table shows nothing and so stamps nothing")
 
         // Settings' button, which ignores the stamp entirely.

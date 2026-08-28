@@ -68,7 +68,40 @@ pub const DEFAULT_CPU_REQUEST: &str = "100m";
 pub const DEFAULT_CPU_LIMIT: &str = "1000m";
 
 /// A tenant daemon's memory floor: SQLite plus the ONNX embedder's working set.
-pub const DEFAULT_MEMORY_REQUEST: &str = "256Mi";
+///
+/// A request is a promise about the p50, and the scheduler is the thing that
+/// believes it. This said 256Mi until somebody measured the promise: on the
+/// carrier box (3 vCPU, 3814 MiB, no swap) the four tenant pods read 91, 317,
+/// 376 and 509 MiB on one pass and 123, 293, 349 and 545 MB on another the same
+/// day, because a daemon that has embedded anything keeps its ONNX session
+/// resident and rests at roughly 300-500 MB. 384Mi is about the p50 of that,
+/// which is a truthful number and not a comfortable one: half the fleet is
+/// above it on any given read. The scheduler was reserving 256Mi per tenant
+/// while the kernel paid three to five hundred, and on 2026-08-19 the node ran
+/// out of memory globally with FOUR tenants on it and OOM-killed two squelchd
+/// processes.
+///
+/// Which tenant dies in that is nobody's decision. A tenant pod is burstable
+/// (request below limit, `oom_score_adj` 933), so the kernel picks a RUNNING
+/// mailbox over anything the node keeps for itself, and the signup that
+/// overcommitted the box finished successfully minutes or days earlier. That is
+/// exactly the failure a request exists to prevent: with the request telling
+/// the truth, the tenant that will not fit fails to SCHEDULE, which surfaces at
+/// signup as the already-documented `500 not_ready` (`deploy/hosted/SETUP.md`
+/// §7, "A tenant refused by the quota looks like a provision that times out")
+/// rather than as a dead neighbour.
+///
+/// 384Mi is today's truth and a stopgap, not a target. The daemon-side work in
+/// flight - unloading the embedder when it goes idle, smaller embed batches -
+/// brings the real number down over the coming weeks, so revisit this off a
+/// week of `container_memory_working_set_bytes` at p50 and p99 rather than off
+/// a feeling. The limit stays at 1Gi: that one is the ceiling, this one is the
+/// promise, and they answer different questions.
+///
+/// Inert in production on its own. `deploy/hosted/15-warden-config.yaml`
+/// restates every bound as an env entry and an env entry outranks this
+/// constant, so a change here that is not made there ships nothing.
+pub const DEFAULT_MEMORY_REQUEST: &str = "384Mi";
 
 /// A tenant daemon's memory ceiling. Past this the container is OOM-killed and
 /// restarted, which is one tenant down rather than the node down.
@@ -129,6 +162,12 @@ pub const MIN_PENDING_TTL_SECS: u64 = 600;
 /// proxies; a larger number is a typo, and a typo here degrades silently to one
 /// shared bucket for every caller, so it is a refusal to boot instead.
 pub const MAX_TRUSTED_PROXY_HOPS: usize = 8;
+
+/// Ceiling on `SQUELCH_WARDEN_EMBED_IDLE_UNLOAD_SECS`. The knob is an idle
+/// window in seconds and 0 is its off switch, so a value past a month is a
+/// typo, not a policy; the daemon adds its reap interval to it, and a ceiling
+/// keeps that sum from ever being a question.
+pub const MAX_EMBED_IDLE_UNLOAD_SECS: u64 = 30 * 24 * 60 * 60;
 
 /// Shortest bearer token that may be configured.
 ///
@@ -222,8 +261,31 @@ pub struct Config {
     pub user_namespaces: bool,
     /// Optional PVC holding a pre-seeded embedding-weights cache. When set,
     /// every tenant's init container copies from it instead of each tenant
-    /// downloading ~130 MB from Hugging Face on first boot.
+    /// downloading ~126 MB from Hugging Face on first boot.
+    ///
+    /// The copy is per model directory and skips what the tenant already has,
+    /// so it also fills in a model a tenant is missing rather than only ever
+    /// seeding an empty cache; see [`crate::objects::SEED_SCRIPT`]. Nothing a
+    /// tenant downloaded itself is ever overwritten, and a copy that fails
+    /// leaves the pod up: the daemon downloads what it does not find.
+    ///
+    /// NOTHING HERE CHECKS THAT THE PVC EXISTS. This name is rendered straight
+    /// into every tenant's pod spec, and a name that resolves to no claim
+    /// leaves each new tenant pod Pending on a volume that will never bind.
+    /// Seed the volume first; `deploy/hosted/SETUP.md` step 10 is the order,
+    /// and `deploy/hosted/PRODUCTION.md` has what the failure looks like.
     pub model_pvc: Option<String>,
+    /// Which embedding weights tenant daemons load, injected as
+    /// `SQUELCH_EMBED_MODEL`. Optional, and unset means the daemon's own pinned
+    /// default, which is the normal state.
+    ///
+    /// It exists because the daemon's env is a CLOSED list rendered here: a
+    /// var this file does not name cannot reach a tenant at all, so without
+    /// this knob moving the fleet's embedding model would mean cutting a new
+    /// image. A fastembed `model_code` or variant name, validated by the daemon
+    /// rather than here, since fastembed's table is the authority on what
+    /// resolves.
+    pub embed_model: Option<String>,
     /// The node network, when the CNI drops kubelet probe traffic without one.
     ///
     /// A readiness probe originates from the NODE, not from a pod, so it
@@ -294,6 +356,14 @@ pub struct Config {
     pub llm_stage1_daily_cap: Option<u32>,
     /// Per-tenant daily ceiling on stage-2 calls.
     pub llm_stage2_daily_cap: Option<u32>,
+    /// Seconds a tenant daemon holds its idle embedding session before dropping
+    /// it, passed on as `SQUELCH_EMBED_IDLE_UNLOAD_SECS`. Unset leaves the
+    /// daemon's own default, which is the only reason this exists as an option
+    /// rather than a number: the env a tenant pod gets is a CLOSED list built
+    /// here, so a knob the daemon reads is a knob a hosted tenant cannot reach
+    /// unless the warden renders it. `0` pins the session in memory, which is
+    /// the off switch if the reaper ever misbehaves in production.
+    pub embed_idle_unload_secs: Option<u64>,
 }
 
 impl std::fmt::Debug for Config {
@@ -318,6 +388,7 @@ impl std::fmt::Debug for Config {
             .field("pull_secret", &self.pull_secret)
             .field("user_namespaces", &self.user_namespaces)
             .field("model_pvc", &self.model_pvc)
+            .field("embed_model", &self.embed_model)
             .field("node_cidr", &self.node_cidr)
             .field("http_readiness", &self.http_readiness)
             .field("run_as", &self.run_as)
@@ -330,6 +401,7 @@ impl std::fmt::Debug for Config {
             .field("llm_stage2_model", &self.llm_stage2_model)
             .field("llm_stage1_daily_cap", &self.llm_stage1_daily_cap)
             .field("llm_stage2_daily_cap", &self.llm_stage2_daily_cap)
+            .field("embed_idle_unload_secs", &self.embed_idle_unload_secs)
             .finish()
     }
 }
@@ -595,8 +667,8 @@ impl Config {
             None => None,
             Some(raw) => Some(canonical_llm_base_url(&raw)?),
         };
-        let llm_stage1_model = llm_value_var(get, "SQUELCH_WARDEN_LLM_STAGE1_MODEL")?;
-        let llm_stage2_model = llm_value_var(get, "SQUELCH_WARDEN_LLM_STAGE2_MODEL")?;
+        let llm_stage1_model = env_value_var(get, "SQUELCH_WARDEN_LLM_STAGE1_MODEL")?;
+        let llm_stage2_model = env_value_var(get, "SQUELCH_WARDEN_LLM_STAGE2_MODEL")?;
         let llm_stage1_daily_cap = llm_cap_var(get, "SQUELCH_WARDEN_LLM_STAGE1_DAILY_CAP")?;
         let llm_stage2_daily_cap = llm_cap_var(get, "SQUELCH_WARDEN_LLM_STAGE2_DAILY_CAP")?;
         // The four tuning vars mean nothing without a gateway: a model pin the
@@ -628,6 +700,23 @@ impl Config {
                 }
             }
         }
+        let embed_idle_unload_secs = match var(get, "SQUELCH_WARDEN_EMBED_IDLE_UNLOAD_SECS") {
+            None => None,
+            Some(value) => {
+                let secs = value.parse::<u64>().map_err(|e| {
+                    ConfigError::invalid(format!(
+                        "invalid SQUELCH_WARDEN_EMBED_IDLE_UNLOAD_SECS `{value}`: {e}"
+                    ))
+                })?;
+                if secs > MAX_EMBED_IDLE_UNLOAD_SECS {
+                    return Err(ConfigError::invalid(format!(
+                        "SQUELCH_WARDEN_EMBED_IDLE_UNLOAD_SECS `{secs}` exceeds {MAX_EMBED_IDLE_UNLOAD_SECS} (thirty days); 0 is the off switch, anything longer than a month is a typo"
+                    )));
+                }
+                Some(secs)
+            }
+        };
+
         // Tombstone for the shared-key bridge: the var no longer exists, and a
         // manifest that still sets it belongs to an operator who believes the
         // shared Secret still feeds new tenants. Same posture as the inert
@@ -694,6 +783,7 @@ impl Config {
             pull_secret: optional_name_var(get, "SQUELCH_WARDEN_IMAGE_PULL_SECRET")?,
             user_namespaces,
             model_pvc: optional_name_var(get, "SQUELCH_WARDEN_MODEL_PVC")?,
+            embed_model: env_value_var(get, "SQUELCH_WARDEN_EMBED_MODEL")?,
             node_cidr,
             http_readiness,
             run_as,
@@ -706,6 +796,7 @@ impl Config {
             llm_stage2_model,
             llm_stage1_daily_cap,
             llm_stage2_daily_cap,
+            embed_idle_unload_secs,
         })
     }
 
@@ -898,10 +989,10 @@ fn canonical_llm_base_url(raw: &str) -> Result<String, ConfigError> {
     Ok(url.to_string())
 }
 
-/// An optional LLM tuning value (a model id): printable, no whitespace, no
-/// shell metacharacters, because it becomes an environment value in every
-/// tenant pod.
-fn llm_value_var(get: Lookup, name: &str) -> Result<Option<String>, ConfigError> {
+/// An optional free-form value (a model id, an embedding `model_code`):
+/// printable, no whitespace, no shell metacharacters, because it becomes an
+/// environment value in every tenant pod.
+fn env_value_var(get: Lookup, name: &str) -> Result<Option<String>, ConfigError> {
     match var(get, name) {
         None => Ok(None),
         Some(value) => {
@@ -988,7 +1079,7 @@ mod tests {
         assert_eq!(c.storage_size, "10Gi");
         assert_eq!(c.daemon_resources.cpu_request, "100m");
         assert_eq!(c.daemon_resources.cpu_limit, "1000m");
-        assert_eq!(c.daemon_resources.memory_request, "256Mi");
+        assert_eq!(c.daemon_resources.memory_request, "384Mi");
         assert_eq!(c.daemon_resources.memory_limit, "1Gi");
         assert_eq!(c.daemon_resources.ephemeral_request, "256Mi");
         assert_eq!(c.daemon_resources.ephemeral_limit, "1Gi");
@@ -1006,8 +1097,13 @@ mod tests {
         assert!(!c.http_readiness);
         assert!(c.node_cidr.is_none());
         assert!(c.model_pvc.is_none());
+        // Unset means the daemon's own pinned embedding model, which is what a
+        // fleet should be running unless somebody deliberately moved it.
+        assert!(c.embed_model.is_none());
         assert!(c.pull_secret.is_none());
         assert!(c.console_sso_url.is_none());
+        // Unset means the tenant daemon keeps its own idle-unload default.
+        assert!(c.embed_idle_unload_secs.is_none());
         // The LLM env feature is off unless the operator turns it on.
         assert!(c.llm_base_url.is_none());
         assert!(c.llm_stage1_model.is_none());
@@ -1216,6 +1312,30 @@ mod tests {
 
     /// The whole LLM knob set, accepted together and validated together. The
     /// URL is normalized so two spellings of one gateway are one string.
+    /// The embedder window parses as a number, and `0` survives as `Some(0)`:
+    /// it is the off switch (never unload), not an absent setting.
+    #[test]
+    fn the_embedder_idle_window_parses_and_zero_is_a_value() {
+        let mut vars = required();
+        vars.insert(
+            "SQUELCH_WARDEN_EMBED_IDLE_UNLOAD_SECS".to_string(),
+            "900".to_string(),
+        );
+        assert_eq!(load(&vars).unwrap().embed_idle_unload_secs, Some(900));
+
+        vars.insert(
+            "SQUELCH_WARDEN_EMBED_IDLE_UNLOAD_SECS".to_string(),
+            "0".to_string(),
+        );
+        assert_eq!(load(&vars).unwrap().embed_idle_unload_secs, Some(0));
+
+        vars.insert(
+            "SQUELCH_WARDEN_EMBED_IDLE_UNLOAD_SECS".to_string(),
+            "ten minutes".to_string(),
+        );
+        assert!(load(&vars).is_err(), "a bad value is a refusal to boot");
+    }
+
     #[test]
     fn accepts_a_full_llm_configuration() {
         let mut vars = required();
@@ -1274,6 +1394,28 @@ mod tests {
         vars.insert(
             "SQUELCH_WARDEN_LLM_STAGE1_MODEL".to_string(),
             "claude haiku".to_string(),
+        );
+        assert!(load(&vars).is_err());
+    }
+
+    /// The embedding pin, which is NOT part of the LLM block and needs no
+    /// gateway: it is a fastembed model name, not a call to anybody.
+    #[test]
+    fn the_embedding_model_is_optional_and_stands_alone() {
+        let mut vars = required();
+        vars.insert(
+            "SQUELCH_WARDEN_EMBED_MODEL".to_string(),
+            "Xenova/bge-small-en-v1.5".to_string(),
+        );
+        let c = load(&vars).unwrap();
+        assert_eq!(c.embed_model.as_deref(), Some("Xenova/bge-small-en-v1.5"));
+        // No gateway configured, and it is still accepted.
+        assert!(c.llm_base_url.is_none());
+
+        // A value with a space would break the env value it becomes.
+        vars.insert(
+            "SQUELCH_WARDEN_EMBED_MODEL".to_string(),
+            "bge small".to_string(),
         );
         assert!(load(&vars).is_err());
     }

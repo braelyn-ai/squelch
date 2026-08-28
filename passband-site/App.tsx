@@ -722,6 +722,9 @@ function CornerLinks() {
         </a>
       </footer>
       <footer style={{ ...styles.corner, right: "1.5rem" }}>
+        <a style={styles.link} href="/about">
+          About
+        </a>
         <a style={styles.link} href="/privacy">
           Privacy
         </a>

@@ -27,12 +27,18 @@ enum ShareOrigin: String, Sendable, Hashable {
 }
 
 enum MainView: String, Sendable, Hashable, CaseIterable {
-    case sitrep, emails, auth, rules, audit, usage, settings, process
+    case sitrep, emails, auth, rules, audit, groups, usage, settings, process
 
-    /// The TOP rail group — also the 1..5 number-key mapping. Usage/Settings are
-    /// excluded so that adding them never renumbers 1..5. `process` is off the
-    /// rail entirely: its one door is the all-mail header's peer-review chip.
-    static let mainViews: [MainView] = [.sitrep, .emails, .auth, .rules, .audit]
+    /// The TOP rail group — also the 1..N number-key mapping, taken from
+    /// POSITION in this array. Usage/Settings are excluded so that adding one
+    /// never renumbers the rest. `process` is off the rail entirely: its one door
+    /// is the all-mail header's peer-review chip.
+    ///
+    /// `groups` is APPENDED rather than inserted, which is the whole reason it
+    /// sits below Audit: anywhere earlier and every digit above it shifts, and
+    /// the keys people have in their fingers are worth more than alphabetical
+    /// tidiness.
+    static let mainViews: [MainView] = [.sitrep, .emails, .auth, .rules, .audit, .groups]
     /// The BOTTOM rail group, pinned below a divider.
     static let bottomViews: [MainView] = [.usage, .settings]
 
@@ -43,6 +49,7 @@ enum MainView: String, Sendable, Hashable, CaseIterable {
         case .auth: "Auth"
         case .rules: "Rules"
         case .audit: "Audit"
+        case .groups: "Groups"
         case .usage: "Usage"
         case .settings: "Settings"
         case .process: "Process"
@@ -56,6 +63,7 @@ enum MainView: String, Sendable, Hashable, CaseIterable {
         case .auth: "key"
         case .rules: "slider.horizontal.3"
         case .audit: "scroll"
+        case .groups: "person.2"
         case .usage: "waveform.path.ecg"
         case .settings: "gearshape"
         case .process: "checkmark.seal"
@@ -146,7 +154,6 @@ struct SitrepZoneCache: Sendable {
     var banking: [BankingRecord] = []
     var receipts: [Receipt] = []
     var newsletters: [Newsletter] = []
-    var rulesCount: Int?
     /// When the last full refresh COMPLETED. nil = never loaded.
     var loadedAt: Date?
 }
@@ -205,14 +212,15 @@ struct RefreshError: Equatable, Sendable {
 /// `remind` is its own kind rather than a flavour of `done`: the forward action
 /// resolves the thread AND schedules its return, so the inverse is two calls,
 /// and "undo_fired kind=done" would count a reminder as a completion.
-enum UndoKind: Sendable { case archive, done, label, ruleDelete, remind }
+enum UndoKind: Sendable { case archive, done, label, ruleDelete, groupDelete, remind }
 
 /// A queued undo. `revert` is the exact inverse call to fire on `u`/toast-click;
 /// the forward action has already gone out.
 struct PendingUndo: Identifiable, Sendable {
     let id = UUID()
     var kind: UndoKind
-    /// The message id for mail actions; the (now-deleted) rule id for ruleDelete.
+    /// The message id for mail actions; the (now-deleted) rule id for ruleDelete,
+    /// and the (now-deleted) group id for groupDelete.
     var messageId: Int
     var label: String
     var createdAt: Date = Date()
@@ -287,8 +295,53 @@ struct ComposeState: Sendable, Equatable {
     /// nothing at all).
     var forwardOfMessageId: Int?
     var to: String = ""
+    /// The other two recipient headers, comma-joined in the same wire-string
+    /// form as `to`. Edited through [`Recipients`], which is what enforces the
+    /// rule that matters: an address is in ONE of the three, so moving somebody
+    /// to Bcc takes them out of the header everyone can read rather than listing
+    /// them twice.
+    var cc: String = ""
+    var bcc: String = ""
+    /// The send group this composition is addressed to, once one has been
+    /// picked.
+    ///
+    /// For a `to`/`bcc` group this is ATTRIBUTION ONLY — the picker has already
+    /// expanded the membership into the fields above, and the daemon records
+    /// which group that was. For an `individual` group it is the whole audience:
+    /// `to` holds only the `#slug` token that keeps the pill alive across a draft
+    /// round-trip, and the daemon reads the membership itself.
+    var groupId: Int?
+    /// The picked group's mode and name, for what the composer has to SAY: the
+    /// pill's label, and the review pane's line about how many emails are about
+    /// to leave. Display state — the daemon re-reads both from `groupId`, so
+    /// nothing here can talk it into a different shape.
+    var groupMode: GroupMode?
+    var groupName: String?
     var subject: String = ""
     var body: String = ""
+    /// WHETHER THESE THREE FIELDS ARE THE ANSWER, or whether the daemon still
+    /// derives the audience from the parent.
+    ///
+    /// A new message and a forward are addressed by hand, so they state it from
+    /// the first keystroke. A REPLY does not: it opens knowing only which
+    /// message it answers, and the real set — the parent's Reply-To, the room a
+    /// reply-all widens to — is derived server-side. Sending `cc: ""` before
+    /// that preview lands would be the client asserting an empty copy list it
+    /// never had, and on a reply-all that silently narrows the mail to one
+    /// person.
+    ///
+    /// So it flips exactly once per composer, when the derived set is seeded
+    /// into the fields (see `InlineReply.loadRecipients`). Until then the wire
+    /// carries no `cc` at all and the daemon derives, exactly as it always has
+    /// — which is also the safe answer if the preview never lands.
+    var recipientsStated = false
+    /// WHAT THIS COMPOSER OPENED WITH — the daemon's derivation on a reply,
+    /// nothing at all everywhere else. Compared against by the autosave: a reply
+    /// whose three fields still say exactly what was derived has not been
+    /// addressed by anybody, and minting a draft for it would make every
+    /// abandoned `r` come back as restorable mail. A Bcc typed into it, or a
+    /// name moved out of the Cc, makes the two differ and the draft real.
+    var seededRecipients = Recipients()
     /// The server-side draft this composer is autosaving into, once one exists.
     /// Rides along to `send` so a successful send deletes the draft in the same
     /// transaction — otherwise the next `c` would restore mail already gone.
@@ -334,6 +387,29 @@ struct ComposeState: Sendable, Equatable {
     /// actually goes out is the original as Gmail holds it, pixels and all.
     /// Nothing else drifts — same message, same id, same files.
     var forwardedMessage: ClientMessage?
+
+    /// The three recipient headers as one editable value. The strings stay the
+    /// stored form — they are what goes on the wire, verbatim — and this is the
+    /// view of them that knows the list grammar.
+    var recipients: Recipients {
+        get { Recipients(to: to, cc: cc, bcc: bcc) }
+        set {
+            to = newValue.to
+            cc = newValue.cc
+            bcc = newValue.bcc
+        }
+    }
+
+    /// Write the three recipient fields AND record that they are now the
+    /// answer. Every recipient edit a composer offers goes through here: the
+    /// moment a person touches one of these fields they have stated who the
+    /// mail reaches, and the daemon's derivation stops applying. Setting
+    /// `recipients` directly is for SEEDING — filling the fields with what the
+    /// daemon already derived — which the seeder marks itself.
+    mutating func stateRecipients(_ next: Recipients) {
+        recipients = next
+        recipientsStated = true
+    }
 
     /// The one word both compose events use for what this draft IS —
     /// `compose_opened` and `compose_send` must not disagree about that.
@@ -391,6 +467,19 @@ struct RuleEditorRequest: Identifiable, Sendable {
     /// only caller — its rule is a demonstration, and a real write would both
     /// invent a rule nobody asked for and 403 on a read-only daemon.
     var intercept: (@MainActor @Sendable (CreateRuleBody) -> Void)?
+    /// Called after a successful save so the opener re-fetches its list.
+    var onSaved: (@MainActor @Sendable () -> Void)?
+}
+
+/// What the group editor was opened with. `group` nil is a create; present is an
+/// edit, and the editor opens on that group's own values.
+struct GroupEditorRequest: Identifiable, Sendable {
+    let id = UUID()
+    var group: SendGroup?
+    /// Seed a create with addresses the user already had in hand — the composer's
+    /// "save these people as a group" path. Ignored on an edit, which has its own
+    /// membership.
+    var seedMembers: [GroupMember] = []
     /// Called after a successful save so the opener re-fetches its list.
     var onSaved: (@MainActor @Sendable () -> Void)?
 }
@@ -538,17 +627,24 @@ final class AppStore {
         else { return nil }
         return summary
     }
-    /// Bumped when a sync brings a message NEWER than the one the reader holds
-    /// into the thread on screen — see SitrepPoller.performPull. The viewer
-    /// watches it and refetches without moving the reading position.
+    /// Bumped when a message NEWER than the one the reader holds lands in the
+    /// thread on screen — from the live event feed the instant triage emits it,
+    /// or from the 10s poll behind it. The viewer watches it and refetches
+    /// without moving the reading position. See `noteThreadArrival`.
     ///
-    /// A token rather than the mail itself: the poller reads the attention
-    /// bands, which say a thread moved but not what it now contains, and the
-    /// viewer is the one place that knows how to adopt a thread. It is also why
-    /// nothing resets it — a counter only has to CHANGE, so a thread switch
-    /// under a live token is a viewer that simply never hears about the bump it
-    /// no longer cares about.
+    /// A token rather than the mail itself: neither reporter carries the
+    /// thread's new contents (the feed has one denormalized row, the poller
+    /// reads the attention bands, which say a thread moved and not what it now
+    /// holds), and the viewer is the one place that knows how to adopt a
+    /// thread. It is also why nothing resets it — a counter only has to CHANGE,
+    /// so a thread switch under a live token is a viewer that simply never
+    /// hears about the bump it no longer cares about.
     var openThreadRefreshToken = 0
+    /// WHAT THE HUMAN HAS ALREADY BEEN TOLD about the thread they are reading.
+    /// Private because `noteThreadArrival` is the only door: the refetch and
+    /// the announcement have different rules, and ThreadArrivals is where the
+    /// difference lives.
+    private var arrivals = ThreadArrivals()
     var compose: ComposeState?
     /// The reader's inline reply composer. Deliberately NOT part of
     /// `modalOverlayOpen`: it is a bar inside the reading surface, not an overlay
@@ -562,6 +658,7 @@ final class AppStore {
     var triageFix: TriageFixTarget?
     var remindTarget: RemindTarget?
     var ruleEditor: RuleEditorRequest?
+    var groupEditor: GroupEditorRequest?
     var processModeOpen = false
     var askBarOpen = false
     /// The ⌘K agent's conversation, HELD HERE rather than in AskBar: the modal
@@ -640,6 +737,9 @@ final class AppStore {
                 settings = stored
                 connStatus = .connected
                 connError = nil
+                #if os(iOS)
+                    await PushRegistration.shared.registerAndSync()
+                #endif
                 // A link that arrived during boot (the app was LAUNCHED by one)
                 // races the keychain read and finds no Connect gate to land on.
                 // On the Mac it is not dropped for that: this install having an
@@ -757,6 +857,9 @@ final class AppStore {
             settings = fresh
             connStatus = .connected
             connError = nil
+            #if os(iOS)
+                await PushRegistration.shared.registerAndSync()
+            #endif
             Analytics.capture("connect_succeeded")
             // Fresh connection = fresh sync history; a stale lastRefresh from a
             // prior session must not make a failing daemon look recently synced.
@@ -796,6 +899,9 @@ final class AppStore {
             // — streams take their credentials at construction and keep them.
             AccountManager.shared.restartFeeds(account.id, with: fresh)
             settings = fresh
+            #if os(iOS)
+                await PushRegistration.shared.registerAndSync()
+            #endif
             return (true, nil)
         } catch {
             // Restore the prior working client — a fat-fingered token must not
@@ -892,6 +998,9 @@ final class AppStore {
         guard await performSwitch(to: record) else {
             return (false, "account added, but the keychain refused its credentials; pick it from the account switcher to retry")
         }
+        #if os(iOS)
+            await PushRegistration.shared.registerAndSync()
+        #endif
         return (true, nil)
     }
 
@@ -1124,6 +1233,9 @@ final class AppStore {
         // through `closeThread`/`closeCompose`: those flush drafts, and step
         // (4) already saved and settled everything there was to save.
         threadId = nil
+        // The ledger goes with it: what the other mailbox's reader had already
+        // been told about says nothing about this one's.
+        arrivals.reset(to: nil)
         threadQueue = []
         pendingReplyMessageId = nil
         compose = nil
@@ -1135,6 +1247,7 @@ final class AppStore {
         triageFix = nil
         remindTarget = nil
         ruleEditor = nil
+        groupEditor = nil
         // Every revert closure targets the old account's daemon.
         undos = []
         authRings = []
@@ -1318,6 +1431,9 @@ final class AppStore {
         // mounted and may never re-adopt.
         if self.threadId != threadId { openThreadSummary = nil }
         self.threadId = threadId
+        // The arrivals ledger follows the thread, and declines to forget on a
+        // REOPEN of the same one — see ThreadArrivals.reset.
+        arrivals.reset(to: threadId)
         self.threadQueue = queue
         // An ordinary open puts the reader straight in the window — opening an
         // email is a jump. Only done+next passes an edge, and it walks the
@@ -1340,6 +1456,7 @@ final class AppStore {
 
     func closeThread() {
         threadId = nil
+        arrivals.reset(to: nil)
         threadQueue = []
         // The flight is deliberately left where it is: the last email of a queue
         // is mid-departure when this runs, and there is nothing left to put back
@@ -1348,6 +1465,49 @@ final class AppStore {
         DraftSaver.shared.flush(.inlineReply, inlineReply)
         inlineReply = nil
         pendingReplyMessageId = nil
+    }
+
+    // MARK: - live arrivals
+
+    /// A frame off the live event feed, offered to the thread on screen.
+    ///
+    /// THE ACCOUNT IS AN ARGUMENT and never read from here. One event stream
+    /// runs per account — including the ones nobody is looking at, which is the
+    /// entire reason they are held — and thread ids and message ids alike are
+    /// one daemon's SQLite ints. A background mailbox whose ids happened to
+    /// collide with the live thread's would otherwise pull a stranger's mail
+    /// into the email on screen.
+    func noteLiveEvent(_ event: Event, accountId: UUID) {
+        guard AccountManager.shared.activeId == accountId else { return }
+        // A read receipt is not new mail: nothing joined the thread, and
+        // `sender` on one of those rows is the user's own address. The reader
+        // keeps its receipts fresh on its own schedule.
+        guard event.kind != .opened else { return }
+        noteThreadArrival(
+            thread: event.thread_id, message: event.message_id, sender: event.sender)
+    }
+
+    /// NEW MAIL IN THE THREAD SOMEBODY IS READING — the one door, and both
+    /// reporters come through it: the event feed the moment triage emits, and
+    /// the 10s poll that is the only one to see an arrival the feed missed or
+    /// never carried.
+    ///
+    /// Two things follow and they are decided separately (see ThreadArrivals).
+    /// The REFETCH is a token bump the viewer answers by adopting a fresh copy
+    /// in place — that is what puts the reply into the thread under the
+    /// reader's eyes, without taking the page away from them. The ANNOUNCEMENT
+    /// is the toast, and it is the only thing that says so out loud: the system
+    /// banner is deliberately suppressed while the app is frontmost with a
+    /// window up (see Notifier.presentation), which is precisely the case a
+    /// person reading the thread is in.
+    func noteThreadArrival(thread: String, message: Int, sender: String) {
+        let verdict = arrivals.admit(
+            thread: thread, message: message, held: currentThreadSummary?.newestMessageId)
+        guard verdict.refetch else { return }
+        openThreadRefreshToken &+= 1
+        guard verdict.announce else { return }
+        let name = SenderID.displayName(sender)
+        pushToast(name.isEmpty ? "new message in this thread" : "new message from \(name)")
     }
 
     /// True while a modal owns the screen; the surfaces under it blur so the modal
@@ -1363,7 +1523,9 @@ final class AppStore {
     var modalOverlayOpen: Bool {
         askBarOpen || shortcutsOpen || processModeOpen
             || triageFix != nil || remindTarget != nil || ruleEditor != nil
-            || !authQueue.isEmpty || tour.wantsBlur || whatsNew.active
+            || groupEditor != nil
+            || !authQueue.isEmpty || retriage != nil
+            || tour.wantsBlur || whatsNew.active
     }
 
     // MARK: - sitrep zones
@@ -1408,13 +1570,12 @@ final class AppStore {
         case shipments([Shipment]?)
         case banking([BankingRecord]?)
         case receipts([Receipt]?)
-        case rules(Int?)
         case newsletters([Newsletter])
     }
 
     private func performZoneRefresh() async {
         let e = epoch
-        // Six independent fetches racing in one group, each zone written the
+        // Five independent fetches racing in one group, each zone written the
         // moment ITS fetch answers — completion order, not a fixed await
         // order, which is what actually keeps one wedged endpoint riding out
         // its timeout from holding every later zone's paint hostage. Every
@@ -1429,7 +1590,6 @@ final class AppStore {
             }
             group.addTask { .banking(try? await APIClient.shared.getBanking()) }
             group.addTask { .receipts(try? await APIClient.shared.getReceipts()) }
-            group.addTask { .rules((try? await APIClient.shared.listRules())?.count) }
             group.addTask { .newsletters(await NewsletterFeed.load()) }
             for await answer in group {
                 guard e == epoch else {
@@ -1441,12 +1601,11 @@ final class AppStore {
                 case .shipments(let rows?): zones.shipments = rows
                 case .banking(let rows?): zones.banking = rows
                 case .receipts(let rows?): zones.receipts = rows
-                case .rules(let count?): zones.rulesCount = count
                 case .newsletters(let rows):
                     if !rows.isEmpty || zones.newsletters.isEmpty {
                         zones.newsletters = rows
                     }
-                case .calendar, .shipments, .banking, .receipts, .rules: break
+                case .calendar, .shipments, .banking, .receipts: break
                 }
             }
         }
@@ -1558,8 +1717,100 @@ final class AppStore {
     /// What a cleared shipment is CALLED in its toast: the card's own title rule
     /// (item name, else the carrier), kept short enough to sit in one.
     private static func shipmentLabel(_ s: Shipment) -> String {
-        let trimmed = s.item_name.trimmingCharacters(in: .whitespaces)
-        return trimmed.isEmpty ? s.carrier.label : trimmed
+        let name = s.displayItem
+        return name.isEmpty ? s.carrier.label : name
+    }
+
+    // MARK: - dev re-triage
+
+    /// A dev re-triage in flight. NON-NIL BLOCKS THE APP: the modal covers
+    /// everything and takes every click, because a re-triage rewrites tiers and
+    /// bands underneath whatever page you would otherwise be reading.
+    var retriage: RetriageRun?
+
+    /// How often the modal asks the daemon where it is. A re-triage takes
+    /// minutes and the poll is one indexed aggregate, so this is about how alive
+    /// the counter should FEEL, not about cost.
+    private static let retriagePollSeconds: UInt64 = 2
+
+    /// Kick a re-triage of the trailing `days` and watch it to the end.
+    ///
+    /// The kick's own `reset` seeds the total so the modal opens with a real
+    /// number instead of a zero that ticks up; the first poll then replaces it
+    /// with the SERVER's total, which is the authority (a second kick, or a
+    /// per-message re-triage from the fix palette, joins the same run).
+    func startRetriage(days: Int) async {
+        guard retriage == nil else { return }
+        let e = epoch
+        retriage = RetriageRun()
+        do {
+            let result = try await APIClient.shared.retriage(.days(days))
+            guard e == epoch else { return endRetriage() }
+            // Nothing to do is not a run: opening a blocking modal over zero
+            // rows would be a wall the user has to dismiss to learn nothing
+            // happened.
+            guard result.reset > 0 else {
+                retriage = nil
+                pushToast("nothing to re-triage in the last \(days)d", .info)
+                return
+            }
+            retriage?.total = result.reset
+        } catch {
+            retriage = nil
+            pushToast(errText(error, "re-triage failed"), .error)
+            return
+        }
+        await watchRetriage(epoch: e)
+    }
+
+    /// Poll until the queues drain, then let the board catch up. Ends by itself
+    /// on completion; `endRetriage` is the human's way out from the modal, and
+    /// the `retriage != nil` guards are what make that immediate — the server
+    /// keeps working either way, this only stops WATCHING.
+    ///
+    /// EVERY RESUME IS FENCED ON THE EPOCH, like every other write in this file.
+    /// An account switch mid-run points `APIClient` at a DIFFERENT daemon, and
+    /// without the fence this loop would go on polling — counting the new
+    /// mailbox's re-triage, or reading its empty `total` as this run finishing
+    /// and closing the modal on a success toast about mail it never touched.
+    private func watchRetriage(epoch e: Int) async {
+        while retriage != nil {
+            try? await Task.sleep(for: .seconds(Self.retriagePollSeconds))
+            guard retriage != nil, e == epoch else { return endRetriage() }
+            do {
+                let p = try await APIClient.shared.retriageProgress()
+                guard retriage != nil, e == epoch else { return endRetriage() }
+                retriage?.adopt(p)
+            } catch {
+                guard retriage != nil, e == epoch else { return endRetriage() }
+                // A daemon too old to answer cannot be waited on: say so and
+                // leave the modal standing on its "close" button rather than
+                // spinning against a route that will never exist.
+                if let api = error as? APIError, api.kind == .notFound {
+                    retriage?.unsupported = true
+                    return
+                }
+                retriage?.failure = errText(error, "lost the daemon")
+                return
+            }
+            if retriage?.finished == true { break }
+        }
+        guard retriage != nil, e == epoch else { return endRetriage() }
+        // The whole point of the wait: the tiers on screen are the OLD verdicts
+        // until this lands.
+        let count = retriage?.total ?? 0
+        retriage = nil
+        // The same join-then-pull a triage correction uses: a poll already in
+        // flight may have read the daemon mid-run, so its rows are not the ones
+        // to settle on.
+        await SitrepPoller.shared.refreshAfterCorrection()
+        pushToast("re-triaged \(count) email\(count == 1 ? "" : "s")", .success)
+    }
+
+    /// Stop watching. The daemon's queues are untouched — they drain on their
+    /// own — so this is only about giving the window back.
+    func endRetriage() {
+        retriage = nil
     }
 
     // MARK: - the flat mail pages
@@ -1914,6 +2165,20 @@ final class AppStore {
         // The signature, below where typing starts. Only into an empty body — a
         // caller arriving with content composed that content, not a signature.
         if next.body.isEmpty { next.body = Prefs.shared.signatureSeed }
+        // A composer with NO PARENT addresses itself: there is nothing for the
+        // daemon to derive an audience from, so its three fields are the whole
+        // answer from the first keystroke.
+        //
+        // A REPLY opened into this pane — the agent's hand-off — keeps deriving,
+        // UNLESS it arrived carrying a copy list. That case is the hand-off of a
+        // send the model addressed and the person read on the confirm card, and
+        // leaving it deriving would drop those addresses on the floor between
+        // the card and the composer.
+        if next.replyToMessageId == nil || !next.cc.isEmpty || !next.bcc.isEmpty {
+            next.recipientsStated = true
+        }
+        // Whatever it opened with is what "untouched" means for the autosave.
+        next.seededRecipients = next.recipients
         compose = next
         DraftSaver.shared.noteOpened(.compose)
         Analytics.capture("compose_opened", ["kind": next.analyticsKind])
@@ -2030,12 +2295,45 @@ final class AppStore {
         // this seeds would survive as the only visible trace.
         guard var next = compose, next.replyToMessageId == nil, next.forwardOfMessageId == nil,
             next.draftId == nil,
-            next.to.isEmpty, next.subject.isEmpty, Prefs.shared.isBodyUntouched(next.body)
+            next.to.isEmpty, next.cc.isEmpty, next.bcc.isEmpty, next.subject.isEmpty,
+            Prefs.shared.isBodyUntouched(next.body)
         else { return }
         next.to = draft.to
+        // Nil is a daemon too old to carry them, not an emptied field — leave
+        // the composer's own (empty) values rather than writing "" over them,
+        // which reads identically here but would not if the seeding rule ever
+        // changes.
+        next.cc = draft.cc ?? next.cc
+        next.bcc = draft.bcc ?? next.bcc
         next.subject = draft.subject
         next.body = draft.body
         next.draftId = draft.id
+        compose = next
+        await resolveDraftGroup()
+    }
+
+    /// Turn a restored draft's `#slug` token back into a group.
+    ///
+    /// The token is all the draft could keep — the drafts row has no group
+    /// column, and giving it one would put the audience in two places that can
+    /// disagree. So the composer re-resolves on restore, and a token that no
+    /// longer names anything (deleted, or renamed, which changes the slug) simply
+    /// does not resolve: the pill renders as a problem and the daemon refuses the
+    /// send. Both are correct. Guessing which audience someone meant is not a
+    /// thing to do with an irreversible action.
+    private func resolveDraftGroup() async {
+        let e = epoch
+        guard let slug = compose.map({ GroupToken.firstSlug(in: $0.to) }) ?? nil,
+            let group = await GroupToken.resolve(slug),
+            e == epoch,
+            var next = compose,
+            // Still the same composition: a restore that raced a keystroke must
+            // not stamp a group onto whatever is in the slot now.
+            GroupToken.firstSlug(in: next.to) == slug
+        else { return }
+        next.groupId = group.id
+        next.groupMode = group.mode
+        next.groupName = group.name
         compose = next
     }
 
@@ -2066,8 +2364,11 @@ final class AppStore {
     }
 
     /// Fill the just-opened inline composer from the draft keyed to this parent.
-    /// Body only: a reply carries nothing else — the daemon derives the recipient
-    /// and `Re: <subject>` from the parent.
+    ///
+    /// The BODY, plus any copy lists the draft holds. A reply still derives its
+    /// `to` and its `Re: <subject>` from the parent, but a Bcc never derives
+    /// from anything — so a saved one has to come back, or closing a reply to
+    /// think about it would silently un-blind-copy somebody.
     private func restoreReply(_ messageId: Int) async {
         let e = epoch
         guard let rows = try? await APIClient.shared.listDrafts(),
@@ -2081,6 +2382,15 @@ final class AppStore {
             Prefs.shared.isBodyUntouched(next.body)
         else { return }
         next.body = draft.body
+        // Only a draft that actually recorded a copy list gets to state one:
+        // restoring `""` over an unseeded composer would flip
+        // `recipientsStated` on a reply that has not learned its audience yet.
+        if let cc = draft.cc, let bcc = draft.bcc, !cc.isEmpty || !bcc.isEmpty {
+            next.cc = cc
+            next.bcc = bcc
+            next.to = draft.to.isEmpty ? next.to : draft.to
+            next.recipientsStated = true
+        }
         next.draftId = draft.id
         inlineReply = next
     }
@@ -2098,6 +2408,48 @@ final class AppStore {
     /// this. A self-host daemon never says `assistant_relay`, and nil means
     /// the switch is simply not offered (same posture as `trackingAvailable`).
     var relayAvailable: Bool { sitrep.stats?.assistant_relay == true }
+
+    // MARK: - gmail connection
+
+    /// Whether this mailbox's Gmail credential has stopped working.
+    ///
+    /// `== false` and not `!= true` on purpose, and it is the whole posture of
+    /// this flag: nil means the daemon did not say (too old, or a door wired
+    /// without a metrics registry), and a daemon that cannot see the credential
+    /// must not have its silence rendered as an alarm. A false alarm here sends
+    /// somebody through a Google consent screen for nothing.
+    var gmailDisconnected: Bool { sitrep.stats?.gmail?.connected == false }
+
+    /// A mailbox catch-up in flight, as `(done, total)`.
+    ///
+    /// Nil is the normal state. When it is not nil, triage is blocked upstream
+    /// and anything waiting on a verdict is waiting on this — which is the one
+    /// thing a stalled-looking progress bar needs to be able to say.
+    var catchUp: (done: Int, total: Int)? {
+        guard let c = sitrep.stats?.catch_up, c.total > 0 else { return nil }
+        return (c.done, c.total)
+    }
+
+    /// Where to re-consent, when the daemon offered a link.
+    ///
+    /// Hosted only. A self-host mailbox is repaired with `squelchd auth` at a
+    /// shell, so nil is the branch that shows the instruction instead of a
+    /// button, never an error.
+    var gmailReconnectURL: String? {
+        guard let raw = sitrep.stats?.gmail?.reconnect_url, Opener.isHTTP(raw) else { return nil }
+        return raw
+    }
+
+    /// How long the mailbox has been dark, for the banner's subtitle.
+    ///
+    /// `Fmt.date` and not a formatter of its own: the daemon emits fractional
+    /// seconds on some fields and not others, and a bare `ISO8601DateFormatter`
+    /// parses only one of those shapes — silently returning nil for the other,
+    /// which here would quietly drop "expired 3 hours ago" and leave the vaguer
+    /// sentence with nothing announcing the loss. `Fmt` tries both, memoizes,
+    /// and holds the lock these formatters need; this is read every render.
+    var gmailDisconnectedSince: Date? { Fmt.date(sitrep.stats?.gmail?.disconnected_since) }
+
 
     // MARK: - invite sharing
 
@@ -2166,6 +2518,9 @@ final class AppStore {
 
     func openRuleEditor(_ request: RuleEditorRequest) { ruleEditor = request }
     func closeRuleEditor() { ruleEditor = nil }
+
+    func openGroupEditor(_ request: GroupEditorRequest) { groupEditor = request }
+    func closeGroupEditor() { groupEditor = nil }
 
     // MARK: - undo
 

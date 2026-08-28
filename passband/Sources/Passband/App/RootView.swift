@@ -52,8 +52,16 @@ struct RootView: View {
         // SHARE PASSBAND, hung here for the same reason Add Account is: it is
         // raised from Settings and from the two-week nudge, and neither knows
         // which page is on screen.
+        // WHICH share screen depends on whether there is anything to hand out.
+        // `SharePanel` mints a real invite code, and a code is useless until
+        // Google's review clears (`ShareGate`), so until then the sheet is the
+        // waitlist pointer instead.
         .sheet(isPresented: $store.shareSheetOpen) {
-            SharePanel()
+            if ShareGate.invitesEnabled {
+                SharePanel()
+            } else {
+                ShareWaitlistPanel()
+            }
         }
         // THE TWO-WEEK ASK. Over the shell rather than inside a page, because
         // it is about the app and not about whatever surface it lands on. It
@@ -301,6 +309,7 @@ struct MainShell: View {
         case .auth: RoutedHost(view: .auth) { AuthView() }
         case .rules: RoutedHost(view: .rules) { RulesView() }
         case .audit: RoutedHost(view: .audit) { AuditView() }
+        case .groups: RoutedHost(view: .groups) { GroupsView() }
         case .usage: UsageView()
         case .settings: SettingsView()
         case .process: RoutedHost(view: .process) { ProcessView() }
@@ -312,6 +321,15 @@ struct MainShell: View {
     /// them working with a search/compose field focused, since a chord is not a
     /// typed character.
     private var globalBindings: [KeyBinding] {
+        // THE ONE MODAL THAT REALLY IS MODAL. Every other overlay COMPOSES with
+        // this set deliberately (see KeyDispatch's header: "1..5 view nav and ⌘K
+        // keep firing from inside a modal") — which is right for a palette you
+        // are meant to act from, and wrong for a re-triage: the board behind the
+        // scrim is mid-rewrite, so navigating to it, searching it, or undoing
+        // into it are all reads and writes against verdicts that are being
+        // replaced. Refusing the whole set HERE is the only place that covers
+        // every one of them at once.
+        guard store.retriage == nil else { return [] }
         var bindings: [KeyBinding] = MainView.mainViews.enumerated().map { index, view in
             KeyBinding("\(index + 1)", "go to \(view.rawValue)") { store.setView(view) }
         }

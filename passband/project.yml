@@ -52,7 +52,7 @@ targets:
         # keys to Info.plist, not here.
         INFOPLIST_FILE: Sources/Passband/Info.plist
         # Mirror of ./VERSION, which build.sh reads as the source of truth.
-        MARKETING_VERSION: "0.0.4"
+        MARKETING_VERSION: "0.0.5"
         CURRENT_PROJECT_VERSION: "1"
         COMBINE_HIDPI_IMAGES: YES
         ASSETCATALOG_COMPILER_APPICON_NAME: Passband
@@ -169,6 +169,8 @@ targets:
         # target above. CFBundleURLTypes (passband://) lives there, not here.
         INFOPLIST_FILE: Sources/PassbandiOS/Info.plist
         CODE_SIGN_ENTITLEMENTS: Sources/PassbandiOS/PassbandiOS.entitlements
+        APS_ENVIRONMENT: development
+        APS_ENVIRONMENT[config=Release]: production
         # The passband-ios-* tag overrides this in CI; it exists so an untagged local
         # build never claims a version ahead of what TestFlight actually has.
         MARKETING_VERSION: "0.0.2"
@@ -194,7 +196,58 @@ targets:
       - sdk: WebKit.framework
       - sdk: Security.framework
       - sdk: UserNotifications.framework
+      # Embeds the extension in the app bundle; without this the target builds
+      # and ships nowhere, and every push stays generic.
+      - target: PassbandiOSNotify
       # NO Sparkle: see the Updater.swift exclusion above.
+
+  # The notification service extension: a push arrives content-free (the relay
+  # is blind on purpose), and this process fetches what the mail says from the
+  # user's own daemon before the banner is shown.
+  #
+  # Its source list is HAND-PICKED rather than a folder: an extension is woken
+  # for every push and killed in seconds, so it links the credential store, the
+  # wire types and the banner mapping, and nothing that draws, stores or holds
+  # the BYOK key. Each file here is one the app compiles too — the point is
+  # that a pushed banner and a live one come out of the same code.
+  PassbandiOSNotify:
+    type: app-extension
+    platform: iOS
+    sources:
+      - path: Sources/PassbandiOSNotify
+      - path: Sources/Passband/Model/Keychain.swift
+      - path: Sources/Passband/Model/EventBanner.swift
+      - path: Sources/Passband/Model/WireTypes.swift
+      # WireTypes reaches for `String.withoutEmoji` when it normalizes a
+      # subject; the helper lives here.
+      - path: Sources/Passband/Model/SubjectText.swift
+      - path: Sources/Passband/Lib/SenderIdentity.swift
+      - path: Sources/Passband/Lib/Format.swift
+      - path: Sources/Passband/Lib/AsyncMemo.swift
+      - path: Sources/Passband/Lib/Sessions.swift
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: app.passband.client.ios.notify
+        INFOPLIST_FILE: Sources/PassbandiOSNotify/Info.plist
+        CODE_SIGN_ENTITLEMENTS: Sources/PassbandiOSNotify/PassbandiOSNotify.entitlements
+        # Version-locked to the app: iOS refuses to install a bundle whose
+        # embedded extension disagrees about either number.
+        MARKETING_VERSION: "0.0.2"
+        CURRENT_PROJECT_VERSION: "1"
+        TARGETED_DEVICE_FAMILY: "1"
+        # The same signing posture as the app target above, for the same
+        # reasons: ad-hoc on the simulator, the team's Apple Development
+        # certificate on a physical device.
+        CODE_SIGN_IDENTITY: "-"
+        CODE_SIGN_IDENTITY[config=Release]: "-"
+        ENABLE_HARDENED_RUNTIME: NO
+        ENABLE_HARDENED_RUNTIME[config=Release]: NO
+        DEVELOPMENT_TEAM: AAT39BQ9LV
+        CODE_SIGN_IDENTITY[sdk=iphoneos*]: "Apple Development"
+        CODE_SIGN_IDENTITY[config=Release][sdk=iphoneos*]: "Apple Development"
+    dependencies:
+      - sdk: Security.framework
+      - sdk: UserNotifications.framework
 
 schemes:
   Passband:

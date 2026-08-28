@@ -183,7 +183,7 @@ const TOK_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
 fn upsert_device_is_idempotent_and_refreshes_liveness() {
     let (store, acct) = store();
 
-    let first = store.upsert_device(acct, TOK_A, "ios").unwrap();
+    let first = store.upsert_device(acct, TOK_A, "ios", None).unwrap();
     assert_eq!(first.token, TOK_A);
     assert_eq!(first.platform, "ios");
     assert_eq!(first.account_id, acct);
@@ -191,14 +191,14 @@ fn upsert_device_is_idempotent_and_refreshes_liveness() {
     // Same token again: same row id, `created_at` preserved (first sight is a
     // fact), `last_registered_at` moved forward.
     std::thread::sleep(std::time::Duration::from_millis(5));
-    let again = store.upsert_device(acct, TOK_A, "ios").unwrap();
+    let again = store.upsert_device(acct, TOK_A, "ios", None).unwrap();
     assert_eq!(again.id, first.id, "a re-register must not fork a row");
     assert_eq!(again.created_at, first.created_at);
     assert!(again.last_registered_at >= first.last_registered_at);
     assert_eq!(store.list_devices(acct).unwrap().len(), 1);
 
     // A distinct token is a distinct device.
-    store.upsert_device(acct, TOK_B, "ios").unwrap();
+    store.upsert_device(acct, TOK_B, "ios", None).unwrap();
     let all = store.list_devices(acct).unwrap();
     assert_eq!(all.len(), 2);
     assert_eq!(all[0].id, first.id, "listed oldest-first");
@@ -212,11 +212,11 @@ fn a_cross_account_token_collision_is_refused_not_rebound() {
     let (store, acct) = store();
     let other = store.ensure_account("other@example.com").unwrap();
 
-    let a = store.upsert_device(acct, TOK_A, "ios").unwrap();
+    let a = store.upsert_device(acct, TOK_A, "ios", None).unwrap();
     assert!(store.list_devices(other).unwrap().is_empty());
 
     let err = store
-        .upsert_device(other, TOK_A, "macos")
+        .upsert_device(other, TOK_A, "macos", None)
         .expect_err("another account must not be able to adopt this token");
     assert!(
         matches!(err, CoreError::InvalidInput(ref m) if !m.contains(TOK_A)),
@@ -234,7 +234,7 @@ fn a_cross_account_token_collision_is_refused_not_rebound() {
     assert!(store.list_devices(other).unwrap().is_empty());
 
     // The owner can still re-register it, of course.
-    let refreshed = store.upsert_device(acct, TOK_A, "ios").unwrap();
+    let refreshed = store.upsert_device(acct, TOK_A, "ios", None).unwrap();
     assert_eq!(refreshed.id, a.id);
 }
 
@@ -244,8 +244,8 @@ fn a_cross_account_token_collision_is_refused_not_rebound() {
 fn delete_device_by_token_is_scoped_and_idempotent() {
     let (store, acct) = store();
     let other = store.ensure_account("other@example.com").unwrap();
-    store.upsert_device(acct, TOK_A, "ios").unwrap();
-    store.upsert_device(acct, TOK_B, "ios").unwrap();
+    store.upsert_device(acct, TOK_A, "ios", None).unwrap();
+    store.upsert_device(acct, TOK_B, "ios", None).unwrap();
 
     // Another account cannot delete this account's device.
     assert!(!store.delete_device_by_token(other, TOK_A).unwrap());

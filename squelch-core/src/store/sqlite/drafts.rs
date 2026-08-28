@@ -9,10 +9,12 @@ fn map_draft(r: &rusqlite::Row<'_>) -> rusqlite::Result<Draft> {
         account_id: r.get(1)?,
         reply_to_message_id: r.get(2)?,
         to_addr: r.get(3)?,
-        subject: r.get(4)?,
-        body: r.get(5)?,
-        created_at: dt(r, 6)?,
-        updated_at: dt(r, 7)?,
+        cc_addr: r.get(4)?,
+        bcc_addr: r.get(5)?,
+        subject: r.get(6)?,
+        body: r.get(7)?,
+        created_at: dt(r, 8)?,
+        updated_at: dt(r, 9)?,
     })
 }
 
@@ -24,9 +26,7 @@ impl SqliteStore {
         &self,
         account_id: AccountId,
         reply_to_message_id: Option<i64>,
-        to_addr: &str,
-        subject: &str,
-        body: &str,
+        fields: DraftFields<'_>,
         now: DateTime<Utc>,
     ) -> Result<Draft> {
         let conn = self.lock()?;
@@ -46,23 +46,34 @@ impl SqliteStore {
             // alone, only `updated_at` moves.
             Some(id) => {
                 conn.execute(
-                    "UPDATE drafts SET to_addr = ?2, subject = ?3, body = ?4, updated_at = ?5
+                    "UPDATE drafts SET to_addr = ?2, cc_addr = ?3, bcc_addr = ?4,
+                            subject = ?5, body = ?6, updated_at = ?7
                      WHERE id = ?1",
-                    params![id, to_addr, subject, body, now.to_rfc3339()],
+                    params![
+                        id,
+                        fields.to_addr,
+                        fields.cc_addr,
+                        fields.bcc_addr,
+                        fields.subject,
+                        fields.body,
+                        now.to_rfc3339()
+                    ],
                 )?;
                 id
             }
             None => {
                 conn.execute(
-                    "INSERT INTO drafts(account_id, reply_to_message_id, to_addr, subject, body,
-                         created_at, updated_at)
-                     VALUES(?1,?2,?3,?4,?5,?6,?6)",
+                    "INSERT INTO drafts(account_id, reply_to_message_id, to_addr, cc_addr,
+                         bcc_addr, subject, body, created_at, updated_at)
+                     VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?8)",
                     params![
                         account_id,
                         reply_to_message_id,
-                        to_addr,
-                        subject,
-                        body,
+                        fields.to_addr,
+                        fields.cc_addr,
+                        fields.bcc_addr,
+                        fields.subject,
+                        fields.body,
                         now.to_rfc3339(),
                     ],
                 )?;
@@ -70,8 +81,8 @@ impl SqliteStore {
             }
         };
         let draft = conn.query_row(
-            "SELECT id, account_id, reply_to_message_id, to_addr, subject, body,
-                    created_at, updated_at
+            "SELECT id, account_id, reply_to_message_id, to_addr, cc_addr, bcc_addr,
+                    subject, body, created_at, updated_at
              FROM drafts WHERE id = ?1",
             params![id],
             map_draft,
@@ -91,8 +102,8 @@ impl SqliteStore {
         // `triage.message_id`, so the subquery matches nothing and NOT EXISTS
         // holds: it is never filtered.
         let mut stmt = conn.prepare(
-            "SELECT id, account_id, reply_to_message_id, to_addr, subject, body,
-                    created_at, updated_at
+            "SELECT id, account_id, reply_to_message_id, to_addr, cc_addr, bcc_addr,
+                    subject, body, created_at, updated_at
              FROM drafts
              WHERE account_id = ?1
                AND NOT EXISTS (

@@ -88,6 +88,14 @@ struct ThreadViewer: View {
     /// issue competing `scrollTo`s at two targets, which is a column that
     /// judders rather than lands. See `settle`.
     @State private var settleTask: Task<Void, Never>?
+    /// HOW MUCH MAIL LANDED BELOW THE READER while they were reading, and it is
+    /// only ever non-zero for somebody who is NOT at the end of the thread:
+    /// `refreshInPlace` carries a reader who was parked on the newest onto the
+    /// message that just arrived, and there is nothing to point at when the
+    /// thing being pointed at is already in front of you. Everyone else keeps
+    /// their place, so the arrival is off screen below them and the pill is the
+    /// only thing that says it happened.
+    @State private var arrivals = 0
 
     enum ConfirmMode: Equatable { case ask, noLink }
 
@@ -609,6 +617,13 @@ struct ThreadViewer: View {
                     // hands off. It fires twice a gesture, not per tick.
                     .onScrollPhaseChange { _, phase in
                         handScrolling = phase != .idle
+                        // A WHEEL NEVER TOUCHES THE SELECTION, so somebody who
+                        // scrolled down to the arrival themselves would still be
+                        // looking at a pill telling them it is below. Asked of
+                        // the map, which is already tracking every card's frame,
+                        // and only when the hand comes off: mid-gesture the
+                        // answer changes every tick.
+                        if phase == .idle, parkedOnNewest { arrivals = 0 }
                     }
                 }
                 // A STEP animates, A JUMP DOES NOT. j/k moves to the neighbouring
@@ -618,6 +633,9 @@ struct ThreadViewer: View {
                 // instantiated is the one SwiftUI reliably declines to perform:
                 // it has nothing to animate from, so it does nothing at all.
                 .onChange(of: index) { was, now in
+                    // Reaching the end of the thread IS reading what arrived —
+                    // whether that took the pill, a press of `j`, or the rail.
+                    if now == newestIndex { arrivals = 0 }
                     if abs(now - was) == 1 {
                         withAnimation(Motion.scrollFollow) { proxy.scrollTo(now, anchor: .top) }
                     } else {
@@ -714,6 +732,13 @@ struct ThreadViewer: View {
                         on: target, proxy: proxy, tries: 24, every: .milliseconds(40), hold: 3,
                         under: index)
                 }
+                // NEW MAIL IS BELOW YOU, and this is the only thing in the
+                // window that says so: the arrival was folded into the stack
+                // without moving the reader, which is the right call and also a
+                // silent one. Bottom-centre, over the mail rather than beside
+                // it, because it is about the thread and not about any one
+                // message in it.
+                .overlay(alignment: .bottom) { arrivalPill }
                 // The style radio rides the mail's own top-right corner rather
                 // than the header row: it is a verdict about the mail below it,
                 // and the header is already a sentence of verbs.
@@ -724,6 +749,47 @@ struct ThreadViewer: View {
                 }
             }
         }
+    }
+
+    /// "2 new messages" with an arrow, over the foot of the column, for a
+    /// reader who is somewhere up in the history while the conversation carries
+    /// on below them. A press takes them to the end of it.
+    ///
+    /// It says the COUNT and not the sender, which the toast that fired at the
+    /// same moment already named: by the time somebody looks up from a
+    /// paragraph, the number of emails between them and the end is the thing
+    /// they cannot get any other way.
+    ///
+    /// Absent at zero rather than hidden — this is a floating target over a
+    /// scroll surface, and one that is merely transparent would go on eating
+    /// the wheel where it sits for the whole time nothing has arrived.
+    private var arrivalPill: some View {
+        ZStack {
+            if arrivals > 0 {
+                Button { index = newestIndex } label: {
+                    HStack(spacing: 6) {
+                        Image(systemName: "arrow.down")
+                            .font(.system(size: 10, weight: .bold))
+                        Text("\(arrivals) new message\(arrivals == 1 ? "" : "s")")
+                            .font(Typo.chip)
+                    }
+                    .foregroundStyle(Palette.accentInk)
+                    .padding(.horizontal, 13)
+                    .padding(.vertical, 7)
+                    .contentShape(Capsule())
+                }
+                .buttonStyle(.plain)
+                .glassCapsule(tint: Palette.accent.opacity(0.4))
+                .transition(.move(edge: .bottom).combined(with: .opacity))
+                .accessibilityLabel("jump to the newest message")
+            }
+        }
+        .padding(.bottom, 14)
+        // SCOPED TO THE PILL, and it has to be: `arrivals` changes in the same
+        // update that adopts the freshly fetched thread, so the same animation
+        // hung on the column would take a whole relayout of the mail with it —
+        // every card and every web frame, sliding, while somebody reads.
+        .animation(Motion.disclose, value: arrivals)
     }
 
     /// EMPTY ROOM UNDER THE LAST MESSAGE, and it is the whole reason the newest
@@ -1107,11 +1173,25 @@ struct ThreadViewer: View {
                 guard let m = messages[safe: index] else { return }
                 store.openSearch(seed: "from:\(m.from_addr)")
             },
-            KeyBinding("e", "done + next") { Task { await doneAndNext() } },
-            KeyBinding("d", "done + next") { Task { await doneAndNext() } },
+            // THE PAIR: `e`/`d` finish this email and leave, `E`/`D` finish it
+            // and open the next one in the queue. One letter, one verb, on every
+            // surface — the shifted twin is the SAME verb with the walk attached,
+            // not a different one, which is why it is a case away rather than a
+            // key away.
+            //
+            // Plain done CLOSES even when there is a queue behind it. Finishing
+            // an email is not a commitment to read the next one, and a reader
+            // that hauls in more mail on the key you press to be rid of the mail
+            // in front of you is the app arguing with you.
+            KeyBinding("e", "done") { Task { await doneAndClose() } },
+            KeyBinding("d", "done") { Task { await doneAndClose() } },
+            KeyBinding("E", "done + next") { Task { await doneAndNext() } },
+            KeyBinding("D", "done + next") { Task { await doneAndNext() } },
             // Plain `h`, the same key as every other surface — it took "prev
-            // email"'s key (see the queue block above), because a verb cannot
-            // be the app's one shifted letter.
+            // email"'s key (see the queue block above) rather than moving to
+            // `H`, which would have made remind a verb you can ONLY reach
+            // shifted. `E`/`D` above are a different thing: the shift is an
+            // extra clause on a key that still means the same verb unshifted.
             KeyBinding("h", "remind + next") {
                 guard let thread, let m = remindable else { return }
                 store.openRemind(
@@ -1311,12 +1391,31 @@ struct ThreadViewer: View {
         // Anchor AFTER the await: a reader who moved while the fetch was in
         // flight is anchored where they are now, not where they were.
         let anchor = anchorId
+        let before = messages.count
         // Same overwrite as the post-send reload: the cached copy predates the
         // arrival, and reopening this thread must not serve it back.
         ThreadPrefetch.shared.note(threadId, view)
         adopt(view)
-        if let anchor, let found = messages.firstIndex(where: { $0.id == anchor }) {
-            index = found
+        let gained = max(0, messages.count - before)
+        // THE READER WHO STAYED WHERE THEY WERE has the arrival below them and
+        // out of the window, and the pill is the only thing that says so. It
+        // COUNTS rather than flags: a second reply landing while it is already
+        // up has to say two.
+        //
+        // Everyone else — parked on the newest, or anchored to a message this
+        // fetch no longer carries — is left where `adopt` put them, looking
+        // straight at the new mail, and a pill pointing at what somebody is
+        // already reading is noise.
+        let held = anchor.flatMap { id in messages.firstIndex { $0.id == id } }
+        if let held {
+            index = held
+            arrivals += gained
+        }
+        // Only when something actually arrived: a token bump whose refetch
+        // brought nothing (the daemon had not stored the message yet) is not a
+        // reading experience anybody had.
+        if gained > 0 {
+            Analytics.capture("thread_live_arrival", ["followed": held == nil])
         }
         await refreshOpens()
     }
@@ -1354,9 +1453,53 @@ struct ThreadViewer: View {
         store.openThread(next.thread_id, queue: queue)
     }
 
-    /// e/d — "done + next": mark the current thread's update done (keeping its
+    /// e/d — "done": resolve the email in front of you and leave, whatever is
+    /// or is not queued behind it. The same departure animation as done + next,
+    /// because it is the same verb — the walk is the only difference.
+    private func doneAndClose() async {
+        let liftedAt = liftOff()
+        await resolveOpenThread()
+        await flightOut(since: liftedAt)
+        // Same outlived-its-reader guard as the walk: if this finished after the
+        // reader moved to another thread, closing would close THAT one.
+        guard store.threadId == threadId else { return }
+        store.closeThread()
+    }
+
+    /// The resolve both verbs share, undo-first through `Actions.done` whenever
+    /// there is a row to hand it — the queue's own entry, which is the update
+    /// the surface underneath is still showing.
+    ///
+    /// A reader with no queue behind it (search, a right-rail record, a push
+    /// notification) has no row, so it resolves the newest message directly.
+    /// There is no undo chip on that path: undo restores a row to a band, and
+    /// this one never came from one.
+    private func resolveOpenThread() async {
+        if let row = store.threadQueue.first(where: { $0.thread_id == threadId }) {
+            await Actions.done(row)
+            return
+        }
+        guard let newest else { return }
+        do {
+            try await APIClient.shared.setStatus(newest.id, .done)
+            // Same unpin as Actions.done — this path resolves the message
+            // without going through it.
+            await ImageStore.shared.release(messageId: newest.id)
+            FrameHeights.shared.clear(messageId: newest.id)
+            // And the same optimistic drop: the surface underneath is still
+            // mounted, so without this the reader closes back onto a row for
+            // mail that is already done.
+            store.noteResolved(newest.id)
+            store.pushToast("done", .info)
+        } catch {
+            store.pushToast(errText(error, "done failed"), .error)
+        }
+    }
+
+    /// E/D — "done + next": mark the current thread's update done (keeping its
     /// 5s undo), then advance to the NEXT queued update in place; if none
-    /// remain, close the viewer.
+    /// remain — or if this reader never had a queue behind it — close the
+    /// viewer, which is exactly what plain `e` does.
     ///
     /// AND IT IS A MOTION, not a swap. The email you finished flies up and out,
     /// and then the next one comes in from below — the difference between "that
@@ -1373,35 +1516,28 @@ struct ThreadViewer: View {
     /// 220ms is ever waited on.
     private func doneAndNext() async {
         let queue = store.threadQueue
-        guard let cur = queue.firstIndex(where: { $0.thread_id == threadId }) else {
-            // Not opened from a queue (search, a right-rail record): `e` still
-            // means done — resolve the newest message directly and close. It
-            // still leaves the same way; there is simply nothing behind it.
-            let liftedAt = liftOff()
-            if let newest {
-                do {
-                    try await APIClient.shared.setStatus(newest.id, .done)
-                    // Same unpin as Actions.done — this path resolves the
-                    // message without going through it.
-                    await ImageStore.shared.release(messageId: newest.id)
-                    FrameHeights.shared.clear(messageId: newest.id)
-                    // And the same optimistic drop: the surface underneath is
-                    // still mounted, so without this the reader closes back
-                    // onto a row for mail that is already done.
-                    store.noteResolved(newest.id)
-                    store.pushToast("done", .info)
-                } catch {
-                    store.pushToast(errText(error, "done failed"), .error)
-                }
+        let cur = queue.firstIndex(where: { $0.thread_id == threadId })
+        // THE NEXT DIFFERENT EMAIL, not merely the next row. Every band listing
+        // is one row per THREAD — the store partitions them that way, and
+        // resolving one resolves the whole thread — so on those queues this
+        // reads exactly like `cur + 1`. The REMINDER SCHEDULE is the exception
+        // the store spells out: it lists one row per REMINDER, so two siblings
+        // of one thread can both be on it, and stepping onto the second would
+        // re-open the email just finished. `cur` would then find that same row
+        // again, and the walk would never move for as long as the key is held.
+        //
+        // Already-resolved rows are skipped for the same reason: a queue is a
+        // snapshot taken when the reader opened, and mail dealt with since (the
+        // sibling the store just resolved, a row done from a list underneath) is
+        // not something to walk a reader onto.
+        let next = cur.flatMap { c in
+            queue[(c + 1)...].first {
+                $0.thread_id != threadId && !store.resolvedIds.contains($0.id)
             }
-            await flightOut(since: liftedAt)
-            store.closeThread()
-            return
         }
 
-        let next = queue[safe: cur + 1]
         let liftedAt = liftOff()
-        await Actions.done(queue[cur])
+        await resolveOpenThread()
         await flightOut(since: liftedAt)
 
         // The reader can be closed while the email is still leaving — Esc, or
@@ -1409,9 +1545,10 @@ struct ThreadViewer: View {
         // reader must not haul the next thread back onto a page nobody is on.
         guard store.threadId == threadId else { return }
 
-        guard let next else {
-            // Nothing behind it: the queue is finished, and the reader leaves
-            // with the email rather than snapping back to show an empty one.
+        guard let cur, let next else {
+            // Nothing behind it — an empty queue, or the end of one: the reader
+            // leaves with the email rather than snapping back to show an empty
+            // one.
             store.closeThread()
             return
         }
@@ -1482,6 +1619,10 @@ struct ThreadViewer: View {
         map.forget()
         newestHeight = 0
         landed = false
+        // Another thread's arrivals are not this one's, and a REOPEN of the
+        // same thread re-fetches from the top — either way the pill is
+        // pointing at nothing by the time this runs.
+        arrivals = 0
         // Fresh prefetch hit → render it and skip the round-trip entirely (the
         // cache is at most 60s old; e/d/refresh paths repopulate it).
         if let cached = ThreadPrefetch.shared.cached(threadId) {

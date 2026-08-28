@@ -270,6 +270,73 @@ async fn spawn_warden(rec: Shared) -> String {
             ),
         )
         .route(
+            "/v1/tenants/{label}/credentials/replace",
+            put(
+                |AxumState(rec): AxumState<Shared>,
+                 axum::extract::Path(label): axum::extract::Path<String>,
+                 headers: HeaderMap,
+                 body: String| async move {
+                    let parsed: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
+                    let mut r = rec.lock().unwrap();
+                    r.warden_bearers.push(bearer_of(&headers));
+                    let account_email = str_field(&parsed, "account_email");
+                    // UNLIKE the signup route, a PROVISIONED tenant is the whole
+                    // point. What is refused is a mailbox that does not own it.
+                    let owned = matches!(
+                        r.tenants.get(&label),
+                        Some(t) if t.account_email == account_email
+                    );
+                    if !r.tenants.contains_key(&label) {
+                        return json_status(StatusCode::NOT_FOUND, "unknown");
+                    }
+                    if !owned {
+                        return json_status(StatusCode::CONFLICT, "not_owner");
+                    }
+                    // THE STATUS GUARD the real warden carries: a PENDING
+                    // tenant is a signup stopped between its two calls, and
+                    // installing here would finish it with no invite spent.
+                    if !r.tenants[&label].provisioned {
+                        return json_status(StatusCode::CONFLICT, "not_serving");
+                    }
+                    r.credential_puts.push((label.clone(), parsed));
+                    (
+                        StatusCode::OK,
+                        Json(json!({
+                            "pair_code": "ABCD-EFGH",
+                            "pair_url": format!("https://{label}.passband.test"),
+                            "deep_link": "passband://pair?url=x&code=ABCD-EFGH",
+                        })),
+                    )
+                        .into_response()
+                },
+            ),
+        )
+        .route(
+            "/v1/tenants/{label}/recipient",
+            post(
+                |AxumState(rec): AxumState<Shared>,
+                 axum::extract::Path(label): axum::extract::Path<String>,
+                 headers: HeaderMap,
+                 body: String| async move {
+                    let parsed: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
+                    let mut r = rec.lock().unwrap();
+                    r.warden_bearers.push(bearer_of(&headers));
+                    let account_email = str_field(&parsed, "account_email");
+                    // UNLIKE create: a PROVISIONED tenant is exactly what this
+                    // route is for, so being serving is not a conflict. What is
+                    // a conflict is a different mailbox.
+                    match r.tenants.get(&label) {
+                        None => json_status(StatusCode::NOT_FOUND, "not_found"),
+                        Some(t) if t.account_email != account_email => {
+                            json_status(StatusCode::CONFLICT, "exists")
+                        }
+                        Some(t) => (StatusCode::OK, Json(json!({ "recipient": t.recipient })))
+                            .into_response(),
+                    }
+                },
+            ),
+        )
+        .route(
             "/v1/tenants/{label}/credentials",
             put(
                 |AxumState(rec): AxumState<Shared>,
@@ -770,6 +837,33 @@ impl Harness {
         let body = String::from_utf8_lossy(&to_bytes(resp.into_body(), 1 << 20).await.unwrap())
             .to_string();
         (status, headers, body)
+    }
+
+    /// Start a reconnect and return `(consent url, cookie value)`. Takes no
+    /// input, exactly like the route: the mailbox comes from Google.
+    async fn start_reconnect(&self) -> (String, String) {
+        let (status, headers, _) = self.get("/reconnect", None).await;
+        assert_eq!(status, StatusCode::FOUND, "reconnect should redirect");
+        let location = headers[header::LOCATION].to_str().unwrap().to_string();
+        let cookie = headers[header::SET_COOKIE].to_str().unwrap().to_string();
+        let cookie = cookie.split(';').next().unwrap().to_string();
+        (location, cookie)
+    }
+
+    /// Walk a whole reconnect: the hop out, then Google's redirect back.
+    async fn run_reconnect(&self) -> (StatusCode, String) {
+        let (consent, cookie) = self.start_reconnect().await;
+        self.rec.lock().unwrap().expected_challenge = Some(query_param(&consent, "code_challenge"));
+        let (status, _, body) = self
+            .get(
+                &format!(
+                    "/oauth/callback?code=test-code&state={}",
+                    state_param(&consent)
+                ),
+                Some(&cookie),
+            )
+            .await;
+        (status, body)
     }
 
     /// Post the signup form and return `(consent url, cookie value)`.
@@ -1989,4 +2083,166 @@ async fn the_activation_poller_stamps_once_and_quiesces() {
     let after_third = read().await;
     assert_eq!(after_third[0].1.as_deref(), Some(ada_stamp.as_str()));
     assert!(after_third[1].1.is_some());
+}
+
+// --- reconnect ---------------------------------------------------------------
+//
+// A refresh token can stop working while everything else is healthy: revoked by
+// the user, or expired because the consent screen is still in Testing, where
+// Google gives them seven days. The daemon cannot ask for a new one, so before
+// `/reconnect` the only repair was an operator with a shell on the cluster.
+
+/// THE HAPPY PATH: a second grant for a mailbox that already has a tenant
+/// installs a fresh sealed credential over the dead one, and provisions nothing.
+///
+/// It goes through the REPLACE route, not signup's: that one answers 409 for an
+/// active tenant, which is every tenant worth reconnecting.
+#[tokio::test]
+async fn a_reconnect_installs_a_fresh_credential_over_the_dead_one() {
+    let h = Harness::new().await;
+    h.complete_signup("ada").await;
+
+    let installs_after_signup = h.rec.lock().unwrap().credential_puts.len();
+    let tenants_after_signup = h.rec.lock().unwrap().tenants.len();
+    let invite_before = h.invite_row().await;
+
+    let (status, body) = h.run_reconnect().await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    {
+        let r = h.rec.lock().unwrap();
+        assert_eq!(
+            r.credential_puts.len(),
+            installs_after_signup + 1,
+            "the reconnect must install a credential"
+        );
+        let (label, put) = r.credential_puts.last().unwrap();
+        assert_eq!(label, "ada");
+        // A REAL SEALED BLOB, not an echo of anything: age armor, openable by
+        // the identity the warden minted for this tenant and nobody else.
+        let ciphertext = str_field(put, "cred_read_ciphertext");
+        assert!(
+            ciphertext.starts_with("-----BEGIN AGE ENCRYPTED FILE-----"),
+            "expected age armor, got {ciphertext:.40}"
+        );
+        // NOTHING WAS PROVISIONED: no second tenant.
+        assert_eq!(r.tenants.len(), tenants_after_signup);
+    }
+    // And no invite spent: the mailbox was paid for once, and re-consenting
+    // must not cost another. Read after the guard is gone, never across it.
+    assert_eq!(
+        h.invite_row().await,
+        invite_before,
+        "no invite may be spent"
+    );
+}
+
+/// A real Google account with no mailbox here is told so, and NOTHING is
+/// installed. This is the check that stops `/reconnect` becoming a way to
+/// provision without an invite.
+#[tokio::test]
+async fn a_reconnect_for_a_mailbox_with_no_tenant_installs_nothing() {
+    let h = Harness::new().await;
+
+    let (status, _) = h.run_reconnect().await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    let r = h.rec.lock().unwrap();
+    assert!(
+        r.credential_puts.is_empty(),
+        "a mailbox with no tenant must install nothing"
+    );
+    assert!(r.tenants.is_empty(), "and must provision nothing");
+}
+
+/// THE PARAMETER THE WHOLE FEATURE RESTS ON. Without `prompt=consent` Google
+/// recognises a returning user and can answer with an access token and no
+/// refresh token, which is precisely what this flow exists to replace — and it
+/// would fail silently, an hour later, looking exactly like the original bug.
+#[tokio::test]
+async fn a_reconnect_asks_google_for_a_replacement_refresh_token() {
+    let h = Harness::new().await;
+    let (consent, _) = h.start_reconnect().await;
+
+    assert_eq!(query_param(&consent, "access_type"), "offline");
+    assert_eq!(query_param(&consent, "prompt"), "consent");
+    // And the full Gmail set: a replacement that covered less than the original
+    // would leave the mailbox half readable.
+    let scope = query_param(&consent, "scope");
+    for want in ["gmail.readonly", "gmail.modify", "gmail.send"] {
+        assert!(scope.contains(want), "scope {scope} is missing {want}");
+    }
+}
+
+/// THE CUSTODY CHECK, from the cluster's side. If the store and the warden ever
+/// disagree about who owns a mailbox, the credential does NOT get installed.
+///
+/// The store's mapping is not the only thing standing between a Google account
+/// and somebody else's mailbox: the warden matches the same address against the
+/// tenant's own identity Secret and refuses on its own. This drives that second
+/// check by making the two records disagree, which is the shape a compromised
+/// or buggy control plane would have.
+#[tokio::test]
+async fn a_reconnect_is_refused_when_the_cluster_disagrees_about_the_owner() {
+    let h = Harness::new().await;
+    h.complete_signup("ada").await;
+    let installs_after_signup = h.rec.lock().unwrap().credential_puts.len();
+
+    // The cluster now believes a different mailbox owns `ada`, while the
+    // control store still maps this Google account to it.
+    h.rec
+        .lock()
+        .unwrap()
+        .tenants
+        .get_mut("ada")
+        .unwrap()
+        .account_email = "someone-else@example.com".to_string();
+
+    let (status, _) = h.run_reconnect().await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_GATEWAY,
+        "a custody disagreement must not read as a user error"
+    );
+
+    let r = h.rec.lock().unwrap();
+    assert_eq!(
+        r.credential_puts.len(),
+        installs_after_signup,
+        "no credential may be installed when the two records disagree"
+    );
+}
+
+/// A PENDING tenant may not be finished through the reconnect link.
+///
+/// Signup is two warden calls, and a tenant that stopped between them exists
+/// with an identity and no workload. Installing a credential into that is
+/// completing a signup: a provisioned mailbox with no invite spent, reached
+/// through a public link. The control store's `active_tenant_for_email` already
+/// refuses to name a non-active tenant, so this drives the case where the store
+/// says yes anyway, which is what the warden's own status guard is for.
+#[tokio::test]
+async fn a_reconnect_cannot_finish_a_half_done_signup() {
+    let h = Harness::new().await;
+    h.complete_signup("ada").await;
+
+    // Put the cluster back into the shape a stopped-mid-signup tenant has:
+    // identity present, nothing serving.
+    h.rec
+        .lock()
+        .unwrap()
+        .tenants
+        .get_mut("ada")
+        .unwrap()
+        .provisioned = false;
+    let installs_before = h.rec.lock().unwrap().credential_puts.len();
+
+    let (status, _) = h.run_reconnect().await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+
+    assert_eq!(
+        h.rec.lock().unwrap().credential_puts.len(),
+        installs_before,
+        "a pending tenant must not be provisioned through reconnect"
+    );
 }

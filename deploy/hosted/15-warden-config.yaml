@@ -7,8 +7,8 @@
 # and one ConfigMap behind two `envFrom`s is how they agree by construction
 # rather than by an operator remembering to diff two files.
 #
-# Two env blocks that disagree take turns rewriting the same tenant every
-# quarter hour, each half behaving correctly and neither one visibly wrong: the
+# Two env blocks that disagree take turns rewriting the same tenant every five
+# minutes, each half behaving correctly and neither one visibly wrong: the
 # roller applies its render, the next signup or `llm mint` writes the other
 # back, pods restart forever, and both drift reports say the fleet is behind.
 #
@@ -31,8 +31,8 @@
 #    starts. The roller picks up a change on its next tick because every run is a
 #    fresh pod; the serving pod does not, and goes on rendering the old values
 #    into new signups until `kubectl -n warden rollout restart
-#    deploy/squelch-warden`. Do both in the same minute: 15 minutes is the whole
-#    window in which the two disagree.
+#    deploy/squelch-warden`. Do both in the same minute: five minutes is the
+#    whole window in which the two disagree.
 # 3. **Quote every value.** `data` is `map[string]string`, and YAML reads a bare
 #    `on` as a boolean, at which point kubectl refuses the whole file with
 #    `cannot unmarshal bool into Go value of type string`. Loud, and only
@@ -85,7 +85,7 @@ data:
   # silently upgrade every tenant's daemon on any pod restart. The warden
   # refuses to start without one. Changing this value and applying is what a
   # daemon rollout IS; the roller does the rest.
-  SQUELCH_WARDEN_IMAGE: "ghcr.io/braelyn-ai/squelchd:daemon-0.0.3"
+  SQUELCH_WARDEN_IMAGE: "ghcr.io/braelyn-ai/squelchd:daemon-0.0.4"
   # Everything below is a default, restated so this file is the one place an
   # operator has to look. See squelch-warden/README.md.
   SQUELCH_WARDEN_TENANT_NAMESPACE: "tenants"
@@ -163,9 +163,28 @@ data:
   SQUELCH_WARDEN_CONSOLE_SSO_URL: "https://signup.passband.app"
   # Per-tenant-container bounds. The number of tenants a box carries is these
   # divided into it; size them with 70-tenant-limits.yaml, not separately.
+  #
+  # The memory request is a promise about a daemon's resting size and the
+  # scheduler believes it, so it has to be true. It said 256Mi while a daemon
+  # that has embedded anything rests at roughly 300-500 MB (the ONNX session
+  # stays resident), and on 2026-08-19 the node ran out of memory with FOUR
+  # tenants on it; the kernel took two of them, because a burstable tenant pod
+  # is what it picks. 384Mi is about the p50 of what they measure at, not a
+  # comfortable number. With it, the tenant that will not fit is refused at
+  # signup instead of a running mailbox being killed for it, and on this box
+  # the thing doing the refusing is the quota in 70-tenant-limits.yaml, which
+  # is sized to five tenants at this request. Change one and redo the other.
+  #
+  # Revisit once the daemon unloads its embedder when idle; the constant in
+  # squelch-warden/src/config.rs carries the measurements.
+  #
+  # These land on the tenant DEPLOYMENT, which is the one object a drift report
+  # renders, so unlike the ingress and storage knobs above a change here does
+  # reach existing tenants: the roller converges them one per tick, each as an
+  # ordinary pod restart, once rule 2 has been followed.
   SQUELCH_WARDEN_CPU_REQUEST: "100m"
   SQUELCH_WARDEN_CPU_LIMIT: "1000m"
-  SQUELCH_WARDEN_MEMORY_REQUEST: "256Mi"
+  SQUELCH_WARDEN_MEMORY_REQUEST: "384Mi"
   SQUELCH_WARDEN_MEMORY_LIMIT: "1Gi"
   SQUELCH_WARDEN_EPHEMERAL_REQUEST: "256Mi"
   SQUELCH_WARDEN_EPHEMERAL_LIMIT: "1Gi"
@@ -205,8 +224,50 @@ data:
   # WHOLE fleet, confirm it, and only then flip this and roll again. See
   # PRODUCTION.md, "Turning on the HTTP readiness probe".
   SQUELCH_WARDEN_HTTP_READINESS: "off"
-  # Uncomment once the shared weights volume exists (SETUP.md step 10).
+  # The shared, pre-seeded embedding-weights volume (`60-models.yaml`, SETUP.md
+  # step 10). Every tenant's INIT container mounts it read-only and copies any
+  # model directory the tenant does not already have onto the tenant's own
+  # volume; the daemon never sees the mount.
+  #
+  # UNCOMMENT IT AFTER SETUP.md STEP 10 HAS CREATED AND SEEDED THE PVC, and not
+  # before. Nothing here checks: the warden renders this name straight into
+  # every tenant's pod spec, and a name that resolves to no claim leaves each
+  # NEW tenant pod Pending on a volume that will never bind. `kubectl -n tenants
+  # describe pod` says `persistentvolumeclaim "squelch-models" not found`, the
+  # signup that made it gets `500 not_ready`, and the next roll reads that
+  # tenant as a casualty and halts the fleet. The rollback is this line
+  # commented out again and a warden restart.
+  #
+  # That is also why it ships commented. This file goes on in step 8, the first
+  # tenant in step 9, and the volume in step 10, and on a greenfield box the
+  # thing step 10 seeds FROM is the tenant step 9 produced.
+  #
+  # What it costs to leave commented, measured on this box in August 2026: every
+  # new tenant pulled ~126 MB of fp32 ONNX weights from Hugging Face on first
+  # boot (the tenant NetworkPolicy allows 443 egress for exactly this), slowly
+  # enough that the 30-day initial mail backfill outran the embedder and
+  # thousands of rows landed with no vectors. It is also the prerequisite for
+  # SQUELCH_WARDEN_HTTP_READINESS above, which puts that download inside every
+  # readiness wait the warden makes.
+  #
+  # This lands on the tenant's pod spec, so it IS drift the roller can see and
+  # every existing tenant takes one pod restart for it. The roller converges one
+  # tenant per run, so the fleet catches up at the CronJob's schedule times the
+  # number of tenants: four tenants on the */5 schedule is about twenty minutes.
   # SQUELCH_WARDEN_MODEL_PVC: "squelch-models"
+  # How long a tenant daemon holds its idle ONNX embedding session before
+  # dropping it and handing the heap back. Unset, the daemon's own default (600)
+  # applies; this is the OFF SWITCH (0 = never unload) if the reaper misbehaves.
+  # SQUELCH_WARDEN_EMBED_IDLE_UNLOAD_SECS: "0"
+  # Moves the whole fleet's embedding model without cutting a new daemon image;
+  # unset means the daemon's own pin, which is Xenova/bge-small-en-v1.5.
+  #
+  # SEED THE MODEL PVC WITH THE NEW WEIGHTS FIRST. Naming a model
+  # SQUELCH_WARDEN_MODEL_PVC does not hold puts a cold download in front of
+  # every tenant that restarts for the change, which is the same failure the
+  # warden warns about for HTTP readiness with no PVC at all, and the roller
+  # takes those pods one at a time.
+  # SQUELCH_WARDEN_EMBED_MODEL: "Xenova/bge-small-en-v1.5"
   # Uncomment if the squelchd image is private. This is the pull secret for
   # TENANT pods; the warden's own pod takes `imagePullSecrets` in
   # `20-warden.yaml`, and the roller's in `90-warden-roller.yaml`.

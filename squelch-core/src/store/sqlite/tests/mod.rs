@@ -6,6 +6,7 @@ mod device_tokens;
 mod drafts;
 mod events;
 mod feedback;
+mod groups;
 mod messages;
 mod migrate;
 mod rules;

@@ -9,6 +9,23 @@ import SwiftUI
 /// How many ranked standing items show before the quiet "{n} more" expander.
 private let eyesVisible = 10
 
+/// THE FOR-YOUR-EYES WALK: the queue the reader is handed when an email is
+/// opened from this band, so `E` (done + next) can step through it without
+/// coming back here.
+///
+/// The FULL ranked list, not the visible slice — the cursor stops at the
+/// collapse cutoff because arrowing past it is how you ASK for the rest, but a
+/// walk that quietly ended at row ten would strand exactly the mail the band is
+/// hiding. And the same ranking `body` renders, so the order you see is the
+/// order you get.
+///
+/// Computed at KEY-PRESS AND CLICK TIME ONLY. It re-ranks the standing list,
+/// which is the cost `SitrepCursor` exists to keep out of the render path.
+@MainActor
+private func eyesWalk(_ store: AppStore, weight: Double) -> [AttentionUpdate] {
+    Ranking.rank(store.sitrep.standing, weight: weight)
+}
+
 /// The sitrep's hover + keyboard cursor, in an `@Observable` box rather than
 /// `SitrepView`'s `@State`.
 ///
@@ -63,10 +80,6 @@ struct SitrepView: View {
     /// so the first pass lays out side-by-side rather than flashing stacked.
     @State private var pageWidth: CGFloat = .infinity
 
-    /// Zone data lives in the STORE, not in `@State`: `@State` is discarded on
-    /// navigate-away, so a revisit would show empty cards until refetch.
-    private var rulesCount: Int? { store.zones.rulesCount }
-
     /// The rows the cursor can reach, recomputed at KEY-PRESS time. The render
     /// path does NOT come through here — `body` ranks once into a `let` and
     /// passes the result down.
@@ -87,6 +100,16 @@ struct SitrepView: View {
 
         return VStack(spacing: 0) {
             masthead
+            // ABOVE THE HERO, because it outranks it. The hero's question is
+            // "what needs you today", and its answer is worthless while the
+            // mailbox behind it has been frozen since Tuesday. This is the
+            // landing page, so it is where somebody wondering why nothing has
+            // arrived actually looks.
+            if store.gmailDisconnected {
+                GmailDisconnectedBanner()
+                    .padding(.horizontal, 28)
+                    .padding(.top, 14)
+            }
             // THE HERO STAYS PUT. It sits above BOTH columns, so it cannot scroll
             // with one of them and hold still for the other; and "one item needs
             // you today" is the page's standing answer, which is worth keeping on
@@ -111,7 +134,7 @@ struct SitrepView: View {
                         // Same key as the pinned rail below: whichever layout is
                         // on screen is the one the tour's ring finds.
                         railCards.tourTarget(.records)
-                        StatusStrip(rulesCount: rulesCount)
+                        StatusStrip()
                     }
                     .padding(.top, 14)
                     .padding(.bottom, 28)
@@ -125,7 +148,7 @@ struct SitrepView: View {
                     ScrollView(.vertical) {
                         VStack(spacing: 16) {
                             leftZones(visible: visible, overflow: overflow)
-                            StatusStrip(rulesCount: rulesCount)
+                            StatusStrip()
                         }
                         .padding(.top, 14)
                         .padding(.bottom, 28)
@@ -364,15 +387,15 @@ struct SitrepView: View {
             },
             KeyBinding("Enter", "open email") {
                 guard eyesActionable, let u = reachable[safe: cursor.index] else { return }
-                store.openThread(u.thread_id)
+                store.openThread(u.thread_id, queue: eyesWalk(store, weight: prefs.rankWeight))
             },
             // Same guard as every other verb here — inert unless a row is
-            // actually highlighted. Reply opens the email and composes inside it;
-            // no queue, exactly like Enter above (this dashboard is a set of
-            // records, not a walk).
+            // actually highlighted. Reply opens the email and composes inside it,
+            // and hands over the same walk Enter does, so `E` keeps working from
+            // inside the reader once the reply is away.
             KeyBinding("r", "reply") {
                 guard eyesActionable, let u = reachable[safe: cursor.index] else { return }
-                Actions.reply(u)
+                Actions.reply(u, queue: eyesWalk(store, weight: prefs.rankWeight))
             },
             KeyBinding("v", "fix triage") {
                 guard eyesActionable, let u = reachable[safe: cursor.index] else { return }
@@ -560,6 +583,9 @@ private struct DashHero: View {
 
 private struct ObligationRow: View {
     @Environment(AppStore.self) private var store
+    /// READ AT CLICK TIME ONLY, never in `body` — an Observable property read
+    /// during a render pass would subscribe all 10 rows to the rank slider.
+    @Environment(Prefs.self) private var prefs
     let update: AttentionUpdate
     let index: Int
     let cursor: SitrepCursor
@@ -583,9 +609,11 @@ private struct ObligationRow: View {
         let overdue = chip?.overdue ?? false
 
         // Click anywhere on the row opens the email; done is keyboard-only (e/d).
+        // The walk rides along with the click too — how you opened an email must
+        // not decide whether `E` inside it has anywhere to go.
         Button {
             cursor.index = index
-            store.openThread(update.thread_id)
+            store.openThread(update.thread_id, queue: eyesWalk(store, weight: prefs.rankWeight))
         } label: {
             HStack(spacing: 9) {
                 Avatar(sender: update.senderString, size: 22)
@@ -712,7 +740,6 @@ private struct ObligationWash: View {
 
 private struct StatusStrip: View {
     @Environment(AppStore.self) private var store
-    let rulesCount: Int?
     @State private var refreshing = false
 
     var body: some View {
@@ -742,13 +769,6 @@ private struct StatusStrip: View {
                     .help("today's stage-2 triage cost estimate")
             }
 
-            if let rulesCount {
-                ChromeChip(
-                    text: "\(rulesCount) \(rulesCount == 1 ? "rule" : "rules")",
-                    icon: "slider.horizontal.3",
-                    tone: Palette.inkDim, help: "sender rules"
-                ) { store.setView(.rules) }
-            }
             Spacer(minLength: 0)
         }
         .padding(.top, 2)
@@ -766,31 +786,25 @@ private struct StatusStrip: View {
 // MARK: - dev re-triage button
 
 /// DEV-MODE re-triage: renders nothing unless the developerMode pref is on.
-/// Fires POST /client/retriage for the trailing 7 days and toasts the count.
+/// Fires POST /client/retriage for the trailing 7 days and then hands the window
+/// to `RetriageModal`, which blocks the app until the queues drain — the run
+/// rewrites every tier on the board, so there is nothing here worth reading
+/// while it happens. `busy` is the STORE's run, not a local flag: the modal
+/// outlives this button (a re-triage kicked from the sitrep survives navigating
+/// away), so the only honest source for "already going" is the run itself.
 struct RetriageButton: View {
     @Environment(AppStore.self) private var store
     @Environment(Prefs.self) private var prefs
-    @State private var busy = false
 
     private static let days = 7
+
+    private var busy: Bool { store.retriage != nil }
 
     var body: some View {
         if prefs.developerMode {
             Button {
                 guard !busy else { return }
-                busy = true
-                Task {
-                    do {
-                        let result = try await APIClient.shared.retriage(.days(Self.days))
-                        store.pushToast(
-                            result.reset > 0
-                                ? "re-triaging \(result.reset) email\(result.reset == 1 ? "" : "s") (last \(Self.days)d)…"
-                                : "nothing to re-triage in the window", .info)
-                    } catch {
-                        store.pushToast(errText(error, "re-triage failed"), .error)
-                    }
-                    busy = false
-                }
+                Task { await store.startRetriage(days: Self.days) }
             } label: {
                 Label("re-triage 7d", systemImage: "arrow.trianglehead.2.clockwise")
                     .font(Typo.micro)

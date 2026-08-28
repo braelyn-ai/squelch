@@ -55,6 +55,7 @@ run_suite subject-text \
 # The attachment buckets against the wire type they bucket. WireTypes is pure
 # Codable structs, so the pair builds with no app and no daemon.
 run_suite attachment-kinds \
+  Sources/Passband/Model/SubjectText.swift \
   Sources/Passband/Model/WireTypes.swift \
   Sources/Passband/Lib/AttachmentKinds.swift \
   Tests/AttachmentKindsTests.swift
@@ -63,10 +64,19 @@ run_suite attachment-kinds \
 # staging rules are the last thing standing between an attachment named
 # `invoice.html` and WebKit, so they are asserted rather than read.
 run_suite staged-attachment \
+  Sources/Passband/Model/SubjectText.swift \
   Sources/Passband/Model/WireTypes.swift \
   Sources/Passband/Lib/AttachmentKinds.swift \
   Sources/Passband/Lib/StagedAttachment.swift \
   Tests/StagedAttachmentTests.swift
+
+# The blocking re-triage modal's state machine. Pure value logic, so it builds
+# with the wire type alone — no store, no daemon, no SwiftUI.
+run_suite retriage-run \
+  Sources/Passband/Model/SubjectText.swift \
+  Sources/Passband/Model/WireTypes.swift \
+  Sources/Passband/Model/RetriageRun.swift \
+  Tests/RetriageRunTests.swift
 
 run_suite email-images \
   Sources/Passband/Lib/ImageProxy.swift \
@@ -80,6 +90,7 @@ run_suite email-images \
 # the real pipeline: what it takes out of a body is what neither answer here may
 # still claim.
 run_suite cid-images \
+  Sources/Passband/Model/SubjectText.swift \
   Sources/Passband/Model/WireTypes.swift \
   Sources/Passband/Lib/AttachmentKinds.swift \
   Sources/Passband/Lib/HTMLImg.swift \
@@ -127,6 +138,15 @@ run_suite share-nudge \
 # through an injected now/calendar — which is the whole reason it is testable:
 # a reminder is only ever wrong LATER, so the arithmetic has to be pinned here
 # rather than discovered by an email that never came back.
+# Who a message is addressed to. One file, no dependencies — Recipients.swift is
+# kept free of SwiftUI precisely so the move-to-Bcc rule can be asserted without
+# an app, because every way it can go wrong is invisible on screen: a list split
+# on the wrong comma, or an address left in To while the sender believes it went
+# out blind.
+run_suite recipients \
+  Sources/Passband/Lib/Recipients.swift \
+  Tests/RecipientsTests.swift
+
 run_suite remind-times \
   Sources/Passband/Lib/RemindTimes.swift \
   Tests/RemindTimesTests.swift
@@ -136,9 +156,38 @@ run_suite remind-times \
 # is why the correspondent graph stays local — so the brand/robot heuristics
 # guarding it are asserted rather than reasoned about. Pure string work;
 # WireTypes and Format ride along for the Tier and the capitalizer.
+# The wire contract behind the disconnected banner, and the RFC3339 shapes its
+# since-when has to survive. WireTypes carries the object; Format carries the
+# parser that tries both fractional and plain, which is the bug this pins.
+run_suite gmail-health \
+  Sources/Passband/Model/WireTypes.swift \
+  Sources/Passband/Model/SubjectText.swift \
+  Sources/Passband/Lib/Format.swift \
+  Sources/Passband/Lib/AsyncMemo.swift \
+  Tests/GmailHealthTests.swift
+
 run_suite sender-identity \
+  Sources/Passband/Model/SubjectText.swift \
   Sources/Passband/Model/WireTypes.swift \
   Sources/Passband/Lib/Format.swift \
   Sources/Passband/Lib/AsyncMemo.swift \
   Sources/Passband/Lib/SenderIdentity.swift \
   Tests/SenderIdentityTests.swift
+
+# The keymap's two-pass dispatch, which is what makes `E` (done + next) a
+# different verb from `e` (done) instead of the same one shouted — and what
+# makes a declining guard spelled only "e" quietly lose the shifted key to an
+# exact binding in another set. That failure abandons a draft, so it is asserted
+# rather than remembered. KeyDispatch.swift is the whole suite: the registry and
+# the algorithm are pure, and only the NSEvent bridge below them is AppKit.
+run_suite key-dispatch \
+  Sources/Passband/Keys/KeyDispatch.swift \
+  Tests/KeyDispatchTests.swift
+
+# The ledger between the live event feed, the 10s poll and the person reading
+# the thread they both have news about. Pure value logic — no store, no
+# network — because the rule it encodes ("ask again as often as you like, tell
+# them once") is the kind that is only ever wrong later.
+run_suite thread-arrivals \
+  Sources/Passband/Lib/ThreadArrivals.swift \
+  Tests/ThreadArrivalsTests.swift

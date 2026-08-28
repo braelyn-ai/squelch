@@ -17,8 +17,8 @@ use crate::triage::{CalendarInfo, CarrierTrack, DeadlineHit, ReceiptInfo, Shipme
 use crate::types::{
     AccountId, AttachmentInfo, AttentionStatus, AttentionUpdate, AuditEntry, Banking,
     CalendarUpdate, Deadline, Disposition, Event, EventKind, FieldReasons, NewMessage, OpenRate,
-    Receipt, SealedKind, SearchHit, SenderRule, Sensitivity, ShredCandidate, StoreStats,
-    ThreadView, Tier, TriageAxis, TriageFeedback, UnsubscribeRecord, Update,
+    Receipt, RetriageProgress, SealedKind, SearchHit, SenderRule, Sensitivity, ShredCandidate,
+    StoreStats, ThreadView, Tier, TriageAxis, TriageFeedback, UnsubscribeRecord, Update,
 };
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -100,6 +100,15 @@ pub struct TriagedMessage {
     /// own address is filtered out at ingest). Contacts come exclusively from
     /// recipients of sent mail, never from inbound senders.
     pub recipients: Vec<String>,
+    /// Sent mail only: the FAITHFUL To/Cc address set, lowercased and deduped,
+    /// which becomes the `message_recipients` index.
+    ///
+    /// Deliberately not `recipients`, which is filtered for contact seeding (the
+    /// account's own address and robot addresses dropped). This one answers "who
+    /// did this go to" — the question `messages.to_addrs` answers in display
+    /// form — so send-group history can join against it and still see a mail
+    /// that went to `support@` or to the user themselves. Empty on received mail.
+    pub recipient_addrs: Vec<String>,
     pub sensitivity: Sensitivity,
     pub sealed_kind: Option<SealedKind>,
     pub importance: u8,
@@ -267,6 +276,10 @@ pub struct Device {
     pub token: String,
     /// Free-form platform tag; `ios` today.
     pub platform: String,
+    /// Opaque client-minted label naming the account this device registered
+    /// under, stamped onto every push sent here so the receiver can tell which
+    /// mailbox an event id belongs to. `None` for a client that never sent one.
+    pub tag: Option<String>,
     pub created_at: DateTime<Utc>,
     /// Refreshed on every re-registration — iOS re-hands its token each launch,
     /// so this, not `created_at`, is the liveness signal.
@@ -393,11 +406,33 @@ pub struct Draft {
     /// The message this replies to; `None` is the new-message draft.
     pub reply_to_message_id: Option<i64>,
     pub to_addr: String,
+    /// The other two recipient lists, comma-joined exactly like `to_addr`. `""`
+    /// when there are none, which is every draft written before the columns
+    /// existed — and for `bcc_addr` empty is the ONLY state anything else can
+    /// infer, since nothing derives a blind copy list.
+    pub cc_addr: String,
+    pub bcc_addr: String,
     pub subject: String,
     pub body: String,
     /// First save of this draft; an edit keeps it.
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+}
+
+/// The COMPOSITION half of a draft: everything the composer holds, with the
+/// keys (`account_id`, `reply_to_message_id`) left out. Taken by
+/// [`SqliteStore::upsert_draft`](sqlite::SqliteStore::upsert_draft) as one
+/// value rather than as five adjacent `&str` parameters, and that is the whole
+/// reason it exists: five strings in a row is a transposition waiting to
+/// happen, and two of them are recipient lists — swap `cc_addr` and `bcc_addr`
+/// and a restored draft sends the blind list where everyone can read it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DraftFields<'a> {
+    pub to_addr: &'a str,
+    pub cc_addr: &'a str,
+    pub bcc_addr: &'a str,
+    pub subject: &'a str,
+    pub body: &'a str,
 }
 
 /// One non-confident triage row queued for the Stage-2 LLM pass, with message
@@ -1154,6 +1189,12 @@ pub trait Store: Send + Sync {
     /// message feeds, and resets the source with it.
     fn shipments_extract_apply(&self, applied: &ShipmentsApplied) -> Result<bool>;
 
+    /// How far the live dev re-triage has got, for the progress modal that
+    /// blocks the app while one runs. Read-only and cheap: one aggregate over
+    /// the rows carrying a live `retriage_at` stamp — see [`RetriageProgress`].
+    /// A zero `total` means no run is in flight.
+    fn retriage_progress(&self, account_id: AccountId) -> Result<RetriageProgress>;
+
     /// DEV RE-TRIAGE: clear the LLM markers on non-sealed, non-sent inbound rows
     /// so they re-enter the Stage-1 queue, deleting their stale `banking`,
     /// `marketing` and `shipment_orders` rows (extraction recreates them) and
@@ -1511,7 +1552,17 @@ pub trait Store: Send + Sync {
     /// A token registered to ANOTHER account is refused with
     /// [`CoreError::InvalidInput`] and nothing is written — re-registration must
     /// never silently repoint a device's pushes at a different account.
-    fn upsert_device(&self, account_id: AccountId, token: &str, platform: &str) -> Result<Device>;
+    ///
+    /// `tag` is overwritten on every re-registration, including back to `None`:
+    /// it describes where this device currently files the account, and a stale
+    /// one would route a push at a mailbox the phone has since forgotten.
+    fn upsert_device(
+        &self,
+        account_id: AccountId,
+        token: &str,
+        platform: &str,
+        tag: Option<&str>,
+    ) -> Result<Device>;
 
     /// Every registered device for the account, oldest first — a stable order, so
     /// a push fan-out and its response array line up reproducibly.
@@ -1809,6 +1860,24 @@ pub trait Store: Send + Sync {
         thread_id: &str,
         day: &str,
     ) -> Result<u32>;
+
+    /// Give back one charge from [`Store::stage2_increment_budget`], for a call
+    /// that was charged and then rejected at CONFIG level.
+    ///
+    /// Charging before the call is what stops a retry storm exceeding the cap,
+    /// and that stays. But a config-level rejection (see
+    /// [`crate::triage::llm::is_config_failure`]) is a 4xx in ~0ms that spends
+    /// no tokens and no money — and because it is shared by every queued row,
+    /// one broken config can charge the whole day's cap in minutes. That is not
+    /// a hypothetical: on 2026-08-25 a hosted tenant's gateway misconfiguration
+    /// burned 498 of a 500-call daily cap, and because the day key is UTC, the
+    /// fleet stayed capped for 22 hours AFTER the gateway was fixed. Fixing an
+    /// outage has to restore service, not schedule it for tomorrow.
+    ///
+    /// Row-level permanent failures (`json_parse`, `max_tokens_truncation`)
+    /// deliberately keep their charge: the model ran and was paid for.
+    fn stage2_refund_budget(&self, account_id: AccountId, thread_id: &str, day: &str)
+    -> Result<()>;
 
     /// Apply a parsed Stage-2 result onto a triage row IN ONE TRANSACTION:
     /// overwrite importance/tier/one_line/reason, stamp `model_used` (leaving the

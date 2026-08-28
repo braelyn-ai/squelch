@@ -426,6 +426,51 @@ actor APIClient {
 
     // MARK: - rules
 
+    // MARK: - send groups
+
+    /// Every group, for the Groups page. Counts only; membership rides on
+    /// [`group(_:)`].
+    func listGroups() async throws -> [SendGroup] { try await get("/client/groups") }
+
+    /// Composer autocomplete. An empty fragment is answered with nothing rather
+    /// than everything, so callers may pass what the user has typed as-is.
+    func searchGroups(_ q: String, limit: Int = 8) async throws -> [SendGroup] {
+        try await get("/client/groups", query: ["q": q, "limit": String(limit)])
+    }
+
+    /// One group WITH its membership.
+    func group(_ id: Int) async throws -> SendGroup { try await get("/client/groups/\(id)") }
+
+    @discardableResult
+    func createGroup(_ body: GroupBody) async throws -> SendGroup {
+        try await post("/client/groups", body: body)
+    }
+
+    /// `members` REPLACES the membership: the editor sends the list it is
+    /// showing, so a member dropped on screen is dropped on the daemon.
+    @discardableResult
+    func updateGroup(_ id: Int, _ body: GroupBody) async throws -> SendGroup {
+        try await put("/client/groups/\(id)", body: body)
+    }
+
+    /// The route answers `{"deleted": true}`; the body carries nothing a caller
+    /// needs, because a failed delete is a thrown status rather than a `false`.
+    func deleteGroup(_ id: Int) async throws { try await deleteNoContent("/client/groups/\(id)") }
+
+    /// What has already gone to this group: recorded sends and mail derived from
+    /// matching stored recipients against the membership, newest first.
+    func groupHistory(_ id: Int, limit: Int? = nil, offset: Int? = nil) async throws
+        -> GroupHistoryPage
+    {
+        try await get(
+            "/client/groups/\(id)/history",
+            query: ["limit": limit.map(String.init), "offset": offset.map(String.init)])
+    }
+
+    /// The membership cap, served rather than compiled in: the app and the
+    /// daemon ship on separate trains and a baked-in limit is one that disagrees.
+    func groupLimits() async throws -> GroupLimits { try await get("/client/groups/limits") }
+
     func listRules() async throws -> [SenderRule] { try await get("/client/rules") }
 
     @discardableResult
@@ -552,7 +597,8 @@ actor APIClient {
     /// the daemon derives `Re: <parent subject>`; pass "" only to mean it.
     @discardableResult
     func actionSend(
-        body: String, replyToMessageId: Int? = nil, to: String? = nil, subject: String? = nil,
+        body: String, replyToMessageId: Int? = nil, to: String? = nil, cc: String? = nil,
+        bcc: String? = nil, groupId: Int? = nil, subject: String? = nil,
         overrideGuard: Bool = false, draftId: Int? = nil, includeTracker: Bool = false,
         replyAll: Bool = false, forwardOfMessageId: Int? = nil
     ) async throws -> SendResult {
@@ -564,7 +610,19 @@ actor APIClient {
                 // never set beside `reply_to_message_id`: the daemon refuses a
                 // send that claims to be both an answer and a forward.
                 forward_of_message_id: forwardOfMessageId,
-                to: to, subject: subject, body: body,
+                to: to,
+                // NOT collapsed to nil when empty, unlike everything else here:
+                // `""` is this client saying "nobody, and I mean it", while
+                // absent hands the copy list back to the daemon's derivation.
+                // The caller decides which it means; see `ComposeSubmit`.
+                cc: cc,
+                // Nothing derives a blind copy, so empty and absent are the
+                // same thing and the caller may pass either.
+                bcc: bcc?.isEmpty == true ? nil : bcc,
+                // Attribution for an expanded group; the whole audience for a
+                // fan-out, whose membership the daemon reads itself.
+                group_id: groupId,
+                subject: subject, body: body,
                 // Both composers write markdown; the daemon renders the HTML
                 // half from this same source after the guard has scanned it.
                 body_format: "markdown",
@@ -664,13 +722,15 @@ actor APIClient {
     /// draft, so a second PUT edits the same row rather than making another. A
     /// sealed or unknown parent is a 404 and stores nothing.
     @discardableResult
-    func putDraft(replyToMessageId: Int?, to: String, subject: String, body: String) async throws
-        -> DraftView
-    {
+    func putDraft(
+        replyToMessageId: Int?, to: String, cc: String = "", bcc: String = "", subject: String,
+        body: String
+    ) async throws -> DraftView {
         try await put(
             "/client/drafts",
             body: DraftBody(
-                reply_to_message_id: replyToMessageId, to: to, subject: subject, body: body))
+                reply_to_message_id: replyToMessageId, to: to, cc: cc, bcc: bcc, subject: subject,
+                body: body))
     }
 
     /// Discard one draft. Another account's id and an unknown id are the same 404.
@@ -684,6 +744,11 @@ actor APIClient {
 
     struct RetriageMessageBody: Codable, Sendable { var message_id: Int }
     struct RetriageDaysBody: Codable, Sendable { var days: Int }
+
+    /// How far the live re-triage has got. 404 on a daemon too old to report it.
+    func retriageProgress() async throws -> RetriageProgress {
+        try await get("/client/retriage")
+    }
 
     @discardableResult
     func retriage(_ scope: RetriageScope) async throws -> RetriageResult {

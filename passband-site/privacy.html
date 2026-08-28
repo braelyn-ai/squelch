@@ -28,167 +28,391 @@
       }
       h1 { font-size: 1.8rem; margin-bottom: 0.25rem; }
       h2 { font-size: 1.15rem; margin-top: 2.2rem; }
+      h3 { font-size: 1rem; margin-top: 1.6rem; }
       .meta { color: #777; font-size: 0.9rem; margin-top: 0; }
       a { color: #3556c9; }
       nav { margin-bottom: 2rem; font-size: 0.9rem; }
       ul { padding-left: 1.3rem; }
       li { margin: 0.3rem 0; }
+      table {
+        border-collapse: collapse;
+        width: 100%;
+        font-size: 0.9rem;
+        margin: 1rem 0;
+      }
+      th, td {
+        border: 1px solid #ddd;
+        padding: 0.45rem 0.6rem;
+        text-align: left;
+        vertical-align: top;
+      }
+      th { background: #f6f6f6; font-weight: 600; }
+      .tier {
+        border-left: 3px solid #3556c9;
+        padding-left: 1rem;
+        margin: 1.2rem 0;
+      }
     </style>
   </head>
   <body>
-    <nav><a href="/">← Passband</a></nav>
+    <nav><a href="/">&larr; Passband</a></nav>
     <h1>Privacy Policy</h1>
-    <p class="meta">Effective August 7, 2026</p>
+    <p class="meta">Effective August 25, 2026</p>
 
     <p>
-      Passband is a Mac email client, and squelchd is the self-hosted daemon
-      behind it. You run both on hardware you control. This policy explains
-      what data the software touches, where that data lives, and what, if
-      anything, ever reaches infrastructure we operate.
+      Passband is an email client for Mac and iOS. Behind it runs
+      <strong>squelchd</strong>, a daemon that syncs your Gmail mailbox, triages
+      it, and lets you act on it. This policy explains what data the software
+      touches, where that data lives, and what reaches infrastructure we
+      operate.
     </p>
+
+    <h2>Two tiers, two very different answers</h2>
     <p>
-      The short version: your mail is synced, analyzed, and stored on your own
-      machine. We do not run servers that receive, store, or can access your
-      email or your Google credentials.
+      Passband is offered in two forms, and the honest answer to "where does my
+      mail live" is completely different in each. Read the one you use.
     </p>
+
+    <div class="tier">
+      <h3>Self-host</h3>
+      <p>
+        You run squelchd on hardware you control. Your mail, your search index,
+        and your Google OAuth tokens are stored on your machine and never
+        transit or rest on our infrastructure. We could not read your mail if we
+        wanted to; we hold no copy and no key. The only things that ever reach
+        us are the optional relay services described below, which carry timing
+        and opaque identifiers and never message content.
+      </p>
+    </div>
+
+    <div class="tier">
+      <h3>Hosted (Passband accounts at signup.passband.app)</h3>
+      <p>
+        We run squelchd for you, one isolated instance per account, on
+        infrastructure we operate. <strong>Your mail content and your Google
+        refresh token are stored on our servers.</strong> Holding them is what
+        the hosted tier is; always-on triage and mobile push are not possible
+        otherwise. The rest of this policy sets out exactly what we hold, how it
+        is protected, who can reach it, and how to get rid of it.
+      </p>
+    </div>
 
     <h2>Google user data</h2>
     <p>
-      Passband accesses Gmail through Google APIs, with your consent, using
-      OAuth. It requests:
+      Passband accesses Gmail through Google APIs with your consent, using
+      OAuth. It requests exactly these scopes and nothing else:
     </p>
-    <ul>
-      <li>
-        <strong>Read access</strong> (<code>gmail.readonly</code>) to sync
-        your messages so the daemon can triage them.
-      </li>
-      <li>
-        <strong>Optional write access</strong> (<code>gmail.modify</code>,
-        <code>gmail.send</code>), granted separately and only if you enable
-        it, so you can archive, label, and send mail from Passband. Every
-        write action is user-initiated, requires explicit confirmation, and
-        is recorded in a local audit log.
-      </li>
-    </ul>
+    <table>
+      <tr><th>Scope</th><th>What it is used for</th></tr>
+      <tr>
+        <td><code>gmail.readonly</code></td>
+        <td>
+          Sync message headers and bodies so the daemon can triage them, render
+          threads, search them, and extract deadlines, shipment tracking, and
+          calendar details.
+        </td>
+      </tr>
+      <tr>
+        <td><code>gmail.modify</code></td>
+        <td>
+          Apply the outcome of a triage or an explicit user action: archive,
+          label, mark read or unread, park a thread for later. Never used by the
+          sync path.
+        </td>
+      </tr>
+      <tr>
+        <td><code>gmail.send</code></td>
+        <td>
+          Send mail you compose in Passband: replies, forwards, new messages,
+          and invitations you choose to share from your own address.
+        </td>
+      </tr>
+      <tr>
+        <td><code>userinfo.email</code>, <code>openid</code></td>
+        <td>
+          Confirm which mailbox a token belongs to, and identify your account at
+          sign-in. The daemon refuses to store a credential whose mailbox does
+          not match the configured account.
+        </td>
+      </tr>
+    </table>
     <p>
-      Message content and metadata are stored in a local SQLite database on
-      your machine. OAuth tokens are stored in your operating system keychain
-      or a local credentials file you designate. Neither ever transits or
-      rests on our infrastructure.
+      Read access and write access are held in separate credential slots, and
+      the sync pipeline is structurally unable to load the write slot. On
+      self-host, write access is a second, separate consent you can decline and
+      never grant. On hosted, all three scopes are granted in a single consent
+      at signup, because a hosted account has no second path back to Google;
+      a partial consent provisions nothing at all.
+    </p>
+    <p>
+      Every write action is user-initiated or the direct result of a rule you
+      configured, and is recorded in an audit log on your own daemon.
     </p>
 
     <h2>Limited Use disclosure</h2>
     <p>
-      Passband's use and transfer to any other app of information received
-      from Google APIs will adhere to the
+      Passband's use and transfer to any other app of information received from
+      Google APIs will adhere to the
       <a href="https://developers.google.com/terms/api-services-user-data-policy">Google
-      API Services User Data Policy</a>, including the Limited Use
-      requirements. In particular:
+      API Services User Data Policy</a>, including the Limited Use requirements.
+      In particular:
     </p>
     <ul>
-      <li>Google user data is used only to provide and improve the user-facing features of Passband: triaging, displaying, and acting on your mail at your direction.</li>
-      <li>It is never sold, never used for advertising, and never transferred to third parties except as described below at your direction.</li>
-      <li>No human reads it except with your explicit consent, or where required for security or legal compliance.</li>
-      <li>Google user data is never used to develop, improve, or train generalized or non-personalized artificial intelligence or machine learning models.</li>
+      <li>
+        Google user data is used only to provide and improve the user-facing
+        features of Passband: triaging, displaying, searching, and acting on
+        your mail at your direction.
+      </li>
+      <li>
+        It is never sold, never used for advertising or ad targeting, and never
+        transferred to third parties except as explicitly described in this
+        policy.
+      </li>
+      <li>
+        No human reads it except with your explicit consent, for a support
+        request you have made, or where required for security investigation or
+        legal compliance.
+      </li>
+      <li>
+        Google user data is never used to develop, improve, or train generalized
+        or non-personalized artificial intelligence or machine learning models.
+        Where message content is sent to a model provider (see below), it is
+        sent for inference on your own mail only, under terms that prohibit
+        training on it.
+      </li>
     </ul>
 
-    <h2>Optional AI processing, with your own keys</h2>
+    <h2>Where your data is stored</h2>
+
+    <h3>Self-host</h3>
     <p>
-      Two features can send message content to a large language model
-      provider, and both are off until you supply your own API key:
-    </p>
-    <ul>
-      <li>
-        <strong>LLM triage.</strong> If you configure an Anthropic or OpenAI
-        API key, the daemon sends message excerpts to that provider, under
-        your own account and their terms, to score importance and extract
-        deadlines and summaries. Without a key, triage runs on local
-        heuristics only. Security-sensitive mail (verification codes,
-        password resets, and similar) is detected deterministically before
-        any model is consulted and is never sent to a model.
-      </li>
-      <li>
-        <strong>The assistant.</strong> Passband's built-in assistant uses
-        your own Anthropic API key. Content it reads on your behalf goes to
-        Anthropic under your account.
-      </li>
-    </ul>
-    <p>
-      In both cases you choose the provider, you hold the key, and you can
-      remove it at any time. We are not a party to that data flow.
+      Message content and metadata are stored in a local SQLite database on your
+      machine. OAuth tokens are stored in your operating system keychain
+      (macOS) or a credentials file with restrictive permissions in a location
+      you designate (Linux). Neither ever transits or rests on our
+      infrastructure.
     </p>
 
-    <h2>Infrastructure we do operate</h2>
+    <h3>Hosted</h3>
     <p>
-      Two small services run on our infrastructure. Both are designed to see
-      timing and opaque identifiers, never content:
+      Each hosted account gets its own isolated daemon instance and its own
+      SQLite database on a dedicated volume, on a server we operate at Hetzner
+      Cloud (Germany). Specifically, we hold:
     </p>
     <ul>
       <li>
-        <strong>Push relay.</strong> To deliver notifications, your daemon
-        sends the relay device tokens, opaque event identifiers, and
-        optional collapse identifiers. The relay forwards to Apple and
-        retains nothing. It cannot see message content, senders, or
-        subjects.
+        <strong>Your synced mail.</strong> Message headers, bodies, attachments,
+        labels, and derived triage data, in your account's own database.
       </li>
       <li>
-        <strong>Read receipts (opt-in).</strong> If you enable open
-        tracking on mail you send, the relay briefly buffers an opaque
-        token, a timestamp, and a user agent string until your daemon
-        collects them. Only your daemon can map a token back to a message.
-        Collected entries are deleted from the relay.
+        <strong>Your Google refresh token</strong>, encrypted to a per-account
+        key that exists only as an encrypted-at-rest secret in our cluster. Our
+        signup and control-plane services do not retain the plaintext token
+        after provisioning.
+      </li>
+      <li>
+        <strong>Your account record:</strong> the email address you signed up
+        with, your account label, timestamps, and the invite you used. This is
+        stored in a managed PostgreSQL database at Railway.
+      </li>
+      <li>
+        <strong>Encrypted backups.</strong> Your database is continuously
+        replicated to Cloudflare R2 object storage, encrypted before it leaves
+        our server with a key held outside that storage. Server disk snapshots
+        are retained by Hetzner for 7 days.
       </li>
     </ul>
     <p>
-      Relay logs contain request timing and status codes only. Device
-      tokens, open tokens, and payloads are never logged.
+      We do not have per-account access controls that would prevent our own
+      operators from reaching a hosted account's data: as with any hosted
+      service, whoever administers the servers can in principle read what is on
+      them. Access is limited to Passband operators, is used only for the
+      reasons listed in the Limited Use disclosure above, and if you would
+      rather not extend that trust to anyone, the self-host tier exists exactly
+      for you and is free.
     </p>
+
+    <h2>Automated processing by language models</h2>
+    <p>
+      Passband uses large language models to score importance, summarize
+      threads, extract deadlines and shipment details, and power the built-in
+      assistant. Where the request goes depends on your tier, and this is the
+      most consequential difference between them.
+    </p>
+
+    <h3>Self-host: your own key, or nothing</h3>
+    <p>
+      These features are off until you supply your own Anthropic or OpenAI API
+      key. With a key configured, the daemon sends message excerpts directly to
+      that provider under your own account and their terms. With no key,
+      triage runs on local heuristics only and no message content leaves your
+      machine.
+    </p>
+
+    <h3>Hosted: our gateway, our provider account</h3>
+    <p>
+      Hosted accounts do not bring a key. Your daemon sends message content to
+      an LLM gateway we operate at <code>bifrost.passband.app</code>, which
+      forwards it to <strong>Anthropic</strong> under a Passband account, using
+      a per-account credential with a spending limit. Message content therefore
+      passes through our infrastructure and reaches Anthropic as a subprocessor.
+      Anthropic does not train models on this content. The gateway records
+      per-account token counts and spend so budgets can be enforced; message
+      content is not used for any purpose other than serving your request.
+    </p>
+
+    <h3>What is never sent to a model, on either tier</h3>
+    <p>
+      Security-sensitive mail (verification codes, one-time passcodes, password
+      resets, and similar) is detected deterministically, before any model is
+      consulted, and is never sent to a model, never exposed to the assistant,
+      and never crosses the agent-facing interface.
+    </p>
+
+    <h2>Services we operate</h2>
+    <table>
+      <tr><th>Service</th><th>What it sees</th></tr>
+      <tr>
+        <td><strong>Push relay</strong></td>
+        <td>
+          Device tokens, opaque event identifiers, and optional collapse
+          identifiers, forwarded to Apple Push Notification service. It retains
+          nothing and cannot see message content, senders, or subjects.
+        </td>
+      </tr>
+      <tr>
+        <td><strong>Read receipts</strong> (opt-in)</td>
+        <td>
+          If you enable open tracking on mail you send, the relay briefly
+          buffers an opaque token, a timestamp, and a user agent string until
+          your daemon collects them. Only your daemon can map a token back to a
+          message. Collected entries are deleted from the relay.
+        </td>
+      </tr>
+      <tr>
+        <td><strong>LLM gateway</strong> (hosted only)</td>
+        <td>
+          Message content in transit to Anthropic, plus per-account token and
+          spend accounting. Request and response bodies are not retained.
+        </td>
+      </tr>
+      <tr>
+        <td><strong>Signup and control plane</strong> (hosted only)</td>
+        <td>
+          Your email address, account label, invite code, and provisioning
+          state. Also the waitlist form: an email address and whatever you type
+          into it.
+        </td>
+      </tr>
+    </table>
+    <p>
+      Relay logs contain request timing and status codes only. Device tokens,
+      open tokens, and payloads are never logged.
+    </p>
+
+    <h2>Subprocessors</h2>
+    <p>
+      These third parties process data on our behalf for the hosted tier. Only
+      Anthropic and our own hosting providers ever handle Google user data.
+    </p>
+    <table>
+      <tr><th>Provider</th><th>Purpose</th><th>Handles mail content</th></tr>
+      <tr><td>Hetzner Cloud</td><td>Servers running hosted daemons</td><td>Yes (at rest and in memory)</td></tr>
+      <tr><td>Cloudflare</td><td>Encrypted database backups (R2), DNS</td><td>Encrypted only</td></tr>
+      <tr><td>Anthropic</td><td>Language model inference</td><td>Yes (in transit, no training)</td></tr>
+      <tr><td>Railway</td><td>Signup, control plane, relays, gateway hosting</td><td>Gateway transit only</td></tr>
+      <tr><td>Resend</td><td>Sending waitlist and invite email</td><td>No</td></tr>
+      <tr><td>PostHog</td><td>Product analytics (see below)</td><td>No</td></tr>
+      <tr><td>Apple</td><td>Push notification delivery</td><td>No</td></tr>
+    </table>
+
+    <h2>Third parties you direct us to, on either tier</h2>
+    <ul>
+      <li>
+        <strong>Shipment carriers.</strong> If you configure your own carrier
+        API credentials (UPS, FedEx, DHL, USPS), your daemon sends tracking
+        numbers it found in your mail directly to that carrier to fetch delivery
+        status. We never proxy a carrier call. With no credentials configured,
+        no carrier is ever contacted.
+      </li>
+      <li>
+        <strong>Your own model provider.</strong> On self-host, the API key you
+        supply determines who receives message excerpts, under your account and
+        their terms. We are not a party to that flow.
+      </li>
+      <li>
+        <strong>People you write to.</strong> Mail you send, forward, or share
+        an invitation to goes from your own Gmail address to the recipient you
+        chose. Invitation recipients are never disclosed to us.
+      </li>
+    </ul>
 
     <h2>App telemetry</h2>
     <p>
-      The Passband app reports anonymous usage events (for example, "an email
-      was archived") to help us understand which features are used. Event
-      names and values come from a fixed allowlist enforced in code; message
-      content, subjects, senders, labels, and search queries are structurally
-      unable to leave the app through this channel. You can reduce or disable
-      telemetry in Settings under Privacy.
+      The Passband apps report anonymous usage events (for example, "an email
+      was archived") to PostHog to help us understand which features are used.
+      Event names and property values come from a fixed allowlist enforced in
+      code: message content, subjects, senders, recipients, labels, and search
+      queries are structurally unable to leave the app through this channel.
+      Events are keyed to a random per-install identifier, or for hosted
+      accounts to an opaque account identifier that is not your email address.
+      You can reduce or disable telemetry in Settings under Privacy.
     </p>
 
     <h2>Retention and deletion</h2>
     <p>
-      Your data is retained on your machine for as long as you keep it. To
-      delete everything: delete the local database and credentials files (or
-      keychain entries), and revoke Passband's access at
+      <strong>Self-host:</strong> your data is retained on your machine for as
+      long as you keep it. To delete everything, delete the local database and
+      credentials (or keychain entries) and revoke Passband's access at
       <a href="https://myaccount.google.com/permissions">myaccount.google.com/permissions</a>.
-      Because we hold no copy of your mail or tokens, there is nothing for us
-      to delete on our side; relay buffers are transient and deleted on
-      collection.
+      We hold no copy, so there is nothing for us to delete.
+    </p>
+    <p>
+      <strong>Hosted:</strong> your mail is retained for as long as your account
+      exists. To delete it, email us at the address below and we will destroy
+      the account's database, volume, encryption key, and stored refresh token.
+      Once the per-account key is destroyed the encrypted backups are
+      permanently unreadable, and they age out of object storage and out of
+      Hetzner's 7-day snapshots after that. Revoking Passband at
+      <a href="https://myaccount.google.com/permissions">myaccount.google.com/permissions</a>
+      immediately ends our access to your mailbox on either tier, and is
+      effective whether or not you have asked us to delete anything.
     </p>
 
     <h2>Security</h2>
     <p>
-      The read credential and the write credential are held in separate
-      slots, and the sync pipeline is structurally unable to load the write
-      slot. Agent-facing interfaces are read-only and never expose
-      security-sensitive mail. The daemon binds to loopback by default. The
-      full threat model is documented in
+      The read credential and the write credential are held in separate slots,
+      and the sync pipeline is structurally unable to load the write slot.
+      Agent-facing interfaces are read-only and never expose security-sensitive
+      mail. Self-hosted daemons bind to loopback by default. Hosted accounts are
+      isolated from one another at the container, network, and storage layers,
+      and each has its own encryption identity. Secrets are encrypted at rest.
+      The full threat model is public at
       <a href="https://github.com/braelyn-ai/squelch/blob/main/docs/SECURITY.md">SECURITY.md</a>.
+    </p>
+    <p>
+      To report a vulnerability, email the address below. We will acknowledge
+      within 72 hours.
     </p>
 
     <h2>Children</h2>
-    <p>Passband is not directed to children under 13 and we do not knowingly collect data from them.</p>
+    <p>
+      Passband is not directed to children under 13 and we do not knowingly
+      collect data from them.
+    </p>
 
     <h2>Changes</h2>
     <p>
       Changes to this policy will be posted on this page with an updated
-      effective date.
+      effective date. Material changes to what we collect or who receives it
+      will also be announced to hosted account holders by email.
     </p>
 
     <h2>Contact</h2>
     <p>
-      Questions about privacy: email
-      <a href="mailto:bboynton97@gmail.com">bboynton97@gmail.com</a> or open
-      an issue at
+      Questions about privacy, deletion requests, and vulnerability reports:
+      <a href="mailto:bboynton97@gmail.com">bboynton97@gmail.com</a>, or open an
+      issue at
       <a href="https://github.com/braelyn-ai/squelch">github.com/braelyn-ai/squelch</a>.
     </p>
   </body>

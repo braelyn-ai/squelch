@@ -39,6 +39,9 @@ struct ActionLayer: View {
             if let request = store.ruleEditor {
                 RuleEditor(request: request) { store.closeRuleEditor() }
             }
+            if let request = store.groupEditor {
+                GroupEditor(request: request) { store.closeGroupEditor() }
+            }
             if store.processModeOpen { ProcessMode { store.processModeOpen = false } }
             if !store.authQueue.isEmpty { AuthCodeModal() }
             if let target = store.triageFix {
@@ -49,11 +52,18 @@ struct ActionLayer: View {
             }
             if store.askBarOpen { AskBar { store.askBarOpen = false } }
             if store.shortcutsOpen { ShortcutsOverlay { store.shortcutsOpen = false } }
-            // LAST, so it stacks above every other overlay in this layer. It is
-            // shown at most once per version, at a moment nothing else has been
-            // raised yet, and a modal that can end up UNDER something has to be
-            // dismissed twice to be read once.
+            // Above everything else in this layer, because it is shown at most
+            // once per version at a moment nothing else has been raised yet, and
+            // a modal that can end up UNDER something has to be dismissed twice
+            // to be read once.
             if store.whatsNew.active { WhatsNewCard() }
+            // LAST, and it outranks even the card above: that one is a greeting
+            // the user can dismiss, this one is the app being unavailable while
+            // a re-triage rewrites what every other overlay here is about.
+            // Anything already open when it starts stays open UNDER it and is
+            // there again when the run ends — closing them would be this modal
+            // reaching outside itself to tidy up state it does not own.
+            if let run = store.retriage { RetriageModal(run: run) }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomLeading)
         .keyBindings(.list, [
@@ -256,11 +266,12 @@ struct ShortcutsOverlay: View {
             title: "Thread viewer",
             items: [
                 (["j", "k"], "older / newer message"),
-                (["h", "l"], "previous / next queued email"),
+                (["←", "→"], "previous / next queued email"),
                 (["r"], "reply"),
                 (["Enter"], "reply all"),
                 (["c"], "new message"),
-                (["e", "d"], "done + next"),
+                (["e", "d"], "done, and close the reader"),
+                (["E", "D"], "done, and open the next email"),
                 (["h"], "remind + next"),
                 (["u"], "unsubscribe from this sender"),
                 (["t"], "new rule for this sender"),

@@ -679,6 +679,53 @@ fn embed_e2e_real_model_ranks_relevant_first() {
     );
 }
 
+/// E2E against the REAL fastembed model: `max_tokens` must reach the tokenizer.
+/// Nothing offline can prove that — a stub embedder has no tokenizer, and the
+/// config tests only prove the number travels as far as `EmbedSettings`. Same
+/// SQUELCH_EMBED_E2E gate, so CI skips it.
+#[test]
+fn embed_e2e_max_tokens_reaches_the_tokenizer() {
+    if std::env::var("SQUELCH_EMBED_E2E").ok().as_deref() != Some("1") {
+        eprintln!("skipping embed_e2e (set SQUELCH_EMBED_E2E=1 to run)");
+        return;
+    }
+    use crate::config::EmbedConfig;
+    use crate::embed::FastEmbedder;
+
+    // ~2000 characters, past both cuts. Varied sentences on purpose: a repeated
+    // string tokenizes to one repeated token, and both windows would then read
+    // the same thing and agree for the wrong reason.
+    let mut text = String::new();
+    let mut day = 0;
+    while text.len() < 2000 {
+        text.push_str(&format!(
+            "On day {day} we shipped invoice {day} to the Denver warehouse and confirmed delivery. "
+        ));
+        day += 1;
+    }
+
+    let embed_at = |max_tokens: usize| {
+        let cfg = EmbedConfig {
+            max_tokens,
+            ..EmbedConfig::default()
+        };
+        FastEmbedder::new(&cfg.settings())
+            .unwrap()
+            .embed(&text)
+            .unwrap()
+    };
+    let short = embed_at(256);
+    let long = embed_at(512);
+
+    let dot: f32 = short.iter().zip(long.iter()).map(|(a, b)| a * b).sum();
+    let norm = |v: &[f32]| v.iter().map(|x| x * x).sum::<f32>().sqrt();
+    let cos = dot / (norm(&short) * norm(&long));
+    assert!(
+        cos < 0.999,
+        "256 and 512 tokens of the same 2000-char text produced the same vector (cos {cos}); max_tokens never reached the tokenizer"
+    );
+}
+
 // ---- RECENCY -----------------------------------------------------------
 //
 // Mail is not a document corpus: the thread the reader wants is

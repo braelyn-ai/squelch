@@ -24,6 +24,10 @@ const TOKEN_MAX_LEN: usize = 200;
 const MAX_PLATFORM_LEN: usize = 32;
 const DEFAULT_PLATFORM: &str = "ios";
 
+/// The routing tag is a client-minted UUID today; the ceiling leaves room for
+/// another shape without being wide enough to hide anything in.
+const MAX_TAG_LEN: usize = 64;
+
 #[derive(Debug, Deserialize)]
 pub struct RegisterBody {
     pub token: String,
@@ -31,6 +35,13 @@ pub struct RegisterBody {
     /// experiment needs no schema or API change.
     #[serde(default)]
     pub platform: Option<String>,
+    /// Opaque label naming the account THIS CLIENT files these credentials
+    /// under, stamped onto every push aimed at this device. The daemon never
+    /// interprets it; it exists so the receiving extension can tell which of a
+    /// phone's mailboxes an event id belongs to, event ids being per-daemon
+    /// ints that collide across accounts. Omitted by clients that predate it.
+    #[serde(default)]
+    pub tag: Option<String>,
 }
 
 /// The unregister body — the token rides here, never in the path.
@@ -74,6 +85,26 @@ fn validate_token(token: &str) -> Result<&str, ApiError> {
     Ok(token)
 }
 
+/// A tag is opaque, so this bounds SHAPE and nothing else. `:` is excluded
+/// with intent: the pusher joins tag and event id with one, and a tag carrying
+/// its own would let a client forge the id half of somebody's push payload.
+/// Absent and empty both mean "untagged" — an older client, or the Mac.
+fn validate_tag(tag: Option<&str>) -> Result<Option<String>, ApiError> {
+    let Some(raw) = tag.map(str::trim).filter(|t| !t.is_empty()) else {
+        return Ok(None);
+    };
+    if raw.len() > MAX_TAG_LEN
+        || !raw
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
+    {
+        return Err(ApiError::bad_request(
+            "tag must be a short alphanumeric label",
+        ));
+    }
+    Ok(Some(raw.to_string()))
+}
+
 /// `ios` by default; otherwise a short lowercase-ish label.
 fn validate_platform(platform: Option<&str>) -> Result<String, ApiError> {
     let raw = platform.unwrap_or(DEFAULT_PLATFORM).trim();
@@ -101,10 +132,13 @@ pub async fn register_device(
 ) -> Result<impl IntoResponse, ApiError> {
     let token = validate_token(&body.token)?.to_string();
     let platform = validate_platform(body.platform.as_deref())?;
+    let tag = validate_tag(body.tag.as_deref())?;
 
     let store = state.store.clone();
     let account_id = state.account_id;
-    let device = blocking(move || store.upsert_device(account_id, &token, &platform)).await?;
+    let device =
+        blocking(move || store.upsert_device(account_id, &token, &platform, tag.as_deref()))
+            .await?;
 
     // Audited with the device ROW ID; the token never reaches the audit log.
     crate::handlers::audit_action(
@@ -154,6 +188,26 @@ mod tests {
         assert!(validate_token(&"a".repeat(201)).is_err(), "too long");
         assert!(validate_token(&"g".repeat(64)).is_err(), "not hex");
         assert!(validate_token("").is_err());
+    }
+
+    #[test]
+    fn a_tag_is_optional_and_shape_bounded() {
+        let uuid = "3F2A9C1E-7B44-4D0A-9E21-8C5B6D0F1A32";
+        assert_eq!(validate_tag(Some(uuid)).unwrap().as_deref(), Some(uuid));
+        // Case is PRESERVED, unlike platform: the tag is matched byte for byte
+        // against what the client minted, so folding it would break routing.
+        assert_eq!(
+            validate_tag(Some(" abc \n")).unwrap().as_deref(),
+            Some("abc")
+        );
+        assert_eq!(validate_tag(None).unwrap(), None);
+        assert_eq!(validate_tag(Some("   ")).unwrap(), None);
+
+        // The delimiter the pusher relies on, and anything else with room to
+        // hide in, is refused rather than mangled.
+        assert!(validate_tag(Some("acct:41")).is_err());
+        assert!(validate_tag(Some(&"x".repeat(65))).is_err());
+        assert!(validate_tag(Some("a b")).is_err());
     }
 
     #[test]

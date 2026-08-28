@@ -241,6 +241,72 @@ pub(crate) fn format_recipients(mailboxes: &[(String, Option<String>)]) -> Optio
     (!parts.is_empty()).then(|| parts.join(", "))
 }
 
+/// The bare addresses out of the same mailbox list [`format_recipients`] renders,
+/// lowercased and deduplicated in header order.
+///
+/// Deliberately UNFILTERED, exactly like `format_recipients` and unlike contact
+/// seeding: this is the recipient index, and it has to be able to say that a
+/// mail went to the user's own address or to `support@`.
+pub(crate) fn dedupe_lowercased(mailboxes: &[(String, Option<String>)]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for (addr, _) in mailboxes {
+        let lc = addr.trim().to_ascii_lowercase();
+        if lc.is_empty() || out.contains(&lc) {
+            continue;
+        }
+        out.push(lc);
+    }
+    out
+}
+
+/// The inverse of [`format_recipients`]: the bare, lowercased addresses out of a
+/// stored `messages.to_addrs` display string.
+///
+/// Exists for the paths that only ever see the rendered column — the recipients
+/// backfill sweep and the one-time `message_recipients` migration — and NOT for
+/// the ingest path, which has the parsed mailboxes in hand and uses
+/// [`dedupe_lowercased`] instead. Parsing back out of a display string is
+/// strictly the lossier route; nothing should reach for it that has the mailboxes.
+///
+/// SPLIT IS QUOTE-AWARE, because `format_recipients` quotes exactly the names
+/// that would otherwise forge a second recipient (`"Doe, Jane" <j@x>`). It drops
+/// embedded `"` rather than escaping them, so quotes here are balanced and a
+/// backslash is never an escape — matching the Swift client's splitter, which is
+/// quote-aware and not backslash-aware. An unterminated quote (impossible from
+/// our own writer, but a hand-edited row is not) runs to the end of the string
+/// and yields one token rather than losing the rest.
+pub fn parse_stored_recipients(to_addrs: &str) -> Vec<String> {
+    let mut tokens: Vec<String> = Vec::new();
+    let mut current = String::new();
+    let mut in_quotes = false;
+    for c in to_addrs.chars() {
+        match c {
+            '"' => in_quotes = !in_quotes,
+            ',' if !in_quotes => tokens.push(std::mem::take(&mut current)),
+            _ => current.push(c),
+        }
+    }
+    tokens.push(current);
+
+    let mut out: Vec<String> = Vec::new();
+    for token in tokens {
+        let token = token.trim();
+        // `Name <addr>` -> `addr`; a bare address has no brackets and stands as
+        // written. The LAST pair wins: a display name may legitimately contain a
+        // `<` (it was quoted on the way in, and the quotes are gone by now).
+        let addr = match (token.rfind('<'), token.rfind('>')) {
+            (Some(open), Some(close)) if close > open + 1 => &token[open + 1..close],
+            _ => token,
+        };
+        let lc = addr.trim().to_ascii_lowercase();
+        if lc.is_empty() || out.contains(&lc) {
+            continue;
+        }
+        out.push(lc);
+    }
+    out
+}
+
 /// Heuristic: does `addr` look like a machine/robot address rather than a person?
 /// Used ONLY to filter recipient contact seeding, so mailto-unsubscribe traffic
 /// never becomes a "person I know" and pollutes triage. Combines local-part
@@ -870,8 +936,30 @@ pub fn ingest(
         if let Some(cc) = m.cc() {
             collect_mailboxes(cc, &mut mailboxes);
         }
+        // BCC, on SENT MAIL ONLY. Gmail strips this header on delivery and keeps
+        // it on the sender's own Sent copy, so this reads the blind copy list of
+        // a message the user themselves sent — never a stranger's.
+        //
+        // Not an optional nicety: a bcc-only send carries NO To beyond the
+        // sender, so without this its outbox row would render as mail addressed
+        // to nobody, and `message_recipients` would have nothing to attribute a
+        // bcc group send to.
+        //
+        // The `is_sent` guard above is what keeps this honest. On received mail
+        // a `Bcc` header is at best the sender's leak and at worst forged, and
+        // in neither case is it "who this went to".
+        if let Some(bcc) = m.bcc() {
+            collect_mailboxes(bcc, &mut mailboxes);
+        }
     }
     let to_addrs = format_recipients(&mailboxes);
+    // THE FAITHFUL RECIPIENT SET, taken here because `recipients` below is about
+    // to be filtered down to contact-worthy addresses (self dropped, robots
+    // dropped) and this one must not be. It answers "who did this go to", the
+    // same question `to_addrs` answers, and feeds `message_recipients` — which
+    // send-group history joins against. A group whose member is `support@` or
+    // the user's own address still received the mail.
+    let recipient_addrs: Vec<String> = dedupe_lowercased(&mailboxes);
     let mut recipients: Vec<String> = mailboxes.into_iter().map(|(addr, _)| addr).collect();
 
     // Extract fields with graceful fallbacks for malformed mail.
@@ -1043,6 +1131,7 @@ pub fn ingest(
         return TriagedMessage {
             message,
             recipients,
+            recipient_addrs,
             sensitivity: Sensitivity::Sealed,
             sealed_kind: Some(kind),
             importance: 0,
@@ -1071,6 +1160,7 @@ pub fn ingest(
         return TriagedMessage {
             message,
             recipients,
+            recipient_addrs,
             sensitivity: Sensitivity::Normal,
             sealed_kind: None,
             importance: 0,
@@ -1136,6 +1226,7 @@ pub fn ingest(
     TriagedMessage {
         message,
         recipients,
+        recipient_addrs,
         sensitivity: Sensitivity::Normal,
         sealed_kind: None,
         importance: result.importance,
@@ -1501,6 +1592,68 @@ mod tests {
         let f = raw(1, "g-recv", eml, /* is_sent */ false);
         let t = ingest(&f, &Stage1Config::default(), Utc::now(), |_| false);
         assert_eq!(t.message.to_addrs, None);
+    }
+
+    /// Gmail keeps the `Bcc` header on the SENDER'S own Sent copy, and that copy
+    /// is the only record of who a blind blast reached. Without reading it, a
+    /// bcc-only send lists in the outbox addressed to nobody.
+    #[test]
+    fn sent_mail_reads_its_own_bcc_and_received_mail_never_does() {
+        let eml = "From: Me <me@example.com>\r\n\
+                   To: Me <me@example.com>\r\n\
+                   Bcc: Ann <ann@fund.com>, bo@fund.com\r\n\
+                   Subject: Update #3\r\n\
+                   Date: Mon, 7 Jul 2026 10:00:00 +0000\r\n\
+                   \r\n\
+                   we closed the round\r\n";
+        let f = raw(1, "g-bcc", eml, /* is_sent */ true);
+        let t = ingest(&f, &Stage1Config::default(), Utc::now(), |_| false);
+        assert_eq!(
+            t.message.to_addrs.as_deref(),
+            Some("Me <me@example.com>, Ann <ann@fund.com>, bo@fund.com"),
+            "the outbox must show who a blind blast actually reached"
+        );
+        assert!(t.recipient_addrs.contains(&"ann@fund.com".to_string()));
+        assert!(t.recipient_addrs.contains(&"bo@fund.com".to_string()));
+
+        // On RECEIVED mail a `Bcc` header is at best the sender's leak and at
+        // worst forged, and in neither case is it "who this went to".
+        let f = raw(1, "g-bcc-in", eml, /* is_sent */ false);
+        let t = ingest(&f, &Stage1Config::default(), Utc::now(), |_| false);
+        assert_eq!(t.message.to_addrs, None);
+        assert!(t.recipient_addrs.is_empty());
+    }
+
+    /// The inverse of `format_recipients`, used by the backfill paths that only
+    /// ever see the rendered column.
+    #[test]
+    fn stored_recipients_parse_back_to_bare_addresses() {
+        assert_eq!(
+            parse_stored_recipients(
+                "Alice <ALICE@friends.com>, bob@friends.com, \"Doe, John\" <john@x.com>"
+            ),
+            vec!["alice@friends.com", "bob@friends.com", "john@x.com"],
+            "the split is quote-aware: a lastname-first name is ONE recipient"
+        );
+        assert!(parse_stored_recipients("").is_empty());
+        // Case-folded dedup, matching what the index stores.
+        assert_eq!(parse_stored_recipients("a@x.com, A@X.com"), vec!["a@x.com"]);
+    }
+
+    /// Round-trip: anything the ingest path renders, the backfill path reads
+    /// back identically. These two must not drift.
+    #[test]
+    fn format_and_parse_recipients_round_trip() {
+        let mailboxes = vec![
+            ("ALICE@friends.com".to_string(), Some("Alice".to_string())),
+            ("john@x.com".to_string(), Some("Doe, John".to_string())),
+            ("bare@x.com".to_string(), None),
+        ];
+        let rendered = format_recipients(&mailboxes).unwrap();
+        assert_eq!(
+            parse_stored_recipients(&rendered),
+            dedupe_lowercased(&mailboxes)
+        );
     }
 
     #[test]

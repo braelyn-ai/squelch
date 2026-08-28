@@ -303,8 +303,64 @@ pub const BLOCKED_EGRESS_CIDRS: &[&str] = &[
 /// operator configured a model PVC (see `deploy/hosted/SETUP.md`). Copied
 /// rather than symlinked because the daemon's root filesystem is read-only and
 /// fastembed expects to own its cache directory.
+///
+/// PER MODEL DIRECTORY, not per cache. The obvious condition is "copy if the
+/// cache directory does not exist", and it has a hole the size of the whole
+/// feature: a tenant that booted once BEFORE the PVC was configured downloaded
+/// its own weights, so the cache directory exists, so it never takes anything
+/// from the PVC again, including a model it does not have. Every tenant
+/// provisioned before this volume existed is in exactly that state, and so is
+/// every tenant on the day the pinned model changes. Copying entry by entry and
+/// skipping the ones already present fixes both, keeps the tenant's own
+/// downloads untouched, and stays idempotent across restarts. `$m` is
+/// `/models/<model dir>`, so `${m#/models/}` is its name without needing
+/// `basename` in the image.
+///
+/// Per DIRECTORY is also what makes the copy safe. A model in fastembed's
+/// Hugging Face cache layout is mostly symlinks from `snapshots/` into
+/// `blobs/`, and whether `cp -r` recreates those or dereferences them differs
+/// between coreutils and BSD. Either is correct here, because the links are
+/// relative and point inside the directory being copied: preserved they still
+/// resolve, dereferenced the copy is just bigger. A per-file copy is what would
+/// break, which is why the loop iterates `/models/*` and not what is under it.
+///
+/// TEMP PATH THEN RENAME, because "skip what is already there" and "copy in
+/// place" combine into a trap. A `cp -r` straight to `$d` that dies partway
+/// (the node under memory pressure, the init container OOM-killed, a source
+/// file it cannot read) leaves a half-populated model directory, and every
+/// later boot sees `-e "$d"` and skips it. What that costs depends on how it
+/// died: hf-hub re-fetches what it cannot resolve, so a missing snapshot
+/// pointer or a dangling link only makes the tenant pay the download it was
+/// meant to skip. The one that does not heal is a TRUNCATED file at the right
+/// path, which looks fetched and fails at session load. Copying to
+/// `$d.seed-tmp` and renaming means `$d` only ever appears complete: rename is
+/// atomic, and both paths are on the tenant's own volume so it is a rename and
+/// not a cross-device copy. The `rm -rf "$t"` at the top of each iteration
+/// sweeps the leftovers of a run that died, so an interrupted seed costs disk
+/// once rather than accumulating.
+///
+/// A FAILED MODEL COPY IS NOT A FAILED POD. The weights half is best-effort by
+/// construction: the daemon can always download what it does not find, so the
+/// worst a failure here costs is the slow first boot this feature exists to
+/// avoid. Fatal, it would cost the fleet. `set -eu` plus one unreadable file on
+/// the shared volume (a PVC whose modes or ownership are wrong, which
+/// `deploy/hosted/SETUP.md` step 10 warns about) exits the init container 1 on
+/// EVERY tenant's next roll, and [`crate::provision`]'s roll reads a tenant
+/// that will not come up as a casualty and halts. So the copy is chained rather
+/// than trusted to `set -e`, and a failure sweeps its own temp directory and
+/// says so on stderr. The credentials half above stays strict: a daemon with no
+/// credentials file is not a daemon, and there is nothing for it to fall back
+/// to.
+///
+/// The limit, stated: this protects a directory THIS script wrote. A cache
+/// already half-populated under the model's real name (a download the daemon
+/// itself did not finish) is indistinguishable from a good one at `-e`, and the
+/// script leaves it alone. Repairing that is the operator's job, and the
+/// procedure is the reclaim step in `deploy/hosted/PRODUCTION.md`: delete the
+/// bad directory and let the next boot seed or re-download it.
 pub const SEED_SCRIPT: &str = "set -eu\n\
     want=$(sha256sum /etc/squelch/credential/credentials.json | cut -d ' ' -f 1)\n\
+    [ -n \"$want\" ] || { echo 'squelch-seed: no credential file to seed from' >&2; exit 1; }\n\
     have=''\n\
     if [ -f /data/.credentials.seed ]; then have=$(cat /data/.credentials.seed); fi\n\
     if [ \"$want\" != \"$have\" ]; then\n\
@@ -312,9 +368,19 @@ pub const SEED_SCRIPT: &str = "set -eu\n\
     \x20 chmod 600 /data/credentials.json\n\
     \x20 printf '%s\\n' \"$want\" > /data/.credentials.seed\n\
     fi\n\
-    if [ -d /models ] && [ ! -d /data/.local/share/squelch/models ]; then\n\
-    \x20 mkdir -p /data/.local/share/squelch\n\
-    \x20 cp -r /models /data/.local/share/squelch/models\n\
+    if [ -d /models ] && mkdir -p /data/.local/share/squelch/models; then\n\
+    \x20\x20for m in /models/*; do\n\
+    \x20\x20\x20\x20[ -e \"$m\" ] || continue\n\
+    \x20\x20\x20\x20d=/data/.local/share/squelch/models/${m#/models/}\n\
+    \x20\x20\x20\x20t=$d.seed-tmp\n\
+    \x20\x20\x20\x20rm -rf \"$t\"\n\
+    \x20\x20\x20\x20if [ ! -e \"$d\" ]; then\n\
+    \x20\x20\x20\x20\x20\x20cp -r \"$m\" \"$t\" && mv \"$t\" \"$d\" || {\n\
+    \x20\x20\x20\x20\x20\x20\x20\x20rm -rf \"$t\"\n\
+    \x20\x20\x20\x20\x20\x20\x20\x20echo \"squelch-seed: could not copy ${m#/models/}, the daemon will download it\" >&2\n\
+    \x20\x20\x20\x20\x20\x20}\n\
+    \x20\x20\x20\x20fi\n\
+    \x20\x20done\n\
     fi\n";
 
 /// The init container's bounds. Constants rather than config: it copies at most
@@ -1258,6 +1324,14 @@ fn daemon_env(config: &Config, name: &TenantName) -> Vec<EnvVar> {
         ),
     ];
 
+    // Which embedding weights the daemon loads, when the operator pinned one.
+    // ABSENT unless set, so a warden with the knob unset builds the same pod a
+    // warden that never heard of it did: the daemon ships its own pin, and this
+    // exists only so the fleet can be moved off it without cutting an image.
+    if let Some(model) = &config.embed_model {
+        env.push(plain("SQUELCH_EMBED_MODEL", model));
+    }
+
     // The control plane's origin, behind the console's "Continue with Google"
     // link. ABSENT when the operator did not configure one, rather than empty:
     // the daemon treats a blank value as unset anyway, but an empty env var in a
@@ -1281,6 +1355,13 @@ fn daemon_env(config: &Config, name: &TenantName) -> Vec<EnvVar> {
             name.control_secret(),
             SHARE_TOKEN_KEY,
         ));
+    }
+
+    // The tenant daemon's idle-embedder window, present only when the operator
+    // pinned one. Unset, the daemon keeps its own default: this is a pod-shaped
+    // override, not a policy the warden holds an opinion about.
+    if let Some(secs) = config.embed_idle_unload_secs {
+        env.push(plain("SQUELCH_EMBED_IDLE_UNLOAD_SECS", &secs.to_string()));
     }
 
     // The LLM gateway block, present only when the operator configured one.
@@ -1608,6 +1689,15 @@ mod tests {
             "/etc/squelch/identity/identity.txt"
         );
         assert_eq!(plain["HOME"], "/data");
+        // Unpinned, the daemon picks its own embedding model, and the var is
+        // absent rather than empty.
+        assert!(!plain.contains_key("SQUELCH_EMBED_MODEL"));
+        // Unset by default, so the daemon keeps its own idle-unload window.
+        assert!(
+            env.iter()
+                .all(|e| e.name != "SQUELCH_EMBED_IDLE_UNLOAD_SECS"),
+            "an unset embedder knob still reached the pod"
+        );
 
         // The address comes from the Secret, so it is encrypted at rest and is
         // not in the Deployment anyone can `kubectl get -o yaml`.
@@ -1716,6 +1806,32 @@ mod tests {
         );
     }
 
+    /// The daemon reads `SQUELCH_EMBED_IDLE_UNLOAD_SECS`, but a hosted tenant's
+    /// env is this CLOSED list, so the daemon knob is unreachable unless the
+    /// warden renders it. `0` is the off switch, and it has to survive the
+    /// render as `"0"` rather than being read as unset.
+    #[test]
+    fn the_embedder_idle_window_reaches_the_pod_when_the_operator_pins_one() {
+        let mut c = test_config();
+        c.embed_idle_unload_secs = Some(900);
+        let pod = tenant_deployment(&c).spec.unwrap().template.spec.unwrap();
+        let env = pod.containers[0].env.clone().unwrap();
+        let plain: BTreeMap<&str, &str> = env
+            .iter()
+            .filter_map(|e| Some((e.name.as_str(), e.value.as_deref()?)))
+            .collect();
+        assert_eq!(plain["SQUELCH_EMBED_IDLE_UNLOAD_SECS"], "900");
+
+        c.embed_idle_unload_secs = Some(0);
+        let pod = tenant_deployment(&c).spec.unwrap().template.spec.unwrap();
+        let env = pod.containers[0].env.clone().unwrap();
+        let zero = env
+            .iter()
+            .find(|e| e.name == "SQUELCH_EMBED_IDLE_UNLOAD_SECS")
+            .expect("the off switch is a value, not an absence");
+        assert_eq!(zero.value.as_deref(), Some("0"));
+    }
+
     /// The tuning knobs, each landing under the daemon's real variable name.
     /// Stage 2's model is `SQUELCH_MODEL`, not `SQUELCH_STAGE2_MODEL`: it
     /// predates the stage split.
@@ -1738,6 +1854,30 @@ mod tests {
         assert!(!plain.contains_key("SQUELCH_STAGE2_MODEL"));
         assert_eq!(plain["SQUELCH_STAGE1_GLOBAL_DAILY_CAP"], "200");
         assert_eq!(plain["SQUELCH_STAGE2_GLOBAL_DAILY_CAP"], "40");
+    }
+
+    /// The embedding pin reaching a tenant. Not part of the LLM block: it needs
+    /// no gateway, because it names weights the daemon loads locally.
+    ///
+    /// The var is a CLOSED list's newest member. The daemon has read
+    /// `SQUELCH_EMBED_MODEL` since the model was pinned, but nothing this file
+    /// does not render can reach a tenant, so without this line the daemon-side
+    /// override would be unreachable on hosted and moving the fleet's embedding
+    /// model would mean cutting a new image.
+    #[test]
+    fn a_pinned_embedding_model_reaches_the_daemon_without_a_gateway() {
+        let mut c = test_config();
+        c.embed_model = Some("Xenova/bge-small-en-v1.5".to_string());
+        let pod = tenant_deployment(&c).spec.unwrap().template.spec.unwrap();
+        let env = pod.containers[0].env.clone().unwrap();
+
+        let plain: BTreeMap<&str, &str> = env
+            .iter()
+            .filter_map(|e| Some((e.name.as_str(), e.value.as_deref()?)))
+            .collect();
+        assert_eq!(plain["SQUELCH_EMBED_MODEL"], "Xenova/bge-small-en-v1.5");
+        // No gateway was configured, and the LLM block is still absent.
+        assert!(!plain.contains_key("SQUELCH_ANTHROPIC_BASE_URL"));
     }
 
     /// The rotation mechanism for the virtual key, same story as the
@@ -2088,7 +2228,7 @@ mod tests {
         );
         assert_eq!(
             daemon.requests.clone().unwrap()["memory"],
-            Quantity("256Mi".into())
+            Quantity("384Mi".into())
         );
         assert_eq!(
             daemon.requests.unwrap()["ephemeral-storage"],
@@ -2186,6 +2326,94 @@ mod tests {
         assert!(SEED_SCRIPT.contains("if [ \"$want\" != \"$have\" ]"));
         // The old no-clobber guard is what made rotation impossible.
         assert!(!SEED_SCRIPT.contains("if [ ! -f /data/credentials.json ]"));
+    }
+
+    /// The weights half seeds model by model. The whole-cache guard it replaced
+    /// could only ever fire on a tenant's very first boot, which meant a tenant
+    /// provisioned before the PVC existed, or one alive on the day the pinned
+    /// model changed, took nothing from it ever again and downloaded instead.
+    #[test]
+    fn the_seed_script_fills_in_a_missing_model_beside_the_ones_a_tenant_has() {
+        // The guard that made it first-boot-only.
+        assert!(!SEED_SCRIPT.contains("[ ! -d /data/.local/share/squelch/models ]"));
+        // Per entry, and skipping what is already there.
+        assert!(SEED_SCRIPT.contains("for m in /models/*; do"));
+        assert!(SEED_SCRIPT.contains("if [ ! -e \"$d\" ]; then"));
+        // `set -eu` still governs the credentials half above: an unset variable
+        // or a failed install there must stop the container.
+        assert!(SEED_SCRIPT.starts_with("set -eu\n"));
+    }
+
+    /// The destination appears complete or not at all. Copying in place would
+    /// pair with the "skip what exists" guard to make one interrupted `cp` a
+    /// permanent one: the half-copied directory is skipped by every later boot.
+    /// hf-hub re-fetches a dangling link, so most of those heal at the price of
+    /// the download; a truncated file at the right path does not.
+    #[test]
+    fn a_model_is_copied_to_a_temp_path_and_renamed_into_place() {
+        assert!(SEED_SCRIPT.contains("t=$d.seed-tmp"));
+        assert!(SEED_SCRIPT.contains("cp -r \"$m\" \"$t\""));
+        assert!(SEED_SCRIPT.contains("mv \"$t\" \"$d\""));
+        // Never the destination directly: that is the whole bug.
+        assert!(!SEED_SCRIPT.contains("cp -r \"$m\" \"$d\""));
+        // An interrupted run costs disk once, not once per restart.
+        assert!(SEED_SCRIPT.contains("rm -rf \"$t\""));
+        // And the sweep has to come BEFORE the copy, or it collects the temp
+        // directory the same iteration just built.
+        let sweep = SEED_SCRIPT.find("rm -rf \"$t\"").unwrap();
+        let copy = SEED_SCRIPT.find("cp -r \"$m\" \"$t\"").unwrap();
+        assert!(sweep < copy, "the sweep must precede the copy");
+    }
+
+    /// A model the init container cannot copy costs that tenant the download
+    /// this feature exists to avoid. Fatal, it would cost the FLEET: one source
+    /// file the container cannot read (a shared volume whose modes or ownership
+    /// are wrong) exits every tenant's init container 1 on its next roll, and
+    /// [`crate::provision`]'s roll reads a tenant that will not come up as a
+    /// casualty and halts. So the copy is chained, not left to `set -e`.
+    /// `want=$(sha256sum ... | cut ...)` takes the PIPELINE's status, which is
+    /// `cut`'s, so under `set -e` a missing or unreadable credential file did
+    /// not stop the script: `want` came out empty, matched the empty `have` of a
+    /// fresh volume, the copy was skipped, and the init container exited 0 with
+    /// no credentials installed. A daemon with no credentials file is not a
+    /// daemon, so an empty hash is the init container's failure, said out loud.
+    #[test]
+    fn an_absent_credential_file_fails_the_seed_instead_of_seeding_nothing() {
+        let guard = "[ -n \"$want\" ] || { echo 'squelch-seed: no credential file to seed from' >&2; exit 1; }";
+        assert!(SEED_SCRIPT.contains(guard));
+        let hashed = SEED_SCRIPT.find("want=$(sha256sum").unwrap();
+        let guarded = SEED_SCRIPT.find(guard).unwrap();
+        let compared = SEED_SCRIPT.find("if [ \"$want\" != \"$have\" ]").unwrap();
+        assert!(
+            hashed < guarded && guarded < compared,
+            "guard sits between the hash and the compare"
+        );
+    }
+
+    #[test]
+    fn a_failed_model_copy_does_not_fail_the_pod() {
+        // Chained, with the fallback branch that keeps the shell's status 0.
+        assert!(SEED_SCRIPT.contains("cp -r \"$m\" \"$t\" && mv \"$t\" \"$d\" || {"));
+        assert!(SEED_SCRIPT.contains("the daemon will download it"));
+        // The fallback sweeps its own wreckage, so a failure costs no disk.
+        let fallback = SEED_SCRIPT.find("|| {").unwrap();
+        let swept = SEED_SCRIPT[fallback..].find("rm -rf \"$t\"").unwrap();
+        let said = SEED_SCRIPT[fallback..]
+            .find("squelch-seed: could not copy")
+            .unwrap();
+        assert!(swept < said, "sweep the temp path before saying so");
+        // `mkdir -p` rides in the `if` condition for the same reason: a failure
+        // there is a verdict, not an exit.
+        assert!(
+            SEED_SCRIPT
+                .contains("if [ -d /models ] && mkdir -p /data/.local/share/squelch/models; then")
+        );
+        // The credentials half stays strict. A daemon with no credentials file
+        // is not a daemon, and it has nothing to fall back to.
+        assert!(
+            SEED_SCRIPT
+                .contains(" cp /etc/squelch/credential/credentials.json /data/credentials.json\n")
+        );
     }
 
     #[test]

@@ -229,7 +229,7 @@ pub struct Rolled {
     /// on the strength of a cluster that has just gone quiet. This one is a fact
     /// about one tenant that no retry changes, and stopping on it would park
     /// every tenant after it in [`Warden::fleet`] order behind a run that halts
-    /// at the same label every fifteen minutes, forever.
+    /// at the same label on every tick, forever.
     ///
     /// The pod is probably still up - the daemon installed its credential onto
     /// its own volume long ago - so this is not [`Rolled::stranded`]. It is a
@@ -636,15 +636,92 @@ impl Warden {
             return Err(WardenError::Conflict);
         }
 
+        self.install_credentials(&name, &ciphertext, status, reopening)
+            .await
+    }
+
+    /// REPLACE a live tenant's credential, because its owner re-consented.
+    ///
+    /// The sibling of [`Warden::set_credentials`] and deliberately not a
+    /// relaxation of it. That route's 409 for an ACTIVE tenant is load bearing
+    /// — a second phase two against a serving mailbox is somebody claiming it —
+    /// and the way to admit the one caller who legitimately has a replacement
+    /// is a door with its own key, not a weaker lock on the existing one.
+    ///
+    /// THE KEY IS THE MAILBOX. `account_email` is matched against the tenant's
+    /// own identity Secret, so this route cannot install a credential into a
+    /// mailbox the caller has not proved they own. The control plane checks the
+    /// same thing against its store before calling; this is the second check,
+    /// made by a different service from a different record, and it is the one
+    /// the cluster is authoritative for.
+    ///
+    /// A CANCELLED account is refused rather than reopened. `set_credentials`
+    /// owns reopening, and it is a decision about billing and consent that a
+    /// re-consent link must not be able to make on its own.
+    pub async fn replace_credentials(
+        &self,
+        raw_label: &str,
+        raw_email: &str,
+        raw_ciphertext: &str,
+    ) -> Result<Pairing, WardenError> {
+        let name = TenantName::parse(raw_label)?;
+        let account_email = validate::validate_account_email(raw_email)?;
+        let ciphertext = validate::validate_ciphertext(raw_ciphertext)?;
+
+        let Some(identity) = self.identity(&name).await? else {
+            return Err(WardenError::NotFound);
+        };
+        // A closed account is not reopened by re-consenting. See above.
+        if is_cancelled(&identity) {
+            return Err(WardenError::Conflict);
+        }
+        match secret_value(&identity, objects::ACCOUNT_EMAIL_KEY) {
+            Some(stored) if stored == account_email => {}
+            // A DIFFERENT mailbox, or a Secret this warden did not write. Both
+            // are the same refusal: which one it was is exactly what somebody
+            // probing would want to learn.
+            _ => return Err(WardenError::Conflict),
+        }
+
+        // AND THE STATUS, which is the half the control plane's own check is not
+        // independent of. Its store only maps a mailbox to an ACTIVE tenant, so
+        // today nothing pending reaches here — but that is ONE gate, and this
+        // route exists to be the second one. A PENDING tenant is a signup that
+        // stopped between its two calls, and installing a credential into it
+        // would finish that signup: a mailbox provisioned with no invite spent,
+        // through a public link. STOPPED is deliberately down and must not be
+        // brought back up by re-consenting. FAILED is admitted with Active on
+        // purpose: a tenant whose pod is not serving is often one whose
+        // credential is exactly what died.
+        let status = self.status_of(&name).await?;
+        if !matches!(status, TenantStatus::Active | TenantStatus::Failed) {
+            return Err(WardenError::Conflict);
+        }
+        self.install_credentials(&name, &ciphertext, status, false)
+            .await
+    }
+
+    /// Everything both credential routes do once their own guard has passed:
+    /// store the blob, apply the workload, wait for the new pod, and mint a
+    /// pairing. Shared rather than copied because the ORDER in it is the
+    /// contract (volume, policy, service, workload, ingress) and two copies of
+    /// an order are one edit away from disagreeing.
+    async fn install_credentials(
+        &self,
+        name: &TenantName,
+        ciphertext: &str,
+        status: TenantStatus,
+        reopening: bool,
+    ) -> Result<Pairing, WardenError> {
         // Verbatim. The warden does not parse, re-serialize or pretty-print
         // this: it is somebody else's ciphertext and the only correct thing to
         // do with it is put it where the daemon will look.
         self.apply(
-            &name,
+            name,
             Object::Secret(Box::new(objects::credential_secret(
                 &self.config,
-                &name,
-                &ciphertext,
+                name,
+                ciphertext,
             ))),
             "credential_write_failed",
         )
@@ -655,20 +732,20 @@ impl Warden {
         // never briefly reachable; the Ingress is last, so the hostname starts
         // answering only once there is something behind it.
         self.apply(
-            &name,
-            Object::Pvc(Box::new(objects::data_pvc(&self.config, &name))),
+            name,
+            Object::Pvc(Box::new(objects::data_pvc(&self.config, name))),
             "volume_failed",
         )
         .await?;
         self.apply(
-            &name,
-            Object::NetworkPolicy(Box::new(objects::network_policy(&self.config, &name))),
+            name,
+            Object::NetworkPolicy(Box::new(objects::network_policy(&self.config, name))),
             "network_policy_failed",
         )
         .await?;
         self.apply(
-            &name,
-            Object::Service(Box::new(objects::service(&self.config, &name))),
+            name,
+            Object::Service(Box::new(objects::service(&self.config, name))),
             "service_failed",
         )
         .await?;
@@ -678,19 +755,19 @@ impl Warden {
         // rotation would find nothing to differ from. The Secret can only
         // exist if `llm_base_url` was configured when `set_llm_key` accepted
         // it, so this pickup cannot stamp the annotation with the feature off.
-        let llm_hash = self.llm_hash(&name).await?;
+        let llm_hash = self.llm_hash(name).await?;
         // The same pickup, for the same reason: "PUT control-token then PUT
         // credentials" is a legal order too, and a pod born without the
         // annotation would never differ from the first rotation.
-        let share_hash = self.share_hash(&name).await?;
+        let share_hash = self.share_hash(name).await?;
         // The hash of what was just stored, not of what is running: this is the
         // whole mechanism by which a re-consent reaches the daemon.
         self.apply(
-            &name,
+            name,
             Object::Deployment(Box::new(objects::deployment(
                 &self.config,
-                &name,
-                &objects::credential_hash(&ciphertext),
+                name,
+                &objects::credential_hash(ciphertext),
                 llm_hash.as_deref(),
                 share_hash.as_deref(),
             ))),
@@ -698,8 +775,8 @@ impl Warden {
         )
         .await?;
         self.apply(
-            &name,
-            Object::Ingress(Box::new(objects::ingress(&self.config, &name))),
+            name,
+            Object::Ingress(Box::new(objects::ingress(&self.config, name))),
             "ingress_failed",
         )
         .await?;
@@ -724,7 +801,7 @@ impl Warden {
         }
         let pod = self
             .cluster
-            .ready_pod(&objects::pod_selector(&name), self.config.ready_timeout)
+            .ready_pod(&objects::pod_selector(name), self.config.ready_timeout)
             .await
             .map_err(|e| fail(name.as_str(), "not_ready", &e))?;
 
@@ -757,7 +834,7 @@ impl Warden {
             tracing::info!(tenant = %name, "reopened a cancelled account");
         }
 
-        let pairing = self.mint_pairing(&name, &pod).await?;
+        let pairing = self.mint_pairing(name, &pod).await?;
         tracing::info!(tenant = %name, "tenant provisioned");
         Ok(pairing)
     }
@@ -2311,7 +2388,7 @@ impl Warden {
     /// [`Warden::torn_down_before_the_marker`]'s question, it costs one GET on
     /// this path alone, and getting it wrong here is not a miscount - the
     /// summary would name a closed account as a mailbox that is down, exit 1
-    /// over it every fifteen minutes, and send an operator to
+    /// over it on every tick, and send an operator to
     /// `squelch-control reconcile <label>`, which is the call that would put it
     /// back on the internet.
     async fn workloadless(&self, name: &TenantName) -> Result<Step, WardenError> {
@@ -2362,6 +2439,50 @@ impl Warden {
     }
 
     /// The idempotent-retry path of phase one.
+    /// The age recipient of a tenant that ALREADY EXISTS, for the control plane
+    /// to seal a REPLACEMENT credential to.
+    ///
+    /// [`Warden::create_tenant`] deliberately cannot answer this: it 409s for
+    /// anything past `pending`, because a second POST for a serving tenant is
+    /// somebody claiming a taken subdomain. That is the right rule for signup
+    /// and the wrong one for a re-consent, which is a request about a mailbox
+    /// the caller has just proved ownership of.
+    ///
+    /// `account_email` is REQUIRED and matched, so this route cannot be used to
+    /// enumerate recipients or to aim a credential at somebody else's mailbox.
+    /// The control plane checks the same thing from its own store first; this
+    /// is the second check, made by a different service from a different
+    /// record, and it is the one that is authoritative about custody.
+    ///
+    /// Returning the recipient is safe by construction: it is the PUBLIC half
+    /// of the tenant's identity. The private half never leaves the Secret this
+    /// reads, and a recipient is exactly what the control plane is already
+    /// handed at signup.
+    pub async fn recipient_for(
+        &self,
+        raw_label: &str,
+        raw_email: &str,
+    ) -> Result<Created, WardenError> {
+        let name = TenantName::parse(raw_label)?;
+        let account_email = validate::validate_account_email(raw_email)?;
+
+        let Some(existing) = self.identity(&name).await? else {
+            return Err(WardenError::NotFound);
+        };
+        let stored_email = secret_value(&existing, objects::ACCOUNT_EMAIL_KEY);
+        let recipient = secret_value(&existing, objects::RECIPIENT_KEY);
+        match (stored_email, recipient) {
+            (Some(stored), Some(recipient)) if stored == account_email => {
+                tracing::info!(tenant = %name, "re-issued the recipient for a re-consent");
+                Ok(Created { recipient })
+            }
+            // A DIFFERENT mailbox, or a Secret this warden did not write. Both
+            // are 409 and not 404: the tenant exists, and which of the two it
+            // was is not something a caller gets to distinguish.
+            _ => Err(WardenError::Conflict),
+        }
+    }
+
     async fn reuse(
         &self,
         name: &TenantName,

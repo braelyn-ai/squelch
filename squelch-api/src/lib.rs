@@ -12,6 +12,8 @@ mod devices;
 mod error;
 mod events;
 pub mod gmail_write;
+mod group_send;
+mod groups;
 pub mod guard;
 mod handlers;
 mod invite_mail;
@@ -142,6 +144,7 @@ fn client_router(state: ApiState) -> Router {
         // Recipient autocomplete over Sent-derived contacts. Human door only —
         // the agent door must never see who the user writes to.
         .route("/client/contacts", get(handlers::get_contacts))
+        .merge(groups::routes())
         .route("/client/sealed", get(handlers::list_sealed))
         .route(
             "/client/sealed/{message_id}/reveal",
@@ -194,7 +197,10 @@ fn client_router(state: ApiState) -> Router {
             get(handlers::get_triage_feedback).post(handlers::post_triage_feedback),
         )
         // Dev re-triage + inspector: human-door only.
-        .route("/client/retriage", post(handlers::retriage))
+        .route(
+            "/client/retriage",
+            get(handlers::retriage_progress).post(handlers::retriage),
+        )
         .route(
             "/client/triage-debug/{message_id}",
             get(handlers::triage_debug),

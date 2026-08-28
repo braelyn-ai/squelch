@@ -153,7 +153,15 @@ impl Harness {
     }
 
     fn register(&self, token: &str) {
-        self.store.upsert_device(self.acct, token, "ios").unwrap();
+        self.store
+            .upsert_device(self.acct, token, "ios", None)
+            .unwrap();
+    }
+
+    fn register_tagged(&self, token: &str, tag: &str) {
+        self.store
+            .upsert_device(self.acct, token, "ios", Some(tag))
+            .unwrap();
     }
 
     fn cursor(&self) -> Option<i64> {
@@ -260,6 +268,84 @@ async fn a_push_advances_the_cursor() {
     assert_eq!(bodies[0]["collapse_id"], json!("thread-thread1"));
     assert_eq!(bodies[1]["collapse_id"], json!("thread-thread2"));
     assert_eq!(bodies[0]["device_tokens"], json!([DEV_A]));
+
+    h.stop().await;
+}
+
+/// A phone holding two mailboxes registers the same device with each daemon
+/// under a different tag. One daemon's push must name ITS tag, so the receiver
+/// can tell whose event 41 arrived — event ids being per-daemon ints that
+/// collide across accounts.
+#[tokio::test]
+async fn a_tagged_device_gets_its_tag_on_the_wire() {
+    let (base, relay) = spawn_relay().await;
+    let h = start(&base, |_, _| {});
+    h.register_tagged(DEV_A, "3F2A9C1E-7B44-4D0A-9E21-8C5B6D0F1A32");
+    wait_for("the initial cursor", Duration::from_secs(2), || {
+        h.cursor().is_some()
+    })
+    .await;
+
+    let id = h.emit(1);
+    wait_for("the push", Duration::from_secs(5), || relay.count() == 1).await;
+
+    let body = relay.bodies().remove(0);
+    assert_eq!(
+        body["event_id"],
+        json!(format!("3F2A9C1E-7B44-4D0A-9E21-8C5B6D0F1A32:{id}"))
+    );
+    // The tag joins the id and changes NOTHING else: the body is the same
+    // closed, content-free shape it is without one.
+    let mut keys: Vec<&str> = body
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(|k| k.as_str())
+        .collect();
+    keys.sort_unstable();
+    assert_eq!(keys, vec!["collapse_id", "device_tokens", "event_id"]);
+
+    h.stop().await;
+}
+
+/// Two accounts on one phone, one daemon: each device carries its own tag, so
+/// the fan-out splits into one request per tag rather than one shared payload
+/// that would tell both receivers the same wrong thing.
+#[tokio::test]
+async fn each_tag_gets_its_own_request() {
+    let (base, relay) = spawn_relay().await;
+    let h = start(&base, |_, _| {});
+    h.register_tagged(DEV_A, "acct-a");
+    h.register_tagged(DEV_B, "acct-b");
+    wait_for("the initial cursor", Duration::from_secs(2), || {
+        h.cursor().is_some()
+    })
+    .await;
+
+    let id = h.emit(1);
+    wait_for("both requests", Duration::from_secs(5), || {
+        relay.count() == 2
+    })
+    .await;
+
+    let bodies = relay.bodies();
+    let mut seen: Vec<(String, String)> = bodies
+        .iter()
+        .map(|b| {
+            (
+                b["event_id"].as_str().unwrap().to_string(),
+                b["device_tokens"][0].as_str().unwrap().to_string(),
+            )
+        })
+        .collect();
+    seen.sort();
+    assert_eq!(
+        seen,
+        vec![
+            (format!("acct-a:{id}"), DEV_A.to_string()),
+            (format!("acct-b:{id}"), DEV_B.to_string()),
+        ]
+    );
 
     h.stop().await;
 }
@@ -582,7 +668,7 @@ async fn a_cold_start_joins_at_the_head() {
                 .unwrap()
                 .unwrap();
         }
-        store.upsert_device(acct, DEV_A, "ios").unwrap();
+        store.upsert_device(acct, DEV_A, "ios", None).unwrap();
     });
 
     wait_for("the head cursor", Duration::from_secs(2), || {
@@ -632,7 +718,7 @@ async fn the_relay_bearer_is_presented_when_configured() {
     let acct = store.ensure_account("me@example.com").unwrap();
     let (events, _) = broadcast::channel::<i64>(256);
     store.attach_event_notifier(events.clone()).unwrap();
-    store.upsert_device(acct, DEV_A, "ios").unwrap();
+    store.upsert_device(acct, DEV_A, "ios", None).unwrap();
 
     let (shutdown, shutdown_rx) = watch::channel(false);
     let pusher = Pusher::for_test(store.clone() as Arc<dyn Store>, acct, &base)

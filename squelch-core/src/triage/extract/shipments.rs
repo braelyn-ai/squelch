@@ -82,8 +82,10 @@ is shown.
 - item_name: a short human name of WHAT was bought, as a shopper would say it \
 (e.g. \"Anker USB-C charger\", \"Double Take mirror\"). Use the product name \
 from the email body when present. NEVER output boilerplate like \"your \
-package\", \"order update\", or a sentence from the subject line. null if the \
-email never names the item.
+package\", \"order update\", or a sentence from the subject line. NEVER use an \
+em dash or en dash: this name is shown to the user exactly as you write it (a \
+plain hyphen, as in \"USB-C\", is fine). null if the email never names the \
+item.
 - carrier: which carrier is transporting the package: \"ups\", \"usps\", \
 \"fedex\", \"dhl\", or \"amazon\". Use the carrier the email states or the \
 tracking number's format implies. \"other\" if a different carrier is named. \

@@ -53,8 +53,76 @@ plus `GF_SECURITY_ADMIN_PASSWORD`. All live in Railway variables and in the
 
 `deploy/hosted/80-monitoring.yaml`: node-exporter, kube-state-metrics, and a
 Prometheus in **agent mode** that scrapes node-exporter, kubelet, cadvisor,
-kube-state-metrics, Traefik and cert-manager, then pushes everything out.
-No inbound port; the firewall stays 22/80/443. Total footprint ~200 MB.
+kube-state-metrics, Traefik and cert-manager, then pushes what survives
+relabeling. No inbound port; the firewall stays 22/80/443. It is meant to be a
+small tenant of the box and has to be kept that way on purpose; see below.
+
+### cadvisor and kubelet are allow-listed by metric name
+
+Those two endpoints are the cardinality hogs, and the agent is what pays for
+them: a 213 MiB working set against a 256Mi limit on a 3.8 GB box that has
+already global-OOM-killed tenant daemons. (How much of that 213 was series and
+how much was page cache over the agent's WAL is unmeasured; the agent now
+scrapes itself, so the next answer is a measurement.) So once the config below
+is applied they are not scraped whole: cadvisor keeps five families, drops the
+`id`, `name` and `image` labels, and drops the container-less rollups; kubelet
+keeps `kubelet_volume_stats_*` and nothing else. Everything else the dashboard
+reads with a `container_` in the name (`kube_pod_container_info`,
+`kube_pod_container_status_*`) is kube-state-metrics, not cadvisor, and that
+job is still scraped in full.
+
+**Adding a panel on a cadvisor or kubelet family that is not in the keep regex
+gets you NO DATA, not a slow query.** The fix is to widen the regex in the job's
+`metric_relabel_configs` in `80-monitoring.yaml`. The comment above each job
+says which names are in and why one is deliberately out.
+
+Two things bite here. First, `up` and the other synthetic scrape series are
+appended after metric relabeling, so a broken keep regex looks like a healthy
+target serving nothing, not like a dead target. That is what the third line on
+the dashboard's **Unhealthy signals** panel watches for: it counts cadvisor and
+kubelet targets that are either down or reporting zero samples past relabeling,
+and it should sit flat at zero. Second, **applying the ConfigMap does not
+reload the agent**: it runs without `--web.enable-lifecycle` and reads its
+config once, at boot. Carrier served a 13-day-stale Prometheus config exactly
+that way, and every per-tenant panel was blank while nothing looked wrong.
+
+```sh
+kubectl apply -f deploy/hosted/80-monitoring.yaml
+kubectl -n monitoring rollout restart deploy/prometheus-agent
+```
+
+To see what a target actually offers before guessing at a name, dump the
+families off the endpoint through the API server's node proxy, which spares you
+the service-account token, the TLS flags and a shell inside the agent's
+container:
+
+```sh
+NODE=$(kubectl get node -o jsonpath='{.items[0].metadata.name}')
+kubectl get --raw "/api/v1/nodes/$NODE/proxy/metrics/cadvisor" \
+  | grep '^# TYPE' | awk '{print $3}'
+```
+
+Swap `/metrics/cadvisor` for `/metrics` to do the same for the kubelet's own
+families.
+
+The agent scrapes itself on a job of its own (`prometheus-agent`, under ten
+series), because the allow-lists are a memory argument and it should be possible
+to read whether they worked. On the Railway Prometheus:
+
+```promql
+prometheus_agent_active_series{cluster="carrier"}
+process_resident_memory_bytes{cluster="carrier", job="prometheus-agent"}
+```
+
+The two do not track each other: resident memory includes page cache over the
+agent's WAL under `/data`, so a series cut moves the first immediately and the
+second only as the cache turns over. `prometheus_target_scrapes_sample_out_of_order_total`
+is on the same job, and it is where a relabel rule that collapses two series
+into one shows up. From the box, the resident half of that, without Grafana:
+
+```sh
+kubectl -n monitoring top pod -l app.kubernetes.io/name=prometheus-agent
+```
 
 ## What the dashboard answers
 
@@ -139,6 +207,14 @@ warden) and serves Prometheus text on container port `metrics`, named
 namespace by `app.kubernetes.io/name=squelchd` plus the port name, relabels
 `app.kubernetes.io/instance` to `tenant`, and caps each scrape at 500 samples.
 
+One series on that listener is worth naming, because it is the reader for
+**Tenant memory** rather than a health signal of its own:
+`squelchd_embedder_loaded` is 1 while the daemon's ONNX embedding session is
+resident and 0 while it is unloaded. That session is 85-90% of a tenant pod's
+RSS, so the **Embedder loaded** timeline is what turns a memory sawtooth from a
+mystery into cause and effect. A tenant pinned at 1 is a session the idle reaper
+never gets to put down.
+
 That listener has no authentication, so reaching it is a network question and
 the answer is one rule: the per-tenant NetworkPolicy admits the `monitoring`
 namespace's `app.kubernetes.io/name=prometheus-agent` pod to 9464 and nothing
@@ -156,3 +232,10 @@ time() - squelchd_sync_last_success_timestamp_seconds > 900
 One tenant firing is usually a dead refresh token (its
 `squelchd_gmail_api_errors_total{kind="auth"}` will be climbing) and that tenant
 has to re-consent; every tenant firing at once is the box.
+
+A first backfill that ran without the embedder (the init never settled inside
+its three-minute ceiling) is `increase(squelchd_embedder_gate_timeouts_total[1h])
+> 0`. The mailbox is fine; it is the memory profile that is not, because the
+vector backfill pass then drains that mailbox in batches instead of ingest
+embedding it one message at a time. One is worth a look; a train of them is a
+wedged init retrying.

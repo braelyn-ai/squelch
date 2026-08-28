@@ -7,8 +7,8 @@ image"), `../../docs/RELEASING.md` (surfaces and tags), and
 `../../squelch-warden/README.md` (the roller).
 
 Budget: ten minutes of typing, then **one roller tick per tenant that is
-behind** — fifteen minutes each, unattended. A four-tenant fleet is done in an
-hour. Nothing below needs watching while it converges.
+behind** — five minutes each, unattended. A four-tenant fleet is done in twenty
+minutes. Nothing below needs watching while it converges.
 
 ---
 
@@ -166,7 +166,7 @@ kubectl -n warden patch cronjob squelch-warden-roll -p '{"spec":{"suspend":false
 The roller converges **one** tenant per run and exits. This is the safety model,
 not a throughput bug: a finished rollout only proves the API server saw a ready
 replica, and squelchd opens its socket before it finishes starting, so what
-actually clears a render is a quarter hour of a real daemon serving real mail
+actually clears a render is five minutes of a real daemon serving real mail
 plus the next tick's refusal to roll anything if that mailbox is not up.
 
 ```sh

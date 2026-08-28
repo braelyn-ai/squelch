@@ -47,6 +47,29 @@ const BACKOFF_CAP: Duration = Duration::from_secs(300);
 const HTTP_TIMEOUT: Duration = Duration::from_secs(35);
 const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// How the event id goes out. A bare int for an untagged device; otherwise
+/// `"<tag>:<id>"`, the tag being the opaque label the client registered with.
+///
+/// The tag is client-minted and names nothing about the mailbox: it is the
+/// receiver's own word for one of its accounts, so the relay and APNs carry it
+/// while staying exactly as blind as they were. `:` cannot appear inside a tag
+/// (the human door refuses one that does), so the split is unambiguous.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(untagged)]
+pub enum PushEventId {
+    Plain(i64),
+    Tagged(String),
+}
+
+impl PushEventId {
+    fn new(tag: Option<&str>, id: i64) -> Self {
+        match tag {
+            Some(tag) => Self::Tagged(format!("{tag}:{id}")),
+            None => Self::Plain(id),
+        }
+    }
+}
+
 /// The complete wire body, and THE PRIVACY BOUNDARY: the content-bearing fields
 /// of [`Event`] (sender, one_line, tier, importance, kind, deadline) are absent
 /// and must stay absent. Adding a field here is a security change.
@@ -54,7 +77,7 @@ const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 pub struct PushRequest<'a> {
     pub device_tokens: &'a [String],
     /// Monotonic event id; the relay forwards it verbatim, never interprets it.
-    pub event_id: i64,
+    pub event_id: PushEventId,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub collapse_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -119,6 +142,21 @@ fn next_backoff(current: Option<Duration>) -> Duration {
         None => BACKOFF_BASE,
         Some(d) => (d * 2).min(BACKOFF_CAP),
     }
+}
+
+/// Devices sorted into one bucket per tag, first-seen order preserved so a
+/// fan-out and its logs stay reproducible. One request per bucket is the price
+/// of the tag: every token in a bucket shares one payload, and the payload is
+/// what carries the tag.
+fn by_tag(devices: &[(Option<String>, String)]) -> Vec<(Option<String>, Vec<String>)> {
+    let mut groups: Vec<(Option<String>, Vec<String>)> = Vec::new();
+    for (tag, token) in devices {
+        match groups.iter_mut().find(|(t, _)| t == tag) {
+            Some((_, tokens)) => tokens.push(token.clone()),
+            None => groups.push((tag.clone(), vec![token.clone()])),
+        }
+    }
+    groups
 }
 
 /// A device token reduced to something safe to log: at most 8 characters, enough
@@ -249,16 +287,19 @@ impl Pusher {
             if batch.is_empty() {
                 return Ok(());
             }
-            let mut tokens: Vec<String> = self
+            // The TAG rides with each token: it decides which payload the
+            // token's push is carried in, so it cannot be dropped here the way
+            // the rest of the row is.
+            let mut devices: Vec<(Option<String>, String)> = self
                 .store
                 .list_devices(self.account_id)?
                 .into_iter()
-                .map(|d| d.token)
+                .map(|d| (d.tag, d.token))
                 .collect();
 
             // Nothing registered: an event nobody can receive is history, not
             // backlog. Advance without opening a socket to the relay.
-            if tokens.is_empty() {
+            if devices.is_empty() {
                 if let Some(last) = batch.last() {
                     cursor = last.id;
                     self.set_cursor(cursor)?;
@@ -267,7 +308,7 @@ impl Pusher {
             }
 
             for ev in &batch {
-                let outcome = self.push_event(ev, &tokens).await?;
+                let outcome = self.push_event(ev, &devices).await?;
                 let dead = &outcome.dead;
                 for token in dead {
                     // The relay passes APNs' 410 back verbatim so THIS daemon
@@ -282,8 +323,8 @@ impl Pusher {
                     }
                 }
                 if !dead.is_empty() {
-                    tokens.retain(|t| !dead.contains(t));
-                    if tokens.is_empty() {
+                    devices.retain(|(_, t)| !dead.contains(t));
+                    if devices.is_empty() {
                         // Every device just died. The remaining events have
                         // nowhere to go; skip to the end of the batch.
                         cursor = batch.last().map(|e| e.id).unwrap_or(cursor);
@@ -309,56 +350,64 @@ impl Pusher {
         }
     }
 
-    /// POST one event to the relay for every registered token (chunked to the
-    /// relay's ceiling), returning the per-token tally: a 200 from the relay
-    /// says nothing about whether APNs took anything.
-    async fn push_event(&self, ev: &Event, tokens: &[String]) -> Result<PushOutcome> {
+    /// POST one event to the relay for every registered device — one request
+    /// per tag bucket, each chunked to the relay's ceiling — returning the
+    /// per-token tally: a 200 from the relay says nothing about whether APNs
+    /// took anything.
+    async fn push_event(
+        &self,
+        ev: &Event,
+        devices: &[(Option<String>, String)],
+    ) -> Result<PushOutcome> {
         let collapse = collapse_id(&ev.thread_id);
         let mut outcome = PushOutcome::default();
-        for chunk in tokens.chunks(MAX_TOKENS_PER_REQUEST) {
-            let body = PushRequest {
-                device_tokens: chunk,
-                event_id: ev.id,
-                collapse_id: Some(collapse.clone()),
-                topic: self.topic.as_deref(),
-                environment: self.environment.as_deref(),
-            };
-            let mut req = self.http.post(&self.push_url).json(&body);
-            if let Some(token) = &self.relay_token {
-                req = req.bearer_auth(token);
-            }
-            // The error is NOT propagated: reqwest's Display embeds the URL and
-            // the builder held the bearer. Only the class of failure escapes.
-            let resp = req.send().await.map_err(|_| {
-                eprintln!("squelch: APNs relay unreachable; cursor unmoved");
-                relay_failure()
-            })?;
-            let status = resp.status();
-            if !status.is_success() {
-                eprintln!(
-                    "squelch: APNs relay refused the push (HTTP {}); cursor unmoved",
-                    status.as_u16()
-                );
-                return Err(relay_failure());
-            }
-            let parsed: PushResponse = resp.json().await.map_err(|_| {
-                eprintln!("squelch: APNs relay returned an unreadable body; cursor unmoved");
-                relay_failure()
-            })?;
-            for result in parsed.results {
-                match result.status {
-                    200 => outcome.delivered += 1,
-                    // The device is gone. Data, not an error.
-                    410 => outcome.dead.push(result.token),
-                    // Retryable: `0` is the relay's word for an unreachable or
-                    // timed-out APNs; 429/5xx come through verbatim. Log the
-                    // status only — never the token value or a reason string.
-                    other => {
-                        outcome.failed += 1;
-                        eprintln!(
-                            "squelch: APNs push for one device returned status {other} (token {}…)",
-                            token_prefix(&result.token)
-                        );
+        for (tag, tokens) in by_tag(devices) {
+            let event_id = PushEventId::new(tag.as_deref(), ev.id);
+            for chunk in tokens.chunks(MAX_TOKENS_PER_REQUEST) {
+                let body = PushRequest {
+                    device_tokens: chunk,
+                    event_id: event_id.clone(),
+                    collapse_id: Some(collapse.clone()),
+                    topic: self.topic.as_deref(),
+                    environment: self.environment.as_deref(),
+                };
+                let mut req = self.http.post(&self.push_url).json(&body);
+                if let Some(token) = &self.relay_token {
+                    req = req.bearer_auth(token);
+                }
+                // The error is NOT propagated: reqwest's Display embeds the URL and
+                // the builder held the bearer. Only the class of failure escapes.
+                let resp = req.send().await.map_err(|_| {
+                    eprintln!("squelch: APNs relay unreachable; cursor unmoved");
+                    relay_failure()
+                })?;
+                let status = resp.status();
+                if !status.is_success() {
+                    eprintln!(
+                        "squelch: APNs relay refused the push (HTTP {}); cursor unmoved",
+                        status.as_u16()
+                    );
+                    return Err(relay_failure());
+                }
+                let parsed: PushResponse = resp.json().await.map_err(|_| {
+                    eprintln!("squelch: APNs relay returned an unreadable body; cursor unmoved");
+                    relay_failure()
+                })?;
+                for result in parsed.results {
+                    match result.status {
+                        200 => outcome.delivered += 1,
+                        // The device is gone. Data, not an error.
+                        410 => outcome.dead.push(result.token),
+                        // Retryable: `0` is the relay's word for an unreachable or
+                        // timed-out APNs; 429/5xx come through verbatim. Log the
+                        // status only — never the token value or a reason string.
+                        other => {
+                            outcome.failed += 1;
+                            eprintln!(
+                                "squelch: APNs push for one device returned status {other} (token {}…)",
+                                token_prefix(&result.token)
+                            );
+                        }
                     }
                 }
             }
@@ -457,7 +506,7 @@ mod tests {
         let tokens = vec!["aa".repeat(32)];
         let body = PushRequest {
             device_tokens: &tokens,
-            event_id: ev.id,
+            event_id: PushEventId::new(None, ev.id),
             collapse_id: Some(collapse_id(&ev.thread_id)),
             topic: Some("dev.squelch.ios"),
             environment: Some("production"),
@@ -502,7 +551,7 @@ mod tests {
         let tokens = vec!["bb".repeat(32)];
         let body = PushRequest {
             device_tokens: &tokens,
-            event_id: 1,
+            event_id: PushEventId::new(None, 1),
             collapse_id: None,
             topic: None,
             environment: None,
@@ -512,6 +561,51 @@ mod tests {
         assert_eq!(obj.len(), 2);
         assert!(obj.contains_key("device_tokens"));
         assert!(obj.contains_key("event_id"));
+    }
+
+    /// The tagged spelling stays a STRING on the wire and the plain one stays a
+    /// number: the relay accepts both and forwards whichever it got verbatim.
+    #[test]
+    fn a_tag_rides_in_the_event_id_or_the_id_stays_a_number() {
+        let plain = serde_json::to_value(PushEventId::new(None, 41)).unwrap();
+        assert_eq!(plain, serde_json::json!(41));
+
+        let tagged = serde_json::to_value(PushEventId::new(Some("acct-a"), 41)).unwrap();
+        assert_eq!(tagged, serde_json::json!("acct-a:41"));
+    }
+
+    /// Two mailboxes on one phone register the same device under different
+    /// tags; each bucket gets its own payload, and a token appears in exactly
+    /// one of them.
+    #[test]
+    fn devices_bucket_by_tag_in_first_seen_order() {
+        let devices = vec![
+            (Some("a".to_string()), "t1".to_string()),
+            (None, "t2".to_string()),
+            (Some("a".to_string()), "t3".to_string()),
+            (Some("b".to_string()), "t4".to_string()),
+        ];
+        let groups = by_tag(&devices);
+        assert_eq!(
+            groups,
+            vec![
+                (
+                    Some("a".to_string()),
+                    vec!["t1".to_string(), "t3".to_string()]
+                ),
+                (None, vec!["t2".to_string()]),
+                (Some("b".to_string()), vec!["t4".to_string()]),
+            ]
+        );
+    }
+
+    /// An untagged fleet is the pre-tag deployment: one bucket, one request,
+    /// the same body it always sent.
+    #[test]
+    fn an_untagged_fleet_is_still_one_bucket() {
+        let devices: Vec<(Option<String>, String)> =
+            (0..3).map(|i| (None, format!("t{i}"))).collect();
+        assert_eq!(by_tag(&devices).len(), 1);
     }
 
     #[test]

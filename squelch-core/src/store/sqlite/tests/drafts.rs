@@ -19,9 +19,12 @@ fn upsert_draft_edits_the_same_reply_key_in_place() {
         .upsert_draft(
             acct,
             Some(7),
-            "alice@example.com",
-            "Re: Lunch",
-            "sure",
+            DraftFields {
+                to_addr: "alice@example.com",
+                subject: "Re: Lunch",
+                body: "sure",
+                ..Default::default()
+            },
             t(0),
         )
         .unwrap();
@@ -32,9 +35,12 @@ fn upsert_draft_edits_the_same_reply_key_in_place() {
         .upsert_draft(
             acct,
             Some(7),
-            "alice@example.com",
-            "Re: Lunch",
-            "sure, 1pm",
+            DraftFields {
+                to_addr: "alice@example.com",
+                subject: "Re: Lunch",
+                body: "sure, 1pm",
+                ..Default::default()
+            },
             t(5),
         )
         .unwrap();
@@ -50,20 +56,77 @@ fn upsert_draft_edits_the_same_reply_key_in_place() {
 }
 
 #[test]
+fn a_draft_round_trips_both_copy_lists_and_an_edit_can_empty_them() {
+    let (store, acct) = store();
+    let saved = store
+        .upsert_draft(
+            acct,
+            None,
+            DraftFields {
+                to_addr: "alice@example.com",
+                cc_addr: "bob@example.com, carol@example.com",
+                bcc_addr: "dave@example.com",
+                subject: "Lunch",
+                body: "1pm?",
+            },
+            t(0),
+        )
+        .unwrap();
+    assert_eq!(saved.cc_addr, "bob@example.com, carol@example.com");
+    assert_eq!(saved.bcc_addr, "dave@example.com");
+    assert_eq!(store.list_drafts(acct).unwrap()[0], saved);
+
+    // MOVING SOMEBODY OFF A LIST HAS TO STICK. An edit that empties `bcc_addr`
+    // is the composer's "no longer blind-copying dave", and a store that kept
+    // the old value would put him back on the next restore — silently, since a
+    // Bcc is the one field nothing else on screen would contradict.
+    let edited = store
+        .upsert_draft(
+            acct,
+            None,
+            DraftFields {
+                to_addr: "alice@example.com",
+                cc_addr: "",
+                bcc_addr: "",
+                subject: "Lunch",
+                body: "1pm?",
+            },
+            t(5),
+        )
+        .unwrap();
+    assert_eq!(edited.id, saved.id, "an edit is the same composition");
+    assert_eq!(edited.cc_addr, "");
+    assert_eq!(edited.bcc_addr, "");
+}
+
+#[test]
 fn reply_and_new_message_drafts_coexist_and_each_upsert_in_place() {
     let (store, acct) = store();
     let reply = store
         .upsert_draft(
             acct,
             Some(7),
-            "alice@example.com",
-            "Re: Lunch",
-            "sure",
+            DraftFields {
+                to_addr: "alice@example.com",
+                subject: "Re: Lunch",
+                body: "sure",
+                ..Default::default()
+            },
             t(0),
         )
         .unwrap();
     let fresh = store
-        .upsert_draft(acct, None, "bob@example.com", "Hello", "hi", t(1))
+        .upsert_draft(
+            acct,
+            None,
+            DraftFields {
+                to_addr: "bob@example.com",
+                subject: "Hello",
+                body: "hi",
+                ..Default::default()
+            },
+            t(1),
+        )
         .unwrap();
     assert_ne!(fresh.id, reply.id);
     assert!(fresh.reply_to_message_id.is_none());
@@ -72,7 +135,17 @@ fn reply_and_new_message_drafts_coexist_and_each_upsert_in_place() {
     // The NULL key matches ITSELF (`IS`, not `=`), so the account keeps exactly
     // one new-message draft however many times it is saved.
     let fresh2 = store
-        .upsert_draft(acct, None, "bob@example.com", "Hello", "hi again", t(2))
+        .upsert_draft(
+            acct,
+            None,
+            DraftFields {
+                to_addr: "bob@example.com",
+                subject: "Hello",
+                body: "hi again",
+                ..Default::default()
+            },
+            t(2),
+        )
         .unwrap();
     assert_eq!(fresh2.id, fresh.id);
     assert_eq!(fresh2.created_at, t(1));
@@ -82,7 +155,17 @@ fn reply_and_new_message_drafts_coexist_and_each_upsert_in_place() {
     assert_eq!(all.len(), 2);
     // A second reply target is its own row.
     store
-        .upsert_draft(acct, Some(8), "carol@example.com", "Re: Docs", "ok", t(3))
+        .upsert_draft(
+            acct,
+            Some(8),
+            DraftFields {
+                to_addr: "carol@example.com",
+                subject: "Re: Docs",
+                body: "ok",
+                ..Default::default()
+            },
+            t(3),
+        )
         .unwrap();
     assert_eq!(store.list_drafts(acct).unwrap().len(), 3);
 
@@ -109,9 +192,12 @@ fn delete_draft_is_account_scoped_and_reports_a_miss() {
         .upsert_draft(
             acct,
             Some(7),
-            "alice@example.com",
-            "Re: Lunch",
-            "sure",
+            DraftFields {
+                to_addr: "alice@example.com",
+                subject: "Re: Lunch",
+                body: "sure",
+                ..Default::default()
+            },
             t(0),
         )
         .unwrap();
@@ -133,16 +219,56 @@ fn list_drafts_orders_by_updated_at_desc_and_scopes_by_account() {
     let (store, acct) = store();
     let other = store.ensure_account("other@example.com").unwrap();
     store
-        .upsert_draft(acct, Some(1), "a@example.com", "one", "1", t(0))
+        .upsert_draft(
+            acct,
+            Some(1),
+            DraftFields {
+                to_addr: "a@example.com",
+                subject: "one",
+                body: "1",
+                ..Default::default()
+            },
+            t(0),
+        )
         .unwrap();
     store
-        .upsert_draft(acct, Some(2), "b@example.com", "two", "2", t(1))
+        .upsert_draft(
+            acct,
+            Some(2),
+            DraftFields {
+                to_addr: "b@example.com",
+                subject: "two",
+                body: "2",
+                ..Default::default()
+            },
+            t(1),
+        )
         .unwrap();
     store
-        .upsert_draft(acct, Some(3), "c@example.com", "three", "3", t(2))
+        .upsert_draft(
+            acct,
+            Some(3),
+            DraftFields {
+                to_addr: "c@example.com",
+                subject: "three",
+                body: "3",
+                ..Default::default()
+            },
+            t(2),
+        )
         .unwrap();
     store
-        .upsert_draft(other, Some(1), "z@example.com", "theirs", "z", t(9))
+        .upsert_draft(
+            other,
+            Some(1),
+            DraftFields {
+                to_addr: "z@example.com",
+                subject: "theirs",
+                body: "z",
+                ..Default::default()
+            },
+            t(9),
+        )
         .unwrap();
 
     let subjects: Vec<String> = store
@@ -155,7 +281,17 @@ fn list_drafts_orders_by_updated_at_desc_and_scopes_by_account() {
 
     // Touching the oldest draft moves it to the front.
     store
-        .upsert_draft(acct, Some(1), "a@example.com", "one", "1 again", t(3))
+        .upsert_draft(
+            acct,
+            Some(1),
+            DraftFields {
+                to_addr: "a@example.com",
+                subject: "one",
+                body: "1 again",
+                ..Default::default()
+            },
+            t(3),
+        )
         .unwrap();
     let subjects: Vec<String> = store
         .list_drafts(acct)
@@ -182,14 +318,27 @@ fn list_drafts_hides_a_draft_whose_parent_went_sealed() {
         .upsert_draft(
             acct,
             Some(parent),
-            "alice@example.com",
-            "Re: Lunch",
-            "sure",
+            DraftFields {
+                to_addr: "alice@example.com",
+                subject: "Re: Lunch",
+                body: "sure",
+                ..Default::default()
+            },
             t(0),
         )
         .unwrap();
     store
-        .upsert_draft(acct, None, "bob@example.com", "Hello", "hi", t(1))
+        .upsert_draft(
+            acct,
+            None,
+            DraftFields {
+                to_addr: "bob@example.com",
+                subject: "Hello",
+                body: "hi",
+                ..Default::default()
+            },
+            t(1),
+        )
         .unwrap();
     assert_eq!(store.list_drafts(acct).unwrap().len(), 2);
 
@@ -221,9 +370,12 @@ fn reingest_that_seals_the_parent_deletes_its_draft() {
         .upsert_draft(
             acct,
             Some(parent),
-            "alice@example.com",
-            "Re: Lunch",
-            "sure",
+            DraftFields {
+                to_addr: "alice@example.com",
+                subject: "Re: Lunch",
+                body: "sure",
+                ..Default::default()
+            },
             t(0),
         )
         .unwrap();

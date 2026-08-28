@@ -540,6 +540,21 @@ fn standing_admits_dateless_mail_from_a_sender_the_user_has_written_to() {
 }
 
 #[test]
+fn standing_admits_the_mail_the_user_sent_themselves() {
+    // A self-addressed message is ordinary INBOX mail by the time it lands here:
+    // Gmail hands the same id to both label walks and the INBOX copy wins, so
+    // `is_sent` is 0 and `from_addr` is the user. The contact row `ensure_account`
+    // seeds is the whole reason it stands rather than falling in the gap between
+    // "not from a correspondent" and "not from anyone at all".
+    let (store, acct) = store();
+    let since = Utc::now() - chrono::Duration::days(30);
+
+    let note = dateless(&store, acct, "g1", "t1", "me@example.com");
+
+    assert_eq!(standing_ids(&store, acct, since), vec![note]);
+}
+
+#[test]
 fn standing_known_contact_match_folds_address_case() {
     // from_addr is stored as the header spelled it; the contact row is
     // lowercased by the harvest. Neither side may be assumed normalized.

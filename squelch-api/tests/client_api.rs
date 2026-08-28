@@ -14,7 +14,7 @@ use squelch_core::types::{SealedKind, Sensitivity, Tier};
 use tower::ServiceExt;
 
 mod common;
-use common::{Harness, TOKEN, authed, authed_json, body_json, harness, msg, sent_msg};
+use common::{Harness, TOKEN, authed, authed_json, body_json, harness, msg, sent_msg, state_with};
 
 #[tokio::test]
 async fn missing_token_is_401() {
@@ -308,7 +308,7 @@ async fn shipments_carry_the_carrier_poll_fields() {
 #[tokio::test]
 async fn shipment_poll_kicks_the_poller_and_lists_its_carriers() {
     let kick = Arc::new(tokio::sync::Notify::new());
-    let (state, _store, _acct) = common::state_with(|_, _| {});
+    let (state, _store, _acct) = state_with(|_, _| {});
     // Deliberately unsorted + duplicated: the response must not depend on how
     // the caller assembled the list.
     let app = router(
@@ -582,6 +582,118 @@ async fn retriage_route_exists_resets_and_audits() {
     assert!(
         audit.iter().any(|e| e.action == "retriage"),
         "retriage must land an audit row"
+    );
+}
+
+/// The counter the blocking modal polls. GET and POST share the path, so the
+/// GET half is exactly the "is it mounted" regression the POST test above
+/// guards against — and the client BLOCKS THE APP on this route, so a 404 here
+/// is a modal nobody can watch.
+#[tokio::test]
+async fn retriage_progress_route_reports_the_run_it_kicked() {
+    let Harness { app, store, acct } = harness(|store, acct| {
+        let m = store
+            .upsert_message(&msg(acct, "g1", "t1", "s", "b"))
+            .unwrap();
+        store
+            .set_triage(
+                m,
+                acct,
+                60,
+                Tier::Signal,
+                Sensitivity::Normal,
+                None,
+                "",
+                "",
+                None,
+            )
+            .unwrap();
+        store
+            .stage1_apply(&squelch_core::store::Stage1Applied {
+                message_id: m,
+                account_id: acct,
+                importance: 50,
+                tier: squelch_core::types::Tier::Signal,
+                one_line: "x".into(),
+                reason: "x".into(),
+                field_reasons: Default::default(),
+                stage1_model_used: "claude-x".into(),
+                needs_stage2: false,
+                escalation_reason: None,
+                deadline: None,
+                category: Some("general".into()),
+            })
+            .unwrap();
+    });
+
+    // Before anything is asked for: no run, and NO `started_at` — the client
+    // reads a zero total as "nothing in flight", so it must not be confusable
+    // with a finished one.
+    let resp = app
+        .clone()
+        .oneshot(authed("GET", "/client/retriage"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+    assert_eq!(json["total"], 0);
+    assert_eq!(json["done"], 0);
+    assert!(json["started_at"].is_null());
+
+    let resp = app
+        .clone()
+        .oneshot(authed_json(
+            "POST",
+            "/client/retriage",
+            serde_json::json!({ "days": 7 }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(body_json(resp).await["reset"], 1);
+
+    let resp = app
+        .clone()
+        .oneshot(authed("GET", "/client/retriage"))
+        .await
+        .unwrap();
+    let json = body_json(resp).await;
+    assert_eq!(json["total"], 1, "the kicked row is the run");
+    assert_eq!(json["done"], 0, "and it has not been re-run yet");
+    assert!(
+        json["started_at"].is_string(),
+        "a live run says when it began"
+    );
+
+    // Stage-1 runs again: the row leaves both queues and the run is complete.
+    let queued = store.stage1_queue(acct, 10).unwrap();
+    assert_eq!(queued.len(), 1);
+    store
+        .stage1_apply(&squelch_core::store::Stage1Applied {
+            message_id: queued[0].message_id,
+            account_id: acct,
+            importance: 50,
+            tier: squelch_core::types::Tier::Noise,
+            one_line: "y".into(),
+            reason: "y".into(),
+            field_reasons: Default::default(),
+            stage1_model_used: "claude-y".into(),
+            needs_stage2: false,
+            escalation_reason: None,
+            deadline: None,
+            category: Some("general".into()),
+        })
+        .unwrap();
+
+    let resp = app
+        .clone()
+        .oneshot(authed("GET", "/client/retriage"))
+        .await
+        .unwrap();
+    let json = body_json(resp).await;
+    assert_eq!(
+        (json["total"].as_i64(), json["done"].as_i64()),
+        (Some(1), Some(1)),
+        "the modal unblocks only when the queues are actually empty"
     );
 }
 
@@ -1770,7 +1882,7 @@ async fn mock_gmail_seq(
 
 /// The default harness plus a write credential pointed at a mock Gmail `base`.
 fn app_with_writes(base: String, seed: impl FnOnce(&SqliteStore, i64)) -> Harness {
-    let (state, store, acct) = common::state_with(seed);
+    let (state, store, acct) = state_with(seed);
     let state = state.with_write_test_harness(Arc::new(StubCreds), base);
     Harness {
         app: router(state),
@@ -2318,7 +2430,7 @@ fn app_with_tracking(
     track_base: Option<&str>,
     seed: impl FnOnce(&SqliteStore, i64),
 ) -> Harness {
-    let (state, store, acct) = common::state_with(seed);
+    let (state, store, acct) = state_with(seed);
     let state = state
         .with_write_test_harness(Arc::new(StubCreds), base)
         .with_tracking_base_url(track_base.map(str::to_string));
@@ -2889,6 +3001,443 @@ async fn an_ordinary_reply_still_carries_no_cc() {
     assert!(mime.contains("To: alice@example.com\r\n"), "{mime}");
 }
 
+/// A BCC-ONLY COLD SEND: the shape of a blind blast. It is not a send with no
+/// recipient, so it must not be refused — the `To` falls back to the sender.
+#[tokio::test]
+async fn a_bcc_only_send_addresses_the_sender_and_blind_copies_the_rest() {
+    let (base, handle) = mock_gmail_seq(vec![(200, "{}".to_string())]).await;
+    let Harness { app, .. } = app_with_writes(base, |_, _| {});
+
+    let resp = app
+        .oneshot(authed_json(
+            "POST",
+            "/client/actions/send",
+            serde_json::json!({
+                "bcc": "ann@fund.com, bo@fund.com",
+                "subject": "Update #3",
+                "body": "we closed the round",
+                "confirm": true
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let mime = sent_mime(&handle.await.unwrap()[0]);
+    assert!(
+        mime.contains("To: me@example.com\r\n"),
+        "the account's own address is the visible recipient: {mime}"
+    );
+    assert!(
+        mime.contains("Bcc: ann@fund.com, bo@fund.com\r\n"),
+        "{mime}"
+    );
+    assert!(!mime.contains("Cc:"), "a bcc send invents no Cc: {mime}");
+}
+
+/// Nobody visibly on the mail may also receive a blind copy of it — that is two
+/// deliveries of one message, the second apparently secret.
+#[tokio::test]
+async fn a_bcc_never_duplicates_someone_already_visible() {
+    let (base, handle) = mock_gmail_seq(vec![(200, "{}".to_string())]).await;
+    let Harness { app, .. } = app_with_writes(base, |_, _| {});
+
+    let resp = app
+        .oneshot(authed_json(
+            "POST",
+            "/client/actions/send",
+            serde_json::json!({
+                "to": "Ann <ann@fund.com>",
+                "bcc": "ANN@fund.com, cy@fund.com",
+                "subject": "Update #3",
+                "body": "we closed the round",
+                "confirm": true
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let mime = sent_mime(&handle.await.unwrap()[0]);
+    assert!(mime.contains("To: Ann <ann@fund.com>\r\n"), "{mime}");
+    assert!(
+        mime.contains("Bcc: cy@fund.com\r\n"),
+        "Ann was already visible, so her blind copy is dropped: {mime}"
+    );
+}
+
+/// A blind audience is invisible in the mail itself, so the ledger is the only
+/// place it is written down — as a COUNT, never as addresses.
+#[tokio::test]
+async fn a_bcc_send_audits_its_reach_without_naming_anyone() {
+    let (base, handle) = mock_gmail_seq(vec![(200, "{}".to_string())]).await;
+    let Harness { app, store, acct } = app_with_writes(base, |_, _| {});
+
+    let resp = app
+        .oneshot(authed_json(
+            "POST",
+            "/client/actions/send",
+            serde_json::json!({
+                "bcc": "ann@fund.com, bo@fund.com, cy@fund.com",
+                "subject": "Update #3",
+                "body": "we closed the round",
+                "confirm": true
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    handle.await.unwrap();
+
+    let entries = store.list_audit(acct, 20).unwrap();
+    assert!(
+        entries
+            .iter()
+            .any(|a| a.action == "send" && a.detail.as_deref() == Some("ok:bcc:3")),
+        "expected the reach in the ledger: {entries:?}"
+    );
+    let rendered = serde_json::to_string(&entries).unwrap();
+    assert!(
+        !rendered.contains("fund.com"),
+        "the ledger must not name a blind audience: {rendered}"
+    );
+}
+
+/// An empty `bcc` changes nothing: the send is byte-identical to what it was
+/// before the field existed.
+#[tokio::test]
+async fn an_empty_bcc_writes_no_header() {
+    let (base, handle) = mock_gmail_seq(vec![(200, "{}".to_string())]).await;
+    let Harness { app, .. } = app_with_writes(base, |_, _| {});
+
+    let resp = app
+        .oneshot(authed_json(
+            "POST",
+            "/client/actions/send",
+            serde_json::json!({
+                "to": "ann@fund.com",
+                "bcc": "   ",
+                "subject": "hi",
+                "body": "hello",
+                "confirm": true
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let mime = sent_mime(&handle.await.unwrap()[0]);
+    assert!(!mime.contains("Bcc:"), "{mime}");
+}
+
+/// A send with neither `to` nor `bcc` nor a parent is still refused: the bcc
+/// fallback is a fallback for a blind audience, not a way to compose mail
+/// addressed to nobody.
+#[tokio::test]
+async fn a_send_with_no_audience_at_all_is_still_refused() {
+    let (base, _handle) = mock_gmail_seq(vec![]).await;
+    let Harness { app, .. } = app_with_writes(base, |_, _| {});
+
+    let resp = app
+        .oneshot(authed_json(
+            "POST",
+            "/client/actions/send",
+            serde_json::json!({"subject": "hi", "body": "hello", "confirm": true}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+/// A `to`/`bcc` group went out as ONE message the composer addressed itself, so
+/// the daemon's only job is attribution — and that is what turns the history
+/// entry from inferred into exact.
+#[tokio::test]
+async fn a_bcc_group_send_is_recorded_against_the_group() {
+    let (base, handle) = mock_gmail_seq(vec![(200, "{}".to_string())]).await;
+    let Harness { app, store, acct } = app_with_writes(base, |_, _| {});
+    let group = store
+        .create_send_group(
+            acct,
+            "Preseed Investors",
+            squelch_core::types::GroupMode::Bcc,
+            "",
+            &[
+                squelch_core::store::sqlite::groups::NewGroupMember {
+                    addr: "ann@fund.com".into(),
+                    display_name: None,
+                },
+                squelch_core::store::sqlite::groups::NewGroupMember {
+                    addr: "bo@fund.com".into(),
+                    display_name: None,
+                },
+            ],
+        )
+        .unwrap();
+
+    let resp = app
+        .oneshot(authed_json(
+            "POST",
+            "/client/actions/send",
+            serde_json::json!({
+                "group_id": group,
+                "bcc": "ann@fund.com, bo@fund.com",
+                "subject": "Update #3",
+                "body": "we closed the round",
+                "confirm": true
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    handle.await.unwrap();
+
+    let history = store.group_history(acct, group, 50, 0).unwrap();
+    assert_eq!(history.len(), 1, "the send should be recorded: {history:?}");
+    assert!(history[0].group_send_id.is_some());
+    assert_eq!(history[0].reached, 2);
+    assert_eq!(history[0].group_size, 2);
+    assert_eq!(history[0].subject, "Update #3");
+}
+
+/// An UNRESOLVED group token must be loud. `parse_addr_list` would drop it as
+/// unemittable and send to everyone else on the line, silently missing the
+/// audience the sender believed they had addressed.
+#[tokio::test]
+async fn an_unresolved_group_token_is_refused_rather_than_dropped() {
+    let (base, _handle) = mock_gmail_seq(vec![]).await;
+    let Harness { app, .. } = app_with_writes(base, |_, _| {});
+
+    let resp = app
+        .oneshot(authed_json(
+            "POST",
+            "/client/actions/send",
+            serde_json::json!({
+                "to": "#preseed investors, ann@fund.com",
+                "subject": "Update #3",
+                "body": "we closed the round",
+                "confirm": true
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = body_json(resp).await;
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap()
+            .contains("could not be resolved"),
+        "{body}"
+    );
+}
+
+/// Blasting a list into somebody else's thread is not a thing the composer can
+/// express, so it is not a thing the daemon invents a meaning for.
+#[tokio::test]
+async fn a_group_cannot_be_addressed_by_a_reply() {
+    let (base, _handle) = mock_gmail_seq(vec![]).await;
+    let Harness { app, store, acct } = app_with_writes(base, |store, acct| {
+        seed_one_signal(store, acct, "gmail-parent", "thread-77", "Lunch?");
+    });
+    let id = store.search(acct, "lunch", 10, 0).unwrap()[0].id;
+
+    let resp = app
+        .oneshot(authed_json(
+            "POST",
+            "/client/actions/send",
+            serde_json::json!({
+                "reply_to_message_id": id,
+                "group_id": 1,
+                "body": "hi",
+                "confirm": true
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+/// Another account's group id and an unknown one are the same 404, and neither
+/// costs a Gmail call.
+#[tokio::test]
+async fn an_unknown_group_id_is_404_before_any_send() {
+    let (base, _handle) = mock_gmail_seq(vec![]).await;
+    let Harness { app, .. } = app_with_writes(base, |_, _| {});
+
+    let resp = app
+        .oneshot(authed_json(
+            "POST",
+            "/client/actions/send",
+            serde_json::json!({
+                "group_id": 9999,
+                "to": "ann@fund.com",
+                "subject": "hi",
+                "body": "hello",
+                "confirm": true
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+/// A FAN-OUT answers 202-shaped: the batch id, not a sent message. Every
+/// recipient is recorded PENDING before any mail moves, so a daemon that dies
+/// mid-batch leaves a record of an audience it had not reached rather than no
+/// record at all.
+#[tokio::test]
+async fn a_fan_out_records_every_recipient_pending_before_it_sends() {
+    // The job's sends race this assertion, so the mock is scripted generously
+    // and the assertion is about what the ROUTE wrote, synchronously, before
+    // returning.
+    let (base, _handle) = mock_gmail_seq(vec![
+        (200, "{}".to_string()),
+        (200, "{}".to_string()),
+        (200, "{}".to_string()),
+    ])
+    .await;
+    let Harness { app, store, acct } = app_with_writes(base, |_, _| {});
+    let group = store
+        .create_send_group(
+            acct,
+            "Preseed Investors",
+            squelch_core::types::GroupMode::Individual,
+            "",
+            &["ann@fund.com", "bo@fund.com", "cy@fund.com"].map(|addr| {
+                squelch_core::store::sqlite::groups::NewGroupMember {
+                    addr: addr.into(),
+                    display_name: None,
+                }
+            }),
+        )
+        .unwrap();
+
+    let resp = app
+        .oneshot(authed_json(
+            "POST",
+            "/client/actions/send",
+            serde_json::json!({
+                "group_id": group,
+                "subject": "Update #3",
+                "body": "we closed the round",
+                "confirm": true
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    assert_eq!(body["status"], "sending");
+    assert_eq!(body["recipients"], 3);
+    assert!(body["group_send_id"].as_i64().is_some(), "{body}");
+
+    // The batch exists the moment the route returns, with the whole audience on
+    // it — whatever the job has or has not got to by now.
+    let history = store.group_history(acct, group, 50, 0).unwrap();
+    assert_eq!(history.len(), 1);
+    assert_eq!(history[0].group_size, 3);
+    assert_eq!(history[0].mode, squelch_core::types::GroupMode::Individual);
+    assert_eq!(
+        history[0].reached + history[0].pending + history[0].failed,
+        3,
+        "every recipient is accounted for in some state: {history:?}"
+    );
+}
+
+/// A fan-out is one-to-one BY CONSTRUCTION — that is the whole reason to pick it
+/// over bcc — so no message it produces may carry a second recipient.
+#[tokio::test]
+async fn every_message_in_a_fan_out_names_exactly_one_person() {
+    let (base, handle) =
+        mock_gmail_seq(vec![(200, "{}".to_string()), (200, "{}".to_string())]).await;
+    let Harness { app, store, acct } = app_with_writes(base, |_, _| {});
+    let group = store
+        .create_send_group(
+            acct,
+            "Pair",
+            squelch_core::types::GroupMode::Individual,
+            "",
+            &["ann@fund.com", "bo@fund.com"].map(|addr| {
+                squelch_core::store::sqlite::groups::NewGroupMember {
+                    addr: addr.into(),
+                    display_name: None,
+                }
+            }),
+        )
+        .unwrap();
+
+    let resp = app
+        .oneshot(authed_json(
+            "POST",
+            "/client/actions/send",
+            serde_json::json!({
+                "group_id": group,
+                "subject": "Update #3",
+                "body": "we closed the round",
+                "confirm": true
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let reqs = handle.await.unwrap();
+    assert_eq!(reqs.len(), 2, "one message per member");
+    let mut addressed: Vec<String> = Vec::new();
+    for req in &reqs {
+        let mime = sent_mime(req);
+        assert!(!mime.contains("Cc:"), "a fan-out invents no Cc: {mime}");
+        assert!(!mime.contains("Bcc:"), "a fan-out invents no Bcc: {mime}");
+        let to = mime
+            .lines()
+            .find(|l| l.starts_with("To: "))
+            .expect("every message names a recipient")
+            .trim_start_matches("To: ")
+            .to_string();
+        assert!(!to.contains(','), "one recipient per message, got {to}");
+        addressed.push(to);
+    }
+    addressed.sort();
+    assert_eq!(addressed, vec!["ann@fund.com", "bo@fund.com"]);
+}
+
+/// An empty group cannot be addressed: a "send" that reaches nobody is a
+/// mistake, and it costs nothing to say so before a token is minted.
+#[tokio::test]
+async fn an_empty_group_is_refused() {
+    let (base, _handle) = mock_gmail_seq(vec![]).await;
+    let Harness { app, store, acct } = app_with_writes(base, |_, _| {});
+    let group = store
+        .create_send_group(
+            acct,
+            "Nobody",
+            squelch_core::types::GroupMode::Individual,
+            "",
+            &[],
+        )
+        .unwrap();
+
+    let resp = app
+        .oneshot(authed_json(
+            "POST",
+            "/client/actions/send",
+            serde_json::json!({
+                "group_id": group,
+                "subject": "hi",
+                "body": "hello",
+                "confirm": true
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = body_json(resp).await;
+    assert!(
+        body["error"].as_str().unwrap().contains("nobody in it"),
+        "{body}"
+    );
+}
+
 #[tokio::test]
 async fn an_explicit_to_wins_but_keeps_the_derived_copies() {
     let (base, handle) =
@@ -2919,6 +3468,198 @@ async fn an_explicit_to_wins_but_keeps_the_derived_copies() {
     assert!(
         mime.contains("Cc: carol@example.com, dave@example.com\r\n"),
         "{mime}"
+    );
+}
+
+#[tokio::test]
+async fn a_stated_cc_replaces_the_derived_one_and_an_empty_one_clears_it() {
+    // The composer that SHOWS a Cc field has to be able to empty it. Absent
+    // means derive (the pre-field wire); present — `""` included — means the
+    // caller is stating the whole copy list.
+    for (stated, expected) in [
+        (
+            serde_json::json!("erin@example.com"),
+            Some("Cc: erin@example.com\r\n"),
+        ),
+        (serde_json::json!(""), None),
+    ] {
+        let (base, handle) =
+            mock_gmail_seq(vec![(200, group_metadata_body()), (200, "{}".to_string())]).await;
+        let Harness { app, store, acct } = app_with_writes(base, |store, acct| {
+            seed_one_signal(store, acct, "gmail-parent", "thread-77", "Lunch?");
+        });
+        let id = store.search(acct, "lunch", 10, 0).unwrap()[0].id;
+        let resp = app
+            .oneshot(authed_json(
+                "POST",
+                "/client/actions/send",
+                serde_json::json!({
+                    "reply_to_message_id": id,
+                    "body": "noon works",
+                    "reply_all": true,
+                    "cc": stated,
+                    "confirm": true
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let mime = sent_mime(&handle.await.unwrap()[1]);
+        match expected {
+            Some(line) => assert!(mime.contains(line), "{mime}"),
+            None => assert!(
+                !mime.contains("Cc:"),
+                "an emptied Cc must stay empty: {mime}"
+            ),
+        }
+        // The parent's own copies are never put back either way.
+        assert!(!mime.contains("carol@example.com"), "{mime}");
+        assert!(!mime.contains("dave@example.com"), "{mime}");
+    }
+}
+
+#[tokio::test]
+async fn a_stated_cc_keeps_the_display_names_the_sender_typed() {
+    // Verbatim, not through `cc_excluding`: that parses to bare addresses, and
+    // running a STATED list through it would quietly delete the names.
+    let (base, handle) =
+        mock_gmail_seq(vec![(200, group_metadata_body()), (200, "{}".to_string())]).await;
+    let Harness { app, store, acct } = app_with_writes(base, |store, acct| {
+        seed_one_signal(store, acct, "gmail-parent", "thread-77", "Lunch?");
+    });
+    let id = store.search(acct, "lunch", 10, 0).unwrap()[0].id;
+    let resp = app
+        .oneshot(authed_json(
+            "POST",
+            "/client/actions/send",
+            serde_json::json!({
+                "reply_to_message_id": id,
+                "body": "noon works",
+                "cc": "Bob Smith <bob@example.com>",
+                "confirm": true
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let mime = sent_mime(&handle.await.unwrap()[1]);
+    assert!(
+        mime.contains("Cc: Bob Smith <bob@example.com>\r\n"),
+        "{mime}"
+    );
+}
+
+#[tokio::test]
+async fn a_bcc_reaches_the_header_and_the_ledger_counts_it() {
+    let (base, handle) =
+        mock_gmail_seq(vec![(200, group_metadata_body()), (200, "{}".to_string())]).await;
+    let Harness { app, store, acct } = app_with_writes(base, |store, acct| {
+        seed_one_signal(store, acct, "gmail-parent", "thread-77", "Lunch?");
+    });
+    let id = store.search(acct, "lunch", 10, 0).unwrap()[0].id;
+    let resp = app
+        .oneshot(authed_json(
+            "POST",
+            "/client/actions/send",
+            serde_json::json!({
+                "reply_to_message_id": id,
+                "body": "noon works",
+                "cc": "bob@example.com",
+                "bcc": "erin@example.com, frank@example.com",
+                "confirm": true
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let mime = sent_mime(&handle.await.unwrap()[1]);
+    assert!(
+        mime.contains("Bcc: erin@example.com, frank@example.com\r\n"),
+        "{mime}"
+    );
+    // THE LEDGER IS THE ONLY PLACE A BCC IS WRITTEN DOWN: the copies that reach
+    // the visible recipients carry no trace of it, so the audit line has to.
+    // Counts, never addresses — and a stated `cc` gets no line of its own,
+    // because it is legible in the delivered mail.
+    let detail = store
+        .list_audit(acct, 20)
+        .unwrap()
+        .into_iter()
+        .find(|a| a.action == "send")
+        .and_then(|a| a.detail);
+    assert_eq!(detail.as_deref(), Some("ok:bcc:2"));
+    assert!(
+        !detail.unwrap().contains("erin"),
+        "the ledger counts recipients, it does not name them"
+    );
+}
+
+#[tokio::test]
+async fn a_smuggled_header_never_reaches_the_wire_from_either_copy_list() {
+    // TWO DIFFERENT GUARDS, because the two lists take different paths.
+    //
+    // A `bcc` is filtered through `addrs_excluding` first, which parses to bare
+    // addresses and CUTS the value at an embedded header token — so the honest
+    // prefix survives and the smuggled line is simply gone. Fewer recipients,
+    // never a forged one.
+    let (base, handle) =
+        mock_gmail_seq(vec![(200, group_metadata_body()), (200, "{}".to_string())]).await;
+    let Harness { app, store, acct } = app_with_writes(base, |store, acct| {
+        seed_one_signal(store, acct, "gmail-parent", "thread-77", "Lunch?");
+    });
+    let id = store.search(acct, "lunch", 10, 0).unwrap()[0].id;
+    let resp = app
+        .oneshot(authed_json(
+            "POST",
+            "/client/actions/send",
+            serde_json::json!({
+                "reply_to_message_id": id,
+                "body": "noon works",
+                "bcc": "erin@example.com\r\nBcc: attacker@evil.test",
+                "confirm": true
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let mime = sent_mime(&handle.await.unwrap()[1]);
+    let headers = mime.split("\r\n\r\n").next().unwrap();
+    assert!(headers.contains("Bcc: erin@example.com\r\n"), "{headers}");
+    assert!(
+        !mime.contains("evil.test"),
+        "the smuggled recipient must not exist anywhere: {mime}"
+    );
+
+    // A STATED `cc` is taken verbatim — that is what preserves the display names
+    // the sender typed — so the MIME builder's CR/LF refusal is the whole of the
+    // guard on that path, and it refuses rather than repairs.
+    let (base, handle) = mock_gmail_seq(vec![(200, group_metadata_body())]).await;
+    let Harness { app, store, acct } = app_with_writes(base, |store, acct| {
+        seed_one_signal(store, acct, "gmail-parent", "thread-77", "Lunch?");
+    });
+    let id = store.search(acct, "lunch", 10, 0).unwrap()[0].id;
+    let resp = app
+        .oneshot(authed_json(
+            "POST",
+            "/client/actions/send",
+            serde_json::json!({
+                "reply_to_message_id": id,
+                "body": "noon works",
+                "cc": "bob@example.com\r\nBcc: attacker@evil.test",
+                "confirm": true
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    // Only the metadata fetch happened; nothing was sent.
+    assert_eq!(handle.await.unwrap().len(), 1);
+    assert!(
+        store
+            .list_audit(acct, 20)
+            .unwrap()
+            .iter()
+            .any(|a| a.action == "send" && a.detail.as_deref() == Some("rejected:compose"))
     );
 }
 
@@ -3841,7 +4582,7 @@ fn harness_pointing_inference_at(url: String, seed: impl FnOnce(&SqliteStore, i6
     use squelch_core::config::Stage2Provider;
     use squelch_core::triage::rule_infer::RuleInferClient;
 
-    let (state, store, acct) = common::state_with(seed);
+    let (state, store, acct) = state_with(seed);
     let state = state.with_rule_inference(Some(RuleInferClient::new(
         reqwest::Client::new(),
         url,
@@ -7431,7 +8172,7 @@ async fn a_forward_whose_write_credential_is_dead_says_so_instead_of_blaming_gma
     // composer to blame Gmail when the fix is `squelchd auth --write`, which the
     // client already knows how to say when it sees the 403.
     let (base, handle) = mock_gmail(0).await;
-    let (state, store, acct) = common::state_with(|store, acct| {
+    let (state, store, acct) = state_with(|store, acct| {
         seed_one_signal(
             store,
             acct,
@@ -7479,4 +8220,80 @@ async fn a_forward_whose_write_credential_is_dead_says_so_instead_of_blaming_gma
             .any(|a| a.detail.as_deref() == Some("failed:fetch_original")),
         "and it must not be audited as one"
     );
+}
+
+/// The daemon says whether Gmail still opens, and OMITS the answer when it
+/// cannot see. A door wired without a metrics registry must not report a
+/// cheerful "connected" on behalf of a process that has no idea.
+#[tokio::test]
+async fn stats_omit_the_gmail_answer_when_this_door_cannot_see_the_credential() {
+    let Harness { app, .. } = harness(|_, _| {});
+    let resp = app.oneshot(authed("GET", "/client/stats")).await.unwrap();
+    let json = body_json(resp).await;
+    assert!(
+        json.get("gmail").is_none(),
+        "absence means 'no answer'; a client must not render it as good news"
+    );
+}
+
+/// A live credential reads as connected, and carries NO reconnect link: an
+/// invitation to re-consent for no reason is worse than no invitation.
+#[tokio::test]
+async fn stats_report_a_working_mailbox_as_connected_with_nothing_to_do() {
+    let (state, _store, _acct) = state_with(|_, _| {});
+    let metrics = squelch_core::metrics::SyncMetrics::new();
+    let app = router(
+        state
+            .with_sync_metrics(metrics.clone())
+            .with_console_sso_url(Some("https://signup.example".into())),
+    );
+
+    let resp = app.oneshot(authed("GET", "/client/stats")).await.unwrap();
+    let json = body_json(resp).await;
+    assert_eq!(json["gmail"]["connected"], serde_json::json!(true));
+    assert!(json["gmail"].get("reconnect_url").is_none());
+    assert!(json["gmail"].get("disconnected_since").is_none());
+}
+
+/// A dead credential reads as disconnected, says since when, and on HOSTED
+/// hands back the link that repairs it.
+#[tokio::test]
+async fn stats_report_a_dead_credential_with_the_link_that_repairs_it() {
+    let (state, _store, _acct) = state_with(|_, _| {});
+    let metrics = squelch_core::metrics::SyncMetrics::new();
+    metrics.record_gmail_error(squelch_core::metrics::GmailErrorKind::Auth);
+    let app = router(
+        state
+            .with_sync_metrics(metrics.clone())
+            .with_console_sso_url(Some("https://signup.example".into())),
+    );
+
+    let resp = app.oneshot(authed("GET", "/client/stats")).await.unwrap();
+    let json = body_json(resp).await;
+    assert_eq!(json["gmail"]["connected"], serde_json::json!(false));
+    assert_eq!(
+        json["gmail"]["reconnect_url"],
+        serde_json::json!("https://signup.example/reconnect")
+    );
+    assert!(
+        json["gmail"]["disconnected_since"].as_str().is_some(),
+        "since when is the half a person actually reads"
+    );
+}
+
+/// SELF-HOST: the same dead credential, no link. `squelchd auth` at a shell is
+/// not something a button can do, and offering one that goes nowhere is worse
+/// than the sentence that tells the truth.
+#[tokio::test]
+async fn a_self_host_mailbox_is_told_it_is_disconnected_and_offered_no_link() {
+    let (state, _store, _acct) = state_with(|_, _| {});
+    let metrics = squelch_core::metrics::SyncMetrics::new();
+    metrics.record_gmail_error(squelch_core::metrics::GmailErrorKind::Auth);
+    // No console SSO origin configured: that IS the self-host branch.
+    let app = router(state.with_sync_metrics(metrics.clone()));
+
+    let resp = app.oneshot(authed("GET", "/client/stats")).await.unwrap();
+    let json = body_json(resp).await;
+    assert_eq!(json["gmail"]["connected"], serde_json::json!(false));
+    assert!(json["gmail"].get("reconnect_url").is_none());
 }

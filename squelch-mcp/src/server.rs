@@ -466,10 +466,22 @@ impl SquelchServer {
         // (and never embedded sealed mail in the first place). Degrades to
         // keyword-only when no embedder is attached. No operator filter and no
         // window-fullness on this door: the agent asks for top-k, not pages.
-        let (hits, _window_full) = self
-            .store
-            .hybrid_search(self.account_id, query, &Default::default(), sort, k)
-            .map_err(Self::map_err)?;
+        //
+        // OFF THE RUNTIME, the way `squelch-api`'s `blocking` runs its store
+        // calls: the vector leg runs an ONNX embed of the query, which is tens
+        // of milliseconds on a loaded session and ~200 ms when it has to reload
+        // one first. Inline, that is a tokio worker parked on CPU work. The
+        // per-hit seal check below stays inline: it is a point lookup, and it
+        // was never the thing holding a worker.
+        let store = self.store.clone();
+        let account_id = self.account_id;
+        let query = query.to_string();
+        let (hits, _window_full) = tokio::task::spawn_blocking(move || {
+            store.hybrid_search(account_id, &query, &Default::default(), sort, k)
+        })
+        .await
+        .map_err(|_| ErrorData::internal_error("internal error", None))?
+        .map_err(Self::map_err)?;
 
         // Defense in depth: drop any hit whose thread overlaps a sealed thread,
         // exactly like get_inbox_updates. Relevance is the fused rank (1-based)

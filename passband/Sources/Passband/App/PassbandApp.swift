@@ -101,6 +101,13 @@ struct PassbandCommands: Commands {
             KeyEquivalent(Character("\(index + 1)")), modifiers: accountChordModifiers)
     }
 
+    /// A dev re-triage owns the screen (see `RetriageModal`). These commands are
+    /// AppKit's, not `KeyDispatch`'s, so refusing the global keymap does not
+    /// reach them — ⌘1 would still switch accounts out from under a run that is
+    /// counting the mailbox it started on, and ⌘K would still open the ask bar.
+    /// Each one that navigates or writes is disabled for the duration.
+    private var blocked: Bool { store.retriage != nil }
+
     var body: some Commands {
         // Directly under "About Passband", where every Mac app keeps it.
         CommandGroup(after: .appInfo) {
@@ -113,6 +120,7 @@ struct PassbandCommands: Commands {
         CommandGroup(replacing: .newItem) {
             Button("New Message") { store.openComposeNew() }
                 .keyboardShortcut("n")
+                .disabled(blocked)
         }
 
         // Settings is a routed view rather than a separate window, so the
@@ -120,6 +128,7 @@ struct PassbandCommands: Commands {
         CommandGroup(replacing: .appSettings) {
             Button("Settings…") { store.setView(.settings) }
                 .keyboardShortcut(",", modifiers: .command)
+                .disabled(blocked)
         }
 
         CommandMenu("Go") {
@@ -130,17 +139,20 @@ struct PassbandCommands: Commands {
             // menu's ability to advertise them.
             ForEach(Array(MainView.mainViews.enumerated()), id: \.element) { _, view in
                 Button(view.label) { store.setView(view) }
+                    .disabled(blocked)
             }
             Divider()
             Button("Usage") { store.setView(.usage) }
+                .disabled(blocked)
             Button("Settings") { store.setView(.settings) }
+                .disabled(blocked)
             Divider()
             Button("Back") { store.goBack() }
                 .keyboardShortcut("[", modifiers: [.command])
-                .disabled(!store.canGoBack)
+                .disabled(blocked || !store.canGoBack)
             Button("Forward") { store.goForward() }
                 .keyboardShortcut("]", modifiers: [.command])
-                .disabled(!store.canGoForward)
+                .disabled(blocked || !store.canGoForward)
         }
 
         // ACCOUNTS — one entry per mailbox this install knows about, on the
@@ -164,8 +176,11 @@ struct PassbandCommands: Commands {
                 // Nothing to switch INTO from the Connect gate: the app has no
                 // identity on screen, and pointing the client at a daemon
                 // behind a screen that is still asking for one is a switch the
-                // human cannot see happen.
-                .disabled(store.connStatus != .connected)
+                // human cannot see happen. Nor OUT of a live re-triage, which
+                // is counting the mailbox it started on — the run's own epoch
+                // fence catches the switch, but the switch should not be
+                // offered in the first place.
+                .disabled(blocked || store.connStatus != .connected)
             }
             Divider()
             // DELIBERATELY CHORDLESS. ⌘` is the system's window cycler, and
@@ -173,33 +188,38 @@ struct PassbandCommands: Commands {
             // own — this is the tenth-account escape hatch and a place for the
             // menu to say the list wraps, not a primary way to move.
             Button("Next Account") { Task { await accounts.switchToNext() } }
-                .disabled(store.connStatus != .connected || accounts.accounts.count < 2)
+                .disabled(
+                    blocked || store.connStatus != .connected || accounts.accounts.count < 2)
             Divider()
             Button("Add Account…") { store.addAccountSheetOpen = true }
                 // The gate is already a connect form. Offering a second one on
                 // top of it would add an account to an install that has none.
-                .disabled(store.connStatus != .connected)
+                .disabled(blocked || store.connStatus != .connected)
         }
 
         CommandMenu("Inbox") {
             Button("Ask Your Inbox…") { store.askBarOpen = true }
                 .keyboardShortcut("k", modifiers: [.command])
+                .disabled(blocked)
             Button("New Ask Chat") {
                 store.assistant.clear()
                 store.askBarOpen = true
             }
             .keyboardShortcut("k", modifiers: [.command, .shift])
+            .disabled(blocked)
             Button("Search…") { store.openSearch() }
                 .keyboardShortcut("f", modifiers: [.command])
+                .disabled(blocked)
             Divider()
             Button("Check for New Mail") {
                 Task { await SitrepPoller.shared.triggerMailRefresh() }
             }
             .keyboardShortcut("r", modifiers: [.command])
+            .disabled(blocked)
             Divider()
             Button("Undo Last Action") { Task { await store.fireUndo() } }
                 .keyboardShortcut("z", modifiers: [.command])
-                .disabled(store.undos.isEmpty)
+                .disabled(blocked || store.undos.isEmpty)
         }
 
         CommandGroup(after: .toolbar) {
@@ -214,6 +234,11 @@ struct PassbandCommands: Commands {
         CommandGroup(replacing: .help) {
             Button("Keyboard Shortcuts") { store.shortcutsOpen = true }
                 .keyboardShortcut("/", modifiers: [.command])
+                // Not harmful, just untidy: the overlay would open UNDERNEATH
+                // the re-triage modal and still be sitting there when the run
+                // ends. Theme and Check for Updates stay live — neither
+                // navigates, writes, nor leaves a surface behind.
+                .disabled(blocked)
         }
     }
 }

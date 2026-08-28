@@ -36,8 +36,11 @@ pub const LEDGER_ALL_DAYS: u32 = u32::MAX;
 /// responses (re-auth, wait, file a bug, check the network).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GmailErrorKind {
-    /// 401, or a credential that could not be refreshed at all (`invalid_grant`
-    /// means the refresh token is dead and only `squelchd auth` fixes it).
+    /// 401, or a credential that could not be refreshed at all. `invalid_grant`
+    /// means the refresh token is dead: a hosted tenant repairs that by
+    /// re-consenting through the control plane's `/reconnect`, and a self-host
+    /// one with `squelchd auth`. Either way the daemon cannot fix it alone,
+    /// which is why this kind also sets a state a client can render.
     Auth,
     /// 429, or a 403 whose body names a rate/quota reason.
     Quota,
@@ -187,7 +190,30 @@ pub struct SyncMetrics {
     /// failure, so it answers "is this broken NOW", not "how often".
     sync_consecutive_failures: AtomicU64,
 
+    /// A catch-up in flight: how many messages it has to re-fetch, and how many
+    /// it has done. BOTH ZERO means no catch-up is running.
+    ///
+    /// A catch-up is the loop's longest single call by orders of magnitude — a
+    /// 30-day re-walk of every message in the mailbox — and until this pair
+    /// existed it emitted NOTHING while it ran. Not a log line, not a counter,
+    /// not a stamp: `poll_once` had simply not returned yet. Most of the work
+    /// is upserts of mail already stored, so the message count and the database
+    /// size sit still too, and the only honest reading available from outside
+    /// was "indistinguishable from wedged". That is what these two numbers end.
+    catchup_total: AtomicU64,
+    catchup_done: AtomicU64,
+
     gmail_auth: AtomicU64,
+    /// Unix seconds of the FIRST credential failure in the current outage, or 0
+    /// while the mailbox is connected. A STATE, not a count, for the same
+    /// reason `sync_consecutive_failures` is one: `gmail_auth` answers "how
+    /// often has this ever failed", and the only question a person staring at
+    /// an empty mailbox has is "is it broken now, and since when".
+    ///
+    /// Stamped on the first failure and left alone by later ones, so the value
+    /// is when the mailbox went dark rather than when it last retried. Cleared
+    /// by the next token that works.
+    gmail_auth_failed_since: AtomicI64,
     gmail_quota: AtomicU64,
     gmail_http: AtomicU64,
     gmail_network: AtomicU64,
@@ -218,6 +244,18 @@ pub struct SyncMetrics {
     /// [`Self::record_revisit`], so no call site can forget it.
     llm_last_ok_unix: AtomicI64,
 
+    /// First backfills that gave up waiting for the embedder to settle and ran
+    /// without it (see `sync::EMBEDDER_GATE_CEILING`). Rare to the point that a
+    /// single one is worth looking at: each is a mailbox ingested with no
+    /// Counted per ATTEMPT: a first run whose backfill errors before the cursor
+    /// is stored comes back through the gate on the next lifecycle and pays the
+    /// ceiling again, so a wedged init reads as a train of these, not one.
+    /// vectors, which the batch pass then has to embed, which is the memory that
+    /// OOM-killed two tenant daemons on 2026-08-19. A counter and not a stderr
+    /// line alone, because nobody reads a tenant's stderr until something has
+    /// already fallen over.
+    embedder_gate_timeouts: AtomicU64,
+
     /// Carrier polls as `[carrier][outcome]`, both axes closed enums — 20
     /// series, fixed forever, no matter how many shipments or tracking numbers
     /// pass through. A TRACKING NUMBER IS NEVER A LABEL: it names a parcel and
@@ -230,6 +268,13 @@ pub struct SyncMetrics {
     /// Unix seconds of the last poll a carrier answered. 0 = never, for the same
     /// reason as the sync stamp below.
     carrier_poll_last_success_unix: AtomicI64,
+
+    /// 1 while the embedding session is resident, 0 while it is unloaded (or was
+    /// never built). A GAUGE, and the series that explains a pod's memory
+    /// sawtooth: the session is 85-90% of a tenant daemon's RSS, so a graph of
+    /// memory next to this one reads as cause and effect instead of a mystery.
+    /// Written by [`crate::embed::LazyEmbedder`] on each load and unload.
+    embedder_loaded: AtomicU64,
 }
 
 impl SyncMetrics {
@@ -271,6 +316,69 @@ impl SyncMetrics {
             GmailErrorKind::Network => &self.gmail_network,
         };
         slot.fetch_add(1, Ordering::Relaxed);
+        // A credential failure is the one Gmail error a person can DO something
+        // about, so it gets a state as well as a count. Only the first one in
+        // an outage stamps: `compare_exchange` against 0 leaves an existing
+        // stamp where it is, so the value keeps meaning "since when".
+        if kind == GmailErrorKind::Auth {
+            let _ = self.gmail_auth_failed_since.compare_exchange(
+                0,
+                Utc::now().timestamp(),
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            );
+        }
+    }
+
+    /// A catch-up is starting over `total` messages.
+    pub fn catchup_begin(&self, total: u64) {
+        self.catchup_total.store(total, Ordering::Relaxed);
+        self.catchup_done.store(0, Ordering::Relaxed);
+    }
+
+    /// Widen an in-flight catch-up's denominator without resetting its
+    /// progress: the SENT phase is more of the same wait, not a new one.
+    pub fn catchup_begin_extend(&self, total: u64) {
+        self.catchup_total.store(total, Ordering::Relaxed);
+    }
+
+    /// One more message of the catch-up is fetched and ingested.
+    pub fn catchup_step(&self) -> u64 {
+        self.catchup_done.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
+    /// The catch-up is over, whether it finished or bailed. Cleared on BOTH
+    /// paths: a pair left standing after an error would report a run that is
+    /// not happening, which is a worse lie than saying nothing.
+    pub fn catchup_end(&self) {
+        self.catchup_total.store(0, Ordering::Relaxed);
+        self.catchup_done.store(0, Ordering::Relaxed);
+    }
+
+    /// `(done, total)` of a catch-up in flight, or `None` when none is.
+    pub fn catchup_progress(&self) -> Option<(u64, u64)> {
+        match self.catchup_total.load(Ordering::Relaxed) {
+            0 => None,
+            total => Some((self.catchup_done.load(Ordering::Relaxed), total)),
+        }
+    }
+
+    /// A credential just worked: the mailbox is connected again.
+    ///
+    /// The pair to [`SyncMetrics::record_gmail_error`]'s auth arm, and it has to
+    /// be called on the SUCCESS path or the state would only ever latch on. A
+    /// reconnect that fixed the mailbox but left a banner up would send the
+    /// person round the loop a second time.
+    pub fn note_credential_ok(&self) {
+        self.gmail_auth_failed_since.store(0, Ordering::Relaxed);
+    }
+
+    /// When the current credential outage began, or `None` while connected.
+    pub fn gmail_auth_failed_since(&self) -> Option<i64> {
+        match self.gmail_auth_failed_since.load(Ordering::Relaxed) {
+            0 => None,
+            at => Some(at),
+        }
     }
 
     pub fn record_stage1(&self, verdict: Stage1Verdict) {
@@ -318,6 +426,12 @@ impl SyncMetrics {
         self.llm_config_failures.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// A first backfill stopped waiting for the embedder at the ceiling and went
+    /// ahead without one.
+    pub fn record_embedder_gate_timeout(&self) {
+        self.embedder_gate_timeouts.fetch_add(1, Ordering::Relaxed);
+    }
+
     fn stamp_llm_ok(&self) {
         self.llm_last_ok_unix
             .store(Utc::now().timestamp(), Ordering::Relaxed);
@@ -334,6 +448,15 @@ impl SyncMetrics {
             self.carrier_poll_last_success_unix
                 .store(Utc::now().timestamp(), Ordering::Relaxed);
         }
+    }
+
+    /// The embedding session was just loaded (`true`) or dropped (`false`).
+    /// Idempotent: the reaper and the reload path both set an absolute state
+    /// rather than stepping a counter, so a missed edge cannot make the gauge
+    /// drift away from what is actually resident.
+    pub fn set_embedder_loaded(&self, loaded: bool) {
+        self.embedder_loaded
+            .store(u64::from(loaded), Ordering::Relaxed);
     }
 
     /// A poll advanced a shipment's status (`apply_carrier_track` said so).
@@ -596,6 +719,12 @@ pub fn render(metrics: &SyncMetrics, db: Option<&StoreSnapshot>) -> String {
     // exactly right. An absent series would instead make the alert silently
     // evaluate to nothing for the one tenant most likely to be broken.
     e.scalar(
+        "squelchd_gmail_auth_failed_since_timestamp_seconds",
+        MetricKind::Gauge,
+        "Unix timestamp of the first credential failure in the current outage; 0 while the mailbox is connected.",
+        metrics.gmail_auth_failed_since.load(Ordering::Relaxed) as f64,
+    );
+    e.scalar(
         "squelchd_sync_last_success_timestamp_seconds",
         MetricKind::Gauge,
         "Unix timestamp of the last successful sync tick; 0 if this daemon has never synced.",
@@ -699,6 +828,26 @@ pub fn render(metrics: &SyncMetrics, db: Option<&StoreSnapshot>) -> String {
         MetricKind::Gauge,
         "Unix timestamp of the last LLM call any pass got a verdict from; 0 if none ever has.",
         metrics.llm_last_ok_unix.load(Ordering::Relaxed) as f64,
+    );
+
+    // 0 on a healthy daemon forever, which is the point: the series exists from
+    // the first scrape so `increase(...)` reads correctly the one time it moves.
+    e.scalar(
+        "squelchd_embedder_gate_timeouts_total",
+        MetricKind::Counter,
+        "First backfills that gave up waiting for the embedder to settle and ran without it; \
+         each one leaves a mailbox for the vector pass to embed in batches. Alert on any.",
+        metrics.get(&metrics.embedder_gate_timeouts),
+    );
+    // Always emitted, 0 included: a daemon whose embedder never built and one
+    // whose session is currently unloaded are the same shape here, and both are
+    // "not holding 250 MB right now", which is what the series is for. Absent
+    // would instead read as a scraper problem.
+    e.scalar(
+        "squelchd_embedder_loaded",
+        MetricKind::Gauge,
+        "1 while the embedding session is resident in memory, 0 while unloaded or never built.",
+        metrics.get(&metrics.embedder_loaded),
     );
 
     // ALL 20 series are emitted, including carriers this daemon has no
@@ -1000,6 +1149,12 @@ mod tests {
         // Never-synced reads as 0, so `time() - metric` fires rather than going
         // silent.
         assert!(text.contains("squelchd_sync_last_success_timestamp_seconds 0\n"));
+        // Present at 0 for the same reason: a counter that only appears the
+        // first time it moves reads as a scraper problem, not as an event.
+        assert!(text.contains("squelchd_embedder_gate_timeouts_total 0\n"));
+        // The gauge too: "not holding a session" must render as 0, never as
+        // absence, or an unloaded fleet reads as a scraper problem.
+        assert!(text.contains("squelchd_embedder_loaded 0\n"));
         assert!(!text.contains("squelchd_db_size_bytes"));
         assert!(!text.contains("squelchd_store_messages"));
         assert!(!text.contains("squelchd_devices_paired"));
@@ -1142,5 +1297,127 @@ mod tests {
         std::fs::write(dir.join("squelch.db-wal"), b"01234").unwrap();
         assert_eq!(db_file_sizes(&db), (10, 5));
         std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
+#[cfg(test)]
+mod gmail_auth_state_tests {
+    use super::*;
+
+    /// The state answers "is it broken NOW and since when", which is the only
+    /// question the person with the empty mailbox has. The counter beside it
+    /// answers "how often, ever", which is nobody's question.
+    #[test]
+    fn the_first_failure_stamps_and_later_ones_do_not_move_it() {
+        let m = SyncMetrics::new();
+        assert_eq!(m.gmail_auth_failed_since(), None, "starts connected");
+
+        m.record_gmail_error(GmailErrorKind::Auth);
+        let first = m.gmail_auth_failed_since().expect("stamped");
+
+        // Every retry after the first is the SAME outage. If later failures
+        // re-stamped, the value would drift forward to "when it last retried"
+        // and a client would render "disconnected 4 seconds ago" forever.
+        m.record_gmail_error(GmailErrorKind::Auth);
+        m.record_gmail_error(GmailErrorKind::Auth);
+        assert_eq!(
+            m.gmail_auth_failed_since(),
+            Some(first),
+            "since when, not last"
+        );
+
+        // The count still counts.
+        assert_eq!(m.gmail_auth.load(Ordering::Relaxed), 3);
+    }
+
+    /// A credential that works clears it. Without this the banner latches on and
+    /// sends somebody who has already reconnected round the loop again.
+    #[test]
+    fn a_working_credential_reconnects_the_mailbox() {
+        let m = SyncMetrics::new();
+        m.record_gmail_error(GmailErrorKind::Auth);
+        assert!(m.gmail_auth_failed_since().is_some());
+
+        m.note_credential_ok();
+        assert_eq!(m.gmail_auth_failed_since(), None);
+
+        // And a later outage stamps afresh rather than staying cleared.
+        m.record_gmail_error(GmailErrorKind::Auth);
+        assert!(m.gmail_auth_failed_since().is_some());
+    }
+
+    /// Only the credential kind sets it. A quota or transport error is not
+    /// something re-consenting fixes, and telling somebody to reconnect over a
+    /// 429 would send them through Google for nothing.
+    #[test]
+    fn only_a_credential_failure_disconnects_the_mailbox() {
+        let m = SyncMetrics::new();
+        for kind in [
+            GmailErrorKind::Quota,
+            GmailErrorKind::Http,
+            GmailErrorKind::Network,
+        ] {
+            m.record_gmail_error(kind);
+        }
+        assert_eq!(m.gmail_auth_failed_since(), None);
+    }
+}
+
+#[cfg(test)]
+mod catchup_progress_tests {
+    use super::*;
+
+    /// A catch-up has a denominator while it runs and none when it does not.
+    /// Absence is what lets every other caller treat the progress step as a
+    /// no-op on the ordinary incremental path.
+    #[test]
+    fn progress_exists_only_while_a_catch_up_is_running() {
+        let m = SyncMetrics::new();
+        assert_eq!(m.catchup_progress(), None, "no catch-up, no denominator");
+
+        m.catchup_begin(4500);
+        assert_eq!(m.catchup_progress(), Some((0, 4500)));
+        assert_eq!(m.catchup_step(), 1);
+        assert_eq!(m.catchup_step(), 2);
+        assert_eq!(m.catchup_progress(), Some((2, 4500)));
+
+        m.catchup_end();
+        assert_eq!(m.catchup_progress(), None, "and none once it is over");
+    }
+
+    /// The SENT phase widens the same run rather than starting a second one: to
+    /// anybody watching this is one wait, and a bar that reached the end and
+    /// restarted at zero would read as a loop rather than as two phases.
+    #[test]
+    fn the_sent_phase_widens_the_run_instead_of_restarting_it() {
+        let m = SyncMetrics::new();
+        m.catchup_begin(100);
+        for _ in 0..100 {
+            m.catchup_step();
+        }
+        assert_eq!(m.catchup_progress(), Some((100, 100)));
+
+        m.catchup_begin_extend(140);
+        assert_eq!(
+            m.catchup_progress(),
+            Some((100, 140)),
+            "done is carried, only the denominator moves"
+        );
+    }
+
+    /// A catch-up that dies halfway leaves nothing behind. The guard around it
+    /// clears on the error path too, because a denominator still standing would
+    /// report a run that is not happening — a worse lie than the silence this
+    /// whole pair replaced.
+    #[test]
+    fn an_abandoned_catch_up_leaves_no_ghost_denominator() {
+        let m = SyncMetrics::new();
+        m.catchup_begin(4500);
+        m.catchup_step();
+        m.catchup_end();
+        assert_eq!(m.catchup_progress(), None);
+        // And the next one starts clean rather than resuming the ghost.
+        m.catchup_begin(12);
+        assert_eq!(m.catchup_progress(), Some((0, 12)));
     }
 }
