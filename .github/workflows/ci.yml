@@ -4,11 +4,6 @@
 #
 # WHAT IS DELIBERATELY ABSENT:
 #
-# - `cargo fmt --check`. The tree is not fmt-clean today (~120 diffs across
-#   squelch-api/control/tui/warden/squelchd/mcp), and several feature branches
-#   are in flight; a repo-wide reformat now would drop merge conflicts under
-#   all of them. Add the gate (plus the one-time `cargo fmt` commit) once the
-#   branch backlog lands.
 # - The embedding-model E2E. squelch-core's real-fastembed tests gate
 #   themselves behind SQUELCH_EMBED_E2E precisely so CI does not download the
 #   model on every run; leave that env var unset here.
@@ -65,6 +60,13 @@ jobs:
       # build under fastembed is the expensive part, and this is what keeps
       # it from recompiling on every PR.
       - uses: Swatinem/rust-cache@v2
+
+      # BEFORE clippy on purpose: a formatting diff is the cheapest possible
+      # failure and there is no reason to spend a compile discovering it. The
+      # toolchain install above carries rustfmt from rust-toolchain.toml, so
+      # the gate and a local `cargo fmt` can never disagree about the version.
+      - name: fmt
+        run: cargo fmt --all --check
 
       - name: clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
