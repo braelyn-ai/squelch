@@ -938,6 +938,99 @@ async fn search_bad_mode_is_400() {
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }
 
+/// The sort is a first-class request parameter: it is honoured, it is echoed
+/// back, and an unreadable value is refused rather than quietly defaulted.
+#[tokio::test]
+async fn search_sort_is_honoured_echoed_and_validated() {
+    // A stronger old match and a weaker fresh one, so the two sorts genuinely
+    // disagree about which comes first.
+    let Harness { app, .. } = harness(|store, acct| {
+        let old = msg(acct, "g-old", "t-old", "contract", "contract");
+        let mut old = old;
+        old.received_at = chrono::Utc::now() - chrono::Duration::days(500);
+        let n = store.upsert_message(&old).unwrap();
+        store
+            .set_triage(
+                n,
+                acct,
+                60,
+                Tier::Signal,
+                Sensitivity::Normal,
+                None,
+                "",
+                "",
+                None,
+            )
+            .unwrap();
+
+        let fresh = msg(
+            acct,
+            "g-new",
+            "t-new",
+            "weekly digest",
+            "A stray mention of a contract sits far down this roundup of newsletter \
+             items, among gardening tips, local events, recipes, and a reader letter \
+             about compost.",
+        );
+        let n = store.upsert_message(&fresh).unwrap();
+        store
+            .set_triage(
+                n,
+                acct,
+                60,
+                Tier::Signal,
+                Sensitivity::Normal,
+                None,
+                "",
+                "",
+                None,
+            )
+            .unwrap();
+    });
+
+    let threads = |json: &Value| -> Vec<String> {
+        json["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|h| h["thread_id"].as_str().unwrap().to_string())
+            .collect()
+    };
+
+    // Default: recency considered, and the response says so.
+    let resp = app
+        .clone()
+        .oneshot(authed("GET", "/client/search?q=contract"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+    assert_eq!(json["sort"], "recent", "the default is echoed, not omitted");
+    assert_eq!(threads(&json), vec!["t-new", "t-old"]);
+
+    // Opted out: relevance alone, and the order inverts.
+    let resp = app
+        .clone()
+        .oneshot(authed("GET", "/client/search?q=contract&sort=best_match"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+    assert_eq!(json["sort"], "best_match");
+    assert_eq!(
+        threads(&json),
+        vec!["t-old", "t-new"],
+        "best_match ranks the stronger match first however old it is"
+    );
+
+    // A value nobody serves is a 400, not a silent fallback to the default.
+    let resp = app
+        .oneshot(authed("GET", "/client/search?q=contract&sort=newest"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
 /// Explicit `mode=semantic` with NO vector index degrades to keyword and reports
 /// the kind actually run — never erroring the caller.
 #[tokio::test]

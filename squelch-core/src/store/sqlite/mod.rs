@@ -39,7 +39,7 @@ use crate::store::{
     AttachmentBytes, BankingApplied, ContactEntry, Device, DeviceToken, Draft, DraftFields,
     ExtractQueued, InboxUnread, IssuedDeviceToken, MarketingApplied, MarketingOffer, MessageOpen,
     MessageUnsub, MintedPairingCode, MissingVector, NewAuditEntry, NewEvent, RevisitQueued,
-    SealedBody, SealedMessage, SearchFilter, SeedVerdict, SenderHistory, SentMessage,
+    SealedBody, SealedMessage, SearchFilter, SearchSort, SeedVerdict, SenderHistory, SentMessage,
     SentMissingRecipients, SitrepBand, Stage1Applied, Stage1Queued, Stage2Applied,
     Stage2CapOverrides, Stage2Queued, Stage2Usage, Stage2UsageDay, Store, SyncState, ThreadSibling,
     TrackedMessage, TriageDebug, TriagedMessage, UsageTokens,
@@ -827,10 +827,11 @@ impl Store for SqliteStore {
         account_id: AccountId,
         text: &str,
         filter: &SearchFilter,
+        sort: SearchSort,
         limit: u32,
         offset: u32,
     ) -> Result<Vec<SearchHit>> {
-        self.search_filtered(account_id, text, filter, limit, offset)
+        self.search_filtered(account_id, text, filter, sort, limit, offset)
     }
 
     fn attention_updates(

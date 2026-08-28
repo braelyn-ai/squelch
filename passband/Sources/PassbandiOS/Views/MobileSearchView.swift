@@ -32,6 +32,7 @@ import SwiftUI
 
 struct MobileSearchView: View {
     @Environment(AppStore.self) private var store
+    @Environment(Prefs.self) private var prefs
 
     @State private var loading = false
     /// A page append is in flight. SEPARATE from `loading`: that one blanks the
@@ -67,6 +68,15 @@ struct MobileSearchView: View {
     /// that is still on screen.
     private var term: String { store.search.query.trimmed }
 
+    /// THERE IS AN ANSWER ON SCREEN for the question on screen: the hits came
+    /// back for exactly this query under exactly this order. What the
+    /// no-matches copy is allowed to key on — emptiness alone means "not back
+    /// yet" while the field is mid-edit, and `fetchedQuery != nil` alone means
+    /// only that SOME query was once answered.
+    private var answered: Bool {
+        store.search.fetchedQuery == term && store.search.fetchedSort == prefs.searchSort
+    }
+
     /// Long enough to be a sentence, so this is a question. Trimmed first: the
     /// space a person leaves before their next word must not flip the surface
     /// one keystroke early.
@@ -86,7 +96,10 @@ struct MobileSearchView: View {
             // were left, because none of them were ever this view's to lose.
             .searchable(text: $store.search.query, prompt: "Search or ask")
             // SwiftUI cancels this on the next edit, which IS the debounce.
-            .task(id: store.search.query) { await runSearch() }
+            // Keyed on the sort too — same reason as the Mac's panel: flipping
+            // the order has to re-rank what is on screen, not wait for the next
+            // keystroke.
+            .task(id: [store.search.query, prefs.searchSort.rawValue]) { await runSearch() }
             // Return is the send, and only in agent mode: under four spaces it
             // is the search that has already run behind the debounce. The
             // submit path CLEARS the field where the ask row does not: there
@@ -247,7 +260,7 @@ struct MobileSearchView: View {
                 Text("searching…")
                     .font(Typo.rowSub)
                     .foregroundStyle(Palette.inkFaintest)
-            } else if store.search.fetchedQuery != nil {
+            } else if answered {
                 Text("No matches.")
                     .font(Typo.serif(22, weight: .medium))
                     .foregroundStyle(Palette.ink)
@@ -319,36 +332,42 @@ struct MobileSearchView: View {
         // Already holding this term's results: coming back to the tab must not
         // re-fetch and flash, which is the point of parking the session in the
         // store.
-        guard query != store.search.fetchedQuery else { return }
-        loading = true
-        // Debounce: a fresh keystroke cancels this task before the request.
-        try? await Task.sleep(for: Self.debounce)
-        // A cancelled exit MUST clear the flag: the replacing task can
-        // early-return on `query == fetchedQuery` without ever touching it
-        // (backspace inside the debounce window), and a stuck `loading` both
-        // pins the "searching…" note and gates loadMore forever.
-        guard !Task.isCancelled else {
+        // The sort is half of the "already holding this" test: same words under
+        // different rules is a different answer, so changing the order in
+        // Settings re-ranks on the next visit instead of silently doing nothing
+        // until the reader edits their query.
+        let sort = prefs.searchSort
+        // CLEARS `loading` on the way out: this is the path a cancelled
+        // predecessor used to rely on someone else covering. The CURRENT task
+        // owns the flag now; see the cancelled exits below.
+        guard query != store.search.fetchedQuery || sort != store.search.fetchedSort else {
             loading = false
             return
         }
+        loading = true
+        // Debounce: a fresh keystroke cancels this task before the request.
+        try? await Task.sleep(for: Self.debounce)
+        // A CANCELLED TASK WRITES NOTHING. Its replacement has already set
+        // `loading = true` for the keystroke that superseded it, and the two
+        // resumptions are not ordered — clearing the flag here is how
+        // "searching…" blinked off mid-type and let the empty state through.
+        guard !Task.isCancelled else { return }
         do {
             // NO `mode`, exactly as the Mac passes none: the daemon picks
             // hybrid when it has vectors and keyword when it does not, and a
             // client that pinned one would be choosing worse for half the
             // installs.
-            let page = try await APIClient.shared.search(query, limit: 50)
+            let page = try await APIClient.shared.search(query, limit: 50, sort: sort)
             // Re-check after the await, same as the catch does: a superseded
             // task landing late must not stamp `fetchedQuery` with a term that
             // is no longer in the field — the `query != fetchedQuery` guard
             // above would then refuse to fetch the term that IS.
-            guard !Task.isCancelled, term == query else {
-                loading = false
-                return
-            }
+            guard !Task.isCancelled, term == query else { return }
             store.search.hits = page.items
             store.search.nextCursor = page.next_cursor
             store.search.error = nil
             store.search.fetchedQuery = query
+            store.search.fetchedSort = sort
             for hit in page.items.prefix(Self.warmCount) {
                 ThreadPrefetch.shared.prefetch(hit.thread_id)
             }
@@ -356,15 +375,14 @@ struct MobileSearchView: View {
             // Cancellation surfaces here too (URLError.cancelled mid-request):
             // that is a superseded task, not a failure, and writing an error
             // would stamp the NEW search's state with the old one's obituary.
-            guard !Task.isCancelled else {
-                loading = false
-                return
-            }
+            // Nor the flag — same reason as the debounce exit above.
+            guard !Task.isCancelled else { return }
             store.search.error = errText(error, "search failed")
             // Leave `fetchedQuery` nil so returning RETRIES rather than
             // resurrecting a stale error over stale hits, and drop the cursor
             // with it: it belongs to a page set this view is no longer showing.
             store.search.fetchedQuery = nil
+            store.search.fetchedSort = nil
             store.search.nextCursor = nil
         }
         loading = false
@@ -379,10 +397,15 @@ struct MobileSearchView: View {
         guard !loading, !loadingMore, let cursor = store.search.nextCursor else { return }
         let query = term
         guard !query.isEmpty, query == store.search.fetchedQuery else { return }
+        // The cursor is an OFFSET INTO ONE RANKING, so the page after it is
+        // asked for under the sort the hits on screen were ranked by, not under
+        // whatever the preference says now.
+        let sort = store.search.fetchedSort
         loadingMore = true
         defer { loadingMore = false }
         do {
-            let page = try await APIClient.shared.search(query, limit: 50, cursor: cursor)
+            let page = try await APIClient.shared.search(
+                query, limit: 50, cursor: cursor, sort: sort)
             guard query == store.search.fetchedQuery, store.search.nextCursor == cursor else {
                 return
             }

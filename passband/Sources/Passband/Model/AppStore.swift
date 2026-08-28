@@ -175,6 +175,12 @@ struct SearchSession: Sendable, Equatable {
     /// skips the round-trip. nil = what is on screen is not authoritative (never
     /// fetched, or the last fetch failed), so reopening retries.
     var fetchedQuery: String?
+    /// The sort those hits were ranked under. Paired with `fetchedQuery`
+    /// because the skip-the-round-trip check is "same question, same rules":
+    /// changing the order in Settings and reopening the panel on the same term
+    /// has to re-rank, or the setting silently does nothing until the reader
+    /// edits their query.
+    var fetchedSort: SearchSortChoice?
     /// Cursor for the page AFTER the ones in `hits`. nil = the server has no
     /// more (or nothing authoritative is on screen). Parked here with the rest
     /// so reopening resumes mid-scroll instead of dropping back to page one.

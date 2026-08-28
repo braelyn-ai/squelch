@@ -23,9 +23,22 @@ struct SettingsView: View {
         VStack(spacing: 0) {
             // RoutedHeader lives in App/RootView.swift, which is the Mac's window
             // shell and is excluded from the iOS target. The phone titles this
-            // screen with a navigation bar instead.
+            // screen with a navigation bar instead, and files the search order
+            // as a card (see PassbandiOS/Views/AccountPage.swift) because it has
+            // no header to hang a control from.
             #if os(macOS)
-                RoutedHeader(title: "Settings")
+                RoutedHeader(title: "Settings") {
+                    HStack(spacing: 8) {
+                        // Labelled, because a bare pair of words in a corner is
+                        // a puzzle. It sits in the header rather than in a card
+                        // under one tab so the answer is reachable from every
+                        // tab, the way the version stamp is.
+                        Text("search")
+                            .font(Typo.rowSub)
+                            .foregroundStyle(Palette.inkDim)
+                        SearchSortPicker()
+                    }
+                }
             #endif
             HStack(alignment: .top, spacing: 0) {
                 nav
@@ -283,6 +296,29 @@ struct SettingsHint: View {
             .foregroundStyle(Palette.inkFaintest)
             .fixedSize(horizontal: false, vertical: true)
             .frame(maxWidth: .infinity, alignment: .leading)
+    }
+}
+
+/// HOW SEARCH ORDERS ITS RESULTS, as a control. Shared by both shells because
+/// both shells search: the Mac hangs it in the settings header, the phone files
+/// it in a card under Mail. One preference behind both.
+///
+/// It takes effect on the NEXT search rather than re-running one behind the
+/// reader's back — settings is not where results live, and the search panel
+/// re-fetches when it reopens because the session records the order its hits
+/// were ranked under.
+struct SearchSortPicker: View {
+    @Environment(Prefs.self) private var prefs
+
+    var body: some View {
+        @Bindable var prefs = prefs
+        GlassSegmented(
+            options: SearchSortChoice.allCases.map { ($0, $0.label) },
+            selection: $prefs.searchSort
+        )
+        .help(prefs.searchSort.blurb)
+        .accessibilityLabel("Search result order")
+        .accessibilityHint(prefs.searchSort.blurb)
     }
 }
 

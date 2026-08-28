@@ -246,13 +246,25 @@ actor APIClient {
         return try await get("/client/thread/\(escaped)")
     }
 
-    func search(_ q: String, limit: Int? = nil, cursor: String? = nil, mode: SearchMode? = nil)
-        async throws -> Page<SearchHit>
-    {
+    /// `sort` is the reader's standing preference (`Prefs.searchSort`), passed
+    /// on every search rather than stored server-side: the daemon serves every
+    /// paired client, and one device's ordering is not another's.
+    ///
+    /// A cursor is only meaningful beside the sort it was issued under — the
+    /// offset indexes one particular ranking — so a caller paging must pass the
+    /// same sort it opened with.
+    func search(
+        _ q: String,
+        limit: Int? = nil,
+        cursor: String? = nil,
+        mode: SearchMode? = nil,
+        sort: SearchSortChoice? = nil
+    ) async throws -> Page<SearchHit> {
         try await get(
             "/client/search",
             query: [
                 "q": q, "limit": limit.map(String.init), "cursor": cursor, "mode": mode?.rawValue,
+                "sort": sort?.rawValue,
             ])
     }
 

@@ -29,7 +29,12 @@ struct SidePanel: View {
                         Text("close").font(Typo.micro).foregroundStyle(Palette.inkFaintest)
                     }
                 }
-                .padding(.horizontal, 16)
+                // As a strip this header sits on the window's right, nowhere
+                // near the traffic lights. EXPANDED it spans the whole window
+                // and covers the rail, so its leading edge lands in the strip
+                // the buttons own and the title draws underneath them.
+                .padding(.leading, expanded ? TopBar.dotsClearance : 16)
+                .padding(.trailing, 16)
                 .padding(.vertical, 13)
                 .overlay(alignment: .bottom) { Hairline() }
 
@@ -74,6 +79,7 @@ struct SidePanel: View {
 /// in-flight flags, which die with the panel, are local.
 struct SearchView: View {
     @Environment(AppStore.self) private var store
+    @Environment(Prefs.self) private var prefs
     @State private var loading = false
     /// A page append is in flight. SEPARATE from `loading`: that one blanks the
     /// list behind "searching…", and an append must leave the read hits alone.
@@ -87,27 +93,72 @@ struct SearchView: View {
         (store.search.fetchedQuery ?? "").split(separator: " ").map(String.init)
     }
 
+    /// THERE IS AN ANSWER ON SCREEN for the question on screen: the hits came
+    /// back for exactly this query under exactly this order.
+    ///
+    /// What "no matches." is allowed to key on, and the fix for it flashing on
+    /// every keystroke. Emptiness alone does not mean no matches — mid-edit the
+    /// hits belong to the PREVIOUS query, and an empty list there means "not
+    /// back yet". Nor does `!loading`: the flag is a race between the task
+    /// starting for this keystroke and the cancelled one for the last, so it
+    /// dips false between two characters even though nothing was answered.
+    ///
+    /// A failed fetch clears `fetchedQuery`, so an error is never mistaken for
+    /// a nil result; an empty field clears it too, so the resting panel says
+    /// nothing rather than "no matches." at a question nobody asked.
+    private var answered: Bool {
+        store.search.fetchedQuery == store.search.query.trimmed
+            && store.search.fetchedSort == prefs.searchSort
+    }
+
     var body: some View {
         @Bindable var store = store
         let expanded = store.search.expanded
 
         VStack(alignment: .leading, spacing: 0) {
             Field(label: "") {
-                TextField("search mail…", text: $store.search.query)
-                    .textFieldStyle(.plain)
-                    .focused($focused)
+                HStack(spacing: 8) {
+                    TextField("search mail…", text: $store.search.query)
+                        .textFieldStyle(.plain)
+                        .focused($focused)
+                    // IN THE WELL, at its trailing edge: the wait belongs to the
+                    // field, beside the words being waited on, rather than in a
+                    // row of its own above the results.
+                    //
+                    // SPACE RESERVED, DOTS MOUNTED ONLY WHILE WAITING. Reserved,
+                    // because arriving would re-lay the well and shove the text
+                    // and caret leftward on every search. Mounted rather than
+                    // merely faded, because the dots animate forever once they
+                    // appear, and a loop running behind zero opacity is a loop
+                    // that should not be running.
+                    ZStack {
+                        if loading { WaitDots().transition(.opacity) }
+                    }
+                    .frame(width: WaitDots.width)
+                    .animation(.easeInOut(duration: 0.16), value: loading)
+                }
             }
             .padding(.horizontal, 16)
             .padding(.top, 12)
             .padding(.bottom, 8)
 
-            if loading { BandNote("searching…") }
-            if let error = store.search.error { BandNote(error) }
-            if !loading && store.search.error == nil && !store.search.query.trimmed.isEmpty
-                && store.search.hits.isEmpty
-            {
-                BandNote("no matches.")
+            // THE ORDER, beside the thing that produces it. A sort control is
+            // about the answer, so it belongs next to the question and not
+            // three screens away — the same preference is in Settings, and the
+            // two are one value, so flipping it here is what Settings will say
+            // next time it is opened.
+            //
+            // Shown even with an empty field: a control that only appears once
+            // you have results is a control you do not know you have.
+            HStack {
+                SearchSortPicker()
+                Spacer(minLength: 0)
             }
+            .padding(.horizontal, 16)
+            .padding(.bottom, 10)
+
+            if let error = store.search.error { BandNote(error) }
+            if answered && store.search.hits.isEmpty { BandNote("no matches.") }
 
             ScrollViewReader { proxy in
                 ScrollView {
@@ -172,7 +223,10 @@ struct SearchView: View {
                 #endif
             }
         }
-        .task(id: store.search.query) { await runSearch() }
+        // KEYED ON THE SORT TOO, or flipping the order leaves the old ranking on
+        // screen until the reader edits their query. An array because tuples do
+        // not conform to Equatable and `task(id:)` needs one value.
+        .task(id: [store.search.query, prefs.searchSort.rawValue]) { await runSearch() }
     }
 
     private var bindings: [KeyBinding] {
@@ -214,30 +268,44 @@ struct SearchView: View {
 
     private func runSearch() async {
         let term = store.search.query.trimmed
+        // Read at fetch time, not captured on mount: the panel is often built
+        // before a trip to Settings and rebuilt after one.
+        let sort = prefs.searchSort
         guard !term.isEmpty else {
             store.search.hits = []
             store.search.error = nil
             store.search.fetchedQuery = nil
+            store.search.fetchedSort = nil
             store.search.nextCursor = nil
             loading = false
             return
         }
-        // Already holding this term's results: reopening must not re-fetch and
-        // flash, which is the point of hoisting the session into the store.
-        guard term != store.search.fetchedQuery else { return }
-        loading = true
-        // Debounce: a fresh keystroke cancels this task before the request.
-        try? await Task.sleep(for: .milliseconds(220))
-        // A cancelled exit MUST clear the flag: the replacing task can
-        // early-return on `term == fetchedQuery` without ever touching it
-        // (backspace inside the debounce window), and a stuck `loading` both
-        // pins the "searching…" note and gates loadMore forever.
-        guard !Task.isCancelled else {
+        // Already holding this term's results UNDER THIS ORDER: reopening must
+        // not re-fetch and flash, which is the point of hoisting the session
+        // into the store. The sort is half of that test — same words ranked by
+        // different rules is a different answer.
+        //
+        // CLEARS `loading` on the way out, because this is the path a cancelled
+        // predecessor used to rely on someone else covering (backspace inside
+        // the debounce window lands here). The CURRENT task owns the flag now;
+        // see the cancelled exits below.
+        guard term != store.search.fetchedQuery || sort != store.search.fetchedSort else {
             loading = false
             return
         }
+        loading = true
+        // Debounce: a fresh keystroke cancels this task before the request.
+        try? await Task.sleep(for: .milliseconds(220))
+        // A CANCELLED TASK WRITES NOTHING. Its replacement has already set
+        // `loading = true` for the keystroke that superseded it, and the two
+        // resumptions are not ordered — clearing the flag here is how
+        // "searching…" blinked off mid-type and let the empty state through.
+        // Every path that stops being the current search now leaves the flag to
+        // whoever is (including the early return above, which is the case this
+        // used to be covering for).
+        guard !Task.isCancelled else { return }
         do {
-            let page = try await APIClient.shared.search(term, limit: 50)
+            let page = try await APIClient.shared.search(term, limit: 50, sort: sort)
             store.search.hits = page.items
             store.search.nextCursor = page.next_cursor
             // Fresh results land un-armed: Enter straight from the bar means
@@ -245,6 +313,7 @@ struct SearchView: View {
             store.search.index = -1
             store.search.error = nil
             store.search.fetchedQuery = term
+            store.search.fetchedSort = sort
             // Warm the head of the page only. Search rows are read and chosen
             // from, not swept, so the rest can wait for a real click — and the
             // whole 50 would be a stampede for one open.
@@ -255,14 +324,13 @@ struct SearchView: View {
             // Cancellation surfaces here too (URLError.cancelled mid-request):
             // that is a superseded task, not a failure, and writing an error
             // would stamp the NEW search's state with the old one's obituary.
-            guard !Task.isCancelled else {
-                loading = false
-                return
-            }
+            // Nor the flag — same reason as the debounce exit above.
+            guard !Task.isCancelled else { return }
             store.search.error = errText(error, "search failed")
             // Leave `fetchedQuery` nil so reopening RETRIES rather than
             // resurrecting a stale error over stale hits.
             store.search.fetchedQuery = nil
+            store.search.fetchedSort = nil
             // And drop the cursor with it: it belongs to a page set this view
             // is no longer showing.
             store.search.nextCursor = nil
@@ -279,10 +347,17 @@ struct SearchView: View {
         guard !loading, !loadingMore, let cursor = store.search.nextCursor else { return }
         let term = store.search.query.trimmed
         guard !term.isEmpty, term == store.search.fetchedQuery else { return }
+        // The cursor is an OFFSET INTO ONE RANKING, so the page after it has to
+        // be asked for under the sort the hits on screen were ranked by — not
+        // under whatever the preference says now. A sort changed mid-scroll
+        // re-ranks from the top through `runSearch`, which is the only honest
+        // way to serve it.
+        let sort = store.search.fetchedSort
         loadingMore = true
         defer { loadingMore = false }
         do {
-            let page = try await APIClient.shared.search(term, limit: 50, cursor: cursor)
+            let page = try await APIClient.shared.search(
+                term, limit: 50, cursor: cursor, sort: sort)
             guard term == store.search.fetchedQuery, store.search.nextCursor == cursor else {
                 return
             }

@@ -28,6 +28,76 @@ enum TopBar {
     /// close enough to the buttons' own centre (y 16) that a title beside them
     /// reads as being ON their line rather than under it.
     static let height: CGFloat = 40
+
+    /// How far in from the window's LEADING edge anything sharing the strip has
+    /// to start. The traffic lights span x 9-69; this clears them with a
+    /// gutter.
+    ///
+    /// Most surfaces never need it, because the rail is the only thing in the
+    /// strip and it yields the whole span. A surface that goes FULL WINDOW WIDTH
+    /// covers the rail as well, and then its own header starts at x 0 — under
+    /// the buttons, which is where fullscreen search was drawing its title.
+    static let dotsClearance: CGFloat = 78
+}
+
+// MARK: - waiting
+
+/// A THREE-DOT WAIT, for the places a word would be too loud and a spinner too
+/// official — inside a field, beside the thing being waited on.
+///
+/// It says only "working", which is all a search in flight can honestly claim.
+/// The banner it replaced said "searching…" on its own line, which took a row
+/// of the results away from the results and read as an ANSWER rather than as a
+/// status, in the same slot the empty state uses.
+///
+/// The three dots rise and fall on one shared toggle, phase-shifted by their
+/// index so the motion reads as travel rather than a blink. The loop starts in
+/// `onAppear` and dies with the view, so nothing has to remember to stop it.
+struct WaitDots: View {
+    var tone: Color = Palette.inkFaintest
+
+    private static let diameter: CGFloat = 3.5
+    private static let spacing: CGFloat = 3
+
+    /// The space three dots occupy. A caller that shows them CONDITIONALLY
+    /// reserves this much so their arrival does not re-lay whatever they sit
+    /// beside — see the search field, where it would shove the caret.
+    static var width: CGFloat { diameter * 3 + spacing * 2 }
+
+    /// One toggle for all three; the stagger is a per-dot animation delay
+    /// rather than three pieces of state to keep in step.
+    @State private var raised = false
+
+    /// An infinite animation is the case this setting exists for, so this one
+    /// asks even though it is the app's first to. Reduced, the dots simply sit
+    /// there at the brightness they average out to: still a "working" mark,
+    /// with nothing moving.
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    private static let dim: Double = 0.28
+    private static let beat: Double = 0.5
+
+    var body: some View {
+        HStack(spacing: Self.spacing) {
+            ForEach(0..<3, id: \.self) { i in
+                Circle()
+                    .fill(tone)
+                    .frame(width: Self.diameter, height: Self.diameter)
+                    .opacity(reduceMotion ? 0.6 : (raised ? 1 : Self.dim))
+                    .animation(
+                        reduceMotion
+                            ? nil
+                            : .easeInOut(duration: Self.beat)
+                                .repeatForever(autoreverses: true)
+                                .delay(Double(i) * 0.16),
+                        value: raised
+                    )
+            }
+        }
+        .onAppear { raised = true }
+        .accessibilityElement()
+        .accessibilityLabel("searching")
+    }
 }
 
 // MARK: - rules

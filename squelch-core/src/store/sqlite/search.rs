@@ -2,8 +2,10 @@
 //! writes that feed them.
 
 use super::*;
+use crate::store::recency;
 use rusqlite::params_from_iter;
 use rusqlite::types::Value;
+use std::collections::{HashMap, HashSet};
 use zerocopy::AsBytes;
 
 /// The FTS5 MATCH WINDOW over the body column (column 1): up to 24 tokens
@@ -103,6 +105,84 @@ fn push_filter_clauses(sql: &mut String, args: &mut Vec<Value>, filter: &SearchF
     }
 }
 
+/// One recall candidate as the leg that produced it saw it: the message id,
+/// plus the `received_at` the recency blend needs.
+///
+/// The timestamp is carried OUT of the recall SQL rather than looked up
+/// afterwards. Both legs already join `messages`, so it is free here — and the
+/// blend has to happen BEFORE the top-`k` truncation, which is exactly when a
+/// hydrated `SearchHit` does not exist yet.
+#[derive(Clone, Copy)]
+struct Candidate {
+    id: i64,
+    received_at: DateTime<Utc>,
+}
+
+/// The RRF smoothing constant (the standard 60): how far down a list a hit can
+/// sit before its vote stops mattering much.
+const RRF_K: f32 = 60.0;
+
+/// What one full recency vote is worth, as a fraction of being ranked FIRST on
+/// one relevance list.
+///
+/// ON THESE LEGS RECENCY IS A TERM, NOT A FACTOR — the opposite of the keyword
+/// leg's multiplication, and for the opposite reason. RRF scores are
+/// deliberately FLAT at the head of a list (ranks 1 through 10 span 15% of one
+/// list's vote), so a multiplicative boost with any useful range would stop
+/// being a tilt and simply re-sort the top of the results by date. An additive
+/// term denominated in the same `1 / (RRF_K + rank)` units stays comparable to
+/// the thing it votes against: at 0.5, a fresh hit has to be within roughly a
+/// dozen ranks on BOTH legs to overtake an ancient top hit.
+const RRF_RECENCY_WEIGHT: f32 = 0.5;
+
+/// The recency term added to one candidate's fused score.
+fn recency_vote(received_at: DateTime<Utc>, now: DateTime<Utc>) -> f32 {
+    RRF_RECENCY_WEIGHT * recency::boost(received_at, now) as f32 / (RRF_K + 1.0)
+}
+
+/// Fuse ranked candidate lists into one order, best first: Reciprocal Rank
+/// Fusion across the lists a candidate appears in, plus its recency vote when
+/// `sort` asks for one.
+///
+/// One list in is legal and useful — that is the semantic leg, where RRF is a
+/// monotone restatement of the KNN order and the vote is the only thing that
+/// can move a row. Under [`SearchSort::BestMatch`] that leg therefore returns
+/// the KNN order untouched, which is the honest answer to "no time decay".
+///
+/// TIES BREAK by `received_at DESC, id DESC`, and that is not decoration. The
+/// fused order is the sequence the door's cursor indexes into, while the score
+/// map is a `HashMap` whose iteration order is not stable between calls — with
+/// no explicit tiebreaker, equal scores could reshuffle between one page and
+/// the next and drop or repeat rows across the boundary.
+fn fuse_ranked(lists: &[&[Candidate]], sort: SearchSort, now: DateTime<Utc>) -> Vec<Candidate> {
+    let mut score: HashMap<i64, f32> = HashMap::new();
+    let mut seen: HashMap<i64, Candidate> = HashMap::new();
+    for list in lists {
+        for (rank, c) in list.iter().enumerate() {
+            *score.entry(c.id).or_insert(0.0) += 1.0 / (RRF_K + rank as f32 + 1.0);
+            seen.entry(c.id).or_insert(*c);
+        }
+    }
+    let mut ranked: Vec<(Candidate, f32)> = score
+        .into_iter()
+        .map(|(id, s)| {
+            let c = seen[&id];
+            let vote = if sort.considers_recency() {
+                recency_vote(c.received_at, now)
+            } else {
+                0.0
+            };
+            (c, s + vote)
+        })
+        .collect();
+    ranked.sort_by(|a, b| {
+        b.1.total_cmp(&a.1)
+            .then(b.0.received_at.cmp(&a.0.received_at))
+            .then(b.0.id.cmp(&a.0.id))
+    });
+    ranked.into_iter().map(|(c, _)| c).collect()
+}
+
 impl SqliteStore {
     // ON-BOX SEMANTIC RECALL. Inherent methods rather than `Store` ones because
     // they need the attached [`Embedder`] and the sqlite-vec `message_vecs`
@@ -118,12 +198,34 @@ impl SqliteStore {
     /// SECURITY: the KNN hit set is re-joined to `triage` to drop sealed rows
     /// (they should never be indexed at all). BOTH `is_sent` values are INCLUDED
     /// — recall wants the user's own sent mail ("did I say I'd send X").
+    ///
+    /// RAW KNN: this is nearest-by-meaning and nothing else. Recency belongs to
+    /// the SEARCH surfaces built on top of it — see
+    /// [`semantic_search_hits`](Self::semantic_search_hits) — not to the
+    /// primitive they share.
     pub fn semantic_search(
         &self,
         account_id: AccountId,
         query_text: &str,
         k: usize,
     ) -> Result<Vec<(i64, f32)>> {
+        Ok(self
+            .semantic_knn(account_id, query_text, k)?
+            .into_iter()
+            .map(|(c, dist)| (c.id, dist))
+            .collect())
+    }
+
+    /// Embed `query_text` and KNN it: the shared body of [`semantic_search`] and
+    /// [`semantic_search_hits`](Self::semantic_search_hits). Errors when no
+    /// embedder is attached, which is what makes `mode=semantic` a hard failure
+    /// before the background attach rather than a silently empty result.
+    fn semantic_knn(
+        &self,
+        account_id: AccountId,
+        query_text: &str,
+        k: usize,
+    ) -> Result<Vec<(Candidate, f32)>> {
         let embedder = self
             .embedder()
             .ok_or_else(|| CoreError::InvalidInput("no embedder attached".into()))?;
@@ -131,15 +233,15 @@ impl SqliteStore {
         self.knn_by_vector(account_id, &qvec, k)
     }
 
-    /// Lower-level KNN used by [`semantic_search`] (and reused by
-    /// [`hybrid_search`]): given an already-computed query vector, return the `k`
-    /// nearest non-sealed messages for the account as `(message_id, distance)`.
+    /// Lower-level KNN used by [`semantic_knn`](Self::semantic_knn) (and reused
+    /// by [`hybrid_search`]): given an already-computed query vector, return the
+    /// `k` nearest non-sealed messages for the account, each with its distance.
     fn knn_by_vector(
         &self,
         account_id: AccountId,
         query: &[f32],
         k: usize,
-    ) -> Result<Vec<(i64, f32)>> {
+    ) -> Result<Vec<(Candidate, f32)>> {
         if query.len() != VEC_DIMS {
             return Err(CoreError::InvalidInput(format!(
                 "query embedding len {} != vec0 width {VEC_DIMS}",
@@ -151,7 +253,7 @@ impl SqliteStore {
         // column, cap with `k = ?`, then re-join triage to drop any sealed row
         // that should never have been indexed in the first place.
         let mut stmt = conn.prepare(
-            "SELECT v.message_id, v.distance
+            "SELECT v.message_id, v.distance, m.received_at
              FROM message_vecs v
              JOIN messages m ON m.id = v.message_id
              LEFT JOIN triage t ON t.message_id = v.message_id
@@ -162,7 +264,13 @@ impl SqliteStore {
              ORDER BY v.distance",
         )?;
         let rows = stmt.query_map(params![query.as_bytes(), account_id, k as i64], |r| {
-            Ok((r.get::<_, i64>(0)?, r.get::<_, f64>(1)? as f32))
+            Ok((
+                Candidate {
+                    id: r.get::<_, i64>(0)?,
+                    received_at: dt(r, 2)?,
+                },
+                r.get::<_, f64>(1)? as f32,
+            ))
         })?;
         let mut out = Vec::new();
         for row in rows {
@@ -173,10 +281,14 @@ impl SqliteStore {
 
     /// HYBRID RECALL: merge FTS5 keyword rank and vector distance with Reciprocal
     /// Rank Fusion — each candidate scores `sum(1 / (rrf_k + rank))` across the
-    /// lists it appears in, `rrf_k` being the standard smoothing constant (60).
-    /// Keyword catches exact tokens, vectors catch paraphrase, and either list
-    /// alone still produces results. Both exclude sealed rows and include sent
-    /// mail (recall).
+    /// lists it appears in, `rrf_k` being the standard smoothing constant (60),
+    /// plus a RECENCY vote (see [`fuse_ranked`]). Keyword catches exact tokens,
+    /// vectors catch paraphrase, recency breaks the near-ties those two leave
+    /// behind, and any one of them alone still produces results. Both recall
+    /// legs exclude sealed rows and include sent mail (recall).
+    ///
+    /// The recency vote is applied BEFORE the top-`k` truncation, so it decides
+    /// what makes the window rather than just how the window is displayed.
     ///
     /// `filter` is applied POST-HOC to the hydrated top-`k` window, because
     /// neither recall leg can express `from:`/date bounds in its ranking. See
@@ -191,33 +303,28 @@ impl SqliteStore {
         account_id: AccountId,
         query_text: &str,
         filter: &SearchFilter,
+        sort: SearchSort,
         k: usize,
     ) -> Result<(Vec<SearchHit>, bool)> {
-        const RRF_K: f32 = 60.0;
+        // ONE clock for both legs of one search.
+        let now = Utc::now();
 
         // No embedder (e.g. before the background attach) => keyword-only.
-        let vec_hits: Vec<(i64, f32)> = match self.embedder() {
+        let vec_hits: Vec<Candidate> = match self.embedder() {
             Some(embedder) => {
                 let qvec = embedder.embed(query_text)?;
                 self.knn_by_vector(account_id, &qvec, k)?
+                    .into_iter()
+                    .map(|(c, _dist)| c)
+                    .collect()
             }
             None => Vec::new(),
         };
 
         // FTS ranks over the SAME query text, sent mail included.
-        let fts_ids = self.fts_recall_ids(account_id, query_text, k)?;
+        let fts_hits = self.fts_recall(account_id, query_text, k)?;
 
-        use std::collections::HashMap;
-        let mut score: HashMap<i64, f32> = HashMap::new();
-        for (rank, (id, _dist)) in vec_hits.iter().enumerate() {
-            *score.entry(*id).or_insert(0.0) += 1.0 / (RRF_K + rank as f32 + 1.0);
-        }
-        for (rank, id) in fts_ids.iter().enumerate() {
-            *score.entry(*id).or_insert(0.0) += 1.0 / (RRF_K + rank as f32 + 1.0);
-        }
-
-        let mut ranked: Vec<(i64, f32)> = score.into_iter().collect();
-        ranked.sort_by(|a, b| b.1.total_cmp(&a.1));
+        let mut ranked = fuse_ranked(&[&vec_hits, &fts_hits], sort, now);
         ranked.truncate(k);
         // Judged BEFORE the filter drops anything: fullness is a property of
         // the recall window, not of what survived the operators.
@@ -225,16 +332,16 @@ impl SqliteStore {
 
         // Only the ids the KEYWORD leg produced have a match window to show; a
         // vector-only hit matched by meaning, not by any term in the body.
-        let from_fts: std::collections::HashSet<i64> = fts_ids.into_iter().collect();
+        let from_fts: HashSet<i64> = fts_hits.iter().map(|c| c.id).collect();
 
         let mut out = Vec::with_capacity(ranked.len());
-        for (id, _s) in ranked {
-            if let Some(mut hit) = self.search_hit_by_id(account_id, id)? {
+        for c in ranked {
+            if let Some(mut hit) = self.search_hit_by_id(account_id, c.id)? {
                 if !filter.matches(&hit) {
                     continue;
                 }
-                if from_fts.contains(&id)
-                    && let Some(window) = self.fts_snippet(account_id, id, query_text)?
+                if from_fts.contains(&c.id)
+                    && let Some(window) = self.fts_snippet(account_id, c.id, query_text)?
                 {
                     hit.snippet = window;
                 }
@@ -288,11 +395,16 @@ impl SqliteStore {
         Ok(body_window(raw))
     }
 
-    /// SEMANTIC-ONLY recall as hydrated [`SearchHit`]s, best-first by distance,
-    /// for the human door's `mode=semantic` search. Empty without an attached
-    /// embedder. Sealed rows are excluded in SQL; sent mail is included (recall).
-    /// Snippets stay the stored head-of-message text: a vector hit matched by
-    /// meaning, so there is no term window to cut around.
+    /// SEMANTIC-ONLY recall as hydrated [`SearchHit`]s for the human door's
+    /// `mode=semantic` search: the KNN window, reordered by distance rank AND
+    /// recency (see [`fuse_ranked`], which a one-list call reduces to exactly
+    /// that). Errors without an attached embedder. Sealed rows are excluded in
+    /// SQL; sent mail is included (recall). Snippets stay the stored
+    /// head-of-message text: a vector hit matched by meaning, so there is no
+    /// term window to cut around.
+    ///
+    /// Recency reorders WITHIN the KNN window and cannot reach outside it —
+    /// nothing the vector index did not return can be lifted in by being fresh.
     ///
     /// APPROXIMATION: `filter` narrows the top-`k` window AFTER ranking, since
     /// KNN cannot carry a `from:`/date predicate. A heavily-filtered query can
@@ -306,13 +418,16 @@ impl SqliteStore {
         account_id: AccountId,
         query_text: &str,
         filter: &SearchFilter,
+        sort: SearchSort,
         k: usize,
     ) -> Result<(Vec<SearchHit>, bool)> {
-        let ids = self.semantic_search(account_id, query_text, k)?;
-        let window_full = ids.len() == k;
-        let mut out = Vec::with_capacity(ids.len());
-        for (id, _dist) in ids {
-            if let Some(hit) = self.search_hit_by_id(account_id, id)?
+        let knn = self.semantic_knn(account_id, query_text, k)?;
+        let window_full = knn.len() == k;
+        let candidates: Vec<Candidate> = knn.into_iter().map(|(c, _dist)| c).collect();
+        let ranked = fuse_ranked(&[&candidates], sort, Utc::now());
+        let mut out = Vec::with_capacity(ranked.len());
+        for c in ranked {
+            if let Some(hit) = self.search_hit_by_id(account_id, c.id)?
                 && filter.matches(&hit)
             {
                 out.push(hit);
@@ -321,14 +436,23 @@ impl SqliteStore {
         Ok((out, window_full))
     }
 
-    /// FTS5 recall helper for [`hybrid_search`]: message ids in rank order.
+    /// FTS5 recall helper for [`hybrid_search`]: candidates in bm25 rank order.
     /// Unlike [`Store::search`] it INCLUDES sent mail, because recall wants the
     /// user's own outbound mail. Sealed rows are excluded in SQL, and a malformed
     /// FTS query yields an empty list rather than an error.
-    fn fts_recall_ids(&self, account_id: AccountId, query: &str, limit: usize) -> Result<Vec<i64>> {
+    ///
+    /// PURE RELEVANCE ORDER, unlike the keyword leg's own `ORDER BY`: this list
+    /// is an INPUT to the fusion, which applies the recency vote once, across
+    /// every leg. Blending it in here too would count it twice.
+    fn fts_recall(
+        &self,
+        account_id: AccountId,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<Candidate>> {
         let conn = self.lock()?;
         let mut stmt = conn.prepare(
-            "SELECT m.id
+            "SELECT m.id, m.received_at
              FROM messages_fts f
              JOIN messages m ON m.id = f.rowid
              LEFT JOIN triage t ON t.message_id = m.id
@@ -339,7 +463,10 @@ impl SqliteStore {
              LIMIT ?3",
         )?;
         let rows = stmt.query_map(params![account_id, query, limit as i64], |r| {
-            r.get::<_, i64>(0)
+            Ok(Candidate {
+                id: r.get(0)?,
+                received_at: dt(r, 1)?,
+            })
         });
         let rows = match rows {
             Ok(r) => r,
@@ -349,7 +476,7 @@ impl SqliteStore {
         let mut out = Vec::new();
         for row in rows {
             match row {
-                Ok(id) => out.push(id),
+                Ok(c) => out.push(c),
                 Err(_) => return Ok(out),
             }
         }
@@ -385,17 +512,31 @@ impl SqliteStore {
         limit: u32,
         offset: u32,
     ) -> Result<Vec<SearchHit>> {
-        self.search_filtered(account_id, query, &SearchFilter::default(), limit, offset)
+        self.search_filtered(
+            account_id,
+            query,
+            &SearchFilter::default(),
+            SearchSort::default(),
+            limit,
+            offset,
+        )
     }
 
     /// KEYWORD PATH with the operator half applied in SQL. `text` is already
     /// parsed (see [`crate::store::parse_search_query`]); empty text plus a
     /// filter routes to [`filter_only_listing`](Self::filter_only_listing).
+    ///
+    /// Ranked by bm25, SCALED BY RECENCY under [`SearchSort::Recent`] (see
+    /// [`crate::store::recency`]) and left alone under
+    /// [`SearchSort::BestMatch`]. Pagination stays exact either way: the blend
+    /// happens in SQL, so LIMIT/OFFSET still cut a page out of the true
+    /// ordering instead of out of a fetched window.
     pub(super) fn search_filtered(
         &self,
         account_id: AccountId,
         text: &str,
         filter: &SearchFilter,
+        sort: SearchSort,
         limit: u32,
         offset: u32,
     ) -> Result<Vec<SearchHit>> {
@@ -431,7 +572,36 @@ impl SqliteStore {
         );
         let mut args = vec![Value::Integer(account_id), Value::Text(text.to_string())];
         push_filter_clauses(&mut sql, &mut args, filter);
-        sql.push_str(" ORDER BY rank LIMIT ? OFFSET ?");
+        // THE SORT KEY. Both branches are BIGGEST FIRST — `rank` is bm25 and
+        // NEGATIVE (more negative = better), so `-f.rank` is the relevance —
+        // which is what lets the tiebreakers below read the same way under
+        // either one.
+        //
+        // RECENCY IS BLENDED IN SQL, not in Rust. This leg paginates with
+        // LIMIT/OFFSET and must keep doing that exactly; re-ranking a fetched
+        // window would turn exact pagination into the recall legs' over-fetch
+        // approximation for no reason.
+        //
+        // MULTIPLICATIVE, not additive. bm25's magnitude swings by orders of
+        // magnitude with how many terms the reader typed and how rare they are
+        // — the scores in one result set are comparable only to each other. An
+        // additive recency bonus would therefore drown one query and vanish
+        // under the next; a factor means the same thing at every scale.
+        let relevance = if sort.considers_recency() {
+            format!("(-f.rank) * {}", recency::boost_sql("m.received_at", "?"))
+        } else {
+            "(-f.rank)".to_string()
+        };
+        sql.push_str(&format!(
+            " ORDER BY {relevance} DESC, m.received_at DESC, m.id DESC LIMIT ? OFFSET ?"
+        ));
+        // The clock is pushed HERE, after the filter's parameters and before
+        // LIMIT/OFFSET, because anonymous `?` are numbered in the order they
+        // appear in the SQL TEXT and ORDER BY is parsed after WHERE. Under
+        // BestMatch the expression has no placeholder, so neither may the args.
+        if sort.considers_recency() {
+            args.push(Value::Text(Utc::now().to_rfc3339()));
+        }
         args.push(Value::Integer(limit as i64));
         args.push(Value::Integer(offset as i64));
 

@@ -13,6 +13,56 @@ use chrono::{DateTime, NaiveDate, TimeZone, Utc};
 
 use crate::types::SearchHit;
 
+/// HOW A SEARCH ORDERS ITS RESULTS: the reader's standing answer to "when I
+/// search, do I mean the best match or the one I am probably thinking of?"
+///
+/// This is a preference, not an operator. It is not parsed out of the query
+/// text by [`parse_search_query`] and never will be — it arrives beside the
+/// query from whichever door asked (`sort=` on the human door, a tool argument
+/// on the agent door), because it belongs to the ASKER and not to the asking.
+/// One reader who wants recency does not want to retype it every search.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SearchSort {
+    /// Relevance with recency as a CONSIDERATION: the ranking every leg blends
+    /// through [`crate::store::recency`]. The default, because mail is not a
+    /// document corpus and the thread you want is usually the one that moved.
+    #[default]
+    Recent,
+    /// Relevance ALONE — bm25 on the keyword leg, pure fusion on the recall
+    /// legs, no time decay anywhere. For the search where you know the words
+    /// and do not know the year: an old thread stops being penalised for
+    /// being old.
+    BestMatch,
+}
+
+impl SearchSort {
+    /// Parse the wire value. Unknown values are `None` so a door can 400 rather
+    /// than silently serving an order nobody asked for.
+    pub fn parse(s: &str) -> Option<SearchSort> {
+        match s {
+            "recent" => Some(SearchSort::Recent),
+            "best_match" => Some(SearchSort::BestMatch),
+            _ => None,
+        }
+    }
+
+    /// The wire value, echoed back on a response so a client can tell what it
+    /// actually got.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SearchSort::Recent => "recent",
+            SearchSort::BestMatch => "best_match",
+        }
+    }
+
+    /// Whether the recency curve applies. The ONE place the two variants turn
+    /// into behaviour, so a third variant later cannot half-land: every leg
+    /// asks this question rather than matching on the enum itself.
+    pub fn considers_recency(self) -> bool {
+        matches!(self, SearchSort::Recent)
+    }
+}
+
 /// The structured half of a parsed search query: constraints lifted out of the
 /// raw string, applied in SQL on the keyword path and post-hoc on the recall
 /// paths (see [`SearchFilter::matches`]).
@@ -201,6 +251,36 @@ fn parse_day(value: &str) -> Option<DateTime<Utc>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_sort_round_trips_its_wire_values() {
+        for sort in [SearchSort::Recent, SearchSort::BestMatch] {
+            assert_eq!(SearchSort::parse(sort.as_str()), Some(sort));
+        }
+        assert_eq!(
+            SearchSort::default(),
+            SearchSort::Recent,
+            "recency is the default"
+        );
+        assert!(SearchSort::Recent.considers_recency());
+        assert!(!SearchSort::BestMatch.considers_recency());
+    }
+
+    #[test]
+    fn an_unknown_sort_is_refused_rather_than_guessed() {
+        // The door 400s on None. Serving SOME order for a value the caller did
+        // not ask for is the one outcome nobody can debug.
+        for bad in [
+            "",
+            "newest",
+            "best match",
+            "best-match",
+            "RECENT",
+            "relevance",
+        ] {
+            assert_eq!(SearchSort::parse(bad), None, "{bad:?} must not parse");
+        }
+    }
 
     fn day(y: i32, m: u32, d: u32) -> DateTime<Utc> {
         Utc.from_utc_datetime(
