@@ -15,9 +15,10 @@
 // HOUSE RULES for the prose, because it is user-facing copy:
 //   * no em dashes
 //   * say what the human can now do, not what the commit did
-//   * every item names its surface, because the two halves ship separately:
-//     the app updates itself, the daemon is rolled (hosted) or pulled as an
-//     image (self-host), and a note nobody can locate is a note nobody trusts
+//   * every item names its surface, because the three parts ship separately:
+//     the Mac app updates itself, the phone comes through TestFlight, the
+//     daemon is rolled (hosted) or pulled as an image (self-host), and a note
+//     nobody can locate is a note nobody trusts
 
 /// A dotted release version, ordered by component. Failable rather than
 /// lenient: a stamp that does not parse is not a version this code should
@@ -52,16 +53,18 @@ struct ReleaseVersion: Comparable, CustomStringConvertible {
     var description: String { text }
 }
 
-/// Which half of Passband a note landed in. The app updates itself through
-/// Sparkle; the daemon is rolled onto hosted tenants or pulled as an image on a
-/// self-host box. One list, two surfaces, so a reader knows whether a change is
-/// already theirs or arrives with their next daemon.
+/// Which part of Passband a note landed in. The Mac app updates itself through
+/// Sparkle; the phone comes through TestFlight or the App Store; the daemon is
+/// rolled onto hosted tenants or pulled as an image on a self-host box. One
+/// list, three surfaces, so a reader knows whether a change is already theirs
+/// or arrives with their next daemon.
 enum ReleaseSurface: String, CaseIterable, Sendable {
-    case app, daemon
+    case app, ios, daemon
 
     var label: String {
         switch self {
-        case .app: "App"
+        case .app: "Mac"
+        case .ios: "iPhone"
         case .daemon: "Daemon"
         }
     }
@@ -78,10 +81,13 @@ struct ReleaseItem: Sendable {
     }
 }
 
-/// One shipped version, keyed by the APP's version. Daemon work rides in the
-/// release it shipped alongside rather than carrying a version of its own: the
-/// daemon has no screen to read notes on, and two independent stamps buy a
-/// second thing to get wrong for a difference nobody can see.
+/// One shipped version, keyed by the MAC APP's version. Daemon and phone work
+/// ride in the release they shipped alongside rather than being keyed on their
+/// own: the daemon has no screen to read notes on, the phone reads its notes
+/// from the store, and a second key here would be a second thing to get wrong
+/// for a difference nobody can see. Both still carry their own version and tag
+/// (daemon-X, passband-ios-X); those are numbered on their own cadence, and the
+/// phone's is expected to drift as its UX does.
 struct ReleaseNote: Identifiable, Sendable {
     /// Marketing version, matching passband/VERSION for that tag.
     let version: String
@@ -103,6 +109,55 @@ struct ReleaseNote: Identifiable, Sendable {
 enum ReleaseNotes {
     /// THE TABLE. Newest first, and the only place a release note is written.
     static let all: [ReleaseNote] = [
+        ReleaseNote(
+            version: "0.0.6",
+            date: "2026-08-27",
+            headline: "Move through emails faster, better search, and notifications to your phone.",
+            items: [
+                ReleaseItem(
+                    .app,
+                    "Recency is a factor in search. Old mail is demoted. A clearly better old "
+                        + "match still wins. Configurable."),
+                ReleaseItem(.app, "Settings has a search field."),
+                ReleaseItem(
+                    .app,
+                    "Shift-E (and Shift-D) finish the email and open the next one. Plain e and "
+                        + "d finish it and close."),
+                ReleaseItem(.app, "Immediately see new emails for a thread you have open"),
+                ReleaseItem(.app, "CC and BCC everywhere an email is written"),
+                ReleaseItem(
+                    .app,
+                    "When your mailbox is catching up after a week away, the re-triage screen "
+                        + "says so and counts (1,240 of 4,500 messages) rather than telling you "
+                        + "the counter has not moved in a while."),
+                ReleaseItem(.app, "Cmd-Enter saves a rule"),
+                ReleaseItem(
+                    .app,
+                    "The check now chip is gone from Shipments. Carriers are polled on a "
+                        + "schedule."),
+                ReleaseItem(.app, "No more goddam emdashes"),
+                ReleaseItem(.ios, "Mobile notifications finally!!"),
+                ReleaseItem(.ios, "Switch accounts, and add one"),
+                ReleaseItem(.ios, "Mark emails as done in the thread"),
+                ReleaseItem(.ios, "Conversational threads look like message bubbles"),
+                ReleaseItem(.ios, "CC and BCC in the composer and the inline reply"),
+                ReleaseItem(.ios, "Send to groups that you made in the desktop app"),
+                ReleaseItem(.ios, "Attachments open in Quick Look and can be saved to Files."),
+                ReleaseItem(.ios, "All desktop updates"),
+                ReleaseItem(.daemon, "More easily send mail to yourself"),
+                ReleaseItem(
+                    .daemon,
+                    "A CC you emptied stays empty rather than being refilled from the parent."),
+                ReleaseItem(.daemon, "Better metrics reporting"),
+                ReleaseItem(
+                    .daemon,
+                    "Push notifications have account names, so a phone with two mailboxes "
+                        + "never shows one mailbox's business under the other's name"),
+                ReleaseItem(.daemon, "Better semantic search embedding"),
+                ReleaseItem(
+                    .daemon,
+                    "Clearer shipment item names determined by the triage model"),
+            ]),
         ReleaseNote(
             version: "0.0.5",
             date: "2026-08-25",

@@ -6,16 +6,53 @@
      passband/make-changelog.sh; an edit made here is lost on the
      next release. -->
 
-What each version of Passband brought, in the app and in the daemon
-behind it. The two ship separately: the app updates itself, and the
-daemon is rolled onto hosted accounts or pulled as an image on a
-self-host box, so every note says which one it landed in.
+What each version of Passband brought, on the Mac, on the phone, and
+in the daemon behind both. The three ship separately: the Mac app
+updates itself, the phone comes through TestFlight, and the daemon is
+rolled onto hosted accounts or pulled as an image on a self-host box,
+so every note says which one it landed in.
+
+## 0.0.6 (2026-08-27)
+
+Move through emails faster, better search, and notifications to your phone.
+
+### Mac
+
+- Recency is a factor in search. Old mail is demoted. A clearly better old match still wins. Configurable.
+- Settings has a search field.
+- Shift-E (and Shift-D) finish the email and open the next one. Plain e and d finish it and close.
+- Immediately see new emails for a thread you have open
+- CC and BCC everywhere an email is written
+- When your mailbox is catching up after a week away, the re-triage screen says so and counts (1,240 of 4,500 messages) rather than telling you the counter has not moved in a while.
+- Cmd-Enter saves a rule
+- The check now chip is gone from Shipments. Carriers are polled on a schedule.
+- No more goddam emdashes
+
+### iPhone
+
+- Mobile notifications finally!!
+- Switch accounts, and add one
+- Mark emails as done in the thread
+- Conversational threads look like message bubbles
+- CC and BCC in the composer and the inline reply
+- Send to groups that you made in the desktop app
+- Attachments open in Quick Look and can be saved to Files.
+- All desktop updates
+
+### Daemon
+
+- More easily send mail to yourself
+- A CC you emptied stays empty rather than being refilled from the parent.
+- Better metrics reporting
+- Push notifications have account names, so a phone with two mailboxes never shows one mailbox's business under the other's name
+- Better semantic search embedding
+- Clearer shipment item names determined by the triage model
 
 ## 0.0.5 (2026-08-25)
 
 Groups you can address as one, and a mailbox that says so when it stops working.
 
-### App
+### Mac
 
 - Address a group by name. Groups sits at the bottom of the rail on Cmd-6, holds a named audience, and a Groups button beside the To line puts one into an email.
 - How a group is addressed is settled once, when you make it: everybody on the To line, everybody blind, or one separate email per person. The review before you send says which of the three you are about to do.
@@ -42,7 +79,7 @@ Groups you can address as one, and a mailbox that says so when it stops working.
 
 Forwarding, reminders, invites, and mail that renders like its sender meant it to.
 
-### App
+### Mac
 
 - Forward what you are reading. The f key in the reader opens a composer with the original already in it, quote and attachments and all, and shows you exactly what is going along before you send it.
 - Park an email until later. The h key asks when, in the words you would use ("next tuesday", "the 24th"), and the thread comes back at the top of your board on the day you named.
@@ -70,7 +107,7 @@ Forwarding, reminders, invites, and mail that renders like its sender meant it t
 
 Updates that take one click, and a reader that holds still.
 
-### App
+### Mac
 
 - A new version arrives as a card in the window with a single Update button that installs it and relaunches, instead of two dialogs asking the same question twice.
 - Attachments open in Quick Look, the same panel the Finder uses. Photos render in the column and open on a click.
@@ -87,7 +124,7 @@ Updates that take one click, and a reader that holds still.
 
 Packages that track themselves, and a gate that asks the right question first.
 
-### App
+### Mac
 
 - The connect screen asks where your mail should run before it asks for a credential, so the answer you give matches the install you have.
 - Newsletter images load over plain HTTP, which is where a surprising amount of newsletter art still lives.
@@ -102,7 +139,7 @@ Packages that track themselves, and a gate that asks the right question first.
 
 The first build.
 
-### App
+### Mac
 
 - Passband, on your desk.
 

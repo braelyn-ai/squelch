@@ -49,10 +49,11 @@ enum ChangelogTool {
                  passband/make-changelog.sh; an edit made here is lost on the
                  next release. -->
 
-            What each version of Passband brought, in the app and in the daemon
-            behind it. The two ship separately: the app updates itself, and the
-            daemon is rolled onto hosted accounts or pulled as an image on a
-            self-host box, so every note says which one it landed in.
+            What each version of Passband brought, on the Mac, on the phone, and
+            in the daemon behind both. The three ship separately: the Mac app
+            updates itself, the phone comes through TestFlight, and the daemon is
+            rolled onto hosted accounts or pulled as an image on a self-host box,
+            so every note says which one it landed in.
 
             """)
         for note in ReleaseNotes.all {

@@ -31,9 +31,11 @@ deliberate, so a hotfix is never blocked on prose. It does mean a release worth
 announcing needs its note written BEFORE the tag, since the app only ever shows
 notes for versions it is at or past.
 
-Notes are keyed by the APP's version and say which surface each item landed in,
-app or daemon. The daemon has no screen of its own, so its user-facing changes
-ride in the app release that shipped alongside them.
+Notes are keyed by the MAC APP's version and say which surface each item landed
+in: Mac, iPhone or daemon. The phone and the daemon each carry their own version
+and tag (`passband-ios-X`, `daemon-X`, numbered on their own cadence), but their
+user-facing changes ride in the Mac release that shipped alongside them: the
+daemon has no screen of its own, and the phone reads its notes from the store.
 
 House rules for the prose, enforced by the test suite where they can be: no em
 dashes, say what the human can now do rather than what the commit did, and give
