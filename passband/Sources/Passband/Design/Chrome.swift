@@ -28,6 +28,16 @@ enum TopBar {
     /// close enough to the buttons' own centre (y 16) that a title beside them
     /// reads as being ON their line rather than under it.
     static let height: CGFloat = 40
+
+    /// How far in from the window's LEADING edge anything sharing the strip has
+    /// to start. The traffic lights span x 9-69; this clears them with a
+    /// gutter.
+    ///
+    /// Most surfaces never need it, because the rail is the only thing in the
+    /// strip and it yields the whole span. A surface that goes FULL WINDOW WIDTH
+    /// covers the rail as well, and then its own header starts at x 0 — under
+    /// the buttons, which is where fullscreen search was drawing its title.
+    static let dotsClearance: CGFloat = 78
 }
 
 // MARK: - rules

@@ -87,7 +87,10 @@ struct MobileSearchView: View {
             // were left, because none of them were ever this view's to lose.
             .searchable(text: $store.search.query, prompt: "Search or ask")
             // SwiftUI cancels this on the next edit, which IS the debounce.
-            .task(id: store.search.query) { await runSearch() }
+            // Keyed on the sort too — same reason as the Mac's panel: flipping
+            // the order has to re-rank what is on screen, not wait for the next
+            // keystroke.
+            .task(id: [store.search.query, prefs.searchSort.rawValue]) { await runSearch() }
             // Return is the send, and only in agent mode: under four spaces it
             // is the search that has already run behind the debounce. The
             // submit path CLEARS the field where the ask row does not: there

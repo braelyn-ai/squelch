@@ -29,7 +29,12 @@ struct SidePanel: View {
                         Text("close").font(Typo.micro).foregroundStyle(Palette.inkFaintest)
                     }
                 }
-                .padding(.horizontal, 16)
+                // As a strip this header sits on the window's right, nowhere
+                // near the traffic lights. EXPANDED it spans the whole window
+                // and covers the rail, so its leading edge lands in the strip
+                // the buttons own and the title draws underneath them.
+                .padding(.leading, expanded ? TopBar.dotsClearance : 16)
+                .padding(.trailing, 16)
                 .padding(.vertical, 13)
                 .overlay(alignment: .bottom) { Hairline() }
 
@@ -102,6 +107,21 @@ struct SearchView: View {
             .padding(.top, 12)
             .padding(.bottom, 8)
 
+            // THE ORDER, beside the thing that produces it. A sort control is
+            // about the answer, so it belongs next to the question and not
+            // three screens away — the same preference is in Settings, and the
+            // two are one value, so flipping it here is what Settings will say
+            // next time it is opened.
+            //
+            // Shown even with an empty field: a control that only appears once
+            // you have results is a control you do not know you have.
+            HStack {
+                SearchSortPicker()
+                Spacer(minLength: 0)
+            }
+            .padding(.horizontal, 16)
+            .padding(.bottom, 10)
+
             if loading { BandNote("searching…") }
             if let error = store.search.error { BandNote(error) }
             if !loading && store.search.error == nil && !store.search.query.trimmed.isEmpty
@@ -173,7 +193,10 @@ struct SearchView: View {
                 #endif
             }
         }
-        .task(id: store.search.query) { await runSearch() }
+        // KEYED ON THE SORT TOO, or flipping the order leaves the old ranking on
+        // screen until the reader edits their query. An array because tuples do
+        // not conform to Equatable and `task(id:)` needs one value.
+        .task(id: [store.search.query, prefs.searchSort.rawValue]) { await runSearch() }
     }
 
     private var bindings: [KeyBinding] {
