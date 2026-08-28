@@ -12,6 +12,11 @@
 	<string>6.0</string>
 	<key>CFBundleName</key>
 	<string>$(PRODUCT_NAME)</string>
+	<!-- App Store Connect refuses an upload whose .appex lacks a display
+	     name (ITMS-90360), even though nothing ever shows it for a
+	     notification service extension. Same word as the app. -->
+	<key>CFBundleDisplayName</key>
+	<string>Passband</string>
 	<key>CFBundlePackageType</key>
 	<string>XPC!</string>
 	<key>CFBundleShortVersionString</key>
