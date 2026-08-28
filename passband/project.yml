@@ -173,7 +173,7 @@ targets:
         APS_ENVIRONMENT[config=Release]: production
         # The passband-ios-* tag overrides this in CI; it exists so an untagged local
         # build never claims a version ahead of what TestFlight actually has.
-        MARKETING_VERSION: "0.0.6"
+        MARKETING_VERSION: "0.0.3"
         CURRENT_PROJECT_VERSION: "1"
         # iPhone only. The iPad layout is a different design, not a stretch.
         TARGETED_DEVICE_FAMILY: "1"
@@ -232,7 +232,7 @@ targets:
         CODE_SIGN_ENTITLEMENTS: Sources/PassbandiOSNotify/PassbandiOSNotify.entitlements
         # Version-locked to the app: iOS refuses to install a bundle whose
         # embedded extension disagrees about either number.
-        MARKETING_VERSION: "0.0.6"
+        MARKETING_VERSION: "0.0.3"
         CURRENT_PROJECT_VERSION: "1"
         TARGETED_DEVICE_FAMILY: "1"
         # The same signing posture as the app target above, for the same
