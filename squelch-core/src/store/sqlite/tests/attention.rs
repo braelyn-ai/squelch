@@ -1305,3 +1305,105 @@ fn re_arming_clears_the_fired_stamp_on_the_whole_thread() {
     );
     assert_eq!(store.stats(acct, since).unwrap().bands.standing, 0);
 }
+
+/// The per-sender probes SEEK, they do not SCAN. Every one of them compares an
+/// address under COLLATE NOCASE, and SQLite serves a NOCASE comparison only from
+/// an index declared with that collation: the BINARY primary key on `contacts`
+/// cannot. Without `idx_contacts_addr_nocase` the standing band's contact arm
+/// walked every contact once per message in the window, which cost the sitrep's
+/// 10s poll 140ms on a thousand-message store and seconds on a bigger one, under
+/// the mutex every request waits on. That queue WAS the hosted p95 (2026-08-27).
+///
+/// Pinned by PLAN rather than by timing: a timing test is flaky on CI and a plan
+/// is exact. The second half drops the indexes and checks the plans degrade, so
+/// a rename that silently detaches an index cannot pass either.
+#[test]
+fn sender_probes_seek_their_collated_indexes() {
+    use super::super::attention::STANDING_BAND;
+
+    let (store, _acct) = store();
+    let conn = store.lock().unwrap();
+
+    fn plan(conn: &rusqlite::Connection, sql: &str) -> Vec<String> {
+        let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+        // The plan does not depend on the values, but rusqlite still insists
+        // every placeholder is bound.
+        let nulls = vec![rusqlite::types::Value::Null; stmt.parameter_count()];
+        stmt.query_map(rusqlite::params_from_iter(nulls), |r| r.get::<_, String>(3))
+            .unwrap()
+            .map(|line| line.unwrap())
+            .collect()
+    }
+    /// Whether `table` (as the plan names it: the alias when there is one) is
+    /// reached by an index SEEK on `col`, rather than a walk of the account's rows.
+    fn seeks(plan: &[String], table: &str, col: &str) -> bool {
+        plan.iter().any(|line| {
+            line.starts_with(&format!("SEARCH {table} USING")) && line.contains(&format!("{col}=?"))
+        })
+    }
+
+    // The standing band, exactly as `attention_updates` and `stats` spell it.
+    let standing = format!(
+        "SELECT COUNT(*) FROM triage t JOIN messages m ON m.id = t.message_id
+         WHERE t.account_id = ?1 AND {STANDING_BAND}"
+    );
+    // `is_known_contact`, the ingest-time floor and `get_thread`'s bypass bit.
+    let known = "SELECT COUNT(*) FROM contacts
+                 WHERE account_id=?1 AND addr=?2 COLLATE NOCASE AND sent_count > 0";
+    // The triage queues' per-candidate probes (`stage1_queue` and its siblings).
+    let queue = "SELECT EXISTS(SELECT 1 FROM contacts c
+                               WHERE c.account_id = m.account_id
+                                 AND c.addr = m.from_addr COLLATE NOCASE
+                                 AND c.sent_count > 0),
+                        EXISTS(SELECT 1 FROM triage_feedback f
+                               WHERE f.account_id = m.account_id
+                                 AND f.sender = m.from_addr COLLATE NOCASE)
+                 FROM messages m WHERE m.account_id = ?1";
+
+    let p = plan(&conn, &standing);
+    assert!(
+        seeks(&p, "c", "addr"),
+        "standing band walks contacts:\n{p:#?}"
+    );
+    let p = plan(&conn, known);
+    assert!(
+        seeks(&p, "contacts", "addr"),
+        "is_known_contact walks contacts:\n{p:#?}"
+    );
+    let p = plan(&conn, queue);
+    assert!(
+        seeks(&p, "c", "addr"),
+        "queue probe walks contacts:\n{p:#?}"
+    );
+    assert!(
+        seeks(&p, "f", "sender"),
+        "queue probe walks triage_feedback:\n{p:#?}"
+    );
+
+    // THE CANARY: with the collated indexes gone the same statements must fall
+    // back to a walk, or the assertions above were never testing the index.
+    conn.execute_batch(
+        "DROP INDEX idx_contacts_addr_nocase;
+         DROP INDEX idx_triage_feedback_sender_nocase;",
+    )
+    .unwrap();
+    let p = plan(&conn, &standing);
+    assert!(
+        !seeks(&p, "c", "addr"),
+        "the BINARY key served a NOCASE probe?\n{p:#?}"
+    );
+    let p = plan(&conn, known);
+    assert!(
+        !seeks(&p, "contacts", "addr"),
+        "the BINARY key served a NOCASE probe?\n{p:#?}"
+    );
+    let p = plan(&conn, queue);
+    assert!(
+        !seeks(&p, "c", "addr"),
+        "the BINARY key served a NOCASE probe?\n{p:#?}"
+    );
+    assert!(
+        !seeks(&p, "f", "sender"),
+        "the BINARY index served a NOCASE probe?\n{p:#?}"
+    );
+}

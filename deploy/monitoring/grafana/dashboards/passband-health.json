@@ -1622,13 +1622,13 @@
   },
   {
    "type": "timeseries",
-   "title": "Traefik p95 latency",
+   "title": "Traefik p95 latency, per service",
    "id": 23,
    "datasource": {
     "type": "prometheus",
     "uid": "prometheus"
    },
-   "description": "",
+   "description": "95th percentile of Traefik's request duration, ONE LINE PER BACKEND so a tenant cannot hide inside a blend. Read it knowing how histogram_quantile works: the value is a straight-line interpolation inside the bucket the 95th percentile falls in, and a p95 above the top finite bucket renders AS that bucket's bound (so a line pinned flat at the top bucket means 'worse than this', not 'exactly this'). The buckets come from deploy/hosted/05-traefik-metrics.yaml; on the chart's 4-bucket default this panel could not distinguish 0.35s from 1.1s. Long-lived streams (/client/events) are recorded once at close.",
    "gridPos": {
     "h": 8,
     "w": 8,
@@ -1641,11 +1641,11 @@
       "type": "prometheus",
       "uid": "prometheus"
      },
-     "expr": "histogram_quantile(0.95, sum by (le) (rate(traefik_service_request_duration_seconds_bucket[5m])))",
+     "expr": "histogram_quantile(0.95, sum by (service, le) (rate(traefik_service_request_duration_seconds_bucket[5m])))",
      "refId": "A",
      "range": true,
      "instant": false,
-     "legendFormat": "p95"
+     "legendFormat": "{{service}}"
     }
    ],
    "fieldConfig": {
@@ -1683,10 +1683,12 @@
    },
    "options": {
     "legend": {
-     "showLegend": false,
+     "showLegend": true,
      "displayMode": "list",
      "placement": "bottom",
-     "calcs": []
+     "calcs": [
+      "max"
+     ]
     },
     "tooltip": {
      "mode": "multi",

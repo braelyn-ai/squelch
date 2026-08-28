@@ -74,6 +74,19 @@ CREATE TABLE IF NOT EXISTS contacts (
     display_name TEXT,
     PRIMARY KEY(account_id, addr)
 );
+-- THE LOOKUP INDEX. Every reader compares `addr` under COLLATE NOCASE (the
+-- Sent-history harvest lowercases, the per-message Sent ingest keeps the
+-- header's spelling, so neither side can be assumed normalized), and SQLite
+-- uses an index only when its collation MATCHES the comparison's. The primary
+-- key above is BINARY, so `addr = ?2 COLLATE NOCASE` walked every contact of
+-- the account instead of seeking one. In the standing band that walk is
+-- CORRELATED, once per message in the 30-day window: on a thousand-message
+-- store the band cost 140ms and the header's `stats()` 300ms, per client, every
+-- 10s, under the store mutex both doors and the sync loop wait on; a bigger
+-- mailbox paid seconds, and that queue was the whole p95. With this index both
+-- read in ~2ms. Measured 2026-08-27; tests/attention.rs pins the seek.
+CREATE INDEX IF NOT EXISTS idx_contacts_addr_nocase
+    ON contacts(account_id, addr COLLATE NOCASE);
 
 CREATE TABLE IF NOT EXISTS sender_rules (
     id            INTEGER PRIMARY KEY,
@@ -568,6 +581,11 @@ CREATE INDEX IF NOT EXISTS idx_triage_feedback_at
 -- "did they correct THIS MESSAGE" (the row a model may never overwrite).
 CREATE INDEX IF NOT EXISTS idx_triage_feedback_sender
     ON triage_feedback(account_id, sender);
+-- NOCASE twin of the sender index: the triage queues probe this table with
+-- `sender = m.from_addr COLLATE NOCASE` once per candidate row, and a BINARY
+-- index cannot serve a NOCASE comparison (see `idx_contacts_addr_nocase`).
+CREATE INDEX IF NOT EXISTS idx_triage_feedback_sender_nocase
+    ON triage_feedback(account_id, sender COLLATE NOCASE);
 CREATE INDEX IF NOT EXISTS idx_triage_feedback_msg
     ON triage_feedback(account_id, message_id);
 

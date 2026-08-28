@@ -74,8 +74,11 @@ const WITHIN_WINDOW: &str = "(m.received_at >= ?2
 /// Address matching folds case on BOTH sides: `messages.from_addr` is stored as
 /// the header spelled it, and `contacts.addr` is lowercased by the Sent-history
 /// harvest but kept verbatim by the per-message Sent ingest, so neither side can
-/// be assumed normalized.
-const STANDING_BAND: &str = "(t.tier IN ('past_due','deadline')
+/// be assumed normalized. That `COLLATE NOCASE` is served by
+/// `idx_contacts_addr_nocase` and by nothing else: the primary key is BINARY,
+/// and without the collated index this correlated probe walks every contact
+/// once per message in the window. `pub(super)` so the plan test can pin that.
+pub(super) const STANDING_BAND: &str = "(t.tier IN ('past_due','deadline')
         OR t.reminded_at IS NOT NULL
         OR (m.thread_id != '' AND EXISTS(
                 SELECT 1 FROM messages s
