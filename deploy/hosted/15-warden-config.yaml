@@ -85,7 +85,7 @@ data:
   # silently upgrade every tenant's daemon on any pod restart. The warden
   # refuses to start without one. Changing this value and applying is what a
   # daemon rollout IS; the roller does the rest.
-  SQUELCH_WARDEN_IMAGE: "ghcr.io/braelyn-ai/squelchd:daemon-0.0.4"
+  SQUELCH_WARDEN_IMAGE: "ghcr.io/braelyn-ai/squelchd:daemon-0.0.5"
   # Everything below is a default, restated so this file is the one place an
   # operator has to look. See squelch-warden/README.md.
   SQUELCH_WARDEN_TENANT_NAMESPACE: "tenants"
