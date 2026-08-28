@@ -85,7 +85,7 @@ data:
   # silently upgrade every tenant's daemon on any pod restart. The warden
   # refuses to start without one. Changing this value and applying is what a
   # daemon rollout IS; the roller does the rest.
-  SQUELCH_WARDEN_IMAGE: "ghcr.io/braelyn-ai/squelchd:daemon-0.0.4"
+  SQUELCH_WARDEN_IMAGE: "ghcr.io/braelyn-ai/squelchd:daemon-0.0.5"
   # Everything below is a default, restated so this file is the one place an
   # operator has to look. See squelch-warden/README.md.
   SQUELCH_WARDEN_TENANT_NAMESPACE: "tenants"
@@ -254,7 +254,7 @@ data:
   # every existing tenant takes one pod restart for it. The roller converges one
   # tenant per run, so the fleet catches up at the CronJob's schedule times the
   # number of tenants: four tenants on the */5 schedule is about twenty minutes.
-  # SQUELCH_WARDEN_MODEL_PVC: "squelch-models"
+  SQUELCH_WARDEN_MODEL_PVC: "squelch-models"
   # How long a tenant daemon holds its idle ONNX embedding session before
   # dropping it and handing the heap back. Unset, the daemon's own default (600)
   # applies; this is the OFF SWITCH (0 = never unload) if the reaper misbehaves.

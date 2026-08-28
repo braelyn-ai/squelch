@@ -74,7 +74,7 @@ spec:
       # 15-warden-config.yaml). Any image with a shell and tar would do, but the
       # squelchd image is the one already pulled on this node, so naming the
       # fleet's tag is a copy that starts immediately instead of a pull.
-      image: ghcr.io/braelyn-ai/squelchd:daemon-0.0.4
+      image: ghcr.io/braelyn-ai/squelchd:daemon-0.0.5
       command: ["/bin/sh", "-c", "sleep 3600"]
       # /seed is the only writable path in this pod, and it is all it needs:
       # the container sleeps, and `tar -x` streams into the volume without a
