@@ -84,17 +84,7 @@ struct ShipmentsZone: View {
 
     var body: some View {
         ZoneCard(
-            symbol: "shippingbox", title: "Shipments", count: rows.count, tint: Palette.warn,
-            // GLOBAL, which is why it hangs off the zone and not off a card: the
-            // kick asks every carrier about every package. Answers arrive on the
-            // rail's own poll, so nothing here waits for one.
-            trailing: AnyView(
-                ChromeChip(
-                    text: "check now", icon: "arrow.clockwise",
-                    help: "ask the carriers for an update now"
-                ) {
-                    Task { await store.pollShipments() }
-                })
+            symbol: "shippingbox", title: "Shipments", count: rows.count, tint: Palette.warn
         ) {
             if rows.isEmpty {
                 EmptyNote("Nothing en route.")
