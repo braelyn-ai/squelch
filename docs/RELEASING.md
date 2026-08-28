@@ -76,7 +76,8 @@ written again — repoint to a `daemon-*` tag at the next rollout.
 No tag path runs the test suite. The only thing CI checks at tag time is that
 the version numbers agree; past that, a `daemon-*` tag publishes whatever
 compiles and a `passband-mac-*` tag ships whatever notarizes. Tests run on PRs
-(`ci.yml`) and on this desk, or not at all:
+(`ci.yml` when the PR touches the Rust workspace, `ci-passband.yml` when it
+touches the client) and on this desk, or not at all:
 
 ```sh
 DEVELOPER_DIR=/Library/Developer/CommandLineTools cargo test --workspace
