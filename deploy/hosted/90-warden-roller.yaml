@@ -331,7 +331,7 @@ spec:
               # 1. EDIT ME. The SAME warden image as `20-warden.yaml`, always.
               # This binary is the renderer; a roller on an older image renders
               # older tenants.
-              image: ghcr.io/braelyn-ai/squelch-warden:daemon-0.0.4
+              image: ghcr.io/braelyn-ai/squelch-warden:daemon-0.0.5
               imagePullPolicy: IfNotPresent
               # The image's entrypoint IS the binary, so this is the whole
               # command line. Add `--dry-run` to make the timer report what it
