@@ -1,6 +1,20 @@
-# PR gate: build + test the Rust workspace on every PR and on main, and run
-# the Passband swiftc test suites when the client changes. Release publishing
-# stays in the release-*.yml workflows; this workflow never pushes anything.
+# PR gate: build + test the Rust workspace when a PR (or a merge to main)
+# touches it. The Passband swiftc suites are the same idea for the client, in
+# ci-passband.yml. Release publishing stays in the release-*.yml workflows;
+# this workflow never pushes anything.
+#
+# Path-filtered so a client-only or docs-only PR does not build the workspace.
+# The filter is the workspace's real input set: every member crate (all named
+# squelch-* or squelchd; the glob also catches a crate added later without
+# anyone editing this list), the two Cargo manifests, and the toolchain pin.
+# Nothing under deploy/, docs/, scripts/ or passband/ reaches a Rust build —
+# every include_str! points inside its own crate and there is no build.rs —
+# so a change there is correctly not a reason to run this. squelch-desktop is
+# retired and not a member; the glob would run on it, but nothing touches it.
+#
+# Consequence, same as ci-passband: do NOT mark this check required in branch
+# protection. A path-skipped workflow reports no status at all, and a
+# required-but-absent check leaves non-Rust PRs stuck on "expected".
 #
 # WHAT IS DELIBERATELY ABSENT:
 #
@@ -14,8 +28,22 @@ name: ci
 
 on:
   pull_request:
+    paths:
+      - "squelch-*/**"
+      - "squelchd/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - ".github/workflows/ci.yml"
   push:
     branches: [main]
+    paths:
+      - "squelch-*/**"
+      - "squelchd/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - ".github/workflows/ci.yml"
 
 # A force-push or rapid follow-up commit obsoletes the previous run; cancel it
 # rather than queue behind it. On main, never cancel — every merge gets a run.
