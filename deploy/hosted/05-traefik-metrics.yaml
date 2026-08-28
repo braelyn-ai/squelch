@@ -1,0 +1,32 @@
+# Traefik's Prometheus latency histogram, with buckets fine enough to read.
+#
+# k3s ships Traefik through its Helm controller, and a HelmChartConfig is the
+# supported way to hand that chart values: apply this and the controller
+# upgrades the release in place (one Traefik pod restart; the edge is gone for
+# a few seconds). It lives here rather than in
+# /var/lib/rancher/k3s/server/manifests/ so it is in the repo with everything
+# else. `kubectl apply -f` is enough; the controller watches the CRD.
+#
+# WHY. The chart's default buckets are 0.1 / 0.3 / 1.2 / 5.0, four of them. A
+# p95 read from that histogram is a straight-line interpolation inside
+# whichever bucket the 95th percentile lands in, and everything above 5s reads
+# as exactly 5s. So the "Traefik p95 latency" panel showed a flat 1.1s floor
+# that was really ~0.35s of store-mutex queueing, and every spike clipped at
+# 5.0 whether it was 6s or 60s. The panel could not tell those apart, and
+# neither could anyone reading it (2026-08-27).
+#
+# Cardinality: 13 buckets x (service, code, method, protocol) over a handful of
+# services is a few hundred series. Fine.
+apiVersion: helm.cattle.io/v1
+kind: HelmChartConfig
+metadata:
+  name: traefik
+  namespace: kube-system
+spec:
+  valuesContent: |-
+    metrics:
+      prometheus:
+        # The Prometheus client defaults, plus 30 and 60 so the long tail (a
+        # slow read vs. a stream that legitimately lasts a minute) is not one
+        # bucket.
+        buckets: "0.005,0.01,0.025,0.05,0.1,0.25,0.5,1,2.5,5,10,30,60"

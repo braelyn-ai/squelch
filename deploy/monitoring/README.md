@@ -91,6 +91,19 @@ kubectl apply -f deploy/hosted/80-monitoring.yaml
 kubectl -n monitoring rollout restart deploy/prometheus-agent
 ```
 
+Traefik's latency histogram is configured separately, through k3s's Helm
+controller rather than a ConfigMap, because Traefik is k3s's own chart:
+
+```sh
+kubectl apply -f deploy/hosted/05-traefik-metrics.yaml
+kubectl -n kube-system rollout status deploy/traefik
+```
+
+The chart's default histogram has four buckets (0.1/0.3/1.2/5.0), and a p95
+read off it is an interpolation inside one of them: it rendered a 0.35s floor
+as 1.1s and clamped every spike to exactly 5s for as long as the dashboard
+existed. The manifest sets real buckets; the file says why.
+
 To see what a target actually offers before guessing at a name, dump the
 families off the endpoint through the API server's node proxy, which spares you
 the service-account token, the TLS flags and a shell inside the agent's
@@ -132,13 +145,17 @@ kubectl -n monitoring top pod -l app.kubernetes.io/name=prometheus-agent
   disks (root = backed up, tenant volume = not), load, network.
 - **Kubernetes** — restarts, top pods by CPU/memory, OOM kills.
 - **Certificates & edge** — cert-manager expiry (wildcard renewal failing
-  shows here first), Traefik request/5xx/latency.
+  shows here first), Traefik request/5xx/latency. The p95 is one line per
+  backend service, so a slow tenant cannot hide inside a fleet-wide blend; a
+  line pinned flat at the top bucket means "worse than this", not "this".
 - **Tenants** — pod count vs the 100-user cap, per-tenant CPU/memory/PVC/restarts.
 - **Daemon rollout** — which image version each tenant pod runs, and the
   switchover as it happens, plus the roller's own two vital signs: a casualty
   (a roll that exited 4, the fleet frozen, the one thing worth a page) and how
   long since the timer last fired. See below.
-- **Inside squelchd** — sync staleness per tenant, Gmail API errors by kind,
+- **Inside squelchd** — daemon p95 by route (the daemon's own clock, request
+  to response head, so a slow route is named rather than inferred from the
+  edge), sync staleness per tenant, Gmail API errors by kind,
   24h LLM spend, store size, triage throughput.
 
 ## Watching a release roll

@@ -399,10 +399,17 @@ data:
       # labels below and that NetworkPolicy's selectors are one contract; the
       # warden hardcodes them for that reason.
       - job_name: squelchd
-        # Per-tenant series stay bounded no matter what a daemon exports: the
-        # set is ~40 series, so a scrape that returns hundreds is a bug, and
-        # shedding one tenant's scrape beats blowing the fleet's ingest.
-        sample_limit: 500
+        # Per-tenant series stay bounded no matter what a daemon exports, and
+        # shedding one tenant's scrape beats blowing the fleet's ingest. Sized
+        # from the daemon's own bound, not guessed: ~40 scalar series plus the
+        # per-route latency histogram, which the daemon caps at 200 series of
+        # 13 samples each (HTTP_SERIES_CAP x (HTTP_BUCKETS + Inf + sum + count)
+        # in squelch-core/src/metrics.rs) = 2600 at the cap, and a daemon at
+        # the cap is already reporting a bug through its drop counter. A real
+        # daemon exercises ~20 routes and sits around 300. Change the cap or
+        # the bucket count and re-do this sum, or the tenant that grows into
+        # the gap vanishes from every panel at once.
+        sample_limit: 2800
         kubernetes_sd_configs:
           - role: pod
             namespaces:

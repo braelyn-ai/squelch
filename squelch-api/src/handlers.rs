@@ -502,8 +502,8 @@ pub async fn get_thread(
     query(&state, move |store, account_id| {
         let view = store.thread_view_with_html(account_id, &thread_id)?;
         // Memoized per distinct sender: a thread is usually two addresses
-        // repeated, and each miss is a round trip to `contacts`. NOCASE is the
-        // column's own collation, so the key is lowercased to match.
+        // repeated, and each miss is a round trip to `contacts`. The store
+        // compares under COLLATE NOCASE, so the memo key is lowercased to match.
         let mut seen: HashMap<String, bool> = HashMap::new();
         let mut messages = Vec::with_capacity(view.messages.len());
         for message in view.messages {

@@ -1622,13 +1622,13 @@
   },
   {
    "type": "timeseries",
-   "title": "Traefik p95 latency",
+   "title": "Traefik p95 latency, per service",
    "id": 23,
    "datasource": {
     "type": "prometheus",
     "uid": "prometheus"
    },
-   "description": "",
+   "description": "95th percentile of Traefik's request duration, ONE LINE PER BACKEND so a tenant cannot hide inside a blend. Read it knowing how histogram_quantile works: the value is a straight-line interpolation inside the bucket the 95th percentile falls in, and a p95 above the top finite bucket renders AS that bucket's bound (so a line pinned flat at the top bucket means 'worse than this', not 'exactly this'). The buckets come from deploy/hosted/05-traefik-metrics.yaml; on the chart's 4-bucket default this panel could not distinguish 0.35s from 1.1s. Long-lived streams (/client/events) are recorded once at close.",
    "gridPos": {
     "h": 8,
     "w": 8,
@@ -1641,11 +1641,11 @@
       "type": "prometheus",
       "uid": "prometheus"
      },
-     "expr": "histogram_quantile(0.95, sum by (le) (rate(traefik_service_request_duration_seconds_bucket[5m])))",
+     "expr": "histogram_quantile(0.95, sum by (service, le) (rate(traefik_service_request_duration_seconds_bucket[5m])))",
      "refId": "A",
      "range": true,
      "instant": false,
-     "legendFormat": "p95"
+     "legendFormat": "{{service}}"
     }
    ],
    "fieldConfig": {
@@ -1683,10 +1683,12 @@
    },
    "options": {
     "legend": {
-     "showLegend": false,
+     "showLegend": true,
      "displayMode": "list",
      "placement": "bottom",
-     "calcs": []
+     "calcs": [
+      "max"
+     ]
     },
     "tooltip": {
      "mode": "multi",
@@ -3703,6 +3705,83 @@
      "placement": "bottom",
      "calcs": [
       "sum"
+     ]
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   }
+  },
+  {
+   "type": "timeseries",
+   "title": "Daemon p95 by route",
+   "id": 52,
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prometheus"
+   },
+   "description": "95th percentile of the daemon's OWN request time, request arrival to response head, one line per route template across every tenant (add `tenant` to the `by` clause to cut it per mailbox). This is the panel that names a slow route; the Traefik p95 above can only say a tenant was slow. Streaming bodies are not waited for, so /client/events reads as the milliseconds it takes to start, not the hours it stays open. The label set is closed (templates, not paths; status classes, not codes) and capped at 200 series per daemon; squelchd_http_metrics_series_dropped_total above zero means that cap was hit, which is a bug. Before the 2026-08-27 contacts index fix the sitrep's /client/updates and /client/stats sat at hundreds of ms here; they should now be single-digit ms.",
+   "gridPos": {
+    "h": 8,
+    "w": 12,
+    "x": 12,
+    "y": 127
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prometheus"
+     },
+     "expr": "histogram_quantile(0.95, sum by (route, le) (rate(squelchd_http_request_duration_seconds_bucket[5m])))",
+     "refId": "A",
+     "range": true,
+     "instant": false,
+     "legendFormat": "{{route}}"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "color": {
+      "mode": "palette-classic"
+     },
+     "unit": "s",
+     "min": 0,
+     "custom": {
+      "drawStyle": "line",
+      "lineWidth": 2,
+      "fillOpacity": 0,
+      "showPoints": "never",
+      "pointSize": 5,
+      "spanNulls": true,
+      "axisBorderShow": false,
+      "gradientMode": "none",
+      "stacking": {
+       "mode": "none"
+      }
+     },
+     "mappings": [],
+     "thresholds": {
+      "mode": "absolute",
+      "steps": [
+       {
+        "color": "green",
+        "value": null
+       }
+      ]
+     }
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "showLegend": true,
+     "displayMode": "table",
+     "placement": "right",
+     "calcs": [
+      "max",
+      "mean"
      ]
     },
     "tooltip": {
