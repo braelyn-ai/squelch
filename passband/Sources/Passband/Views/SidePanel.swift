@@ -117,9 +117,26 @@ struct SearchView: View {
 
         VStack(alignment: .leading, spacing: 0) {
             Field(label: "") {
-                TextField("search mail…", text: $store.search.query)
-                    .textFieldStyle(.plain)
-                    .focused($focused)
+                HStack(spacing: 8) {
+                    TextField("search mail…", text: $store.search.query)
+                        .textFieldStyle(.plain)
+                        .focused($focused)
+                    // IN THE WELL, at its trailing edge: the wait belongs to the
+                    // field, beside the words being waited on, rather than in a
+                    // row of its own above the results.
+                    //
+                    // SPACE RESERVED, DOTS MOUNTED ONLY WHILE WAITING. Reserved,
+                    // because arriving would re-lay the well and shove the text
+                    // and caret leftward on every search. Mounted rather than
+                    // merely faded, because the dots animate forever once they
+                    // appear, and a loop running behind zero opacity is a loop
+                    // that should not be running.
+                    ZStack {
+                        if loading { WaitDots().transition(.opacity) }
+                    }
+                    .frame(width: WaitDots.width)
+                    .animation(.easeInOut(duration: 0.16), value: loading)
+                }
             }
             .padding(.horizontal, 16)
             .padding(.top, 12)
@@ -140,7 +157,6 @@ struct SearchView: View {
             .padding(.horizontal, 16)
             .padding(.bottom, 10)
 
-            if loading { BandNote("searching…") }
             if let error = store.search.error { BandNote(error) }
             if answered && store.search.hits.isEmpty { BandNote("no matches.") }
 
