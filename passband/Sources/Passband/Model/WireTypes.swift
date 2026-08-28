@@ -363,15 +363,6 @@ struct Shipment: Codable, Sendable, Identifiable, Hashable {
     var displayItem: String { item_name.withoutEmoji }
 }
 
-/// What `POST /client/shipments/poll` answers. `kicked` is false, with an empty
-/// `carriers`, on a daemon holding no carrier credentials: polling is BYOK, so
-/// that is the ordinary state and not an error, but it does mean nothing
-/// happened and the UI must not claim otherwise.
-struct ShipmentPollKick: Codable, Sendable {
-    var kicked: Bool
-    var carriers: [String]
-}
-
 // MARK: - receipts / calendar / banking
 
 struct Receipt: Codable, Sendable, Identifiable, Hashable, SenderStringConvertible {

@@ -642,19 +642,6 @@ actor APIClient {
         try await postNoContent("/client/shipments/\(id)/clear")
     }
 
-    /// Kick the daemon's carrier poller into a pass NOW. GLOBAL — every carrier,
-    /// every package — which is why it takes no id.
-    ///
-    /// DECODED, unlike the clear above, for one reason: carrier polling is BYOK,
-    /// so a daemon holding no carrier keys answers a perfectly normal 200 with
-    /// `kicked: false` and does nothing at all. Discarding that body would leave
-    /// the UI congratulating the user for a pass that never ran. The kick is
-    /// safe to mash either way: it does not bypass the poller's per-carrier
-    /// cooldowns or daily budgets.
-    func pollShipments() async throws -> ShipmentPollKick {
-        try await post("/client/shipments/poll", as: ShipmentPollKick.self)
-    }
-
     // MARK: - read tracking
 
     /// Every recorded open of one SENT message, oldest first. `messageId` is the

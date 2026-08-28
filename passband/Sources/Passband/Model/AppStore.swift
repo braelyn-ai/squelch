@@ -1544,52 +1544,6 @@ final class AppStore {
         }
     }
 
-    /// Ask the daemon to poll every carrier now.
-    ///
-    /// NOTHING IS REFRESHED HERE. The daemon answers before the carrier round
-    /// trips, so a forced zone refresh behind this would repaint the same rows and
-    /// teach the user the button does nothing; the rail's own 45s poll is what
-    /// carries the answers in a few seconds later.
-    ///
-    /// The toast says WHAT WE DID rather than what the carriers will say, because
-    /// those are two different sentences and only the first one is true on a
-    /// daemon with no carrier keys — carrier polling is BYOK, and such a daemon
-    /// runs no poller and does nothing with the kick.
-    func pollShipments() async {
-        do {
-            let kick = try await APIClient.shared.pollShipments()
-            Analytics.capture("shipments_poll_kicked")
-            // A daemon with no carrier credentials answers a normal 200 that
-            // kicked nothing. Saying "checking" there would be a lie the user
-            // cannot see through, since the pass they are waiting on will never
-            // change a single row.
-            if kick.kicked {
-                pushToast("checking \(Self.carrierList(kick.carriers))", .info)
-            } else {
-                pushToast("no carrier keys configured · see docs/SHIPMENTS.md", .info)
-            }
-        } catch {
-            if let api = error as? APIError, api.kind == .notFound {
-                pushToast("this daemon has no carrier polling · update squelchd", .error)
-            } else {
-                pushToast(errText(error, "could not reach the carrier poller"), .error)
-            }
-        }
-    }
-
-    /// The carriers a kick actually reached, as prose. The daemon returns its
-    /// own slugs, so they are labelled through the same `Carrier` vocabulary the
-    /// cards use rather than printed raw.
-    private static func carrierList(_ slugs: [String]) -> String {
-        let names = slugs.map { Carrier(rawValue: $0)?.label ?? $0.uppercased() }
-        switch names.count {
-        case 0: return "the carriers"
-        case 1: return names[0]
-        case 2: return "\(names[0]) and \(names[1])"
-        default: return names.dropLast().joined(separator: ", ") + ", and " + names[names.count - 1]
-        }
-    }
-
     /// What a cleared shipment is CALLED in its toast: the card's own title rule
     /// (item name, else the carrier), kept short enough to sit in one.
     private static func shipmentLabel(_ s: Shipment) -> String {
