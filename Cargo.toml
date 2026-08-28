@@ -3,7 +3,7 @@ resolver = "3"
 members = ["squelch-core", "squelch-httpauth", "squelch-ratelimit", "squelch-mcp", "squelch-tui", "squelch-api", "squelch-relay", "squelch-broker", "squelch-control", "squelch-warden", "squelchd"]
 
 [workspace.package]
-version = "0.0.4"
+version = "0.0.5"
 edition = "2024"
 license = "MIT"
 
