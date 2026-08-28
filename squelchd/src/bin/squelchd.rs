@@ -1882,6 +1882,7 @@ fn build_serve_router(
     account_email: &str,
     api_state: squelch_api::ApiState,
     mcp_cancel: CancellationToken,
+    metrics: Arc<SyncMetrics>,
 ) -> anyhow::Result<axum::Router> {
     // The agent door gets the HUMAN DOOR'S OWN listing policy, read back off the
     // state rather than resolved from config a second time: the two doors must
@@ -1893,7 +1894,16 @@ fn build_serve_router(
         api_state.shipment_policy(),
         mcp_cancel,
     )?;
-    let app = squelch_api::router(api_state).nest_service(squelch_mcp::MCP_PATH, mcp_service);
+    // The latency histogram wraps BOTH doors, outermost, so the number it
+    // records is everything the daemon did for the request including auth. It
+    // is a `Router::layer`, which runs after routing: that is what gives it the
+    // route template rather than the path.
+    let app = squelch_api::router(api_state)
+        .nest_service(squelch_mcp::MCP_PATH, mcp_service)
+        .layer(axum::middleware::from_fn_with_state(
+            metrics,
+            squelch_api::record_http_metrics,
+        ));
     Ok(app)
 }
 
@@ -2214,8 +2224,14 @@ fn cmd_serve(
 
         // Bind BEFORE building the embedder: its first-run model download must
         // not leave the doors unreachable.
-        let app = build_serve_router(store.clone(), &email, api_state, mcp_cancel.clone())
-            .map_err(squelch_core::CoreError::Other)?;
+        let app = build_serve_router(
+            store.clone(),
+            &email,
+            api_state,
+            mcp_cancel.clone(),
+            sync_metrics.clone(),
+        )
+        .map_err(squelch_core::CoreError::Other)?;
         let listener = tokio::net::TcpListener::bind(bind)
             .await
             .map_err(|e| other_err(format!("bind {bind}: {e}")))?;
@@ -3205,8 +3221,9 @@ mod tests {
         let account_id = store.ensure_account("me@localhost").expect("account");
         let api_state = squelch_api::ApiState::new(store.clone(), account_id, "test-token");
         let cancel = CancellationToken::new();
-        let app =
-            build_serve_router(store, "me@localhost", api_state, cancel).expect("router builds");
+        let metrics = SyncMetrics::new();
+        let app = build_serve_router(store, "me@localhost", api_state, cancel, metrics)
+            .expect("router builds");
 
         let resp = app
             .clone()

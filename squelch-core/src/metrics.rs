@@ -6,7 +6,10 @@
 //!
 //! Two halves. [`SyncMetrics`] is the in-process registry the sync engine
 //! increments as it works — atomics only, no locks on any hot path, and it is
-//! LOST ON RESTART by design. Everything else ([`StoreSnapshot`]) is derived
+//! LOST ON RESTART by design. The HTTP doors record into the same registry
+//! ([`HttpMetrics`], one latency histogram per route template), which is the
+//! one place a lock appears: a read lock per request to find the series, a
+//! write lock once per NEW series. Everything else ([`StoreSnapshot`]) is derived
 //! from the store at scrape time, which is what makes the LLM counters survive
 //! a restart: they are read from the persisted usage ledger, not from a
 //! process-lifetime tally.
@@ -16,8 +19,9 @@
 //! writes to this mailbox, and label cardinality is a memory bill in the
 //! scraper besides.
 
-use std::sync::Arc;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::sync::{Arc, RwLock};
 
 use chrono::Utc;
 
@@ -181,6 +185,9 @@ pub enum Stage2Verdict {
 /// scrape landing between two increments is a scrape, not a race.
 #[derive(Debug, Default)]
 pub struct SyncMetrics {
+    /// Per-route latency of the HTTP doors. See [`HttpMetrics`].
+    http: HttpMetrics,
+
     /// Unix seconds of the last successful sync tick. 0 = never — see
     /// [`render`] for why that value is deliberate rather than absent.
     sync_last_success_unix: AtomicI64,
@@ -282,6 +289,11 @@ impl SyncMetrics {
     /// wants ownership.
     pub fn new() -> Arc<Self> {
         Arc::new(Self::default())
+    }
+
+    /// The HTTP doors' latency histogram, for the middleware that feeds it.
+    pub fn http(&self) -> &HttpMetrics {
+        &self.http
     }
 
     /// A sync run returned cleanly: one more OK run, the freshness stamp moves,
@@ -470,6 +482,212 @@ impl SyncMetrics {
     }
 }
 
+// --- HTTP latency --------------------------------------------------------------
+
+/// Upper bounds of the HTTP latency histogram, in seconds, ascending.
+///
+/// Ten rather than a client library's dozen-plus, and the reason is not
+/// resolution: every bound is one sample per (route, method, status) series on
+/// every scrape, and the hosted scrape job's `sample_limit` sheds a WHOLE
+/// tenant's scrape when the total goes over (deploy/hosted/80-monitoring.yaml
+/// sizes that limit from [`HTTP_SERIES_CAP`] and this length; change either
+/// and re-do that arithmetic). The top bound is 10s because anything past it
+/// is "broken", and the difference between 20s and 40s is not a number a
+/// dashboard needs.
+///
+/// The bottom bounds matter more than they look: after the 2026-08-27 index fix
+/// every store read is single-digit milliseconds, and a histogram whose lowest
+/// bound is 100ms would render that whole regime as one flat line.
+pub const HTTP_BUCKETS: [f64; 10] = [0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 10.0];
+
+/// Distinct (route, method, status) series the histogram will hold before it
+/// starts DROPPING new ones. The label set is closed by construction (see
+/// [`HttpMetrics::observe`]) and a daemon touching every route template with
+/// two status classes each sits well under this, so hitting the cap means a
+/// bug, and the counter it bumps is the tell. The cap exists because the
+/// alternative failure is worse: an unbounded family blows the scrape's
+/// `sample_limit` and the tenant vanishes from every panel at once.
+pub const HTTP_SERIES_CAP: usize = 200;
+
+/// The one label value a request that matched no route gets. The actual path
+/// of such a request is attacker-chosen and must never become a label.
+pub const HTTP_ROUTE_UNMATCHED: &str = "unmatched";
+
+/// Latency of the HTTP doors, one histogram series per (route template, method,
+/// status class).
+///
+/// WHY THIS EXISTS: the edge proxy's histogram carries no path. When the hosted
+/// p95 sat at "1.1s" for weeks, attributing it meant timing SQL by hand against
+/// a copy of a store, because nothing in the fleet could say WHICH request was
+/// slow. This can.
+///
+/// WHAT IT MEASURES: arrival of the request at the router to the moment the
+/// handler returns its response HEAD. A streaming body — the SSE feed, a large
+/// thread — is not waited for, so this is the daemon's own time and not the
+/// client's bandwidth, and a feed connection open for six hours records as the
+/// milliseconds it took to start, not as six hours. Traefik's number includes
+/// the body; the two are meant to be read against each other.
+///
+/// LABELS ARE A CLOSED SET, per the module's rule that nothing per-message ever
+/// becomes a label: `route` is the router's own template (`/client/thread/{thread_id}`,
+/// never the id) or [`HTTP_ROUTE_UNMATCHED`]; `method` is one of the nine
+/// standard verbs or `other`; `status` is a class (`2xx`), not a code. Series
+/// are capped at [`HTTP_SERIES_CAP`] on top of that.
+#[derive(Debug, Default)]
+pub struct HttpMetrics {
+    series: RwLock<HashMap<HttpKey, Arc<HttpSeries>>>,
+    /// Observations refused because the series table was full. Present at 0 so
+    /// a scrape can alert on it moving.
+    dropped: AtomicU64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+struct HttpKey {
+    route: String,
+    method: &'static str,
+    status: &'static str,
+}
+
+/// One series. Buckets are stored NON-cumulative (each observation lands in
+/// exactly one) and cumulated at render, so an observe is one atomic add per
+/// bucket rather than one per bound.
+#[derive(Debug, Default)]
+struct HttpSeries {
+    buckets: [AtomicU64; HTTP_BUCKETS.len()],
+    /// Observations above the top bound: the `+Inf` bucket's own share.
+    overflow: AtomicU64,
+    count: AtomicU64,
+    /// The sum in MICROSECONDS, so it stays an integer under an atomic; rendered
+    /// as seconds.
+    sum_micros: AtomicU64,
+}
+
+impl HttpMetrics {
+    /// Record one request. `route` must already be the template or
+    /// [`HTTP_ROUTE_UNMATCHED`]; this method normalizes the other two labels
+    /// itself so no caller can widen the set.
+    pub fn observe(&self, route: &str, method: &str, status: u16, seconds: f64) {
+        let key = HttpKey {
+            route: route.to_owned(),
+            method: normalize_method(method),
+            status: status_class(status),
+        };
+        let series = match self
+            .series
+            .read()
+            .ok()
+            .and_then(|map| map.get(&key).cloned())
+        {
+            Some(series) => series,
+            None => {
+                let Ok(mut map) = self.series.write() else {
+                    return;
+                };
+                if !map.contains_key(&key) && map.len() >= HTTP_SERIES_CAP {
+                    self.dropped.fetch_add(1, Ordering::Relaxed);
+                    return;
+                }
+                map.entry(key).or_default().clone()
+            }
+        };
+        let seconds = if seconds.is_finite() {
+            seconds.max(0.0)
+        } else {
+            0.0
+        };
+        match HTTP_BUCKETS.iter().position(|bound| seconds <= *bound) {
+            Some(i) => series.buckets[i].fetch_add(1, Ordering::Relaxed),
+            None => series.overflow.fetch_add(1, Ordering::Relaxed),
+        };
+        series.count.fetch_add(1, Ordering::Relaxed);
+        series
+            .sum_micros
+            .fetch_add((seconds * 1e6).round() as u64, Ordering::Relaxed);
+    }
+
+    /// Every series, sorted by key so an exposition is deterministic.
+    fn snapshot(&self) -> Vec<(HttpKey, Arc<HttpSeries>)> {
+        let mut rows: Vec<_> = match self.series.read() {
+            Ok(map) => map.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+            Err(_) => Vec::new(),
+        };
+        rows.sort_by(|a, b| a.0.cmp(&b.0));
+        rows
+    }
+}
+
+/// The nine verbs of RFC 9110, or `other`: an extension method is a string the
+/// client chose.
+fn normalize_method(method: &str) -> &'static str {
+    match method {
+        "GET" => "GET",
+        "HEAD" => "HEAD",
+        "POST" => "POST",
+        "PUT" => "PUT",
+        "DELETE" => "DELETE",
+        "PATCH" => "PATCH",
+        "OPTIONS" => "OPTIONS",
+        "CONNECT" => "CONNECT",
+        "TRACE" => "TRACE",
+        _ => "other",
+    }
+}
+
+/// `2xx`-style class. A code outside 100..=599 cannot come from axum, but the
+/// label set stays closed even if one somehow does.
+fn status_class(status: u16) -> &'static str {
+    match status / 100 {
+        1 => "1xx",
+        2 => "2xx",
+        3 => "3xx",
+        4 => "4xx",
+        5 => "5xx",
+        _ => "other",
+    }
+}
+
+/// The histogram family plus its drop counter.
+fn render_http(e: &mut Exposition, http: &HttpMetrics) {
+    const NAME: &str = "squelchd_http_request_duration_seconds";
+    e.family(
+        NAME,
+        MetricKind::Histogram,
+        "Request arrival to response head on the HTTP doors, by route template, method and status class. Streaming bodies are not waited for.",
+    );
+    let bucket = format!("{NAME}_bucket");
+    let sum = format!("{NAME}_sum");
+    let count = format!("{NAME}_count");
+    for (key, series) in http.snapshot() {
+        let base = [
+            ("route", key.route.as_str()),
+            ("method", key.method),
+            ("status", key.status),
+        ];
+        let mut cumulative = 0u64;
+        for (i, bound) in HTTP_BUCKETS.iter().enumerate() {
+            cumulative += series.buckets[i].load(Ordering::Relaxed);
+            let le = fmt_value(*bound);
+            let labels = [base[0], base[1], base[2], ("le", le.as_str())];
+            e.sample(&bucket, &labels, cumulative as f64);
+        }
+        let total = series.count.load(Ordering::Relaxed);
+        let labels = [base[0], base[1], base[2], ("le", "+Inf")];
+        e.sample(&bucket, &labels, total as f64);
+        e.sample(
+            &sum,
+            &base,
+            series.sum_micros.load(Ordering::Relaxed) as f64 / 1e6,
+        );
+        e.sample(&count, &base, total as f64);
+    }
+    e.scalar(
+        "squelchd_http_metrics_series_dropped_total",
+        MetricKind::Counter,
+        "Requests not recorded because the latency histogram hit its series cap; anything above 0 is a bug.",
+        http.dropped.load(Ordering::Relaxed) as f64,
+    );
+}
+
 // --- text exposition ---------------------------------------------------------
 
 /// Prometheus metric type, as it appears on the `# TYPE` line.
@@ -477,6 +695,7 @@ impl SyncMetrics {
 pub enum MetricKind {
     Counter,
     Gauge,
+    Histogram,
 }
 
 impl MetricKind {
@@ -484,6 +703,7 @@ impl MetricKind {
         match self {
             Self::Counter => "counter",
             Self::Gauge => "gauge",
+            Self::Histogram => "histogram",
         }
     }
 }
@@ -887,6 +1107,8 @@ pub fn render(metrics: &SyncMetrics, db: Option<&StoreSnapshot>) -> String {
             .carrier_poll_last_success_unix
             .load(Ordering::Relaxed) as f64,
     );
+
+    render_http(&mut e, &metrics.http);
 
     // The db-derived families are OPTIONAL on purpose: see the caller. A scrape
     // that carries the atomics and omits these is a degraded scrape; a 500 is
@@ -1419,5 +1641,115 @@ mod catchup_progress_tests {
         // And the next one starts clean rather than resuming the ghost.
         m.catchup_begin(12);
         assert_eq!(m.catchup_progress(), Some((0, 12)));
+    }
+}
+
+#[cfg(test)]
+mod http_metrics_tests {
+    use super::*;
+
+    // --- the HTTP histogram ---
+
+    fn http_lines(m: &SyncMetrics) -> Vec<String> {
+        render(m, None)
+            .lines()
+            .filter(|l| l.starts_with("squelchd_http_"))
+            .map(str::to_owned)
+            .collect()
+    }
+
+    #[test]
+    fn http_histogram_renders_cumulative_buckets_sum_and_count() {
+        let m = SyncMetrics::new();
+        m.http().observe("/client/stats", "GET", 200, 0.003);
+        m.http().observe("/client/stats", "GET", 200, 0.7);
+        m.http().observe("/client/stats", "GET", 200, 30.0);
+        let text = render(&m, None);
+        assert!(text.contains("# TYPE squelchd_http_request_duration_seconds histogram\n"));
+        let labels = r#"route="/client/stats",method="GET",status="2xx""#;
+        // Each observation lands in one bucket and the exposition cumulates.
+        for (le, n) in [("0.005", 1), ("0.5", 1), ("1", 2), ("10", 2), ("+Inf", 3)] {
+            let want = format!(
+                "squelchd_http_request_duration_seconds_bucket{{{labels},le=\"{le}\"}} {n}\n"
+            );
+            assert!(text.contains(&want), "missing {want:?} in\n{text}");
+        }
+        assert!(text.contains(&format!(
+            "squelchd_http_request_duration_seconds_sum{{{labels}}} 30.703\n"
+        )));
+        assert!(text.contains(&format!(
+            "squelchd_http_request_duration_seconds_count{{{labels}}} 3\n"
+        )));
+        // The +Inf bucket equals the count, as the format requires.
+        assert!(text.contains("squelchd_http_metrics_series_dropped_total 0\n"));
+    }
+
+    #[test]
+    fn http_histogram_is_present_but_empty_before_any_request() {
+        let m = SyncMetrics::new();
+        let lines = http_lines(&m);
+        // The family lines are HELP/TYPE (not sampled here); the only sample is
+        // the drop counter, at 0 rather than absent.
+        assert_eq!(
+            lines,
+            vec!["squelchd_http_metrics_series_dropped_total 0".to_string()]
+        );
+    }
+
+    #[test]
+    fn http_labels_never_widen_past_the_closed_set() {
+        let m = SyncMetrics::new();
+        // A client-invented verb and codes outside every class still land in
+        // fixed label values; the route is the caller's and is used verbatim.
+        m.http().observe("/client/rules", "BREW", 599, 0.01);
+        m.http().observe("/client/rules", "get", 42, 0.01);
+        let lines = http_lines(&m);
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains(r#"method="other",status="5xx""#))
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains(r#"method="other",status="other""#))
+        );
+        assert!(
+            !lines
+                .iter()
+                .any(|l| l.contains("BREW") || l.contains("599"))
+        );
+        // NaN and negative durations are not a crash and not a negative sum.
+        m.http().observe("/client/rules", "GET", 200, f64::NAN);
+        m.http().observe("/client/rules", "GET", 200, -1.0);
+        assert!(http_lines(&m).iter().any(|l| l
+            == r#"squelchd_http_request_duration_seconds_sum{route="/client/rules",method="GET",status="2xx"} 0"#));
+    }
+
+    #[test]
+    fn http_series_cap_drops_new_keys_and_counts_the_drops() {
+        let m = SyncMetrics::new();
+        for i in 0..HTTP_SERIES_CAP {
+            m.http().observe(&format!("/r{i}"), "GET", 200, 0.01);
+        }
+        // Existing series keep recording; new ones are refused and counted.
+        m.http().observe("/r0", "GET", 200, 0.01);
+        m.http().observe("/one-too-many", "GET", 200, 0.01);
+        m.http().observe("/r0", "POST", 200, 0.01);
+        let lines = http_lines(&m);
+        assert!(!lines.iter().any(|l| l.contains("one-too-many")));
+        assert!(
+            !lines
+                .iter()
+                .any(|l| l.contains(r#"route="/r0",method="POST""#))
+        );
+        assert!(lines.iter().any(|l| l
+            == r#"squelchd_http_request_duration_seconds_count{route="/r0",method="GET",status="2xx"} 2"#));
+        assert!(lines.contains(&"squelchd_http_metrics_series_dropped_total 2".to_string()));
+        // Exactly cap series: (buckets + Inf + sum + count) samples each, plus
+        // the drop counter. This is the arithmetic the scrape job's
+        // sample_limit is sized from.
+        let per_series = HTTP_BUCKETS.len() + 3;
+        assert_eq!(lines.len(), HTTP_SERIES_CAP * per_series + 1);
     }
 }
