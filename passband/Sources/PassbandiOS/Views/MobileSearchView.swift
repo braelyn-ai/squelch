@@ -68,6 +68,15 @@ struct MobileSearchView: View {
     /// that is still on screen.
     private var term: String { store.search.query.trimmed }
 
+    /// THERE IS AN ANSWER ON SCREEN for the question on screen: the hits came
+    /// back for exactly this query under exactly this order. What the
+    /// no-matches copy is allowed to key on — emptiness alone means "not back
+    /// yet" while the field is mid-edit, and `fetchedQuery != nil` alone means
+    /// only that SOME query was once answered.
+    private var answered: Bool {
+        store.search.fetchedQuery == term && store.search.fetchedSort == prefs.searchSort
+    }
+
     /// Long enough to be a sentence, so this is a question. Trimmed first: the
     /// space a person leaves before their next word must not flip the surface
     /// one keystroke early.
@@ -251,7 +260,7 @@ struct MobileSearchView: View {
                 Text("searching…")
                     .font(Typo.rowSub)
                     .foregroundStyle(Palette.inkFaintest)
-            } else if store.search.fetchedQuery != nil {
+            } else if answered {
                 Text("No matches.")
                     .font(Typo.serif(22, weight: .medium))
                     .foregroundStyle(Palette.ink)
@@ -328,20 +337,21 @@ struct MobileSearchView: View {
         // Settings re-ranks on the next visit instead of silently doing nothing
         // until the reader edits their query.
         let sort = prefs.searchSort
+        // CLEARS `loading` on the way out: this is the path a cancelled
+        // predecessor used to rely on someone else covering. The CURRENT task
+        // owns the flag now; see the cancelled exits below.
         guard query != store.search.fetchedQuery || sort != store.search.fetchedSort else {
+            loading = false
             return
         }
         loading = true
         // Debounce: a fresh keystroke cancels this task before the request.
         try? await Task.sleep(for: Self.debounce)
-        // A cancelled exit MUST clear the flag: the replacing task can
-        // early-return on `query == fetchedQuery` without ever touching it
-        // (backspace inside the debounce window), and a stuck `loading` both
-        // pins the "searching…" note and gates loadMore forever.
-        guard !Task.isCancelled else {
-            loading = false
-            return
-        }
+        // A CANCELLED TASK WRITES NOTHING. Its replacement has already set
+        // `loading = true` for the keystroke that superseded it, and the two
+        // resumptions are not ordered — clearing the flag here is how
+        // "searching…" blinked off mid-type and let the empty state through.
+        guard !Task.isCancelled else { return }
         do {
             // NO `mode`, exactly as the Mac passes none: the daemon picks
             // hybrid when it has vectors and keyword when it does not, and a
@@ -352,10 +362,7 @@ struct MobileSearchView: View {
             // task landing late must not stamp `fetchedQuery` with a term that
             // is no longer in the field — the `query != fetchedQuery` guard
             // above would then refuse to fetch the term that IS.
-            guard !Task.isCancelled, term == query else {
-                loading = false
-                return
-            }
+            guard !Task.isCancelled, term == query else { return }
             store.search.hits = page.items
             store.search.nextCursor = page.next_cursor
             store.search.error = nil
@@ -368,10 +375,8 @@ struct MobileSearchView: View {
             // Cancellation surfaces here too (URLError.cancelled mid-request):
             // that is a superseded task, not a failure, and writing an error
             // would stamp the NEW search's state with the old one's obituary.
-            guard !Task.isCancelled else {
-                loading = false
-                return
-            }
+            // Nor the flag — same reason as the debounce exit above.
+            guard !Task.isCancelled else { return }
             store.search.error = errText(error, "search failed")
             // Leave `fetchedQuery` nil so returning RETRIES rather than
             // resurrecting a stale error over stale hits, and drop the cursor

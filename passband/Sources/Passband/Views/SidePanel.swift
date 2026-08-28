@@ -93,6 +93,24 @@ struct SearchView: View {
         (store.search.fetchedQuery ?? "").split(separator: " ").map(String.init)
     }
 
+    /// THERE IS AN ANSWER ON SCREEN for the question on screen: the hits came
+    /// back for exactly this query under exactly this order.
+    ///
+    /// What "no matches." is allowed to key on, and the fix for it flashing on
+    /// every keystroke. Emptiness alone does not mean no matches — mid-edit the
+    /// hits belong to the PREVIOUS query, and an empty list there means "not
+    /// back yet". Nor does `!loading`: the flag is a race between the task
+    /// starting for this keystroke and the cancelled one for the last, so it
+    /// dips false between two characters even though nothing was answered.
+    ///
+    /// A failed fetch clears `fetchedQuery`, so an error is never mistaken for
+    /// a nil result; an empty field clears it too, so the resting panel says
+    /// nothing rather than "no matches." at a question nobody asked.
+    private var answered: Bool {
+        store.search.fetchedQuery == store.search.query.trimmed
+            && store.search.fetchedSort == prefs.searchSort
+    }
+
     var body: some View {
         @Bindable var store = store
         let expanded = store.search.expanded
@@ -124,11 +142,7 @@ struct SearchView: View {
 
             if loading { BandNote("searching…") }
             if let error = store.search.error { BandNote(error) }
-            if !loading && store.search.error == nil && !store.search.query.trimmed.isEmpty
-                && store.search.hits.isEmpty
-            {
-                BandNote("no matches.")
-            }
+            if answered && store.search.hits.isEmpty { BandNote("no matches.") }
 
             ScrollViewReader { proxy in
                 ScrollView {
@@ -254,18 +268,26 @@ struct SearchView: View {
         // not re-fetch and flash, which is the point of hoisting the session
         // into the store. The sort is half of that test — same words ranked by
         // different rules is a different answer.
-        guard term != store.search.fetchedQuery || sort != store.search.fetchedSort else { return }
-        loading = true
-        // Debounce: a fresh keystroke cancels this task before the request.
-        try? await Task.sleep(for: .milliseconds(220))
-        // A cancelled exit MUST clear the flag: the replacing task can
-        // early-return on `term == fetchedQuery` without ever touching it
-        // (backspace inside the debounce window), and a stuck `loading` both
-        // pins the "searching…" note and gates loadMore forever.
-        guard !Task.isCancelled else {
+        //
+        // CLEARS `loading` on the way out, because this is the path a cancelled
+        // predecessor used to rely on someone else covering (backspace inside
+        // the debounce window lands here). The CURRENT task owns the flag now;
+        // see the cancelled exits below.
+        guard term != store.search.fetchedQuery || sort != store.search.fetchedSort else {
             loading = false
             return
         }
+        loading = true
+        // Debounce: a fresh keystroke cancels this task before the request.
+        try? await Task.sleep(for: .milliseconds(220))
+        // A CANCELLED TASK WRITES NOTHING. Its replacement has already set
+        // `loading = true` for the keystroke that superseded it, and the two
+        // resumptions are not ordered — clearing the flag here is how
+        // "searching…" blinked off mid-type and let the empty state through.
+        // Every path that stops being the current search now leaves the flag to
+        // whoever is (including the early return above, which is the case this
+        // used to be covering for).
+        guard !Task.isCancelled else { return }
         do {
             let page = try await APIClient.shared.search(term, limit: 50, sort: sort)
             store.search.hits = page.items
@@ -286,10 +308,8 @@ struct SearchView: View {
             // Cancellation surfaces here too (URLError.cancelled mid-request):
             // that is a superseded task, not a failure, and writing an error
             // would stamp the NEW search's state with the old one's obituary.
-            guard !Task.isCancelled else {
-                loading = false
-                return
-            }
+            // Nor the flag — same reason as the debounce exit above.
+            guard !Task.isCancelled else { return }
             store.search.error = errText(error, "search failed")
             // Leave `fetchedQuery` nil so reopening RETRIES rather than
             // resurrecting a stale error over stale hits.
