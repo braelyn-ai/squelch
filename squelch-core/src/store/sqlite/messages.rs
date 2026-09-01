@@ -285,6 +285,60 @@ impl SqliteStore {
         upsert_message_conn(&conn, msg)
     }
 
+    /// THE LOCAL HALF OF "NOT SPAM": clear the provider's verdict on one message
+    /// and hand the row to triage as if it had just arrived.
+    ///
+    /// The Gmail half (add INBOX, remove SPAM) is the caller's, and runs FIRST —
+    /// see the `not_spam` handler. This is deliberately not idempotent-friendly
+    /// about the queue: it always requeues, because the reason a row is here is
+    /// that the user disagreed with the only verdict it ever had.
+    ///
+    /// What it resets and why:
+    ///
+    /// - `is_spam = 0`, which is the whole visibility change. Every listing's
+    ///   predicate does the rest, with no per-surface work.
+    /// - The LLM markers back to their never-processed state, because the row
+    ///   carries the neutral seed ingest writes for spam and nothing else. It
+    ///   has no verdict to keep.
+    /// - `retriage_at = now`, for the reason `retriage_reset` gives: rescued
+    ///   spam is usually days old, past every pass's stale cutoff, so without
+    ///   the force stamp the next tick would mark it processed without asking a
+    ///   model anything and the user would get their mail back untriaged.
+    /// - The attention lifecycle back to `new`. The row was very likely stamped
+    ///   surfaced the moment the spam page listed it, and mail arriving in the
+    ///   inbox for the first time belongs in the New band — leaving the stamp
+    ///   would file it under Open, which reads as "you have seen this".
+    ///
+    /// SEALED ROWS ARE REFUSED, as everywhere: a sealed row can carry `is_spam`
+    /// (Gmail misfiling an OTP is exactly how), and unsealing one by hand is not
+    /// a thing this route gets to do. Returns whether a row changed, so a
+    /// missing, sealed or already-unspammed id all read as `false` and 404.
+    pub(super) fn clear_spam(&self, account_id: AccountId, message_id: i64) -> Result<bool> {
+        let mut conn = self.lock()?;
+        let now = Utc::now().to_rfc3339();
+        let tx = conn.transaction()?;
+        let cleared = tx.execute(
+            "UPDATE messages SET is_spam = 0
+             WHERE account_id = ?1 AND id = ?2 AND is_spam = 1
+               AND EXISTS(SELECT 1 FROM triage t
+                          WHERE t.message_id = ?2 AND t.sensitivity != 'sealed')",
+            params![account_id, message_id],
+        )?;
+        if cleared == 0 {
+            return Ok(false);
+        }
+        tx.execute(
+            "UPDATE triage
+                SET stage1_model_used = NULL, model_used = NULL, needs_stage2 = 0,
+                    extractor_model_used = NULL, retriage_at = ?3,
+                    status = 'new', surfaced_at = NULL, resolved_at = NULL
+              WHERE account_id = ?1 AND message_id = ?2 AND sensitivity != 'sealed'",
+            params![account_id, message_id, now],
+        )?;
+        tx.commit()?;
+        Ok(true)
+    }
+
     pub(super) fn thread_view(&self, account_id: AccountId, thread_id: &str) -> Result<ThreadView> {
         let conn = self.lock()?;
         let subject = thread_guard_and_subject(&conn, account_id, thread_id)?;
@@ -610,17 +664,17 @@ impl SqliteStore {
         // Filtered is told apart from Squelch/Surface by `confident`: the Filtered
         // rung parks NOT-confident precisely because its verdict is pending an
         // LLM read of `want_text` (see `triage::stage1`).
-        let (stage1_model_used, needs_stage2): (Option<&str>, i64) =
-            if triaged.sensitivity != Sensitivity::Normal
-                || triaged.message.is_sent
-                || triaged.message.is_spam
-            {
-                (Some("n/a"), 0)
-            } else if triaged.matched_rule.is_some() && !triaged.confident {
-                (Some("rule"), 1)
-            } else {
-                (None, if triaged.confident { 0 } else { 1 })
-            };
+        let (stage1_model_used, needs_stage2): (Option<&str>, i64) = if triaged.sensitivity
+            != Sensitivity::Normal
+            || triaged.message.is_sent
+            || triaged.message.is_spam
+        {
+            (Some("n/a"), 0)
+        } else if triaged.matched_rule.is_some() && !triaged.confident {
+            (Some("rule"), 1)
+        } else {
+            (None, if triaged.confident { 0 } else { 1 })
+        };
         // RE-INGEST CLASSIFICATION GUARD. A re-ingest carries only HEURISTIC SEED
         // values, so for a row an LLM already classified (`model_used` set, or a
         // `stage1_model_used` other than the 'rule'/'n/a' sentinels) writing the

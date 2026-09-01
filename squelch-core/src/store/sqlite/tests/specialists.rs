@@ -86,7 +86,15 @@ fn receipt_ingest_auto_resolves_and_lists_and_stays_out_of_bands() {
 
     // 2. AUTO-RESOLVE: the triage row is status='done' with resolved_at set.
     let done = store
-        .attention_updates(acct, since, None, Some(AttentionStatus::Done), None, false)
+        .attention_updates(
+            acct,
+            since,
+            None,
+            Some(AttentionStatus::Done),
+            None,
+            false,
+            SpamScope::Exclude,
+        )
         .unwrap();
     assert_eq!(done.len(), 1, "receipt is auto-resolved to done");
     assert_eq!(done[0].update.id, id);
@@ -95,7 +103,15 @@ fn receipt_ingest_auto_resolves_and_lists_and_stays_out_of_bands() {
     // 3. It is ABSENT from the New band (never inbox clutter) even though it
     //    was never surfaced (surfaced_at IS NULL).
     let fresh = store
-        .attention_updates(acct, since, None, None, Some(SitrepBand::New), false)
+        .attention_updates(
+            acct,
+            since,
+            None,
+            None,
+            Some(SitrepBand::New),
+            false,
+            SpamScope::Exclude,
+        )
         .unwrap();
     assert!(
         fresh.is_empty(),
@@ -154,7 +170,15 @@ fn calendar_ingest_auto_resolves_and_lists_and_stays_out_of_bands() {
     //    (same mechanism as receipts — squelch-internal only; nothing is
     //    written back to Gmail).
     let done = store
-        .attention_updates(acct, since, None, Some(AttentionStatus::Done), None, false)
+        .attention_updates(
+            acct,
+            since,
+            None,
+            Some(AttentionStatus::Done),
+            None,
+            false,
+            SpamScope::Exclude,
+        )
         .unwrap();
     assert_eq!(done.len(), 1, "calendar update is auto-resolved to done");
     assert_eq!(done[0].update.id, id);
@@ -162,7 +186,15 @@ fn calendar_ingest_auto_resolves_and_lists_and_stays_out_of_bands() {
 
     // 3. ABSENT from the New band (never inbox clutter).
     let fresh = store
-        .attention_updates(acct, since, None, None, Some(SitrepBand::New), false)
+        .attention_updates(
+            acct,
+            since,
+            None,
+            None,
+            Some(SitrepBand::New),
+            false,
+            SpamScope::Exclude,
+        )
         .unwrap();
     assert!(
         fresh.is_empty(),

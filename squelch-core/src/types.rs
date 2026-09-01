@@ -991,6 +991,7 @@ mod tests {
                     one_line: Some("bill is 12 days past due".into()),
                     auth_pass: Some(true),
                     is_sent: false,
+                    is_spam: false,
                 },
                 ClientMessage {
                     id: 2,
@@ -1007,6 +1008,7 @@ mod tests {
                     one_line: None,
                     auth_pass: None,
                     is_sent: true,
+                    is_spam: false,
                 },
             ],
         };

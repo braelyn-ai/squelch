@@ -674,6 +674,10 @@ impl Store for SqliteStore {
         self.retriage_reset(account_id, message_id, days)
     }
 
+    fn clear_spam(&self, account_id: AccountId, message_id: i64) -> Result<bool> {
+        self.clear_spam(account_id, message_id)
+    }
+
     fn retriage_progress(&self, account_id: AccountId) -> Result<RetriageProgress> {
         self.retriage_progress(account_id)
     }

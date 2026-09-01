@@ -3261,6 +3261,7 @@ pub type Rules = Vec<SenderRule>;
 mod tests {
     use super::*;
     use crate::config::Stage1Config;
+    use crate::store::SpamScope;
     use crate::store::SqliteStore;
     use crate::types::{Disposition, NewMessage, Tier, TriageAxis};
 
@@ -3324,6 +3325,7 @@ mod tests {
             raw: eml.as_bytes().to_vec(),
             internal_date: Some(Utc::now()),
             is_sent,
+            is_spam: false,
             account_addr: "me@example.com".to_string(),
         }
     }
@@ -3583,6 +3585,7 @@ mod tests {
             received_at: row.received_at,
             sensitivity: row.sensitivity,
             is_sent: false,
+            is_spam: false,
             rule: events::current_rule(&row.from_addr, &rules),
             tier,
             importance,
@@ -4566,6 +4569,7 @@ mod tests {
                 body: "writing this from the phone app".to_string(),
                 body_html: None,
                 is_sent: true,
+                is_spam: false,
                 to_addrs: None,
                 list_unsubscribe: None,
                 list_unsub_one_click: false,
@@ -5270,6 +5274,7 @@ mod tests {
                 body: "body".into(),
                 body_html: None,
                 is_sent: false,
+                is_spam: false,
                 to_addrs: None,
                 list_unsubscribe: None,
                 list_unsub_one_click: false,
@@ -5316,6 +5321,7 @@ mod tests {
                 None,
                 None,
                 false,
+                SpamScope::Exclude,
             )
             .unwrap();
         assert_eq!(rows.len(), 1);

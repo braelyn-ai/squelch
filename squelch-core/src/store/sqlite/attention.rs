@@ -125,6 +125,7 @@ impl SqliteStore {
         Ok(out)
     }
 
+    #[allow(clippy::too_many_arguments)] // the filters of one listing, one per axis
     pub(super) fn attention_updates(
         &self,
         account_id: AccountId,

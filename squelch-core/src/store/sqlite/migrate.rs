@@ -153,7 +153,12 @@ pub(super) fn migrate(conn: &Connection) -> Result<()> {
     // Every other listing wants `is_spam = 0`, which is almost every row and so
     // is better served by a scan the planner was going to do anyway; only the
     // spam page asks for the handful with `is_spam = 1`, and it asks newest-first.
-    if has_columns(conn, "messages", &["is_spam"])? {
+    // BOTH columns in the guard, not just the migrated one. `has_columns` is
+    // there to keep an index off a table that has not grown its column yet, and
+    // an index names every column it covers: checking only `is_spam` left
+    // `received_at` assumed, which holds for any table `schema.sql` built and
+    // not for a partial one.
+    if has_columns(conn, "messages", &["is_spam", "received_at"])? {
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_messages_spam
              ON messages(account_id, received_at) WHERE is_spam = 1",

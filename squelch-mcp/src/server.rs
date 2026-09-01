@@ -529,7 +529,7 @@ impl ServerHandler for SquelchServer {
 mod tests {
     use super::*;
     use rmcp::handler::server::wrapper::Parameters;
-    use squelch_core::store::Store;
+    use squelch_core::store::{SpamScope, Store};
     use squelch_core::types::{AttentionStatus, SealedKind, Sensitivity, Tier};
 
     /// A read through the AGENT DOOR (`get_inbox_updates`) stamps the seen-ledger
@@ -553,6 +553,7 @@ mod tests {
             body: "".into(),
             body_html: None,
             is_sent: false,
+            is_spam: false,
             to_addrs: None,
             list_unsubscribe: None,
             list_unsub_one_click: false,
@@ -602,7 +603,7 @@ mod tests {
 
         // The normal row is now surfaced+open; the sealed row is untouched.
         let rows = store
-            .attention_updates(acct, since, None, None, None, false)
+            .attention_updates(acct, since, None, None, None, false, SpamScope::Exclude)
             .unwrap();
         assert_eq!(rows.len(), 1, "sealed never surfaces");
         assert_eq!(rows[0].update.id, nid);
@@ -676,6 +677,7 @@ mod tests {
             body: subject.into(),
             body_html: None,
             is_sent: false,
+            is_spam: false,
             to_addrs: None,
             list_unsubscribe: None,
             list_unsub_one_click: false,
@@ -711,6 +713,7 @@ mod tests {
             body: body.into(),
             body_html: None,
             is_sent: false,
+            is_spam: false,
             to_addrs: None,
             list_unsubscribe: None,
             list_unsub_one_click: false,

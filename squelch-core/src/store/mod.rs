@@ -1255,6 +1255,16 @@ pub trait Store: Send + Sync {
         days: u32,
     ) -> Result<u64>;
 
+    /// THE LOCAL HALF OF "NOT SPAM": clear `messages.is_spam` on one message and
+    /// hand the row back to triage as newly-arrived mail — LLM markers reset, a
+    /// `retriage_at` force stamp so its age cannot stale-skip it, and the
+    /// attention lifecycle back to `new`. Sealed rows are refused. `false` when
+    /// nothing changed (unknown id, sealed, or not spam to begin with).
+    ///
+    /// The Gmail half is the caller's and runs first; see the `not_spam`
+    /// handler for why that order and not the other one.
+    fn clear_spam(&self, account_id: AccountId, message_id: i64) -> Result<bool>;
+
     /// Mark an extract-queued row PROCESSED without writing a specialist row —
     /// stamp `extractor_model_used` only. Used on the skip / refusal / permanent-
     /// error paths so the row does not loop. Guarded by `sensitivity='normal'`.
@@ -1379,6 +1389,7 @@ pub trait Store: Send + Sync {
     /// them soonest-first, which is a SCHEDULE rather than a band: every such row
     /// is `done` by construction (see [`Store::set_reminder`]), so a caller
     /// asking for it must not also be filtering done away.
+    #[allow(clippy::too_many_arguments)] // the filters of one listing, one per axis
     fn attention_updates(
         &self,
         account_id: AccountId,

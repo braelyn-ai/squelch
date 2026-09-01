@@ -240,6 +240,7 @@ fn client_router(state: ApiState) -> Router {
         // Actions: the only write capability. Require the opt-in write
         // credential; 403 without one.
         .route("/client/actions/archive", post(handlers::action_archive))
+        .route("/client/actions/not_spam", post(handlers::action_not_spam))
         .route("/client/actions/label", post(handlers::action_label))
         .route("/client/actions/send", post(handlers::action_send))
         // Bearer auth wraps EVERY route above.

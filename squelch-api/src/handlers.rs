@@ -21,7 +21,7 @@ use squelch_core::store::{
     ActionMessageRef, Draft, NewAuditEntry, SearchFilter, SearchSort, SitrepBand, SpamScope,
     SqliteStore, Store,
 };
-use squelch_core::sync::{decode_raw_b64url, parse_internal_date};
+use squelch_core::sync::{LABEL_INBOX, LABEL_SPAM, decode_raw_b64url, parse_internal_date};
 use squelch_core::triage::llm::Usage;
 use squelch_core::triage::rule_infer;
 use squelch_core::types::{
@@ -214,8 +214,9 @@ pub async fn get_updates(
     };
     let spam = match q.spam.as_deref() {
         None => SpamScope::Exclude,
-        Some(s) => SpamScope::parse(s)
-            .ok_or_else(|| ApiError::bad_request("spam must be: only"))?,
+        Some(s) => {
+            SpamScope::parse(s).ok_or_else(|| ApiError::bad_request("spam must be: only"))?
+        }
     };
     let since = q
         .since
@@ -2399,6 +2400,73 @@ pub async fn action_archive(
     .await?;
     Ok(Json(
         json!({ "status": "archived", "message_id": body.message_id }),
+    ))
+}
+
+// --- POST /client/actions/not_spam ------------------------------------------
+
+#[derive(Debug, Deserialize)]
+pub struct NotSpamBody {
+    message_id: i64,
+    #[serde(default)]
+    confirm: bool,
+}
+
+/// RESCUE ONE MESSAGE FROM THE PROVIDER'S SPAM FOLDER: remove Gmail's SPAM
+/// label, put INBOX back, then clear the local flag and requeue the row for
+/// triage.
+///
+/// GMAIL FIRST, LOCAL SECOND, and the order is the whole design. If the local
+/// write went first and the Gmail call then failed, the message would be visible
+/// in Passband and still sitting in the spam folder everywhere else — the client
+/// would be lying about the state of the mailbox, and the next sync would not
+/// correct it (nothing re-reads the SPAM label for a row it already has). With
+/// this order a failed Gmail call leaves both sides untouched and the user sees
+/// an error, which is the honest outcome. The reverse failure — Gmail moved, the
+/// local write lost — self-heals: the message now carries INBOX, so the next
+/// history walk ingests it and the upsert's `is_spam = MIN(...)` clears the flag.
+///
+/// It is the SPAM PAGE'S ONLY WRITE, deliberately. The other direction (marking
+/// good mail as spam) is not offered: squelch has its own answer to unwanted
+/// mail in sender rules and the noise tier, and teaching users to train Gmail's
+/// filter from inside a client that does not read that filter's results would be
+/// a button whose effects the product cannot show them.
+pub async fn action_not_spam(
+    State(state): State<ApiState>,
+    Json(body): Json<NotSpamBody>,
+) -> Result<impl IntoResponse, ApiError> {
+    guarded_action(
+        &state,
+        "not_spam",
+        body.message_id,
+        body.confirm,
+        None,
+        // NOT ResolveDone: this mail is arriving, not being handled. `clear_spam`
+        // puts the attention row back to 'new' so it lands in the New band.
+        OnSuccess::LeaveOpen,
+        |client, msg| async move {
+            client
+                .modify(
+                    &msg.gmail_msg_id,
+                    &[LABEL_INBOX.to_string()],
+                    &[LABEL_SPAM.to_string()],
+                )
+                .await
+        },
+    )
+    .await?;
+
+    // The local half. A `false` here means the row was already un-spammed (a
+    // double click, or the sync beat us to it), which is not an error: Gmail
+    // agrees with us either way, and the caller asked for a state that now holds.
+    let message_id = body.message_id;
+    store_call(&state, move |store, account_id| {
+        store.clear_spam(account_id, message_id)
+    })
+    .await?;
+
+    Ok(Json(
+        json!({ "status": "not_spam", "message_id": body.message_id }),
     ))
 }
 

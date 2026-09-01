@@ -230,6 +230,7 @@ mod tests {
             received_at: now,
             sensitivity: Sensitivity::Normal,
             is_sent: false,
+            is_spam: false,
             rule: None,
             tier: Tier::Signal,
             importance: 70,

@@ -11,6 +11,7 @@ mod messages;
 mod migrate;
 mod rules;
 mod search;
+mod spam;
 mod specialists;
 mod support;
 mod tracking;

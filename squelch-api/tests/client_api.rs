@@ -9,7 +9,7 @@ use axum::http::{Request, StatusCode, header};
 use http_body_util::BodyExt;
 use serde_json::Value;
 use squelch_api::{ApiState, router};
-use squelch_core::store::{SqliteStore, Store, UsageTokens};
+use squelch_core::store::{SpamScope, SqliteStore, Store, UsageTokens};
 use squelch_core::types::{SealedKind, Sensitivity, Tier};
 use tower::ServiceExt;
 
@@ -3823,6 +3823,7 @@ async fn updates_stamp_once_and_carry_prestamp_surfaced_at() {
             None,
             None,
             false,
+            SpamScope::Exclude,
         )
         .unwrap();
     let first_stamp = after[0].surfaced_at.expect("surfaced_at now set");
@@ -3840,6 +3841,7 @@ async fn updates_stamp_once_and_carry_prestamp_surfaced_at() {
             None,
             None,
             false,
+            SpamScope::Exclude,
         )
         .unwrap();
     assert_eq!(
@@ -3868,7 +3870,7 @@ async fn peek_returns_the_same_rows_without_stamping_the_ledger() {
 
     // ...and the ledger is untouched: nothing was actually shown to anyone.
     let after_peek = store
-        .attention_updates(acct, window(), None, None, None, false)
+        .attention_updates(acct, window(), None, None, None, false, SpamScope::Exclude)
         .unwrap();
     assert_eq!(after_peek.len(), 2);
     for u in &after_peek {
@@ -3885,7 +3887,7 @@ async fn peek_returns_the_same_rows_without_stamping_the_ledger() {
     let resp2 = app.oneshot(authed("GET", "/client/updates")).await.unwrap();
     assert_eq!(resp2.status(), StatusCode::OK);
     let after_normal = store
-        .attention_updates(acct, window(), None, None, None, false)
+        .attention_updates(acct, window(), None, None, None, false, SpamScope::Exclude)
         .unwrap();
     for u in &after_normal {
         assert!(u.surfaced_at.is_some(), "normal fetch stamps surfaced_at");
@@ -4023,6 +4025,7 @@ async fn dismiss_and_reopen_endpoint() {
             Some(AttentionStatus::Done),
             None,
             false,
+            SpamScope::Exclude,
         )
         .unwrap();
     assert_eq!(done.len(), 1);
@@ -4127,7 +4130,15 @@ async fn reminder_endpoint_defers_the_thread_and_schedules_its_return() {
     // DEFERRING IS RESOLVING: one round trip both hides the mail and schedules
     // it, and the listing carries the pending stamp back.
     let rows = store
-        .attention_updates(acct, reminder_window(), None, None, None, false)
+        .attention_updates(
+            acct,
+            reminder_window(),
+            None,
+            None,
+            None,
+            false,
+            SpamScope::Exclude,
+        )
         .unwrap();
     assert_eq!(rows[0].status, AttentionStatus::Done);
     assert!(rows[0].resolved_at.is_some());
@@ -4166,7 +4177,15 @@ async fn reminder_rejects_a_past_or_unparseable_date() {
     // And nothing was scheduled.
     assert!(
         store
-            .attention_updates(acct, reminder_window(), None, None, None, true)
+            .attention_updates(
+                acct,
+                reminder_window(),
+                None,
+                None,
+                None,
+                true,
+                SpamScope::Exclude
+            )
             .unwrap()
             .is_empty()
     );
@@ -4256,7 +4275,15 @@ async fn reminder_on_the_users_own_sent_mail_is_404() {
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     assert!(
         store
-            .attention_updates(acct, reminder_window(), None, None, None, true)
+            .attention_updates(
+                acct,
+                reminder_window(),
+                None,
+                None,
+                None,
+                true,
+                SpamScope::Exclude
+            )
             .unwrap()
             .is_empty(),
         "nothing was scheduled"
@@ -4371,7 +4398,15 @@ async fn clear_reminder_endpoint_is_idempotent() {
     }
 
     let rows = store
-        .attention_updates(acct, reminder_window(), None, None, None, false)
+        .attention_updates(
+            acct,
+            reminder_window(),
+            None,
+            None,
+            None,
+            false,
+            SpamScope::Exclude,
+        )
         .unwrap();
     assert!(rows[0].remind_at.is_none(), "un-scheduled");
     assert_eq!(
@@ -4433,7 +4468,15 @@ async fn pending_reminder_listing_is_soonest_first_and_never_stamps() {
     // AND IT NEVER STAMPS: these are deferred rows the user is reviewing the
     // schedule of, not mail being shown to them.
     let rows = store
-        .attention_updates(acct, reminder_window(), None, None, None, true)
+        .attention_updates(
+            acct,
+            reminder_window(),
+            None,
+            None,
+            None,
+            true,
+            SpamScope::Exclude,
+        )
         .unwrap();
     assert!(
         rows.iter().all(|u| u.surfaced_at.is_none()),
@@ -4476,6 +4519,7 @@ async fn archive_success_resolves_target_to_done() {
             Some(AttentionStatus::Done),
             None,
             false,
+            SpamScope::Exclude,
         )
         .unwrap();
     assert_eq!(done.len(), 1);
@@ -4987,6 +5031,7 @@ async fn an_inferred_squelch_never_resolves_the_senders_open_mail() {
             Some(AttentionStatus::Done),
             None,
             false,
+            SpamScope::Exclude,
         )
         .unwrap();
     assert!(
@@ -5049,6 +5094,7 @@ async fn a_literal_auto_squelch_is_inferred_and_never_resolves_open_mail() {
             Some(AttentionStatus::Done),
             None,
             false,
+            SpamScope::Exclude,
         )
         .unwrap();
     assert!(
@@ -5595,6 +5641,7 @@ async fn unsubscribe_resolves_the_source_email_to_done() {
             Some(AttentionStatus::Done),
             None,
             false,
+            SpamScope::Exclude,
         )
         .unwrap();
     assert!(
@@ -5672,6 +5719,7 @@ async fn squelch_rule_with_source_message_resolves_it_surface_does_not() {
             Some(AttentionStatus::Done),
             None,
             false,
+            SpamScope::Exclude,
         )
         .unwrap();
     assert!(
@@ -5732,6 +5780,7 @@ async fn an_explicit_squelch_without_sweep_resolves_nothing() {
             Some(AttentionStatus::Done),
             None,
             false,
+            SpamScope::Exclude,
         )
         .unwrap();
     assert!(
@@ -5854,6 +5903,7 @@ async fn sweep_resolves_by_sender_and_a_wildcard_resolves_only_the_source() {
             Some(AttentionStatus::Done),
             None,
             false,
+            SpamScope::Exclude,
         )
         .unwrap();
     let is_done = |id: i64| done.iter().any(|u| u.update.id == id);
@@ -7700,6 +7750,7 @@ async fn forward_success_sends_a_new_conversation_carrying_the_original() {
             Some(squelch_core::types::AttentionStatus::Done),
             None,
             false,
+            SpamScope::Exclude,
         )
         .unwrap();
     assert!(

@@ -1380,6 +1380,7 @@ pub fn ingest_sent(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::store::SpamScope;
 
     fn raw(account_id: AccountId, msgid: &str, bytes: &str, is_sent: bool) -> RawFetched {
         RawFetched {
@@ -1389,6 +1390,7 @@ mod tests {
             raw: bytes.as_bytes().to_vec(),
             internal_date: Some(Utc::now()),
             is_sent,
+            is_spam: false,
             account_addr: "me@example.com".to_string(),
         }
     }
@@ -2729,6 +2731,7 @@ mod tests {
                 None,
                 None,
                 false,
+                SpamScope::Exclude,
             )
             .unwrap();
         assert!(
@@ -2791,6 +2794,7 @@ mod tests {
                 body: "hello".to_string(),
                 body_html: None,
                 is_sent: false,
+                is_spam: false,
                 to_addrs: None,
                 list_unsubscribe: None,
                 list_unsub_one_click: false,
