@@ -8504,3 +8504,39 @@ async fn not_spam_is_confirm_gated_and_needs_a_write_credential() {
         .unwrap();
     assert_eq!(rows.len(), 1, "the row is still spam");
 }
+
+/// THE SHAPE OF THE ACKNOWLEDGEMENT, pinned because the client decodes it and
+/// nothing else checks that seam.
+///
+/// This route answers `{"triggered": bool}` — the same shape `POST
+/// /client/refresh` has always used, because it is the same kind of poke at the
+/// same sync loop. It is asserted by KEY rather than by "some JSON came back":
+/// the client briefly decoded this into a type requiring a `status` field, the
+/// POST arrived and the spam folder synced perfectly, and the DECODE of the
+/// reply threw — which the client reported as being unable to reach the
+/// provider. `passband/Tests/SpamWireTests.swift` holds the other half.
+#[tokio::test]
+async fn spam_refresh_answers_the_triggered_shape() {
+    let Harness { app, .. } = harness(|_, _| {});
+    let resp = app
+        .oneshot(authed_json(
+            "POST",
+            "/client/spam/refresh",
+            serde_json::json!({}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+    assert!(
+        json.get("triggered").and_then(|v| v.as_bool()).is_some(),
+        "the acknowledgement must carry a boolean `triggered`: {json}"
+    );
+    // No sync loop is wired into the test harness, so it reports that honestly
+    // rather than claiming to have started something.
+    assert_eq!(json["triggered"], serde_json::json!(false));
+    assert!(
+        json.get("status").is_none(),
+        "and NOT a `status` field — the client type that wanted one was the bug"
+    );
+}

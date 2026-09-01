@@ -592,8 +592,16 @@ actor APIClient {
     /// FORGET: the daemon does not track that folder, so this is a real Gmail
     /// round trip measured in tens of seconds, and the answer arrives through
     /// the ordinary updates poll rather than this response.
+    ///
+    /// `RefreshResult`, the same `{"triggered": bool}` `refreshMail` above
+    /// decodes, because it is the same kind of poke at the same sync loop. It
+    /// was briefly typed as `StatusResult`, which requires a `status` key this
+    /// route does not send: the POST reached the daemon and the fetch ran
+    /// perfectly, the DECODE of the acknowledgement threw, and the page reported
+    /// that it could not reach the provider. A wrong response type on a
+    /// fire-and-forget call fails at the only place it can still be seen.
     @discardableResult
-    func refreshSpam() async throws -> StatusResult {
+    func refreshSpam() async throws -> RefreshResult {
         try await post("/client/spam/refresh", body: EmptyBody())
     }
 
