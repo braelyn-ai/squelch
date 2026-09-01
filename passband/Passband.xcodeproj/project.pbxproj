@@ -134,6 +134,7 @@
 		764A73259735A815192E7EE0 /* ThreadViewer.swift in Sources */ = {isa = PBXBuildFile; fileRef = F2BD37CBEFEA8CEB215E3247 /* ThreadViewer.swift */; };
 		765C0A73FABBBF4F7A041A83 /* HeroCache.swift in Sources */ = {isa = PBXBuildFile; fileRef = 20CA62DECFED05021D0C9964 /* HeroCache.swift */; };
 		778A9FBEDBA350092B770844 /* Actions.swift in Sources */ = {isa = PBXBuildFile; fileRef = 10544C7DF8CDBA851AF0D9D8 /* Actions.swift */; };
+		7874B70E2E660A8F9446777F /* SpamNotice.swift in Sources */ = {isa = PBXBuildFile; fileRef = 848BEC54D1FCD1F0FC5BE1A5 /* SpamNotice.swift */; };
 		78F890FF424189B1CDC6C501 /* newsreader-italic-var.ttf in Resources */ = {isa = PBXBuildFile; fileRef = 83BF084E665545489EDF2D5E /* newsreader-italic-var.ttf */; };
 		7936BA935C085573F40A410E /* NotificationIcon.swift in Sources */ = {isa = PBXBuildFile; fileRef = 88151BD4CF9D97EE43150B72 /* NotificationIcon.swift */; };
 		79648FA43CA52620F1B9832E /* Sessions.swift in Sources */ = {isa = PBXBuildFile; fileRef = DA80DD18A355200FB6274585 /* Sessions.swift */; };
@@ -182,6 +183,7 @@
 		99CFBE791F3799FBEFB5D213 /* ComposePane.swift in Sources */ = {isa = PBXBuildFile; fileRef = B97BB8DF0B7CB3C4E9EC791B /* ComposePane.swift */; };
 		99E823237BD7F3F4EE5C26DF /* Newsletters.swift in Sources */ = {isa = PBXBuildFile; fileRef = 47779240FEC7579D6A0072CB /* Newsletters.swift */; };
 		9B3E18E0184901FAE39CB499 /* ThreadMinimap.swift in Sources */ = {isa = PBXBuildFile; fileRef = 06AB2FB92191FC4913C38FFF /* ThreadMinimap.swift */; };
+		9C92F8C76EDAC718182EE03C /* SpamNotice.swift in Sources */ = {isa = PBXBuildFile; fileRef = 848BEC54D1FCD1F0FC5BE1A5 /* SpamNotice.swift */; };
 		9EA7C093CFE335E233A6411C /* AuthCodeModal.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A47FA6986F50A4E81628452 /* AuthCodeModal.swift */; };
 		9F54901230BBCD7044B85B48 /* Haptics.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1DBFA0EDE4D57FC2CB095671 /* Haptics.swift */; };
 		A137B52A5F6BC3F6ACC2C0F8 /* Keychain.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1D19065EB7E9BFE9E846675B /* Keychain.swift */; };
@@ -424,6 +426,7 @@
 		82CD5D3AEF359995F968DB53 /* Sparkle.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Sparkle.framework; path = vendor/Sparkle/Sparkle.framework; sourceTree = "<group>"; };
 		83BF084E665545489EDF2D5E /* newsreader-italic-var.ttf */ = {isa = PBXFileReference; lastKnownFileType = file; path = "newsreader-italic-var.ttf"; sourceTree = "<group>"; };
 		84043CEC5CA50FFDDB4CC2DC /* PassbandiOSNotify.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = PassbandiOSNotify.entitlements; sourceTree = "<group>"; };
+		848BEC54D1FCD1F0FC5BE1A5 /* SpamNotice.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SpamNotice.swift; sourceTree = "<group>"; };
 		88151BD4CF9D97EE43150B72 /* NotificationIcon.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NotificationIcon.swift; sourceTree = "<group>"; };
 		8860DE0FE5AA0366C7BE9922 /* JSONValue.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = JSONValue.swift; sourceTree = "<group>"; };
 		89A44DCD12D99794B8DF43B0 /* AuthView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AuthView.swift; sourceTree = "<group>"; };
@@ -581,6 +584,7 @@
 				992EA99CCF93A2EA929D6E3B /* SidePanel.swift */,
 				2B0750416DB37BFF3B78457B /* SitrepView.swift */,
 				22B6CF4EF83BEF15EB372184 /* SitrepZones.swift */,
+				848BEC54D1FCD1F0FC5BE1A5 /* SpamNotice.swift */,
 				06AB2FB92191FC4913C38FFF /* ThreadMinimap.swift */,
 				F2BD37CBEFEA8CEB215E3247 /* ThreadViewer.swift */,
 				627B000AA2D3694B771F50B0 /* TourOverlay.swift */,
@@ -1088,6 +1092,7 @@
 				22511E51CB7D38C82320FE21 /* SitrepView.swift in Sources */,
 				2B851E8B41A22C1E6FA86CC4 /* SitrepWindow.swift in Sources */,
 				61E6D7AA7EB53F8AEE04063C /* SitrepZones.swift in Sources */,
+				7874B70E2E660A8F9446777F /* SpamNotice.swift in Sources */,
 				91F318BC5570E8048D351984 /* StagedAttachment.swift in Sources */,
 				EA0F7FADC742BF00778433BF /* SubjectText.swift in Sources */,
 				913D465C949CCE810929D314 /* ThreadArrivals.swift in Sources */,
@@ -1230,6 +1235,7 @@
 				DBAF51D466CF5A747261E363 /* SitrepView.swift in Sources */,
 				45E3185440F05D41CF616B8D /* SitrepWindow.swift in Sources */,
 				B6F86A1B7C9CECBF25C347FA /* SitrepZones.swift in Sources */,
+				9C92F8C76EDAC718182EE03C /* SpamNotice.swift in Sources */,
 				36AF6616DDF139B04CF8782F /* StagedAttachment.swift in Sources */,
 				C47E10D8934D830B5018DC8B /* SubjectText.swift in Sources */,
 				C8FCFA76D21B9E6DC3093D18 /* SwipeRow.swift in Sources */,

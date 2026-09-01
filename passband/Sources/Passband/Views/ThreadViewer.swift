@@ -2040,6 +2040,7 @@ private struct MessageCard: View, Equatable {
                 .font(.system(size: 13, weight: .semibold))
                 .foregroundStyle(Palette.ink)
             Spacer(minLength: 8)
+            spamChip
             attentionChip
             ReadReceiptMark(opens: opens)
             Text(Fmt.dateTime(message.received_at))
@@ -2065,6 +2066,7 @@ private struct MessageCard: View, Equatable {
                 .font(.system(size: 11, weight: .semibold))
                 .foregroundStyle(Palette.inkDim)
                 .lineLimit(1)
+            spamChip
             attentionChip
             ReadReceiptMark(opens: opens)
             Text(captionTime)
@@ -2095,6 +2097,28 @@ private struct MessageCard: View, Equatable {
                 filled: chip?.overdue ?? false
             )
             .help(message.one_line ?? "this message put the thread in for-your-eyes")
+        }
+    }
+
+    /// WHO FILTERED THIS. A thread opened from the spam page is indistinguishable
+    /// from any other thread once it is on screen — same chrome, same bubbles,
+    /// and no tier or one-liner, because nothing in Passband ever read it. The
+    /// chip is the only thing in the reader that can say the mail in front of
+    /// you was filtered rather than delivered.
+    ///
+    /// PER MESSAGE, which is the case that justifies the wire field being per
+    /// message: a real correspondent and a spoof of them can share a Subject and
+    /// land in one conversation, and this marks the half that was filtered
+    /// without saying anything about the half that was not.
+    ///
+    /// Faint, not alarming. The chip states a fact about provenance; the folder
+    /// working is the normal case, and `Palette.warn` here would read as "this
+    /// message is dangerous" on mail the reader may well be rescuing.
+    @ViewBuilder
+    private var spamChip: some View {
+        if message.is_spam == true {
+            Chip(text: "spam", tone: Palette.inkFaint)
+                .help("your email provider filtered this message; Passband never triaged it")
         }
     }
 

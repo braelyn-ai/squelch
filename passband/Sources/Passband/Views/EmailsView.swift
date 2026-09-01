@@ -13,6 +13,14 @@
 // the rows are SentRows, j/k/Enter work exactly as they do everywhere else, and
 // r/e/d/v/f are inert rather than acting on a row they have no meaning for.
 //
+// AND A FOURTH, `spam`, which is the mail PROVIDER's folder and not ours. It is
+// the only page reached from a chip rather than a segment (the segment appears
+// once you are on it — see `MailMode.segments`), it carries a standing notice
+// saying who filtered its rows, and it subtracts the three verbs that need a
+// triage verdict to mean anything while adding the one verb that only means
+// something here: `i`, back to the inbox. Everything else — the cursor, the
+// reader, the queue — is the ordinary list.
+//
 // AND A LENS OVER THE INBOX: the reminder filter, which swaps the rows for mail
 // that is parked (`h`) and waiting to come back. A lens rather than a fourth
 // page because it is not a place you navigate to — the first Escape sheds it and
@@ -72,10 +80,27 @@ struct EmailsView: View {
     private var actionable: Bool { kbActive || hovering }
     /// The triage verbs on top of that: sent mail has no triage to act on.
     private var triageable: Bool { actionable && mode != .sent }
+    /// And the narrower set that needs a VERDICT to act on, which a spam row has
+    /// never had. `v` would correct a call nobody made, `h` would park the row
+    /// into bands that filter spam out (the daemon refuses the stamp outright),
+    /// and `f` would search a corpus spam is excluded from. Three keys that
+    /// would appear to work and do nothing.
+    ///
+    /// `e`/`d` and `r` stay live: finishing with a row and answering one are
+    /// things you can mean about any mail, verdict or no verdict.
+    private var verdicted: Bool { triageable && mode != .spam }
 
     var body: some View {
         VStack(spacing: 0) {
             header
+            // ABOVE the list rather than inside it, so it does not scroll away.
+            // The sentence answers "who put this here", and that question is
+            // asked at row 40 as readily as at row 1.
+            if mode == .spam {
+                SpamNotice()
+                    .padding(.horizontal, 18)
+                    .padding(.top, 10)
+            }
             #if os(macOS)
                 desktopList
             #else
@@ -139,15 +164,22 @@ struct EmailsView: View {
             BandNote(error)
         } else if page.value == nil {
             BandNote(
-                reminders ? "loading reminders…" : mode == .noise ? "loading noise…" : "loading mail…"
+                reminders
+                    ? "loading reminders…"
+                    : mode == .noise
+                        ? "loading noise…" : mode == .spam ? "loading spam…" : "loading mail…"
             )
         } else if rows.isEmpty {
             // The window the daemon answers with is 30 days, so an empty noise
-            // page says so rather than implying "ever".
+            // or spam page says so rather than implying "ever".
             BandNote(
                 reminders
                     ? "No pending reminders."
-                    : mode == .noise ? "No noise in the last 30 days." : "No mail.")
+                    : mode == .noise
+                        ? "No noise in the last 30 days."
+                        : mode == .spam
+                            ? "Your email provider filtered nothing in the last 30 days."
+                            : "No mail.")
         }
     }
 
@@ -290,19 +322,49 @@ struct EmailsView: View {
     }
 
     #if !os(macOS)
+        /// The spam count when the phone bar should offer the spam door, nil
+        /// otherwise: on the noise page always, and on the inbox only when there
+        /// is no noise count occupying the slot. See the chip's own note.
+        private var spamDoorCount: Int? {
+            guard let spam = store.sitrep.stats?.spam, spam > 0 else { return nil }
+            let noise = store.sitrep.stats?.tier_counts["noise"] ?? 0
+            guard mode == .noise || (mode == .inbox && noise == 0) else { return nil }
+            return spam
+        }
+
         private var phoneHeader: some View {
             @Bindable var store = store
             let noise = store.sitrep.stats?.tier_counts["noise"] ?? 0
 
             return HStack(spacing: 10) {
                 GlassSegmented(
-                    options: MailMode.allCases.map { ($0, $0.label) },
+                    options: MailMode.segments(showingSpam: mode == .spam).map { ($0, $0.label) },
                     selection: $store.mailMode)
                 Spacer(minLength: 8)
                 if let err = store.refreshError {
                     Text("offline")
                         .font(Typo.micro).foregroundStyle(Palette.warn)
                         .help(err.message)
+                } else if let spam = spamDoorCount {
+                    // THE PHONE'S SPAM DOOR, and it is a DRILL-DOWN rather than
+                    // a second number beside the noise one: this bar has the
+                    // segmented control plus room for one count, and two
+                    // competing numbers on a narrow iPhone is how both become
+                    // unreadable. So the path is inbox -> noise -> spam, in
+                    // increasing order of "mail I did not want", and the chip
+                    // shows on the noise page always. It also shows on the
+                    // inbox when there is no noise count to displace, so an
+                    // empty noise bin does not hide the folder behind it.
+                    Button { store.mailMode = .spam } label: {
+                        HStack(spacing: 6) {
+                            Text("\(spam)")
+                                .font(Typo.num(12, weight: .bold))
+                                .foregroundStyle(Palette.inkFaintest)
+                            Text("spam").font(Typo.micro).foregroundStyle(Palette.inkFaintest)
+                        }
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
                 } else if mode == .inbox, noise > 0 {
                     // The count is the door to the page it counts, same as on the
                     // Mac — just without the word "signal" beside it, because the
@@ -341,7 +403,7 @@ struct EmailsView: View {
                 .font(Typo.serif(19, weight: .medium))
                 .foregroundStyle(Palette.ink)
             GlassSegmented(
-                options: MailMode.allCases.map { ($0, $0.label) },
+                options: MailMode.segments(showingSpam: mode == .spam).map { ($0, $0.label) },
                 selection: $store.mailMode)
             Spacer(minLength: 12)
             HStack(spacing: 8) {
@@ -361,6 +423,26 @@ struct EmailsView: View {
                 }
                 .buttonStyle(.plain)
                 .help("the noise page — everything triage filed as noise (n)")
+                // THE SPAM DOOR, in the same shape as the noise count beside it
+                // and deliberately quieter than it: no accent when active, and
+                // absent entirely when the folder is empty or the daemon is too
+                // old to answer. It sits here rather than in the segmented
+                // control because spam is a place you go looking for something,
+                // once, not one of the three lists you live in.
+                if let spam = store.sitrep.stats?.spam, spam > 0 {
+                    Button { store.mailMode = .spam } label: {
+                        HStack(spacing: 8) {
+                            Text("\(spam)")
+                                .font(Typo.num(12, weight: .bold))
+                                .foregroundStyle(
+                                    mode == .spam ? Palette.accent : Palette.inkFaintest)
+                            Text("spam").font(Typo.micro).foregroundStyle(Palette.inkFaintest)
+                        }
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .help("mail your email provider filtered out — Passband never triaged it")
+                }
                 if let err = store.refreshError {
                     Text("· offline")
                         .font(Typo.micro).foregroundStyle(Palette.warn)
@@ -435,7 +517,7 @@ struct EmailsView: View {
                 }
             },
             KeyBinding("v", "fix triage") {
-                guard triageable, let u = selected else { return }
+                guard verdicted, let u = selected else { return }
                 store.openTriageFix(
                     TriageFixTarget(
                         messageId: u.id, sender: u.sender, subject: u.one_line,
@@ -452,7 +534,7 @@ struct EmailsView: View {
             // body text of unrelated mail. Inert on the sent page, where the
             // sender is the reader and the seed would find their whole archive.
             KeyBinding("f", "search this sender") {
-                guard triageable, let u = selected else { return }
+                guard verdicted, let u = selected else { return }
                 store.openSearch(seed: "from:\(u.sender)")
             },
             KeyBinding("e", "done") { resolveSelected() },
@@ -460,7 +542,7 @@ struct EmailsView: View {
             // On the lens it reschedules the row it is already showing — the
             // palette is the same either way.
             KeyBinding("h", "remind me later") {
-                guard triageable, let u = selected else { return }
+                guard verdicted, let u = selected else { return }
                 store.openRemind(
                     RemindTarget(
                         messageId: u.id, sender: u.sender, subject: u.one_line,
@@ -473,6 +555,15 @@ struct EmailsView: View {
             KeyBinding("Backspace", "cancel reminder") {
                 guard reminders, actionable, let u = selected else { return }
                 Task { await Actions.cancelReminder(u) }
+            },
+            // THE SPAM PAGE'S ONE VERB, and it only exists there: `i` for
+            // inbox, which is both where the mail goes and what the key does.
+            // Bound on this page alone rather than everywhere-and-inert,
+            // because there is no other page where "move this out of spam"
+            // names anything — mail elsewhere is already out of it.
+            KeyBinding("i", "not spam · move to inbox") {
+                guard mode == .spam, actionable, let u = selected else { return }
+                Task { await Actions.notSpam(u) }
             },
             KeyBinding("a", "browse all") { store.openSide(.browse) },
             KeyBinding("T", "rules") { store.setView(.rules) },

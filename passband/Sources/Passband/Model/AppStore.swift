@@ -84,12 +84,32 @@ let historyCap = 50
 // MARK: - mail pages
 
 /// Which page the emails tab shows. `inbox` is the flat all-tiers list; `noise`
-/// is the spam-folder equivalent — the same rows and the same verbs, narrowed to
-/// the noise tier BY THE DAEMON so nothing has to be discarded client-side.
-/// `sent` is the odd one out: outbound mail, off its own route, with none of the
-/// triage verbs (nothing triaged it, and nothing can resolve it).
+/// is everything triage scored as noise, narrowed to that tier BY THE DAEMON so
+/// nothing has to be discarded client-side. `sent` is the odd one out: outbound
+/// mail, off its own route, with none of the triage verbs (nothing triaged it,
+/// and nothing can resolve it).
+///
+/// AND `spam`, WHICH IS NOT THE SAME THING AS `noise` however much the words
+/// overlap. Noise is our verdict about mail that reached the inbox; spam is
+/// Gmail's verdict about mail that never did. Nothing in Passband triaged a spam
+/// row and nothing will — the page exists so the folder is reachable without
+/// leaving for the browser, and so the one thing worth doing there (rescuing
+/// something real out of it) can be done here.
 enum MailMode: String, Sendable, Hashable, CaseIterable {
-    case inbox, noise, sent
+    case inbox, noise, sent, spam
+
+    /// The three pages the segmented control always offers.
+    ///
+    /// SPAM IS NOT ONE OF THEM until you are on it. It is a folder you visit
+    /// deliberately, roughly never, and a permanent fourth segment would give a
+    /// bin of filtered mail the same standing in the chrome as the inbox. The
+    /// door is the header's spam chip; the segment appears once you walk
+    /// through it, because a control showing no selection at all is worse than
+    /// a control that grew an option — you need to see where you are and how to
+    /// get back.
+    static func segments(showingSpam: Bool) -> [MailMode] {
+        showingSpam ? [.inbox, .noise, .sent, .spam] : [.inbox, .noise, .sent]
+    }
 
     /// The page's name — the header title and the segmented control both.
     var label: String {
@@ -97,22 +117,29 @@ enum MailMode: String, Sendable, Hashable, CaseIterable {
         case .inbox: "all mail"
         case .noise: "noise"
         case .sent: "sent"
+        case .spam: "spam"
         }
     }
 
     /// Server-side tier filter for the page; nil = every tier. Nil for `sent`
     /// too, but vacuously: that page never goes to /client/updates at all, so
-    /// there is no tier to narrow.
+    /// there is no tier to narrow. Nil for `spam` for a REAL reason — a spam row
+    /// was never triaged, so it carries the neutral tier=noise seed, and asking
+    /// for `tier=noise` here would be filtering on a value that means nothing.
     var tier: Tier? {
         switch self {
-        case .inbox, .sent: nil
+        case .inbox, .sent, .spam: nil
         case .noise: .noise
         }
     }
 
+    /// Whether this page asks the daemon for the provider's spam folder
+    /// (`spam=only`) instead of the ordinary mailbox.
+    var spamOnly: Bool { self == .spam }
+
     /// What `n` flips to, so the key is one binding rather than two. It stays
-    /// the inbox/noise flip from every page: from `sent`, `n` dips into noise
-    /// exactly as it would from the inbox.
+    /// the inbox/noise flip from every page: from `sent` or `spam`, `n` dips
+    /// into noise exactly as it would from the inbox.
     var flipped: MailMode { self == .noise ? .inbox : .noise }
 }
 
@@ -1797,7 +1824,7 @@ final class AppStore {
     /// One page's rows. Never fetched reads as LOADING, so the first paint of a
     /// page shows "loading" rather than claiming it is empty.
     ///
-    /// INBOX AND NOISE ONLY — `.sent` holds a different wire type and lives in
+    /// EVERY PAGE BUT `.sent`, which holds a different wire type and lives in
     /// `sentPage`; asking here for it answers a permanent "loading".
     func mailPage(_ mode: MailMode) -> Loadable<[AttentionUpdate]> {
         mailPages[mode] ?? .loading
@@ -1836,7 +1863,8 @@ final class AppStore {
         withMailPage(mode) { $0.isLoading = true }
         do {
             let fetched = try await APIClient.shared.getUpdates(
-                UpdatesParams(tier: mode.tier, limit: Self.mailLimit))
+                UpdatesParams(
+                    tier: mode.tier, limit: Self.mailLimit, spamOnly: mode.spamOnly))
             // The rows belong to the account that asked for them. Both exits
             // below return rather than fall through, so the `isLoading` write
             // at the bottom is only ever reached by the live epoch.

@@ -34,6 +34,39 @@ enum Actions {
         }
     }
 
+    /// NOT SPAM: one message out of the provider's spam folder and back into
+    /// the mailbox. Gmail loses the SPAM label and regains INBOX, and the daemon
+    /// requeues the row so it finally gets a real triage verdict — it has never
+    /// had one.
+    ///
+    /// NO UNDO, and it is the only verb here without one. The inverse would be
+    /// re-filing the message as spam, which is a thing this product deliberately
+    /// does not do (see the `not_spam` handler): Passband cannot show anyone the
+    /// effects of training a filter it does not read. The stakes are also not
+    /// the same — a mistaken rescue leaves ONE extra message in a mailbox that
+    /// has `e` and archive a keystroke away, where a mistaken done hides mail
+    /// the user wanted. So the row drops off the spam page and that is that.
+    ///
+    /// The row is evicted from the cached pages the same way `done` evicts it,
+    /// for the same reason: the poll is ten seconds behind, and a rescued
+    /// message sitting visibly in the spam list until then reads as a failure.
+    static func notSpam(_ u: AttentionUpdate) async {
+        let restore = store.removeFromBands(u.id)
+        do {
+            try await APIClient.shared.actionNotSpam(u.id)
+            Analytics.capture("email_not_spam")
+            store.removeFromMail(u.id)
+            store.pushToast("moved to your inbox · \(u.sender)", .info)
+        } catch {
+            restore()
+            if let api = error as? APIError, api.kind == .forbidden {
+                store.pushToast("no write credential · run squelchd auth --write", .error)
+            } else {
+                store.pushToast(errText(error, "could not move it out of spam"), .error)
+            }
+        }
+    }
+
     /// Done (undo-first): status->done, revert resets status to open.
     static func done(_ u: AttentionUpdate) async {
         let restore = store.removeFromBands(u.id)

@@ -233,6 +233,15 @@ struct ClientMessage: Codable, Sendable, Identifiable, Hashable, SenderStringCon
     /// somebody else's mail. Aligns the chat bubbles, and picks which message
     /// in a thread a reminder lands on: see ThreadViewer's `h`.
     var is_sent: Bool?
+    /// THE PROVIDER'S SPAM VERDICT on this message. ABSENT on a daemon too old
+    /// to send it, and nil reads as false — a client that could not tell would
+    /// rather say nothing than accuse a message.
+    ///
+    /// The reader needs it because a thread opened from the spam page looks
+    /// exactly like any other thread once it is on screen: same chrome, same
+    /// bubbles, no tier, no one-liner. This is the only thing that can tell the
+    /// reader the mail in front of them was filtered rather than delivered.
+    var is_spam: Bool?
     /// This message's OWN triage verdict — ABSENT on a pre-highlight daemon.
     /// Drives the in-thread attention highlight: the bands show one row per
     /// thread, so the reader is where "which message is the reason" is answered.
@@ -677,6 +686,12 @@ struct StoreStats: Codable, Sendable, Hashable {
     var tier_counts: [String: Int]
     var total: Int
     var sealed: Int
+    /// How many messages the mail PROVIDER filed as spam — its own count, not a
+    /// `tier_counts` entry, because spam is not a tier. ABSENT on a daemon too
+    /// old to say, and nil reads as "no spam page to offer" rather than zero:
+    /// a client that showed a `0 spam` chip against a daemon that simply cannot
+    /// answer would be inventing a fact about the mailbox.
+    var spam: Int?
     var last_history_id: Int?
     var bands: BandCounts
     var last_surfaced_at: String?
@@ -958,6 +973,15 @@ struct Page<T: Codable & Sendable>: Codable, Sendable {
 }
 
 struct ArchiveBody: Codable, Sendable {
+    var message_id: Int
+    var confirm: Bool
+}
+
+/// "Not spam": one message out of the provider's spam folder and back into the
+/// inbox. Same shape as `ArchiveBody` because it is the same kind of act — one
+/// message, one confirmed Gmail write — but its own type, so a future field on
+/// either cannot silently appear on the other.
+struct NotSpamBody: Codable, Sendable {
     var message_id: Int
     var confirm: Bool
 }
@@ -1269,6 +1293,12 @@ struct UpdatesParams: Sendable {
     /// sorts these by remind_at, not by arrival, and it serves done rows —
     /// which every other read here would have excluded.
     var remindersPending: Bool
+    /// SWAP THE LISTING OVER TO THE PROVIDER'S SPAM FOLDER (`spam=only`). Not a
+    /// tier and not a band: spam is Gmail's verdict, nothing in Passband
+    /// triaged these rows, and every other read on this route excludes them.
+    /// A flag rather than an enum on this side because there are only two
+    /// states a client can ask for and the daemon rejects anything else.
+    var spamOnly: Bool
 
     init(
         since: String? = nil,
@@ -1278,7 +1308,8 @@ struct UpdatesParams: Sendable {
         band: Band? = nil,
         limit: Int? = nil,
         cursor: String? = nil,
-        remindersPending: Bool = false
+        remindersPending: Bool = false,
+        spamOnly: Bool = false
     ) {
         self.since = since
         self.min_importance = min_importance
@@ -1288,5 +1319,6 @@ struct UpdatesParams: Sendable {
         self.limit = limit
         self.cursor = cursor
         self.remindersPending = remindersPending
+        self.spamOnly = spamOnly
     }
 }

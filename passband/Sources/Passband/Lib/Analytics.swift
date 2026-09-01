@@ -84,7 +84,7 @@ enum Analytics {
     private static let allowedEvents: Set<String> = [
         "$screen", "Application Opened", "Application Backgrounded",
         "email_archived", "email_done", "email_reopened", "email_labeled",
-        "email_remind",
+        "email_remind", "email_not_spam",
         "block_rule_created", "compose_opened", "compose_send",
         "thread_opened", "thread_live_arrival", "undo_fired", "assistant_asked",
         "triage_corrected", "triage_digest", "rule_created", "rule_deleted",
@@ -104,6 +104,7 @@ enum Analytics {
     /// `email_labeled`) — the "which actions are used" layer.
     private static let minimalEvents: Set<String> = [
         "email_archived", "email_done", "email_reopened", "email_remind",
+        "email_not_spam",
         "block_rule_created", "compose_send", "thread_opened",
         // One bool: mail landed in the thread on screen, and whether the reader
         // was at the end of it (carried to the new message) or up in the
