@@ -230,6 +230,7 @@ struct EmailsView: View {
                                 UpdateRow(
                                     update: u,
                                     selected: kbActive && i == index,
+                                    verbHint: mode == .spam ? "[i][e][d]" : "[r][e][d]",
                                     onHover: {
                                         // A hover must NOT follow-scroll: a row near
                                         // the viewport edge would jump the list out
@@ -424,11 +425,17 @@ struct EmailsView: View {
                 .buttonStyle(.plain)
                 .help("the noise page — everything triage filed as noise (n)")
                 // THE SPAM DOOR, in the same shape as the noise count beside it
-                // and deliberately quieter than it: no accent when active, and
-                // absent entirely when the folder is empty or the daemon is too
-                // old to answer. It sits here rather than in the segmented
-                // control because spam is a place you go looking for something,
-                // once, not one of the three lists you live in.
+                // and one step quieter at rest (inkFaintest against its
+                // inkFaint), absent entirely when the folder is empty or the
+                // daemon is too old to answer. It still takes the accent while
+                // you are ON the page, exactly as the noise count does: that
+                // colour is not emphasis, it is where-you-are, and dropping it
+                // would leave the spam page the one list in the app whose door
+                // does not light up under you.
+                //
+                // It sits here rather than in the segmented control because
+                // spam is a place you go looking for something, once, not one
+                // of the three lists you live in.
                 if let spam = store.sitrep.stats?.spam, spam > 0 {
                     Button { store.mailMode = .spam } label: {
                         HStack(spacing: 8) {

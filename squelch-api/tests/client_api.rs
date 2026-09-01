@@ -8348,3 +8348,159 @@ async fn a_self_host_mailbox_is_told_it_is_disconnected_and_offered_no_link() {
     assert_eq!(json["gmail"]["connected"], serde_json::json!(false));
     assert!(json["gmail"].get("reconnect_url").is_none());
 }
+
+// --- the spam page over HTTP ------------------------------------------------
+
+/// Seed one ordinary signal message and one the provider filtered, and return
+/// `(good, spam)`. Both carry a triage row, because a spam row gets one at
+/// ingest like everything else — a neutral one nothing ever looked at.
+fn seed_inbox_and_spam(store: &SqliteStore, acct: i64) -> (i64, i64) {
+    let good = seed_one_signal(store, acct, "g-good", "t-good", "lunch tomorrow");
+    let mut m = msg(acct, "g-spam", "t-spam", "you have won", "claim your prize");
+    m.is_spam = true;
+    let spam = store.upsert_message(&m).unwrap();
+    store
+        .set_triage(
+            spam,
+            acct,
+            0,
+            Tier::Noise,
+            Sensitivity::Normal,
+            None,
+            "",
+            "",
+            None,
+        )
+        .unwrap();
+    (good, spam)
+}
+
+/// THE DEFAULT IS THE MAILBOX. Every existing client sends no `spam` parameter
+/// and must keep getting exactly what it got before this route learned the word.
+#[tokio::test]
+async fn updates_exclude_spam_when_the_parameter_is_absent() {
+    let mut spam_id = 0;
+    let Harness { app, .. } = harness(|store, acct| {
+        let (_, spam) = seed_inbox_and_spam(store, acct);
+        spam_id = spam;
+    });
+
+    let resp = app.oneshot(authed("GET", "/client/updates")).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+    let items = json["items"].as_array().unwrap();
+    assert_eq!(items.len(), 1, "only the ordinary message");
+    assert_ne!(items[0]["id"].as_i64().unwrap(), spam_id);
+}
+
+/// And `spam=only` is the page: the other side of the verdict, nothing else.
+#[tokio::test]
+async fn updates_serve_only_spam_when_asked_for_it() {
+    let mut spam_id = 0;
+    let Harness { app, .. } = harness(|store, acct| {
+        let (_, spam) = seed_inbox_and_spam(store, acct);
+        spam_id = spam;
+    });
+
+    let resp = app
+        .oneshot(authed("GET", "/client/updates?spam=only"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+    let items = json["items"].as_array().unwrap();
+    assert_eq!(items.len(), 1, "only the filtered message");
+    assert_eq!(items[0]["id"].as_i64().unwrap(), spam_id);
+}
+
+/// AN UNKNOWN VALUE IS A 400, never a silent full listing. A client asking for
+/// the spam folder and quietly getting the inbox back — or the reverse — is the
+/// worst failure this parameter has, because both answers look like real data.
+#[tokio::test]
+async fn updates_reject_an_unknown_spam_value() {
+    let Harness { app, .. } = harness(|store, acct| {
+        seed_inbox_and_spam(store, acct);
+    });
+    for bad in ["yes", "true", "1", "all", "exclude", ""] {
+        let resp = app
+            .clone()
+            .oneshot(authed("GET", &format!("/client/updates?spam={bad}")))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "spam={bad:?} must be refused, not guessed at"
+        );
+    }
+}
+
+/// The spam count rides on /client/stats as its own number, and the tier counts
+/// it used to inflate do not see it.
+#[tokio::test]
+async fn stats_carry_the_spam_count_apart_from_the_tiers() {
+    let Harness { app, .. } = harness(|store, acct| {
+        seed_inbox_and_spam(store, acct);
+    });
+    let resp = app.oneshot(authed("GET", "/client/stats")).await.unwrap();
+    let json = body_json(resp).await;
+    assert_eq!(json["spam"], serde_json::json!(1));
+    assert!(
+        json["tier_counts"].get("noise").is_none()
+            || json["tier_counts"]["noise"] == serde_json::json!(0),
+        "the filtered row must not count as noise: {}",
+        json["tier_counts"]
+    );
+}
+
+/// NOT SPAM NEEDS THE CONFIRM GATE and a write credential, like every other
+/// message-scoped action. Without a write credential the harness has none, so
+/// the confirmed call stops at 403 rather than reaching Gmail — which is the
+/// assertion that matters here: the route is wired, guarded, and ordered.
+#[tokio::test]
+async fn not_spam_is_confirm_gated_and_needs_a_write_credential() {
+    let mut spam_id = 0;
+    let Harness { app, store, acct } = harness(|store, acct| {
+        let (_, spam) = seed_inbox_and_spam(store, acct);
+        spam_id = spam;
+    });
+
+    // No confirm: refused before anything is touched.
+    let resp = app
+        .clone()
+        .oneshot(authed_json(
+            "POST",
+            "/client/actions/not_spam",
+            serde_json::json!({ "message_id": spam_id }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    // Confirmed, but this harness has no write credential.
+    let resp = app
+        .oneshot(authed_json(
+            "POST",
+            "/client/actions/not_spam",
+            serde_json::json!({ "message_id": spam_id, "confirm": true }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+    // AND THE LOCAL FLAG IS UNTOUCHED, which is the ordering guarantee: the
+    // Gmail write runs first, so a refused one leaves the message exactly where
+    // Gmail still has it rather than visible here and filtered everywhere else.
+    let rows = store
+        .attention_updates(
+            acct,
+            chrono::Utc::now() - chrono::Duration::days(1),
+            None,
+            None,
+            None,
+            false,
+            SpamScope::Only,
+        )
+        .unwrap();
+    assert_eq!(rows.len(), 1, "the row is still spam");
+}
