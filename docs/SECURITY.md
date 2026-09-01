@@ -493,10 +493,15 @@ The same reasoning is why the agent door gets **no spam at all** rather than
 spam it is told to distrust: everything the agent reads is text it may act on.
 
 **Enforcement, in order.**
-- **Fetched under its own label.** `squelch-core/src/sync/mod.rs` walks `SPAM`
-  last and subtracts the ids the INBOX and SENT walks already returned, so a
-  message carrying a visible label keeps the visible reading. The store's upsert
-  keeps `is_spam = MIN(stored, incoming)` as the backstop.
+- **Fetched only when asked for.** The poll loop does not walk the `SPAM` label
+  at all — not on backfill, not on a history tick, not on a catch-up.
+  `SyncEngine::sync_spam_window` runs when the page that shows the folder is
+  opened, capped at `sync.spam_max` newest-first. That is a cost decision rather
+  than a security one, but it has a security effect worth stating: the untrusted
+  corpus is not continuously ingested, so on an install where nobody ever opens
+  the page it is never fetched at all. The store's upsert keeps
+  `is_spam = MIN(stored, incoming)`, so a message ever seen under a visible
+  label cannot be hidden by a later spam sighting.
 - **Never triaged.** `sync/ingest.rs` returns a neutral `tier=noise` row before
   Stage-1 — after the seal check, so a misfiled OTP is still sealed and sealed
   still outranks spam. `ingest_message` stamps the `'n/a'` stage markers, which
@@ -521,6 +526,10 @@ spam it is told to distrust: everything the agent reads is text it may act on.
 **Guard tests.** `squelch-core/src/store/sqlite/tests/spam.rs` seeds one spam row
 beside one ordinary row with overlapping search terms and walks every listing at
 once, so a predicate dropped in a refactor fails there rather than in production.
+The sync suite asserts the "not fetched routinely" half against the mock's CALL
+LOG rather than against what landed: "no spam rows appeared" would also pass if
+the walk ran and the folder happened to be empty, and the thing being avoided is
+the request.
 
 ## 5. Outbound secret guard
 
