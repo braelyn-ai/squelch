@@ -1000,12 +1000,36 @@ pub fn ingest(
             // downstream. Check the actual part type and route real HTML
             // through OUR flattener, exactly like the body_html capture
             // below.
-            let text = match m.text_part(0) {
+            //
+            // A BLANK plain part reads as ABSENT. Senders that build both
+            // alternatives from a template routinely ship an EMPTY (or
+            // whitespace-only) text/plain part beside a full HTML one; taking
+            // it literally stored `body = ''` for the whole sender while
+            // `body_html` held kilobytes, and every downstream reader — triage,
+            // the extractors, FTS, embeddings — then judged the mail on its
+            // subject alone. The models do not report an empty body, they fill
+            // it, which is how an empty-bodied Venmo statement came back with
+            // this prompt's own scaffolding in the institution field.
+            let plain = match m.text_part(0) {
                 Some(p) if !p.is_text_html() => p.text_contents().unwrap_or_default().to_string(),
-                _ => match m.html_part(0).and_then(|p| p.text_contents()) {
-                    Some(h) => html_to_text(h),
-                    None => String::new(),
-                },
+                _ => String::new(),
+            };
+            let text = if plain.trim().is_empty() {
+                let flattened = m
+                    .html_part(0)
+                    .and_then(|p| p.text_contents())
+                    .map(html_to_text)
+                    .unwrap_or_default();
+                // Only PREFER the flattened HTML when it actually says
+                // something; otherwise keep the plain part, so a genuinely
+                // empty email is still stored exactly as it arrived.
+                if flattened.trim().is_empty() {
+                    plain
+                } else {
+                    flattened
+                }
+            } else {
+                plain
             };
             // Separately: capture the RENDERED HTML body (when present) and
             // sanitize it server-side for the human door. `None` for
@@ -1526,6 +1550,103 @@ mod tests {
         let c = t.calendar.expect("reservation detected end-to-end");
         assert_eq!(c.kind, crate::triage::CalendarKind::Reservation);
         assert_eq!(c.event_title.as_deref(), Some("EPIC Steak"));
+    }
+
+    #[test]
+    fn empty_plain_part_falls_through_to_the_html_alternative() {
+        // THE VENMO BUG: a template that emits BOTH alternatives can emit the
+        // text/plain one empty. Preferring it literally stored `body = ''` for
+        // every message that sender ever sent, while `body_html` held 20KB —
+        // so triage, the extractors, FTS and embeddings all judged the mail on
+        // its subject alone, and the banking extractor, handed nothing to read,
+        // invented an institution.
+        let eml = "From: Venmo <venmo@venmo.com>\r\n\
+                   To: me@example.com\r\n\
+                   Subject: Your July 2026 transaction history\r\n\
+                   Date: Thu, 20 Aug 2026 23:16:16 +0000\r\n\
+                   MIME-Version: 1.0\r\n\
+                   Content-Type: multipart/alternative; boundary=X\r\n\
+                   \r\n\
+                   --X\r\n\
+                   Content-Type: text/plain; charset=utf-8\r\n\
+                   \r\n\
+                   \r\n\
+                   --X\r\n\
+                   Content-Type: text/html; charset=utf-8\r\n\
+                   \r\n\
+                   <div>You transferred $26.00 to your bank</div>\r\n\
+                   --X--\r\n";
+        let f = raw(1, "g-venmo", eml, false);
+        let t = ingest(&f, &Stage1Config::default(), Utc::now(), |_| false);
+        assert!(
+            t.message.body.contains("You transferred $26.00"),
+            "an empty plain part must not shadow the HTML: {:?}",
+            t.message.body
+        );
+    }
+
+    #[test]
+    fn whitespace_only_plain_part_also_falls_through() {
+        // Same bug wearing a disguise: a part holding a couple of newlines is
+        // as empty as one holding nothing, and `is_empty()` alone would miss it.
+        let eml = "From: Venmo <venmo@venmo.com>\r\n\
+                   Subject: Ellie paid you $108.50\r\n\
+                   Date: Thu, 20 Aug 2026 23:16:16 +0000\r\n\
+                   MIME-Version: 1.0\r\n\
+                   Content-Type: multipart/alternative; boundary=X\r\n\
+                   \r\n\
+                   --X\r\n\
+                   Content-Type: text/plain; charset=utf-8\r\n\
+                   \r\n\
+                   \t   \r\n\
+                   \r\n\
+                   --X\r\n\
+                   Content-Type: text/html; charset=utf-8\r\n\
+                   \r\n\
+                   <div>Ellie Huxtable paid you $108.50</div>\r\n\
+                   --X--\r\n";
+        let f = raw(1, "g-venmo2", eml, false);
+        let t = ingest(&f, &Stage1Config::default(), Utc::now(), |_| false);
+        assert!(
+            t.message.body.contains("Ellie Huxtable paid you"),
+            "a whitespace-only plain part must not shadow the HTML: {:?}",
+            t.message.body
+        );
+    }
+
+    #[test]
+    fn a_real_plain_part_still_wins_over_the_html_alternative() {
+        // The fall-through must stay a FALL-THROUGH. Plain text is still the
+        // preferred surface when the sender actually filled it in — flattened
+        // HTML is a reconstruction, and reconstructing what was handed over
+        // cleanly is how block-gluing bugs get in.
+        let eml = "From: Shop <orders@shop.com>\r\n\
+                   Subject: Your order\r\n\
+                   Date: Thu, 20 Aug 2026 23:16:16 +0000\r\n\
+                   MIME-Version: 1.0\r\n\
+                   Content-Type: multipart/alternative; boundary=X\r\n\
+                   \r\n\
+                   --X\r\n\
+                   Content-Type: text/plain; charset=utf-8\r\n\
+                   \r\n\
+                   THE PLAIN ONE\r\n\
+                   --X\r\n\
+                   Content-Type: text/html; charset=utf-8\r\n\
+                   \r\n\
+                   <div>THE HTML ONE</div>\r\n\
+                   --X--\r\n";
+        let f = raw(1, "g-shop", eml, false);
+        let t = ingest(&f, &Stage1Config::default(), Utc::now(), |_| false);
+        assert!(
+            t.message.body.contains("THE PLAIN ONE"),
+            "{:?}",
+            t.message.body
+        );
+        assert!(
+            !t.message.body.contains("THE HTML ONE"),
+            "{:?}",
+            t.message.body
+        );
     }
 
     #[test]
