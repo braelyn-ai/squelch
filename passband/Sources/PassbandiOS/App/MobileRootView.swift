@@ -10,12 +10,14 @@
 // quick look, mail — plus the search role parked at the trailing end.
 //
 // WHAT CAME OFF THE BAR, and where it went. Settings and the login codes are not
-// places anyone lives; they are reference surfaces you visit off the dashboard
-// and leave, so they hang from the sitrep's navigation bar (a person glyph
-// leading, a key trailing) instead of each spending permanent bar width. The
-// agent's own tab is gone too: one text field per screen is what a phone
-// actually has, so the assistant lives behind the search field and the chat is
-// a push off that stack. Two doors for "ask me something" was one too many.
+// places anyone lives; they are reference surfaces you visit and leave, so they
+// hang from a navigation bar instead of each spending permanent bar width —
+// settings behind the person glyph leading the sitrep's, the codes behind a key
+// trailing Quick Look's, which is the tab that already holds everything else the
+// app pulled out of your mail for you to look up. The agent's own tab is gone
+// too: one text field per screen is what a phone actually has, so the assistant
+// lives behind the search field and the chat is a push off that stack. Two doors
+// for "ask me something" was one too many.
 //
 // AND THE READER IS A PUSH. On the Mac the thread viewer is a zIndex-20 layer
 // that covers the window; here it is a NavigationStack destination — but driven
@@ -169,12 +171,14 @@ private struct MobileShell: View {
                     EmailsView()
                         .navigationTitle("Mail")
                         .navigationBarTitleDisplayMode(.inline)
-                        // `c` ON THE MAC IS GLOBAL; here the new-message door is
-                        // ONE door, and it is on the mail. A phone's global verb
-                        // is a tab, and a compose button repeated across every
-                        // one of them is four buttons for one composer. Replies
-                        // do not come through here at all — they open in the
-                        // reader, where the thread they answer is.
+                        // `c` ON THE MAC IS GLOBAL; here the new-message door
+                        // is on the two surfaces you would reach for it from —
+                        // this one, and the dashboard the app opens on — and not
+                        // on all four, which would be four buttons for one
+                        // composer. Both raise THE SAME `store.compose`, so the
+                        // draft, the autosave and the send ceremony are one code
+                        // path. Replies do not come through here at all: they
+                        // open in the reader, where the thread they answer is.
                         .toolbar {
                             ToolbarItem(placement: .topBarTrailing) {
                                 Button { store.openComposeNew() } label: {

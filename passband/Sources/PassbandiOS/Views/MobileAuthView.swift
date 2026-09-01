@@ -1,16 +1,25 @@
-// LOGIN CODES, BEHIND THE KEY IN THE SITREP'S BAR. The Mac puts auth mail behind
+// LOGIN CODES, BEHIND THE KEY IN QUICK LOOK'S BAR. The Mac puts auth mail behind
 // a rail icon with a countdown ring on it and a whole page (`g`) behind that; the
-// phone now has the same two halves, at phone scale: a key glyph on the dashboard
-// that wears a live dot when something just landed, and this page behind it. A
-// login code is the single most time-critical thing in an inbox — you are standing
-// at a login form holding the phone that has the code on it — so what it costs to
-// reach is one tap from the surface you open the app onto.
+// phone has the same two halves, at phone scale: a key glyph that wears a live
+// dot when something just landed, and this page behind it.
 //
-// IT IS NOT A TAB, and that is the point of moving it here. Codes are not a place
-// you live; they are a thing you look up in the ten seconds a form is waiting on
-// you and then leave. A tab spends permanent bar width on a surface that is empty
-// most days, and Quick Look (where this zone used to head the column) is a scroll
-// you would be racing a code's expiry to reach.
+// IT IS NOT A TAB. Codes are not a place you live; they are a thing you look up
+// in the ten seconds a form is waiting on you and then leave. A tab spends
+// permanent bar width on a surface that is empty most days.
+//
+// THE KEY SITS ON QUICK LOOK, which is the tab whose whole thesis is "something
+// the app pulled out of your mail and is holding for you to look up" — the same
+// sentence this page is. It spent a while on the sitrep's bar instead, and the
+// reason it left is that the dashboard's trailing corner is worth more to a door
+// you open every day (the composer) than to one that is empty most days.
+//
+// AND THE URGENT HALF DOES NOT WAIT TO BE FOUND. Moving the key one tab over
+// would have made the most time-critical row on the phone the hardest to reach,
+// so the case that is actually a race — a code-kind message that just landed —
+// raises its own card at the top of the sitrep and reveals FROM THERE, without
+// coming through this page at all (MobileSitrepView). `freshCodes` is the gate
+// and `revealCode` is the tap, both below, so the two surfaces cannot disagree
+// about what is fresh or take different routes to the same digits.
 //
 // PRESENT, DON'T READ, exactly as the Mac does it. This page renders sealed
 // METADATA only — who it is from, what kind, how long ago. No body is fetched to
@@ -31,10 +40,11 @@ struct MobileAuthView: View {
     @Environment(AppStore.self) private var store
 
     /// Newer than this keeps its live ring and reads "live". Same window the
-    /// Mac's auth page calls "last hour" — and the same one the sitrep's key
-    /// badge asks about, which is why it and `isLive` are internal rather than
-    /// private: two surfaces disagreeing about what "live" means would make the
-    /// dot and the row contradict each other.
+    /// Mac's auth page calls "last hour" — and the same one the key's dot and
+    /// the sitrep's fresh-code card ask about, which is why it and `isLive` are
+    /// internal rather than private: three surfaces disagreeing about what
+    /// "live" means would make the dot, the card and the row contradict each
+    /// other.
     static let liveWindow: TimeInterval = 60 * 60
 
     static func age(_ iso: String?) -> TimeInterval {
@@ -44,6 +54,36 @@ struct MobileAuthView: View {
 
     static func isLive(_ meta: SealedMeta) -> Bool {
         age(meta.received_at) <= liveWindow
+    }
+
+    /// The sitrep card's gate: sealed mail that is BOTH inside the live window
+    /// and actually holding digits, newest first.
+    ///
+    /// BOTH HALVES, because only one of them is a race. A sign-in alert from
+    /// four minutes ago is live and is still a thing you read when you get to
+    /// it — nobody is standing at a form waiting on it — so it stays a row on
+    /// this page and a dot on the key rather than jumping the dashboard. What
+    /// earns the top of the sitrep is the case where the phone is the only
+    /// thing between you and being logged in.
+    static func freshCodes(_ sealed: [SealedMeta]) -> [SealedMeta] {
+        sealed
+            .filter { AuthCode.isCodeKind($0.kind) && isLive($0) }
+            .sorted { age($0.received_at) < age($1.received_at) }
+    }
+
+    /// The reveal itself, shared by this page and the sitrep's card: ONE audited
+    /// `revealSealed` and one `pushAuthCode`, so the modal that appears, its 30s
+    /// self-destruct and its copy button are the same wherever the tap happened.
+    /// The caller owns its own busy flag; nothing is held here, and the digits
+    /// go straight into the store entry the modal reads.
+    @MainActor
+    static func revealCode(_ meta: SealedMeta, into store: AppStore) async {
+        do {
+            let revealed = try await APIClient.shared.revealSealed(meta.id)
+            store.pushAuthCode(AuthCodeEntry(meta: meta, code: AuthCode.extract(revealed.body)))
+        } catch {
+            store.pushToast(errText(error, "reveal failed"), .error)
+        }
     }
 
     @State private var busy: Int?
@@ -139,9 +179,9 @@ struct MobileAuthView: View {
     }
 
     /// The desktop `reveal(_:)`, verbatim in shape: code kinds resolve to digits,
-    /// everything else opens the panel. The digits land in the store's auth queue
-    /// — the same place the arrival flow puts them — so the modal, its timer and
-    /// its dismissal are all the shared implementation.
+    /// everything else opens the panel. This half — the kind branch and the busy
+    /// flag — is the page's; the audited call itself is `revealCode` above,
+    /// which the sitrep's card runs too.
     private func reveal(_ meta: SealedMeta) async {
         guard AuthCode.isCodeKind(meta.kind) else {
             revealing = meta
@@ -150,19 +190,19 @@ struct MobileAuthView: View {
         guard busy == nil else { return }
         busy = meta.id
         defer { busy = nil }
-        do {
-            let revealed = try await APIClient.shared.revealSealed(meta.id)
-            store.pushAuthCode(AuthCodeEntry(meta: meta, code: AuthCode.extract(revealed.body)))
-        } catch {
-            store.pushToast(errText(error, "reveal failed"), .error)
-        }
+        await Self.revealCode(meta, into: store)
     }
 }
 
 /// One sealed message: who, what kind, how old — and a reveal affordance that
 /// says what it will do. Never the subject line of a code mail's body, never a
 /// preview: the point of the seal is that nothing read it.
-private struct AuthRow: View {
+///
+/// INTERNAL, not private, because the sitrep's fresh-code card draws THIS row
+/// rather than a second one that looks like it. A card that rendered the same
+/// message a little differently from the page behind it would be two answers to
+/// "what just arrived".
+struct AuthRow: View {
     @Environment(AppStore.self) private var store
     let meta: SealedMeta
     let live: Bool
