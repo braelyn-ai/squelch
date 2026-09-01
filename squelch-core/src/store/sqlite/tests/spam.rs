@@ -115,6 +115,23 @@ fn spam_is_absent_from_every_listing() {
             .collect(),
         "search_filtered",
     );
+
+    // THE AGENT DOOR'S SEARCH, which is the one that matters most: /mcp reaches
+    // the store through `hybrid_search`, and it is the only caller here whose
+    // reader can be talked into things by what comes back. With no embedder
+    // attached this degenerates to keyword-only, which is exactly the point —
+    // it exercises `fts_recall` and `search_hit_by_id`, the two queries the
+    // legs above do not touch.
+    has(
+        store
+            .hybrid_search(acct, "lunch", &filter, SearchSort::Recent, 50)
+            .unwrap()
+            .0
+            .iter()
+            .map(|h| h.id)
+            .collect(),
+        "hybrid_search",
+    );
 }
 
 /// The header's noise count is the DOOR to the noise page, so it must count
