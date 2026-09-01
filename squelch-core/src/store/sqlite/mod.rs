@@ -39,10 +39,10 @@ use crate::store::{
     AttachmentBytes, BankingApplied, ContactEntry, Device, DeviceToken, Draft, DraftFields,
     ExtractQueued, InboxUnread, IssuedDeviceToken, MarketingApplied, MarketingOffer, MessageOpen,
     MessageUnsub, MintedPairingCode, MissingVector, NewAuditEntry, NewEvent, RevisitQueued,
-    SealedBody, SealedMessage, SearchFilter, SearchSort, SeedVerdict, SenderHistory, SentMessage,
-    SentMissingRecipients, SitrepBand, Stage1Applied, Stage1Queued, Stage2Applied,
-    Stage2CapOverrides, Stage2Queued, Stage2Usage, Stage2UsageDay, Store, SyncState, ThreadSibling,
-    TrackedMessage, TriageDebug, TriagedMessage, UsageTokens,
+    SPAM_SYNCED_AT_KEY, SealedBody, SealedMessage, SearchFilter, SearchSort, SeedVerdict,
+    SenderHistory, SentMessage, SentMissingRecipients, SitrepBand, SpamScope, Stage1Applied,
+    Stage1Queued, Stage2Applied, Stage2CapOverrides, Stage2Queued, Stage2Usage, Stage2UsageDay,
+    Store, SyncState, ThreadSibling, TrackedMessage, TriageDebug, TriagedMessage, UsageTokens,
 };
 use crate::types::{
     AccountId, AttachmentInfo, AttentionStatus, AttentionUpdate, AuditEntry, BandCounts, Banking,
@@ -674,6 +674,10 @@ impl Store for SqliteStore {
         self.retriage_reset(account_id, message_id, days)
     }
 
+    fn clear_spam(&self, account_id: AccountId, message_id: i64) -> Result<bool> {
+        self.clear_spam(account_id, message_id)
+    }
+
     fn retriage_progress(&self, account_id: AccountId) -> Result<RetriageProgress> {
         self.retriage_progress(account_id)
     }
@@ -842,6 +846,7 @@ impl Store for SqliteStore {
         status: Option<AttentionStatus>,
         band: Option<SitrepBand>,
         pending_reminders: bool,
+        spam: SpamScope,
     ) -> Result<Vec<AttentionUpdate>> {
         self.attention_updates(
             account_id,
@@ -850,6 +855,7 @@ impl Store for SqliteStore {
             status,
             band,
             pending_reminders,
+            spam,
         )
     }
 

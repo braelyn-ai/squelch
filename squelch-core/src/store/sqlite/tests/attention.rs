@@ -174,7 +174,7 @@ fn mark_surfaced_is_stamp_once_and_promotes_new_to_open() {
 
     // Pre-stamp: status new, surfaced_at NULL.
     let before = store
-        .attention_updates(acct, since, None, None, None, false)
+        .attention_updates(acct, since, None, None, None, false, SpamScope::Exclude)
         .unwrap();
     assert_eq!(before.len(), 1);
     assert_eq!(before[0].status, AttentionStatus::New);
@@ -184,7 +184,7 @@ fn mark_surfaced_is_stamp_once_and_promotes_new_to_open() {
     let n = store.mark_surfaced(acct, &[id]).unwrap();
     assert_eq!(n, 1, "first surface counts as a transition");
     let after = store
-        .attention_updates(acct, since, None, None, None, false)
+        .attention_updates(acct, since, None, None, None, false, SpamScope::Exclude)
         .unwrap();
     assert_eq!(after[0].status, AttentionStatus::Open);
     let stamp = after[0].surfaced_at.expect("surfaced_at set");
@@ -193,7 +193,7 @@ fn mark_surfaced_is_stamp_once_and_promotes_new_to_open() {
     let n2 = store.mark_surfaced(acct, &[id]).unwrap();
     assert_eq!(n2, 0, "second surface transitions nothing");
     let after2 = store
-        .attention_updates(acct, since, None, None, None, false)
+        .attention_updates(acct, since, None, None, None, false, SpamScope::Exclude)
         .unwrap();
     assert_eq!(after2[0].surfaced_at, Some(stamp));
     assert_eq!(after2[0].status, AttentionStatus::Open);
@@ -219,14 +219,30 @@ fn band_queries_bucket_correctly() {
 
     // STANDING: only the bill (tier past_due/deadline, not done).
     let standing = store
-        .attention_updates(acct, since, None, None, Some(SitrepBand::Standing), false)
+        .attention_updates(
+            acct,
+            since,
+            None,
+            None,
+            Some(SitrepBand::Standing),
+            false,
+            SpamScope::Exclude,
+        )
         .unwrap();
     assert_eq!(standing.len(), 1);
     assert_eq!(standing[0].update.id, bill);
 
     // NEW: everything (nothing surfaced yet).
     let new = store
-        .attention_updates(acct, since, None, None, Some(SitrepBand::New), false)
+        .attention_updates(
+            acct,
+            since,
+            None,
+            None,
+            Some(SitrepBand::New),
+            false,
+            SpamScope::Exclude,
+        )
         .unwrap();
     assert_eq!(new.len(), 3);
 
@@ -235,14 +251,30 @@ fn band_queries_bucket_correctly() {
 
     // NEW now only the bill.
     let new2 = store
-        .attention_updates(acct, since, None, None, Some(SitrepBand::New), false)
+        .attention_updates(
+            acct,
+            since,
+            None,
+            None,
+            Some(SitrepBand::New),
+            false,
+            SpamScope::Exclude,
+        )
         .unwrap();
     assert_eq!(new2.len(), 1);
     assert_eq!(new2[0].update.id, bill);
 
     // OPEN band sorted by age*importance: aged (14d*60) before fresh (0d*70).
     let open = store
-        .attention_updates(acct, since, None, None, Some(SitrepBand::Open), false)
+        .attention_updates(
+            acct,
+            since,
+            None,
+            None,
+            Some(SitrepBand::Open),
+            false,
+            SpamScope::Exclude,
+        )
         .unwrap();
     assert_eq!(open.len(), 2);
     assert_eq!(open[0].update.id, aged, "older*importance floats to top");
@@ -261,7 +293,15 @@ fn set_attention_status_resolves_and_reopens() {
             .unwrap()
     );
     let done = store
-        .attention_updates(acct, since, None, Some(AttentionStatus::Done), None, false)
+        .attention_updates(
+            acct,
+            since,
+            None,
+            Some(AttentionStatus::Done),
+            None,
+            false,
+            SpamScope::Exclude,
+        )
         .unwrap();
     assert_eq!(done.len(), 1);
     assert!(done[0].resolved_at.is_some(), "done stamps resolved_at");
@@ -273,7 +313,15 @@ fn set_attention_status_resolves_and_reopens() {
             .unwrap()
     );
     let open = store
-        .attention_updates(acct, since, None, Some(AttentionStatus::Open), None, false)
+        .attention_updates(
+            acct,
+            since,
+            None,
+            Some(AttentionStatus::Open),
+            None,
+            false,
+            SpamScope::Exclude,
+        )
         .unwrap();
     assert_eq!(open.len(), 1);
     assert!(open[0].resolved_at.is_none(), "reopen clears resolved_at");
@@ -316,7 +364,15 @@ fn resolve_sender_clears_every_open_thread_from_that_address() {
 
     let since = now - chrono::Duration::days(1);
     let open = store
-        .attention_updates(acct, since, None, Some(AttentionStatus::Open), None, false)
+        .attention_updates(
+            acct,
+            since,
+            None,
+            Some(AttentionStatus::Open),
+            None,
+            false,
+            SpamScope::Exclude,
+        )
         .unwrap();
     assert!(
         !open.iter().any(|u| u.update.id == a || u.update.id == b),
@@ -324,7 +380,15 @@ fn resolve_sender_clears_every_open_thread_from_that_address() {
     );
 
     let done = store
-        .attention_updates(acct, since, None, Some(AttentionStatus::Done), None, false)
+        .attention_updates(
+            acct,
+            since,
+            None,
+            Some(AttentionStatus::Done),
+            None,
+            false,
+            SpamScope::Exclude,
+        )
         .unwrap();
     assert!(
         done.iter().all(|u| u.update.id != other),
@@ -375,7 +439,15 @@ fn thread_shows_one_row_and_done_resolves_the_whole_thread() {
     // One row for the duplicated thread, and it is the band-sort-first message
     // (higher importance wins the representative slot).
     let standing = store
-        .attention_updates(acct, since, None, None, Some(SitrepBand::Standing), false)
+        .attention_updates(
+            acct,
+            since,
+            None,
+            None,
+            Some(SitrepBand::Standing),
+            false,
+            SpamScope::Exclude,
+        )
         .unwrap();
     assert_eq!(standing.len(), 2, "two threads, two rows: {standing:#?}");
     assert_eq!(
@@ -405,7 +477,15 @@ fn thread_shows_one_row_and_done_resolves_the_whole_thread() {
             .unwrap()
     );
     let standing2 = store
-        .attention_updates(acct, since, None, None, Some(SitrepBand::Standing), false)
+        .attention_updates(
+            acct,
+            since,
+            None,
+            None,
+            Some(SitrepBand::Standing),
+            false,
+            SpamScope::Exclude,
+        )
         .unwrap();
     assert_eq!(
         standing2.len(),
@@ -416,7 +496,15 @@ fn thread_shows_one_row_and_done_resolves_the_whole_thread() {
 
     // The unrelated thread was untouched.
     let done = store
-        .attention_updates(acct, since, None, Some(AttentionStatus::Done), None, false)
+        .attention_updates(
+            acct,
+            since,
+            None,
+            Some(AttentionStatus::Done),
+            None,
+            false,
+            SpamScope::Exclude,
+        )
         .unwrap();
     assert!(done.iter().all(|u| u.update.id != other));
 }
@@ -435,13 +523,21 @@ fn sealed_rows_never_surface_through_the_ledger() {
     // Never appears in attention_updates (any band).
     assert!(
         store
-            .attention_updates(acct, since, None, None, None, false)
+            .attention_updates(acct, since, None, None, None, false, SpamScope::Exclude)
             .unwrap()
             .is_empty()
     );
     assert!(
         store
-            .attention_updates(acct, since, None, None, Some(SitrepBand::New), false)
+            .attention_updates(
+                acct,
+                since,
+                None,
+                None,
+                Some(SitrepBand::New),
+                false,
+                SpamScope::Exclude
+            )
             .unwrap()
             .is_empty()
     );
@@ -499,7 +595,15 @@ fn dateless(store: &SqliteStore, acct: AccountId, gmail: &str, thread: &str, fro
 
 fn standing_ids(store: &SqliteStore, acct: AccountId, since: DateTime<Utc>) -> Vec<i64> {
     store
-        .attention_updates(acct, since, None, None, Some(SitrepBand::Standing), false)
+        .attention_updates(
+            acct,
+            since,
+            None,
+            None,
+            Some(SitrepBand::Standing),
+            false,
+            SpamScope::Exclude,
+        )
         .unwrap()
         .into_iter()
         .map(|u| u.update.id)
@@ -595,7 +699,7 @@ fn standing_admits_a_thread_the_user_has_written_in() {
 
     // SECURITY/UX: the evidence row is never itself listed, in any band.
     let all = store
-        .attention_updates(acct, since, None, None, None, false)
+        .attention_updates(acct, since, None, None, None, false, SpamScope::Exclude)
         .unwrap();
     assert!(
         all.iter().all(|u| u.update.id != reply),
@@ -824,7 +928,7 @@ fn stats_bands_and_last_surfaced_at() {
 /// The pending-reminder schedule, in listing order.
 fn pending_ids(store: &SqliteStore, acct: AccountId, since: DateTime<Utc>) -> Vec<i64> {
     store
-        .attention_updates(acct, since, None, None, None, true)
+        .attention_updates(acct, since, None, None, None, true, SpamScope::Exclude)
         .unwrap()
         .into_iter()
         .map(|u| u.update.id)
@@ -835,7 +939,7 @@ fn pending_ids(store: &SqliteStore, acct: AccountId, since: DateTime<Utc>) -> Ve
 /// actually reads, so the assertions run through the same columns it does.
 fn all_updates(store: &SqliteStore, acct: AccountId, since: DateTime<Utc>) -> Vec<AttentionUpdate> {
     store
-        .attention_updates(acct, since, None, None, None, false)
+        .attention_updates(acct, since, None, None, None, false, SpamScope::Exclude)
         .unwrap()
 }
 

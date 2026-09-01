@@ -9,7 +9,7 @@ use axum::http::{Request, StatusCode, header};
 use http_body_util::BodyExt;
 use serde_json::Value;
 use squelch_api::{ApiState, router};
-use squelch_core::store::{SqliteStore, Store, UsageTokens};
+use squelch_core::store::{SpamScope, SqliteStore, Store, UsageTokens};
 use squelch_core::types::{SealedKind, Sensitivity, Tier};
 use tower::ServiceExt;
 
@@ -3823,6 +3823,7 @@ async fn updates_stamp_once_and_carry_prestamp_surfaced_at() {
             None,
             None,
             false,
+            SpamScope::Exclude,
         )
         .unwrap();
     let first_stamp = after[0].surfaced_at.expect("surfaced_at now set");
@@ -3840,6 +3841,7 @@ async fn updates_stamp_once_and_carry_prestamp_surfaced_at() {
             None,
             None,
             false,
+            SpamScope::Exclude,
         )
         .unwrap();
     assert_eq!(
@@ -3868,7 +3870,7 @@ async fn peek_returns_the_same_rows_without_stamping_the_ledger() {
 
     // ...and the ledger is untouched: nothing was actually shown to anyone.
     let after_peek = store
-        .attention_updates(acct, window(), None, None, None, false)
+        .attention_updates(acct, window(), None, None, None, false, SpamScope::Exclude)
         .unwrap();
     assert_eq!(after_peek.len(), 2);
     for u in &after_peek {
@@ -3885,7 +3887,7 @@ async fn peek_returns_the_same_rows_without_stamping_the_ledger() {
     let resp2 = app.oneshot(authed("GET", "/client/updates")).await.unwrap();
     assert_eq!(resp2.status(), StatusCode::OK);
     let after_normal = store
-        .attention_updates(acct, window(), None, None, None, false)
+        .attention_updates(acct, window(), None, None, None, false, SpamScope::Exclude)
         .unwrap();
     for u in &after_normal {
         assert!(u.surfaced_at.is_some(), "normal fetch stamps surfaced_at");
@@ -4023,6 +4025,7 @@ async fn dismiss_and_reopen_endpoint() {
             Some(AttentionStatus::Done),
             None,
             false,
+            SpamScope::Exclude,
         )
         .unwrap();
     assert_eq!(done.len(), 1);
@@ -4127,7 +4130,15 @@ async fn reminder_endpoint_defers_the_thread_and_schedules_its_return() {
     // DEFERRING IS RESOLVING: one round trip both hides the mail and schedules
     // it, and the listing carries the pending stamp back.
     let rows = store
-        .attention_updates(acct, reminder_window(), None, None, None, false)
+        .attention_updates(
+            acct,
+            reminder_window(),
+            None,
+            None,
+            None,
+            false,
+            SpamScope::Exclude,
+        )
         .unwrap();
     assert_eq!(rows[0].status, AttentionStatus::Done);
     assert!(rows[0].resolved_at.is_some());
@@ -4166,7 +4177,15 @@ async fn reminder_rejects_a_past_or_unparseable_date() {
     // And nothing was scheduled.
     assert!(
         store
-            .attention_updates(acct, reminder_window(), None, None, None, true)
+            .attention_updates(
+                acct,
+                reminder_window(),
+                None,
+                None,
+                None,
+                true,
+                SpamScope::Exclude
+            )
             .unwrap()
             .is_empty()
     );
@@ -4256,7 +4275,15 @@ async fn reminder_on_the_users_own_sent_mail_is_404() {
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     assert!(
         store
-            .attention_updates(acct, reminder_window(), None, None, None, true)
+            .attention_updates(
+                acct,
+                reminder_window(),
+                None,
+                None,
+                None,
+                true,
+                SpamScope::Exclude
+            )
             .unwrap()
             .is_empty(),
         "nothing was scheduled"
@@ -4371,7 +4398,15 @@ async fn clear_reminder_endpoint_is_idempotent() {
     }
 
     let rows = store
-        .attention_updates(acct, reminder_window(), None, None, None, false)
+        .attention_updates(
+            acct,
+            reminder_window(),
+            None,
+            None,
+            None,
+            false,
+            SpamScope::Exclude,
+        )
         .unwrap();
     assert!(rows[0].remind_at.is_none(), "un-scheduled");
     assert_eq!(
@@ -4433,7 +4468,15 @@ async fn pending_reminder_listing_is_soonest_first_and_never_stamps() {
     // AND IT NEVER STAMPS: these are deferred rows the user is reviewing the
     // schedule of, not mail being shown to them.
     let rows = store
-        .attention_updates(acct, reminder_window(), None, None, None, true)
+        .attention_updates(
+            acct,
+            reminder_window(),
+            None,
+            None,
+            None,
+            true,
+            SpamScope::Exclude,
+        )
         .unwrap();
     assert!(
         rows.iter().all(|u| u.surfaced_at.is_none()),
@@ -4476,6 +4519,7 @@ async fn archive_success_resolves_target_to_done() {
             Some(AttentionStatus::Done),
             None,
             false,
+            SpamScope::Exclude,
         )
         .unwrap();
     assert_eq!(done.len(), 1);
@@ -4987,6 +5031,7 @@ async fn an_inferred_squelch_never_resolves_the_senders_open_mail() {
             Some(AttentionStatus::Done),
             None,
             false,
+            SpamScope::Exclude,
         )
         .unwrap();
     assert!(
@@ -5049,6 +5094,7 @@ async fn a_literal_auto_squelch_is_inferred_and_never_resolves_open_mail() {
             Some(AttentionStatus::Done),
             None,
             false,
+            SpamScope::Exclude,
         )
         .unwrap();
     assert!(
@@ -5595,6 +5641,7 @@ async fn unsubscribe_resolves_the_source_email_to_done() {
             Some(AttentionStatus::Done),
             None,
             false,
+            SpamScope::Exclude,
         )
         .unwrap();
     assert!(
@@ -5672,6 +5719,7 @@ async fn squelch_rule_with_source_message_resolves_it_surface_does_not() {
             Some(AttentionStatus::Done),
             None,
             false,
+            SpamScope::Exclude,
         )
         .unwrap();
     assert!(
@@ -5732,6 +5780,7 @@ async fn an_explicit_squelch_without_sweep_resolves_nothing() {
             Some(AttentionStatus::Done),
             None,
             false,
+            SpamScope::Exclude,
         )
         .unwrap();
     assert!(
@@ -5854,6 +5903,7 @@ async fn sweep_resolves_by_sender_and_a_wildcard_resolves_only_the_source() {
             Some(AttentionStatus::Done),
             None,
             false,
+            SpamScope::Exclude,
         )
         .unwrap();
     let is_done = |id: i64| done.iter().any(|u| u.update.id == id);
@@ -7700,6 +7750,7 @@ async fn forward_success_sends_a_new_conversation_carrying_the_original() {
             Some(squelch_core::types::AttentionStatus::Done),
             None,
             false,
+            SpamScope::Exclude,
         )
         .unwrap();
     assert!(
@@ -8296,4 +8347,196 @@ async fn a_self_host_mailbox_is_told_it_is_disconnected_and_offered_no_link() {
     let json = body_json(resp).await;
     assert_eq!(json["gmail"]["connected"], serde_json::json!(false));
     assert!(json["gmail"].get("reconnect_url").is_none());
+}
+
+// --- the spam page over HTTP ------------------------------------------------
+
+/// Seed one ordinary signal message and one the provider filtered, and return
+/// `(good, spam)`. Both carry a triage row, because a spam row gets one at
+/// ingest like everything else — a neutral one nothing ever looked at.
+fn seed_inbox_and_spam(store: &SqliteStore, acct: i64) -> (i64, i64) {
+    let good = seed_one_signal(store, acct, "g-good", "t-good", "lunch tomorrow");
+    let mut m = msg(acct, "g-spam", "t-spam", "you have won", "claim your prize");
+    m.is_spam = true;
+    let spam = store.upsert_message(&m).unwrap();
+    store
+        .set_triage(
+            spam,
+            acct,
+            0,
+            Tier::Noise,
+            Sensitivity::Normal,
+            None,
+            "",
+            "",
+            None,
+        )
+        .unwrap();
+    (good, spam)
+}
+
+/// THE DEFAULT IS THE MAILBOX. Every existing client sends no `spam` parameter
+/// and must keep getting exactly what it got before this route learned the word.
+#[tokio::test]
+async fn updates_exclude_spam_when_the_parameter_is_absent() {
+    let mut spam_id = 0;
+    let Harness { app, .. } = harness(|store, acct| {
+        let (_, spam) = seed_inbox_and_spam(store, acct);
+        spam_id = spam;
+    });
+
+    let resp = app.oneshot(authed("GET", "/client/updates")).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+    let items = json["items"].as_array().unwrap();
+    assert_eq!(items.len(), 1, "only the ordinary message");
+    assert_ne!(items[0]["id"].as_i64().unwrap(), spam_id);
+}
+
+/// And `spam=only` is the page: the other side of the verdict, nothing else.
+#[tokio::test]
+async fn updates_serve_only_spam_when_asked_for_it() {
+    let mut spam_id = 0;
+    let Harness { app, .. } = harness(|store, acct| {
+        let (_, spam) = seed_inbox_and_spam(store, acct);
+        spam_id = spam;
+    });
+
+    let resp = app
+        .oneshot(authed("GET", "/client/updates?spam=only"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+    let items = json["items"].as_array().unwrap();
+    assert_eq!(items.len(), 1, "only the filtered message");
+    assert_eq!(items[0]["id"].as_i64().unwrap(), spam_id);
+}
+
+/// AN UNKNOWN VALUE IS A 400, never a silent full listing. A client asking for
+/// the spam folder and quietly getting the inbox back — or the reverse — is the
+/// worst failure this parameter has, because both answers look like real data.
+#[tokio::test]
+async fn updates_reject_an_unknown_spam_value() {
+    let Harness { app, .. } = harness(|store, acct| {
+        seed_inbox_and_spam(store, acct);
+    });
+    for bad in ["yes", "true", "1", "all", "exclude", ""] {
+        let resp = app
+            .clone()
+            .oneshot(authed("GET", &format!("/client/updates?spam={bad}")))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "spam={bad:?} must be refused, not guessed at"
+        );
+    }
+}
+
+/// The spam count rides on /client/stats as its own number, and the tier counts
+/// it used to inflate do not see it.
+#[tokio::test]
+async fn stats_carry_the_spam_count_apart_from_the_tiers() {
+    let Harness { app, .. } = harness(|store, acct| {
+        seed_inbox_and_spam(store, acct);
+    });
+    let resp = app.oneshot(authed("GET", "/client/stats")).await.unwrap();
+    let json = body_json(resp).await;
+    assert_eq!(json["spam"], serde_json::json!(1));
+    assert!(
+        json["tier_counts"].get("noise").is_none()
+            || json["tier_counts"]["noise"] == serde_json::json!(0),
+        "the filtered row must not count as noise: {}",
+        json["tier_counts"]
+    );
+}
+
+/// NOT SPAM NEEDS THE CONFIRM GATE and a write credential, like every other
+/// message-scoped action. Without a write credential the harness has none, so
+/// the confirmed call stops at 403 rather than reaching Gmail — which is the
+/// assertion that matters here: the route is wired, guarded, and ordered.
+#[tokio::test]
+async fn not_spam_is_confirm_gated_and_needs_a_write_credential() {
+    let mut spam_id = 0;
+    let Harness { app, store, acct } = harness(|store, acct| {
+        let (_, spam) = seed_inbox_and_spam(store, acct);
+        spam_id = spam;
+    });
+
+    // No confirm: refused before anything is touched.
+    let resp = app
+        .clone()
+        .oneshot(authed_json(
+            "POST",
+            "/client/actions/not_spam",
+            serde_json::json!({ "message_id": spam_id }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    // Confirmed, but this harness has no write credential.
+    let resp = app
+        .oneshot(authed_json(
+            "POST",
+            "/client/actions/not_spam",
+            serde_json::json!({ "message_id": spam_id, "confirm": true }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+    // AND THE LOCAL FLAG IS UNTOUCHED, which is the ordering guarantee: the
+    // Gmail write runs first, so a refused one leaves the message exactly where
+    // Gmail still has it rather than visible here and filtered everywhere else.
+    let rows = store
+        .attention_updates(
+            acct,
+            chrono::Utc::now() - chrono::Duration::days(1),
+            None,
+            None,
+            None,
+            false,
+            SpamScope::Only,
+        )
+        .unwrap();
+    assert_eq!(rows.len(), 1, "the row is still spam");
+}
+
+/// THE SHAPE OF THE ACKNOWLEDGEMENT, pinned because the client decodes it and
+/// nothing else checks that seam.
+///
+/// This route answers `{"triggered": bool}` — the same shape `POST
+/// /client/refresh` has always used, because it is the same kind of poke at the
+/// same sync loop. It is asserted by KEY rather than by "some JSON came back":
+/// the client briefly decoded this into a type requiring a `status` field, the
+/// POST arrived and the spam folder synced perfectly, and the DECODE of the
+/// reply threw — which the client reported as being unable to reach the
+/// provider. `passband/Tests/SpamWireTests.swift` holds the other half.
+#[tokio::test]
+async fn spam_refresh_answers_the_triggered_shape() {
+    let Harness { app, .. } = harness(|_, _| {});
+    let resp = app
+        .oneshot(authed_json(
+            "POST",
+            "/client/spam/refresh",
+            serde_json::json!({}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+    assert!(
+        json.get("triggered").and_then(|v| v.as_bool()).is_some(),
+        "the acknowledgement must carry a boolean `triggered`: {json}"
+    );
+    // No sync loop is wired into the test harness, so it reports that honestly
+    // rather than claiming to have started something.
+    assert_eq!(json["triggered"], serde_json::json!(false));
+    assert!(
+        json.get("status").is_none(),
+        "and NOT a `status` field — the client type that wanted one was the bug"
+    );
 }

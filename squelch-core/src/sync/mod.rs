@@ -23,7 +23,7 @@ use crate::config::{Config, ResolvedLlm, Stage2Provider};
 use crate::credentials::CredentialStore;
 use crate::error::{CoreError, Result};
 use crate::metrics::{GmailErrorKind, RevisitVerdict, Stage1Verdict, Stage2Verdict, SyncMetrics};
-use crate::store::{ContactEntry, Stage2CapOverrides, Store, SyncState};
+use crate::store::{ContactEntry, SPAM_SYNCED_AT_KEY, Stage2CapOverrides, Store, SyncState};
 use crate::sync::ingest::{
     RawFetched, collect_mailboxes, format_recipients, ingest_with_rules, is_robot_address,
 };
@@ -44,6 +44,10 @@ pub const GMAIL_API_BASE: &str = "https://gmail.googleapis.com/gmail/v1/users/me
 pub const LABEL_INBOX: &str = "INBOX";
 /// The SENT system label.
 const LABEL_SENT: &str = "SENT";
+/// The SPAM system label — Gmail's own verdict, which squelch surfaces on its
+/// spam page and never re-litigates. `pub` because the write path's "not spam"
+/// removes exactly this label (and adds [`LABEL_INBOX`] back).
+pub const LABEL_SPAM: &str = "SPAM";
 
 /// The single `sync_state` row key for the REST engine's historyId cursor.
 const HISTORY_KEY: &str = "history";
@@ -94,6 +98,33 @@ enum IngestOrigin {
     Backfill,
     /// A history walk or a catch-up re-scan: mail that may be genuinely new.
     Incremental,
+}
+
+/// WHICH GMAIL LABEL a fetch batch came from, and therefore how the rows land.
+///
+/// An enum rather than the pair of booleans it replaces. Two bools can spell
+/// four states, only three of which mean anything, and the two that get passed
+/// most often differ from each other by argument ORDER alone — the exact shape
+/// of mistake that puts inbound mail in the sent bucket and makes it vanish from
+/// every listing. One argument cannot be transposed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Mailbox {
+    /// Ordinary received mail: the only batch that is triaged.
+    Inbox,
+    /// The user's own outbox. Neutral row, no LLM, seeds contacts.
+    Sent,
+    /// Gmail's SPAM label. Neutral row, no LLM, hidden from every surface but
+    /// the human door's spam page.
+    Spam,
+}
+
+impl Mailbox {
+    fn is_sent(self) -> bool {
+        matches!(self, Mailbox::Sent)
+    }
+    fn is_spam(self) -> bool {
+        matches!(self, Mailbox::Spam)
+    }
 }
 
 /// The SHIPMENTS extractor's own stale cutoff, from `carriers.max_age_days`.
@@ -265,11 +296,11 @@ pub fn advance_history_cursor(current: u64, observed: impl IntoIterator<Item = u
     observed.into_iter().fold(current, u64::max)
 }
 
-/// Drop from `ids` every id also in `claimed`, preserving order. Used to hand the
-/// SENT batch only what the INBOX batch did NOT already ingest: a self-addressed
-/// message carries both labels, and the store's message upsert writes
-/// `is_sent = excluded.is_sent` on conflict, so re-ingesting it as sent would
-/// hide the visible copy. Pure, so the precedence rule is unit-testable.
+/// Drop from `ids` every id also in `claimed`, preserving order. Used to hand
+/// each later label walk only what the earlier ones did NOT already ingest: a
+/// self-addressed message carries both INBOX and SENT, and re-ingesting a
+/// message under a hiding label (`is_sent`, `is_spam`) would take the visible
+/// copy off every listing. Pure, so the precedence rule is unit-testable.
 fn subtract_ids(ids: Vec<String>, claimed: &[String]) -> Vec<String> {
     if claimed.is_empty() {
         return ids;
@@ -484,6 +515,13 @@ pub struct SyncEngine<S: Store, C: CredentialStore + ?Sized> {
     /// Coalescing is intentional — several pokes during one in-flight poll
     /// collapse into a single extra tick.
     refresh: Arc<tokio::sync::Notify>,
+    /// ON-DEMAND SPAM SIGNAL: notifying it makes the poll loop run ONE spam
+    /// window sync on its next pass. Separate from `refresh` because it is a
+    /// different request — `refresh` means "check my mail now", this means "go
+    /// and get the folder we deliberately do not track" — and because
+    /// collapsing them would put the spam fetch back on every manual refresh,
+    /// which is most of what this change removed.
+    spam_refresh: Arc<tokio::sync::Notify>,
     /// Per-cap-kind last-warned UTC day. In-memory only; a restart re-arms them,
     /// and one fresh notice on restart is acceptable.
     warn_days: std::sync::Mutex<WarnDays>,
@@ -544,6 +582,7 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
             embedder: None,
             embedder_gate: None,
             refresh: Arc::new(tokio::sync::Notify::new()),
+            spam_refresh: Arc::new(tokio::sync::Notify::new()),
             warn_days: std::sync::Mutex::new(WarnDays::default()),
             unread_warned: AtomicBool::new(false),
             metrics: SyncMetrics::new(),
@@ -574,6 +613,15 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
     /// still polls on its own interval, just never early.
     pub fn with_refresh(mut self, refresh: Arc<tokio::sync::Notify>) -> Self {
         self.refresh = refresh;
+        self
+    }
+
+    /// Share the ON-DEMAND SPAM signal, so the human door's spam page can ask
+    /// for a fetch of a folder this loop otherwise never touches. Wire the same
+    /// handle into `ApiState::with_spam_refresh`; without it the endpoint is a
+    /// no-op and the page stays on whatever was last fetched.
+    pub fn with_spam_refresh(mut self, spam_refresh: Arc<tokio::sync::Notify>) -> Self {
+        self.spam_refresh = spam_refresh;
         self
     }
 
@@ -810,7 +858,7 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
         let inbox_ids = self.list_message_ids(LABEL_INBOX, Some(&q)).await?;
         // Backfill NEVER notifies (see `IngestOrigin`).
         let n = self
-            .fetch_raw_and_ingest(&inbox_ids, /* is_sent */ false, IngestOrigin::Backfill)
+            .fetch_raw_and_ingest(&inbox_ids, Mailbox::Inbox, IngestOrigin::Backfill)
             .await?;
         eprintln!("squelch: backfilled {n} INBOX messages");
 
@@ -820,9 +868,12 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
         // triage/updates/search.
         let sent_ids = self.list_message_ids(LABEL_SENT, Some(&q)).await?;
         let seeded = self
-            .fetch_raw_and_ingest(&sent_ids, /* is_sent */ true, IngestOrigin::Backfill)
+            .fetch_raw_and_ingest(&sent_ids, Mailbox::Sent, IngestOrigin::Backfill)
             .await?;
         eprintln!("squelch: backfilled {seeded} SENT messages (bodies for recall + contacts)");
+
+        // NO SPAM LEG HERE, deliberately. See `sync_spam_window`: the spam
+        // folder is fetched only when somebody opens the page that shows it.
 
         // Establish the historyId cursor from the profile.
         let history_id = self.fetch_profile_history_id().await?;
@@ -877,11 +928,68 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
                 _ = self.refresh.notified() => {
                     eprintln!("squelch: manual refresh — polling now");
                 }
+                // THE SPAM PAGE ASKED. Run the window sync right here and then
+                // fall through to an ordinary tick, so one click costs one spam
+                // fetch and nothing else changes about the loop's rhythm.
+                //
+                // Its failure is swallowed on purpose. This is a fetch of a
+                // folder nothing depends on, requested by a page somebody is
+                // looking at; letting it bounce the lifecycle would mean a
+                // Gmail hiccup on the spam tab stops the user's actual mail from
+                // syncing. The page learns from the stamp not moving.
+                _ = self.spam_refresh.notified() => {
+                    if let Err(e) = self.sync_spam_window().await {
+                        eprintln!("squelch: spam sync failed ({e})");
+                    }
+                }
                 _ = shutdown.changed() => {
                     if *shutdown.borrow() { return Ok(()); }
                 }
             }
         }
+    }
+
+    /// FETCH THE PROVIDER'S SPAM FOLDER, ONCE, ON REQUEST.
+    ///
+    /// The poll loop does not walk the SPAM label — not on backfill, not on a
+    /// history tick, not on a catch-up. Spam is the largest thing in a mailbox
+    /// and the least read, and every message is a body fetch, a parse and a
+    /// sanitize; tracking it continuously would spend most of this daemon's
+    /// budget keeping a page current that nobody has open. So the fetch happens
+    /// when the page is opened, and the click pays for it.
+    ///
+    /// CAPPED at `sync.spam_max`, newest first. The cap is a bound on how long
+    /// that click can take rather than a claim about which messages are in the
+    /// window — see [`Self::list_message_ids_capped`].
+    ///
+    /// Rows land exactly as the label walk used to leave them: `is_spam = 1`,
+    /// neutral tier, `'n/a'` stage markers, no embedding, no notification. The
+    /// ingest branch owns all of that, so on-demand and routine fetches cannot
+    /// disagree about what a spam row is.
+    ///
+    /// The completion stamp is written LAST and only on success, which is what
+    /// makes it readable as "we looked": a half-finished sync leaves the old
+    /// stamp, and the page keeps saying it is still checking.
+    pub async fn sync_spam_window(&self) -> Result<usize> {
+        let q = format!("newer_than:{}d", self.config.sync.backfill_days);
+        let cap = self.config.sync.spam_max as usize;
+        let ids = self
+            .list_message_ids_capped(LABEL_SPAM, Some(&q), Some(cap))
+            .await?;
+        eprintln!("squelch: spam sync — {} message(s) to fetch", ids.len());
+        // `Backfill`, not `Incremental`: this is a bulk read of old mail the
+        // user asked to look at. `worthy_kind` already refuses a spam row, so
+        // the origin is belt to that brace rather than the guarantee.
+        let n = self
+            .fetch_raw_and_ingest(&ids, Mailbox::Spam, IngestOrigin::Backfill)
+            .await?;
+        self.store.set_app_setting(
+            self.account_id,
+            SPAM_SYNCED_AT_KEY,
+            &Utc::now().to_rfc3339(),
+        )?;
+        eprintln!("squelch: spam sync complete — {n} message(s)");
+        Ok(n)
     }
 
     /// A single poll tick: consult the cursor, either run the incremental
@@ -904,23 +1012,23 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
         }
     }
 
-    /// One incremental poll: TWO label-filtered `history.list` walks from the
-    /// SAME start cursor, INBOX then SENT, with the cursor committed ONCE at the
-    /// end at the max historyId either walk observed.
+    /// One incremental poll: THREE label-filtered `history.list` walks from the
+    /// SAME start cursor, INBOX then SENT then SPAM, with the cursor committed
+    /// ONCE at the end at the max historyId any walk observed.
     ///
     /// The SENT walk is what makes mail the user writes from Gmail web or their
     /// phone land here at all: such a message never carries INBOX, so an
     /// INBOX-only walk is blind to it, and the api's post-send echo covers only
-    /// what was sent through the daemon itself. Both walks start from the same
-    /// `start_history_id` because one Gmail cursor spans the whole mailbox.
+    /// what was sent through the daemon itself. The SPAM walk is blind to the
+    /// other two for the same structural reason, which is why spam was invisible
+    /// in this client until it got a walk of its own. All three start from the
+    /// same `start_history_id` because one Gmail cursor spans the whole mailbox.
     ///
-    /// ORDER IS LOAD-BEARING. A self-addressed message carries both labels and so
-    /// appears in both walks, and the store's message upsert writes
-    /// `is_sent = excluded.is_sent` on conflict — last writer wins — so a SENT
-    /// copy landing second would flip the row to `is_sent = 1` and drop it out of
-    /// every band. The INBOX walk therefore runs FIRST and its ids are subtracted
-    /// from the SENT batch, making the visible copy authoritative no matter what
-    /// the conflict clause does.
+    /// ORDER IS LOAD-BEARING. A self-addressed message carries both INBOX and
+    /// SENT and so appears in two walks; the store's upsert keeps the MINIMUM of
+    /// each visibility flag, but the walk order is the first defense and does not
+    /// depend on that clause holding. INBOX therefore runs FIRST and its ids are
+    /// subtracted from both later batches, making the visible copy authoritative.
     ///
     /// Propagates [`CoreError::NotFound`] on an expired historyId so the caller
     /// can fall back to a catch-up.
@@ -930,7 +1038,7 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
             .await?;
         if !inbox_ids.is_empty() {
             let n = self
-                .fetch_raw_and_ingest(&inbox_ids, false, IngestOrigin::Incremental)
+                .fetch_raw_and_ingest(&inbox_ids, Mailbox::Inbox, IngestOrigin::Incremental)
                 .await?;
             eprintln!("squelch: ingested {n} new INBOX messages");
         }
@@ -961,7 +1069,7 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
             // returns `None` for an `is_sent` row, and the 'n/a' stage markers
             // ingest stamps, which keep it out of both LLM queues.
             match self
-                .fetch_raw_and_ingest(&sent_only, true, IngestOrigin::Incremental)
+                .fetch_raw_and_ingest(&sent_only, Mailbox::Sent, IngestOrigin::Incremental)
                 .await
             {
                 Ok(n) => eprintln!("squelch: ingested {n} new SENT messages"),
@@ -971,6 +1079,11 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
                 }
             }
         }
+
+        // AND NO SPAM WALK. A poll tick runs every few seconds; the spam folder
+        // is the largest thing in a mailbox and the least looked at, so walking
+        // it here would spend most of this daemon's fetch budget on mail nobody
+        // asked to see. It is fetched on demand instead — see `sync_spam_window`.
 
         self.store_history_cursor(advance_history_cursor(
             start_history_id,
@@ -1079,7 +1192,7 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
         // What keeps the whole-window re-scan from storming is the freshness
         // window in `triage::events` plus the one-event-per-message key.
         let n = self
-            .fetch_raw_and_ingest(&ids, false, IngestOrigin::Incremental)
+            .fetch_raw_and_ingest(&ids, Mailbox::Inbox, IngestOrigin::Incremental)
             .await?;
         if n > 0 {
             eprintln!("squelch: catch-up ingested {n} INBOX messages");
@@ -1100,11 +1213,15 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
             sent_only.len()
         );
         let sent_n = self
-            .fetch_raw_and_ingest(&sent_only, true, IngestOrigin::Incremental)
+            .fetch_raw_and_ingest(&sent_only, Mailbox::Sent, IngestOrigin::Incremental)
             .await?;
         if sent_n > 0 {
             eprintln!("squelch: catch-up ingested {sent_n} SENT messages");
         }
+
+        // No SPAM leg, same as the backfill and the walk: a catch-up is already
+        // the longest thing this loop does, and the spam folder is fetched only
+        // when the page that shows it is opened.
 
         let history_id = self.fetch_profile_history_id().await?;
         self.store_history_cursor(history_id)?;
@@ -1324,6 +1441,24 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
     /// List all message ids under `label`, optionally narrowed by a Gmail search
     /// `q`. Paginates fully.
     async fn list_message_ids(&self, label: &str, q: Option<&str>) -> Result<Vec<String>> {
+        self.list_message_ids_capped(label, q, None).await
+    }
+
+    /// [`list_message_ids`](Self::list_message_ids) with an optional ceiling on
+    /// how many ids to collect, which also STOPS PAGINATING once it is reached.
+    ///
+    /// Gmail returns `messages.list` newest-first in practice, so a cap is a
+    /// recent-N window. It is not a contract, which is why the only caller is
+    /// the spam sync: there the cap is a bound on WORK ("do not fetch ten
+    /// thousand bodies because somebody clicked a tab"), not a promise about
+    /// which messages are in it, and a slightly wrong tail is a page that misses
+    /// old junk. Nothing that has to be exact may use it.
+    async fn list_message_ids_capped(
+        &self,
+        label: &str,
+        q: Option<&str>,
+        cap: Option<usize>,
+    ) -> Result<Vec<String>> {
         let mut ids = Vec::new();
         let mut page_token: Option<String> = None;
         loop {
@@ -1336,6 +1471,12 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
             }
             let page: ListMessagesResp = self.get_json(&url).await?;
             ids.extend(page.messages.into_iter().map(|m| m.id));
+            if let Some(cap) = cap
+                && ids.len() >= cap
+            {
+                ids.truncate(cap);
+                break;
+            }
             match page.next_page_token {
                 Some(tok) => page_token = Some(tok),
                 None => break,
@@ -1350,7 +1491,7 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
     async fn fetch_raw_and_ingest(
         &self,
         ids: &[String],
-        is_sent: bool,
+        mailbox: Mailbox,
         origin: IngestOrigin,
     ) -> Result<usize> {
         if ids.is_empty() {
@@ -1397,7 +1538,8 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
                 gmail_thread_id: msg.thread_id.clone(),
                 raw,
                 internal_date: parse_internal_date(msg.internal_date.as_deref()),
-                is_sent,
+                is_sent: mailbox.is_sent(),
+                is_spam: mailbox.is_spam(),
                 account_addr: self.account_email.clone(),
             };
             if let Some((id, text)) = self.ingest_one(&fetched, &rules, now, origin)? {
@@ -1455,6 +1597,16 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
         }
         // STRUCTURAL EXCLUSION: sealed mail is never embedded.
         if triaged.sensitivity != Sensitivity::Normal {
+            return Ok(None);
+        }
+        // NEITHER IS PROVIDER SPAM, for two reasons that point the same way. It
+        // would be the largest single consumer of embedder time in the daemon —
+        // spam outnumbers real mail — spent on the one category of message
+        // semantic recall must never return. And an embedding is a similarity
+        // claim: spam is written to imitate the mail it is impersonating, so a
+        // vector space containing it puts convincing forgeries next to the real
+        // thing in results the user reads as "your mail".
+        if triaged.message.is_spam {
             return Ok(None);
         }
         let text = crate::embed::message_embed_text(
@@ -2199,8 +2351,10 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
                                     one_line: &applied.one_line,
                                     received_at: row.received_at,
                                     sensitivity: row.sensitivity,
-                                    // The Stage-1 queue selects `m.is_sent = 0`.
+                                    // The Stage-1 queue selects `m.is_sent = 0`
+                                    // and `m.is_spam = 0`.
                                     is_sent: false,
+                                    is_spam: false,
                                     // The queue only excludes rows a rule decided
                                     // AT INGEST, so this is the rule as it stands
                                     // NOW, catching rules added since.
@@ -2855,8 +3009,10 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
                                     one_line: &applied.one_line,
                                     received_at: row.received_at,
                                     sensitivity: row.sensitivity,
-                                    // The Stage-2 queue selects `m.is_sent = 0`.
+                                    // The Stage-2 queue selects `m.is_sent = 0`
+                                    // and `m.is_spam = 0`.
                                     is_sent: false,
+                                    is_spam: false,
                                     // Read NOW, not at ingest: the row only
                                     // records the rule in force when it was
                                     // queued, so a sender squelched since then
@@ -3146,6 +3302,7 @@ pub type Rules = Vec<SenderRule>;
 mod tests {
     use super::*;
     use crate::config::Stage1Config;
+    use crate::store::SpamScope;
     use crate::store::SqliteStore;
     use crate::types::{Disposition, NewMessage, Tier, TriageAxis};
 
@@ -3209,6 +3366,7 @@ mod tests {
             raw: eml.as_bytes().to_vec(),
             internal_date: Some(Utc::now()),
             is_sent,
+            is_spam: false,
             account_addr: "me@example.com".to_string(),
         }
     }
@@ -3468,6 +3626,7 @@ mod tests {
             received_at: row.received_at,
             sensitivity: row.sensitivity,
             is_sent: false,
+            is_spam: false,
             rule: events::current_rule(&row.from_addr, &rules),
             tier,
             importance,
@@ -4380,6 +4539,184 @@ mod tests {
         )
     }
 
+    fn spam_eml(at: DateTime<Utc>, subject: &str) -> String {
+        format!(
+            "From: winner@prize-draw.example\r\n\
+             To: me@example.com\r\n\
+             Subject: {subject}\r\n\
+             Date: {}\r\n\
+             \r\n\
+             Claim your prize now. Reply with your bank details.\r\n",
+            at.to_rfc2822()
+        )
+    }
+
+    // ---- the spam folder is fetched ON DEMAND, never on the poll loop -------
+
+    /// THE POINT OF THE WHOLE ARRANGEMENT: an ordinary poll tick must not so
+    /// much as ASK about the SPAM label. Asserted against the mock's call log
+    /// rather than against what landed, because "no spam rows appeared" would
+    /// also pass if the walk ran and the folder happened to be empty — and the
+    /// cost this avoids is the request, not the row.
+    #[tokio::test]
+    async fn a_poll_tick_never_touches_the_spam_label() {
+        let (store, acct) = store_at_cursor(Some(100));
+        let g = MockGmail::default();
+        g.history(LABEL_INBOX, LabelHistory::quiet(100));
+        g.history(LABEL_SENT, LabelHistory::quiet(100));
+        // Scripted so a walk WOULD find something, which is what makes the
+        // absence of the call meaningful.
+        g.history(LABEL_SPAM, LabelHistory::added(140, &[(140, "g-spam")]));
+        g.body("g-spam", spam_eml(Utc::now(), "you have won"));
+        let base = serve_mock(g.clone()).await;
+
+        engine(store.clone(), acct, &base)
+            .poll_once()
+            .await
+            .unwrap();
+
+        assert!(
+            !g.seen().iter().any(|c| c.contains(LABEL_SPAM)),
+            "a poll tick asked about SPAM: {:?}",
+            g.seen()
+        );
+    }
+
+    /// And a catch-up — the expensive whole-window re-listing — does not either.
+    #[tokio::test]
+    async fn a_catch_up_never_lists_the_spam_label() {
+        let (store, acct) = store_at_cursor(None);
+        let g = MockGmail::default();
+        g.listing(LABEL_INBOX, &[]);
+        g.listing(LABEL_SENT, &[]);
+        g.listing(LABEL_SPAM, &["g-spam"]);
+        g.body("g-spam", spam_eml(Utc::now(), "you have won"));
+        g.profile(500);
+        let base = serve_mock(g.clone()).await;
+
+        engine(store.clone(), acct, &base)
+            .poll_once()
+            .await
+            .unwrap();
+
+        assert!(
+            !g.seen().iter().any(|c| c.contains(LABEL_SPAM)),
+            "a catch-up listed SPAM: {:?}",
+            g.seen()
+        );
+    }
+
+    /// Asked for explicitly, it fetches — and the row lands exactly as the old
+    /// label walk left it: flagged spam, neutral, out of both LLM queues.
+    #[tokio::test]
+    async fn an_on_demand_spam_sync_fetches_and_lands_neutral() {
+        let (store, acct) = store_at_cursor(Some(100));
+        let g = MockGmail::default();
+        g.listing(LABEL_SPAM, &["g-spam"]);
+        g.body("g-spam", spam_eml(Utc::now(), "you have won"));
+        let base = serve_mock(g.clone()).await;
+
+        let n = engine(store.clone(), acct, &base)
+            .sync_spam_window()
+            .await
+            .unwrap();
+        assert_eq!(n, 1);
+
+        // It is spam, and it is invisible to the ordinary mailbox.
+        let inbox = store
+            .attention_updates(
+                acct,
+                Utc::now() - ChronoDuration::days(1),
+                None,
+                None,
+                None,
+                false,
+                crate::store::SpamScope::Exclude,
+            )
+            .unwrap();
+        assert!(inbox.is_empty(), "spam must not reach the mailbox listing");
+
+        let spam = store
+            .attention_updates(
+                acct,
+                Utc::now() - ChronoDuration::days(1),
+                None,
+                None,
+                None,
+                false,
+                crate::store::SpamScope::Only,
+            )
+            .unwrap();
+        assert_eq!(spam.len(), 1, "and it must reach the spam page");
+
+        // Never triaged: the same 'n/a' markers the sent branch gets.
+        let row = store
+            .triage_debug(acct, spam[0].update.id)
+            .unwrap()
+            .expect("triage row");
+        assert_eq!(row.tier, "noise");
+        assert_eq!(row.importance, 0);
+        assert_eq!(row.stage1_model_used.as_deref(), Some("n/a"));
+
+        // And the completion stamp is written, which is what lets the page say
+        // "we looked" rather than guessing.
+        assert!(
+            store
+                .get_app_setting(acct, SPAM_SYNCED_AT_KEY)
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    /// THE STAMP IS WRITTEN ONLY ON SUCCESS. A page that read a stamp moved by a
+    /// failed fetch would tell somebody their provider filtered nothing when
+    /// nobody managed to look.
+    #[tokio::test]
+    async fn a_failed_spam_sync_leaves_no_stamp() {
+        let (store, acct) = store_at_cursor(Some(100));
+        // No listing scripted for SPAM and a mock that fails unscripted keys.
+        let dead = "http://127.0.0.1:1".to_string();
+        let out = engine(store.clone(), acct, &dead).sync_spam_window().await;
+        assert!(out.is_err());
+        assert!(
+            store
+                .get_app_setting(acct, SPAM_SYNCED_AT_KEY)
+                .unwrap()
+                .is_none(),
+            "a failed fetch must not look like a completed one"
+        );
+    }
+
+    /// The cap is a bound on how long one click can take: `spam_max` messages,
+    /// and pagination stops once it is reached rather than walking the folder.
+    #[tokio::test]
+    async fn the_spam_sync_stops_at_the_cap() {
+        let (store, acct) = store_at_cursor(Some(100));
+        let g = MockGmail::default();
+        let ids: Vec<String> = (0..10).map(|i| format!("g-spam-{i}")).collect();
+        let refs: Vec<&str> = ids.iter().map(|s| s.as_str()).collect();
+        g.listing(LABEL_SPAM, &refs);
+        for id in &ids {
+            g.body(id, spam_eml(Utc::now(), "you have won"));
+        }
+        let base = serve_mock(g.clone()).await;
+
+        let mut config = Config::default();
+        config.sync.spam_max = 3;
+        let eng = SyncEngine::new(
+            store.clone(),
+            Arc::new(FixedToken),
+            acct,
+            "me@example.com".to_string(),
+            config,
+        )
+        .with_api_base(base.clone());
+
+        assert_eq!(eng.sync_spam_window().await.unwrap(), 3);
+        let fetched = g.seen().iter().filter(|c| c.starts_with("get:")).count();
+        assert_eq!(fetched, 3, "the cap bounds the FETCHES, not just the rows");
+    }
+
     #[tokio::test]
     async fn a_sent_history_record_ingests_neutral_and_silent() {
         // Sent from the phone: SENT only, never INBOX. Before the sent walk this
@@ -4451,6 +4788,7 @@ mod tests {
                 body: "writing this from the phone app".to_string(),
                 body_html: None,
                 is_sent: true,
+                is_spam: false,
                 to_addrs: None,
                 list_unsubscribe: None,
                 list_unsub_one_click: false,
@@ -5155,6 +5493,7 @@ mod tests {
                 body: "body".into(),
                 body_html: None,
                 is_sent: false,
+                is_spam: false,
                 to_addrs: None,
                 list_unsubscribe: None,
                 list_unsub_one_click: false,
@@ -5201,6 +5540,7 @@ mod tests {
                 None,
                 None,
                 false,
+                SpamScope::Exclude,
             )
             .unwrap();
         assert_eq!(rows.len(), 1);

@@ -18,10 +18,10 @@ use serde_json::json;
 use squelch_core::CoreError;
 use squelch_core::config::{CACHE_READ_INPUT_MULT, CACHE_WRITE_INPUT_MULT};
 use squelch_core::store::{
-    ActionMessageRef, Draft, NewAuditEntry, SearchFilter, SearchSort, SitrepBand, SqliteStore,
-    Store,
+    ActionMessageRef, Draft, NewAuditEntry, SearchFilter, SearchSort, SitrepBand, SpamScope,
+    SqliteStore, Store,
 };
-use squelch_core::sync::{decode_raw_b64url, parse_internal_date};
+use squelch_core::sync::{LABEL_INBOX, LABEL_SPAM, decode_raw_b64url, parse_internal_date};
 use squelch_core::triage::llm::Usage;
 use squelch_core::triage::rule_infer;
 use squelch_core::types::{
@@ -152,6 +152,19 @@ pub struct UpdatesQuery {
     /// listing that never stamps the seen-ledger: a schedule the user is
     /// reviewing is not the mail being shown to them.
     reminders: Option<String>,
+    /// THE PROVIDER'S SPAM FOLDER: `only` swaps the listing over to the mail
+    /// Gmail filed as spam, which every other listing on this route excludes.
+    /// Absent means the ordinary mailbox.
+    ///
+    /// Its own parameter and not a `tier` value, because spam is not a verdict
+    /// this system reached — nothing triaged these rows, and they all carry the
+    /// neutral tier=noise seed. A `tier=spam` would have made the provider's
+    /// call look like one of ours in the one place the difference is the point.
+    ///
+    /// One accepted value and a 400 for anything else, for the reason
+    /// `reminders` gives: a client asking for the spam folder and quietly
+    /// getting the inbox back is a failure the user would read as data loss.
+    spam: Option<String>,
     limit: Option<u32>,
     cursor: Option<String>,
     /// READ WITHOUT SURFACING. Default false, so every existing client keeps the
@@ -199,6 +212,12 @@ pub async fn get_updates(
         Some("pending") => true,
         Some(_) => return Err(ApiError::bad_request("reminders must be: pending")),
     };
+    let spam = match q.spam.as_deref() {
+        None => SpamScope::Exclude,
+        Some(s) => {
+            SpamScope::parse(s).ok_or_else(|| ApiError::bad_request("spam must be: only"))?
+        }
+    };
     let since = q
         .since
         .unwrap_or_else(|| Utc::now() - chrono::Duration::days(DEFAULT_UPDATES_WINDOW_DAYS));
@@ -209,8 +228,10 @@ pub async fn get_updates(
     let peek = q.peek || pending_reminders;
 
     let items = store_call(&state, move |store, account_id| {
-        // attention_updates excludes sealed rows in SQL. status/band/reminders
-        // filter server-side; tier and pagination apply over the ranked slice here.
+        // attention_updates excludes sealed rows in SQL, and serves whichever
+        // side of the provider's spam verdict `spam` asked for. status/band/
+        // reminders filter server-side; tier and pagination apply over the
+        // ranked slice here.
         let mut all = store.attention_updates(
             account_id,
             since,
@@ -218,6 +239,7 @@ pub async fn get_updates(
             status_filter,
             band,
             pending_reminders,
+            spam,
         )?;
         if let Some(t) = tier_filter {
             all.retain(|u| u.update.tier == t);
@@ -368,6 +390,32 @@ pub async fn clear_update_reminder(
 /// door. A READ-path trigger — no write scope, no mutation, nothing to audit.
 pub async fn refresh_now(State(state): State<ApiState>) -> impl IntoResponse {
     let triggered = match &state.refresh {
+        Some(notify) => {
+            notify.notify_one();
+            true
+        }
+        None => false,
+    };
+    Json(json!({ "triggered": triggered }))
+}
+
+// --- POST /client/spam/refresh -----------------------------------------------
+
+/// ASK THE DAEMON TO GO AND FETCH THE PROVIDER'S SPAM FOLDER.
+///
+/// The sync loop never walks the SPAM label on its own: spam is the largest and
+/// least-read part of a mailbox, and tracking it continuously would spend most
+/// of the daemon's fetch budget keeping a page current that nobody has open. So
+/// the page asks, and the click pays for it.
+///
+/// FIRE AND FORGET, like `POST /client/refresh` next door. The fetch is bounded
+/// by `sync.spam_max` but still measured in tens of seconds, and holding an HTTP
+/// request open for that would trade a slow page for a timed-out one. The client
+/// polls `/client/updates?spam=only` as it already does, and reads
+/// `stats.spam_synced_at` to tell "still fetching" from "fetched, and the folder
+/// is empty" — two states that are the same empty list on the wire.
+pub async fn refresh_spam(State(state): State<ApiState>) -> impl IntoResponse {
+    let triggered = match &state.spam_refresh {
         Some(notify) => {
             notify.notify_one();
             true
@@ -2378,6 +2426,73 @@ pub async fn action_archive(
     .await?;
     Ok(Json(
         json!({ "status": "archived", "message_id": body.message_id }),
+    ))
+}
+
+// --- POST /client/actions/not_spam ------------------------------------------
+
+#[derive(Debug, Deserialize)]
+pub struct NotSpamBody {
+    message_id: i64,
+    #[serde(default)]
+    confirm: bool,
+}
+
+/// RESCUE ONE MESSAGE FROM THE PROVIDER'S SPAM FOLDER: remove Gmail's SPAM
+/// label, put INBOX back, then clear the local flag and requeue the row for
+/// triage.
+///
+/// GMAIL FIRST, LOCAL SECOND, and the order is the whole design. If the local
+/// write went first and the Gmail call then failed, the message would be visible
+/// in Passband and still sitting in the spam folder everywhere else — the client
+/// would be lying about the state of the mailbox, and the next sync would not
+/// correct it (nothing re-reads the SPAM label for a row it already has). With
+/// this order a failed Gmail call leaves both sides untouched and the user sees
+/// an error, which is the honest outcome. The reverse failure — Gmail moved, the
+/// local write lost — self-heals: the message now carries INBOX, so the next
+/// history walk ingests it and the upsert's `is_spam = MIN(...)` clears the flag.
+///
+/// It is the SPAM PAGE'S ONLY WRITE, deliberately. The other direction (marking
+/// good mail as spam) is not offered: squelch has its own answer to unwanted
+/// mail in sender rules and the noise tier, and teaching users to train Gmail's
+/// filter from inside a client that does not read that filter's results would be
+/// a button whose effects the product cannot show them.
+pub async fn action_not_spam(
+    State(state): State<ApiState>,
+    Json(body): Json<NotSpamBody>,
+) -> Result<impl IntoResponse, ApiError> {
+    guarded_action(
+        &state,
+        "not_spam",
+        body.message_id,
+        body.confirm,
+        None,
+        // NOT ResolveDone: this mail is arriving, not being handled. `clear_spam`
+        // puts the attention row back to 'new' so it lands in the New band.
+        OnSuccess::LeaveOpen,
+        |client, msg| async move {
+            client
+                .modify(
+                    &msg.gmail_msg_id,
+                    &[LABEL_INBOX.to_string()],
+                    &[LABEL_SPAM.to_string()],
+                )
+                .await
+        },
+    )
+    .await?;
+
+    // The local half. A `false` here means the row was already un-spammed (a
+    // double click, or the sync beat us to it), which is not an error: Gmail
+    // agrees with us either way, and the caller asked for a state that now holds.
+    let message_id = body.message_id;
+    store_call(&state, move |store, account_id| {
+        store.clear_spam(account_id, message_id)
+    })
+    .await?;
+
+    Ok(Json(
+        json!({ "status": "not_spam", "message_id": body.message_id }),
     ))
 }
 

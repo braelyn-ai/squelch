@@ -51,6 +51,12 @@ struct UpdateVerbs {
         Actions.reply(update, queue: queue)
     }
 
+    /// `i`, and only on the spam page. Rescues the message out of the provider's
+    /// spam folder; see `Actions.notSpam` for why it has no undo.
+    func notSpam() {
+        Task { await Actions.notSpam(update) }
+    }
+
     /// `t` (registered in ActionLayer for the list context).
     func tune() {
         Actions.tune(sender: update.sender)
@@ -87,10 +93,28 @@ struct SwipeVerb: Identifiable {
 }
 
 extension UpdateVerbs {
+    /// THE SPAM PAGE SWAPS BOTH RAILS, because three of the four ordinary verbs
+    /// are meaningless on a row nothing triaged: tune argues with a verdict that
+    /// was never reached, archive removes an INBOX label the message does not
+    /// carry, and reply answers a machine. What is left is the one thing anybody
+    /// opens this folder to do.
+    ///
+    /// It is a LEADING verb, deliberately not a full-swipe trailing one. Rescue
+    /// is the verb with no undo behind it (see `Actions.notSpam`), and the
+    /// trailing edge is where a thumb flicks without looking.
+    var isSpamPage: Bool { AppStore.shared.mailMode == .spam }
+
     /// Trailing edge (drag LEFT): the resolve. Done leads because it is the one
     /// verb a triage run repeats, and it is what a full swipe commits.
     var trailingVerbs: [SwipeVerb] {
-        [
+        if isSpamPage {
+            return [
+                SwipeVerb(
+                    title: "Done", symbol: "checkmark", tint: Palette.positive, destructive: true,
+                    run: done)
+            ]
+        }
+        return [
             SwipeVerb(
                 title: "Done", symbol: "checkmark", tint: Palette.positive, destructive: true,
                 run: done),
@@ -99,9 +123,16 @@ extension UpdateVerbs {
     }
 
     /// Leading edge (drag RIGHT): the two verbs that keep the mail — answering it
-    /// or filing it.
+    /// or filing it. On the spam page, the one verb that keeps it for real.
     var leadingVerbs: [SwipeVerb] {
-        [
+        if isSpamPage {
+            return [
+                SwipeVerb(
+                    title: "Not spam", symbol: "tray.and.arrow.down", tint: Palette.positive,
+                    run: notSpam)
+            ]
+        }
+        return [
             SwipeVerb(
                 title: "Reply", symbol: "arrowshape.turn.up.left", tint: Palette.accent, run: reply),
             SwipeVerb(title: "Archive", symbol: "archivebox", tint: Palette.warn, run: archive),
@@ -119,21 +150,30 @@ struct UpdateContextMenu: ViewModifier {
     func body(content: Content) -> some View {
         content.contextMenu {
             Button { verbs.open() } label: { Label("Open", systemImage: "envelope.open") }
-            Button { verbs.reply() } label: {
-                Label("Reply", systemImage: "arrowshape.turn.up.left")
+            // The spam page's menu is the short one, for the reason its rails
+            // are short: the verdict verbs have no verdict to act on.
+            if verbs.isSpamPage {
+                Button { verbs.notSpam() } label: {
+                    Label("Not spam", systemImage: "tray.and.arrow.down")
+                }
+            } else {
+                Button { verbs.reply() } label: {
+                    Label("Reply", systemImage: "arrowshape.turn.up.left")
+                }
+                Divider()
+                Button { verbs.tune() } label: {
+                    Label("Tune this sender", systemImage: "slider.horizontal.3")
+                }
+                Button { verbs.fixTriage() } label: {
+                    Label("Fix triage", systemImage: "wand.and.sparkles")
+                }
+                Button { verbs.searchSender() } label: {
+                    Label("Search this sender", systemImage: "magnifyingglass")
+                }
+                Divider()
+                Button { verbs.archive() } label: { Label("Archive", systemImage: "archivebox") }
             }
             Divider()
-            Button { verbs.tune() } label: {
-                Label("Tune this sender", systemImage: "slider.horizontal.3")
-            }
-            Button { verbs.fixTriage() } label: {
-                Label("Fix triage", systemImage: "wand.and.sparkles")
-            }
-            Button { verbs.searchSender() } label: {
-                Label("Search this sender", systemImage: "magnifyingglass")
-            }
-            Divider()
-            Button { verbs.archive() } label: { Label("Archive", systemImage: "archivebox") }
             // Destructive ROLE, not a destructive act: done is undoable for five
             // seconds like every other resolve. The role is what puts it last and
             // in red, which is where a thumb expects the one verb that empties

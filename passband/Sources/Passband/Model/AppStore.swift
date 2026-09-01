@@ -84,12 +84,32 @@ let historyCap = 50
 // MARK: - mail pages
 
 /// Which page the emails tab shows. `inbox` is the flat all-tiers list; `noise`
-/// is the spam-folder equivalent — the same rows and the same verbs, narrowed to
-/// the noise tier BY THE DAEMON so nothing has to be discarded client-side.
-/// `sent` is the odd one out: outbound mail, off its own route, with none of the
-/// triage verbs (nothing triaged it, and nothing can resolve it).
+/// is everything triage scored as noise, narrowed to that tier BY THE DAEMON so
+/// nothing has to be discarded client-side. `sent` is the odd one out: outbound
+/// mail, off its own route, with none of the triage verbs (nothing triaged it,
+/// and nothing can resolve it).
+///
+/// AND `spam`, WHICH IS NOT THE SAME THING AS `noise` however much the words
+/// overlap. Noise is our verdict about mail that reached the inbox; spam is
+/// Gmail's verdict about mail that never did. Nothing in Passband triaged a spam
+/// row and nothing will — the page exists so the folder is reachable without
+/// leaving for the browser, and so the one thing worth doing there (rescuing
+/// something real out of it) can be done here.
 enum MailMode: String, Sendable, Hashable, CaseIterable {
-    case inbox, noise, sent
+    case inbox, noise, sent, spam
+
+    /// The three pages the segmented control always offers.
+    ///
+    /// SPAM IS NOT ONE OF THEM until you are on it. It is a folder you visit
+    /// deliberately, roughly never, and a permanent fourth segment would give a
+    /// bin of filtered mail the same standing in the chrome as the inbox. The
+    /// door is the header's spam chip; the segment appears once you walk
+    /// through it, because a control showing no selection at all is worse than
+    /// a control that grew an option — you need to see where you are and how to
+    /// get back.
+    static func segments(showingSpam: Bool) -> [MailMode] {
+        showingSpam ? [.inbox, .noise, .sent, .spam] : [.inbox, .noise, .sent]
+    }
 
     /// The page's name — the header title and the segmented control both.
     var label: String {
@@ -97,22 +117,29 @@ enum MailMode: String, Sendable, Hashable, CaseIterable {
         case .inbox: "all mail"
         case .noise: "noise"
         case .sent: "sent"
+        case .spam: "spam"
         }
     }
 
     /// Server-side tier filter for the page; nil = every tier. Nil for `sent`
     /// too, but vacuously: that page never goes to /client/updates at all, so
-    /// there is no tier to narrow.
+    /// there is no tier to narrow. Nil for `spam` for a REAL reason — a spam row
+    /// was never triaged, so it carries the neutral tier=noise seed, and asking
+    /// for `tier=noise` here would be filtering on a value that means nothing.
     var tier: Tier? {
         switch self {
-        case .inbox, .sent: nil
+        case .inbox, .sent, .spam: nil
         case .noise: .noise
         }
     }
 
+    /// Whether this page asks the daemon for the provider's spam folder
+    /// (`spam=only`) instead of the ordinary mailbox.
+    var spamOnly: Bool { self == .spam }
+
     /// What `n` flips to, so the key is one binding rather than two. It stays
-    /// the inbox/noise flip from every page: from `sent`, `n` dips into noise
-    /// exactly as it would from the inbox.
+    /// the inbox/noise flip from every page: from `sent` or `spam`, `n` dips
+    /// into noise exactly as it would from the inbox.
     var flipped: MailMode { self == .noise ? .inbox : .noise }
 }
 
@@ -1797,7 +1824,7 @@ final class AppStore {
     /// One page's rows. Never fetched reads as LOADING, so the first paint of a
     /// page shows "loading" rather than claiming it is empty.
     ///
-    /// INBOX AND NOISE ONLY — `.sent` holds a different wire type and lives in
+    /// EVERY PAGE BUT `.sent`, which holds a different wire type and lives in
     /// `sentPage`; asking here for it answers a permanent "loading".
     func mailPage(_ mode: MailMode) -> Loadable<[AttentionUpdate]> {
         mailPages[mode] ?? .loading
@@ -1836,7 +1863,8 @@ final class AppStore {
         withMailPage(mode) { $0.isLoading = true }
         do {
             let fetched = try await APIClient.shared.getUpdates(
-                UpdatesParams(tier: mode.tier, limit: Self.mailLimit))
+                UpdatesParams(
+                    tier: mode.tier, limit: Self.mailLimit, spamOnly: mode.spamOnly))
             // The rows belong to the account that asked for them. Both exits
             // below return rather than fall through, so the `isLoading` write
             // at the bottom is only ever reached by the live epoch.
@@ -1951,6 +1979,84 @@ final class AppStore {
     /// A FILTER, not a fourth MailMode: the segments are three pages of mail,
     /// and this is a lens over one of them that the Escape ladder sheds first.
     var reminderFilter = false
+
+    // MARK: - the provider's spam folder
+
+    /// When this session last ASKED the daemon to fetch the spam folder, nil
+    /// until it has. Paired with `stats.spam_synced_at` (when the daemon last
+    /// FINISHED one) it is the whole state machine for the spam page's copy:
+    /// a request newer than the stamp means a fetch is outstanding.
+    private var spamSyncRequestedAt: Date?
+
+    /// How long a spam fetch may be outstanding before the page stops saying it
+    /// is still checking and admits it did not work.
+    ///
+    /// The daemon stamps `spam_synced_at` only on SUCCESS, which is what makes
+    /// the stamp trustworthy and also what makes this cap necessary: a failed
+    /// fetch moves nothing, so without a deadline the page would spin forever
+    /// on a revoked credential. Two minutes is well past a capped fetch of a
+    /// few hundred messages and well short of a user's patience.
+    private static let spamSyncDeadline: TimeInterval = 120
+
+    /// Whether the daemon is (as far as this client can tell) still fetching.
+    var spamFetchInFlight: Bool {
+        guard let asked = spamSyncRequestedAt else { return false }
+        if Date().timeIntervalSince(asked) > Self.spamSyncDeadline { return false }
+        return !spamSyncLanded(since: asked)
+    }
+
+    /// Whether a fetch was asked for, ran out its deadline, and never landed.
+    /// The page says so rather than showing an empty list as though it were an
+    /// answer.
+    var spamFetchStalled: Bool {
+        guard let asked = spamSyncRequestedAt else { return false }
+        guard Date().timeIntervalSince(asked) > Self.spamSyncDeadline else { return false }
+        return !spamSyncLanded(since: asked)
+    }
+
+    /// Whether the folder has EVER been fetched. Nil stamp means the daemon has
+    /// not looked, which is the normal state — it does not track that folder.
+    var spamEverSynced: Bool { sitrep.stats?.spam_synced_at != nil }
+
+    private func spamSyncLanded(since: Date) -> Bool {
+        guard let stamp = sitrep.stats?.spam_synced_at, let at = Fmt.date(stamp) else {
+            return false
+        }
+        return at >= since
+    }
+
+    /// Whether to offer the spam door at all.
+    ///
+    /// ALWAYS, ONCE THE DAEMON CAN ANSWER — which is a change forced by making
+    /// the fetch lazy. The chip used to be gated on `spam > 0`, and that count
+    /// is now zero until somebody opens the page, which is only reachable
+    /// through the chip: a door that appears once you have been through it.
+    ///
+    /// So the rule is the one Gmail itself uses: the folder is a place that
+    /// exists whether or not anything is in it, and the door to it is always
+    /// there. The count rides along only when there is one. The single
+    /// condition left is that the daemon is new enough to have the field at
+    /// all — `nil` means it cannot serve the page, and offering a door to a
+    /// 400 would be worse than not offering one.
+    var spamDoorVisible: Bool { sitrep.stats?.spam != nil }
+
+    /// Ask the daemon to go and fetch the spam folder. Called when the page is
+    /// OPENED, not on the recurring poll: the daemon does not track that folder,
+    /// so this is a real round trip to Gmail and it should cost one per visit
+    /// rather than one every ten seconds.
+    func refreshSpamFolder() async {
+        let asked = Date()
+        do {
+            try await APIClient.shared.refreshSpam()
+            spamSyncRequestedAt = asked
+        } catch {
+            // A daemon too old for the route, or an unreachable one. Leave the
+            // request unrecorded so the page does not claim to be checking
+            // something nobody was asked to check; the ordinary refresh error
+            // banner already covers an unreachable daemon.
+            spamSyncRequestedAt = nil
+        }
+    }
 
     /// Parked mail, in its OWN cache for the same reason the sent page has one:
     /// these rows are all `done`, so `refreshMail`'s pages — which every list
