@@ -243,6 +243,41 @@ fn a_sealed_row_never_reaches_the_spam_page() {
     assert!(!rows.iter().any(|u| u.update.id == sealed));
 }
 
+/// THE AGENT DOOR GETS NO SPAM AT ALL, not spam it is told to distrust — the
+/// same shape sealed mail gets. A thread of nothing but spam is `NotFound`
+/// through `/mcp`, and a MIXED thread hands over only the half that was
+/// delivered, so a spoof landing in a real conversation cannot reach a reader
+/// that might act on it.
+#[test]
+fn the_agent_door_thread_view_drops_spam() {
+    let (store, acct) = store();
+
+    // All spam: absent, exactly like a sealed thread.
+    triaged(acct, "g-spam", "t-junk")
+        .is_spam(true)
+        .body("wire the deposit today")
+        .seed(&store);
+    assert!(
+        store.thread_view(acct, "t-junk").is_err(),
+        "a thread of nothing but spam must 404, not come back empty"
+    );
+
+    // Mixed: only the delivered message crosses.
+    let real = triaged(acct, "g-real", "t-mixed")
+        .from("dana@northwind.example")
+        .body("here are the redlines")
+        .seed(&store);
+    triaged(acct, "g-spoof", "t-mixed")
+        .from("dana@northwind-example.co")
+        .is_spam(true)
+        .body("wire the deposit to the updated account below")
+        .seed(&store);
+
+    let view = store.thread_view(acct, "t-mixed").unwrap();
+    let ids: Vec<i64> = view.messages.iter().map(|m| m.id).collect();
+    assert_eq!(ids, vec![real], "the spoof must not reach the agent");
+}
+
 // ---- "not spam" ---------------------------------------------------------
 
 /// The rescue: the flag clears, the row requeues for a real verdict with the

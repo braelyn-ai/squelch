@@ -479,6 +479,49 @@ an audit row keeps recipients out of one. A stated `cc` gets no line of its own,
 deliberately: it is legible in the delivered mail, which is the test for whether the
 ledger has to carry it.
 
+## 4b. Provider spam
+
+**Invariant.** Mail the provider filed as spam is stored and readable on one
+human-door page, and is otherwise absent: it never reaches an LLM, never crosses
+the agent door, is never embedded, and never fires a notification.
+
+**Why it is a security rule and not only a cost one.** Spam is attacker-authored
+text selected for its ability to talk a reader into things, and a Stage-1 prompt
+is a reader. It is also the bulk of what arrives, so "score it like anything
+else" would mean spending the most model calls on the least trustworthy corpus.
+The same reasoning is why the agent door gets **no spam at all** rather than
+spam it is told to distrust: everything the agent reads is text it may act on.
+
+**Enforcement, in order.**
+- **Fetched under its own label.** `squelch-core/src/sync/mod.rs` walks `SPAM`
+  last and subtracts the ids the INBOX and SENT walks already returned, so a
+  message carrying a visible label keeps the visible reading. The store's upsert
+  keeps `is_spam = MIN(stored, incoming)` as the backstop.
+- **Never triaged.** `sync/ingest.rs` returns a neutral `tier=noise` row before
+  Stage-1 — after the seal check, so a misfiled OTP is still sealed and sealed
+  still outranks spam. `ingest_message` stamps the `'n/a'` stage markers, which
+  is what keeps the row out of both LLM queues.
+- **Never embedded.** `SyncEngine::ingest_one` returns `None` for a spam row, the
+  same structural gate sealed mail gets. An embedding is a similarity claim, and
+  spam is written to imitate the mail it impersonates.
+- **SQL absence.** Every band, queue, count and search leg pairs `is_spam = 0`
+  with its `is_sent = 0`. The one caller asking for the other side is
+  `GET /client/updates?spam=only`; an unrecognized value is a 400, never a
+  silent full listing.
+- **Agent door.** `store::thread_view` (the `/mcp` shape) selects `is_spam = 0`,
+  so a thread of nothing but spam is `NotFound` — the same shape sealed mail
+  gets. `hybrid_search` is gated on all three of its queries.
+- **Never notifies.** `triage::events::worthy_kind` returns `None` for a spam
+  row as an explicit arm, not as a side effect of its neutral tier.
+- **The one write.** `POST /client/actions/not_spam` removes the label in Gmail
+  FIRST and only then clears the flag locally, so a refused write leaves both
+  sides agreeing. There is deliberately no route the other way: squelch cannot
+  show anyone the effects of training a filter it does not read.
+
+**Guard tests.** `squelch-core/src/store/sqlite/tests/spam.rs` seeds one spam row
+beside one ordinary row with overlapping search terms and walks every listing at
+once, so a predicate dropped in a refactor fails there rather than in production.
+
 ## 5. Outbound secret guard
 
 **Invariant.** A secret-looking outgoing body is blocked unless the caller
