@@ -1393,6 +1393,7 @@ mod tests {
             total: 10,
             sealed: 2,
             spam: 0,
+            spam_synced_at: None,
             last_history_id: None,
             bands: Default::default(),
             last_surfaced_at: None,

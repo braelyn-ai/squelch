@@ -588,6 +588,15 @@ actor APIClient {
     /// triage verdict. The ONLY write the spam page makes — there is no
     /// "mark as spam" going the other way, because Passband cannot show the
     /// effects of training a filter it does not read.
+    /// Ask the daemon to go and fetch the provider's spam folder. FIRE AND
+    /// FORGET: the daemon does not track that folder, so this is a real Gmail
+    /// round trip measured in tens of seconds, and the answer arrives through
+    /// the ordinary updates poll rather than this response.
+    @discardableResult
+    func refreshSpam() async throws -> StatusResult {
+        try await post("/client/spam/refresh", body: EmptyBody())
+    }
+
     @discardableResult
     func actionNotSpam(_ messageId: Int) async throws -> StatusResult {
         try await post(

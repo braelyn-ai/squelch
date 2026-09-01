@@ -41,6 +41,20 @@ pub enum SitrepBand {
     Open,
 }
 
+/// `app_settings` key holding when the on-demand spam sync last COMPLETED
+/// (RFC3339 UTC), absent until one has.
+///
+/// It exists so the spam page can tell "we looked and the folder is empty" apart
+/// from "nobody has looked yet", which are the same empty list on the wire and
+/// opposite facts to a reader. The poll loop never walks the spam label at all,
+/// so without this stamp a page that has not synced yet would tell somebody
+/// their provider filtered nothing — a confident answer nobody has earned.
+///
+/// `pub` because the sync engine writes it and the store reads it into
+/// [`crate::types::StoreStats`], and a key spelled in two places is a key that
+/// eventually disagrees with itself.
+pub const SPAM_SYNCED_AT_KEY: &str = "spam_synced_at";
+
 /// WHICH SIDE of the provider's spam verdict a listing wants. A two-variant
 /// enum rather than a `bool` because the boolean has no honest name: `spam:
 /// true` reads as "include spam" at half the call sites and "only spam" at the

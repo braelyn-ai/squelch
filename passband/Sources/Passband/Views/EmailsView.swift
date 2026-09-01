@@ -121,6 +121,14 @@ struct EmailsView: View {
                 await store.refreshMail(mode)
             }
         }
+        // ASK FOR THE SPAM FOLDER ON ENTRY, and only on entry. Keyed on the mode
+        // alone rather than on the poll tick: the daemon does not track that
+        // folder, so this is a real Gmail round trip and it costs one per visit
+        // instead of one every ten seconds.
+        .task(id: mode) {
+            guard mode == .spam else { return }
+            await store.refreshSpamFolder()
+        }
         // Pull the thread for the row the cursor rests on, DEBOUNCED so sweeping
         // a 500-row list fires one request for the row you stop on rather than
         // one per row you pass. Covers everything past the bounded head-warm.
@@ -172,15 +180,32 @@ struct EmailsView: View {
         } else if rows.isEmpty {
             // The window the daemon answers with is 30 days, so an empty noise
             // or spam page says so rather than implying "ever".
+            //
+            // THE SPAM PAGE HAS THREE EMPTY STATES, not one, and they are the
+            // same empty list on the wire. The daemon does not track that
+            // folder, so "nothing here" is only true once it has actually
+            // looked; saying it while a fetch is in flight, or after one
+            // failed, would be inventing an answer.
             BandNote(
                 reminders
                     ? "No pending reminders."
                     : mode == .noise
                         ? "No noise in the last 30 days."
-                        : mode == .spam
-                            ? "Your email provider filtered nothing in the last 30 days."
-                            : "No mail.")
+                        : mode == .spam ? spamEmptyNote : "No mail.")
         }
+    }
+
+    /// Which of the spam page's three empty states this is. Only the last one
+    /// is a statement about the mailbox; the other two are statements about
+    /// this client's knowledge of it.
+    private var spamEmptyNote: String {
+        if store.spamFetchInFlight {
+            return "Checking your email provider's spam folder…"
+        }
+        if store.spamFetchStalled || !store.spamEverSynced {
+            return "Could not reach your email provider's spam folder."
+        }
+        return "Your email provider filtered nothing in the last 30 days."
     }
 
     /// The sent rows, same three gated notes. The reader opens with NO queue:
@@ -326,11 +351,14 @@ struct EmailsView: View {
         /// The spam count when the phone bar should offer the spam door, nil
         /// otherwise: on the noise page always, and on the inbox only when there
         /// is no noise count occupying the slot. See the chip's own note.
-        private var spamDoorCount: Int? {
-            guard let spam = store.sitrep.stats?.spam, spam > 0 else { return nil }
+        private var showSpamDoor: Bool {
+            guard store.spamDoorVisible else { return false }
             let noise = store.sitrep.stats?.tier_counts["noise"] ?? 0
-            guard mode == .noise || (mode == .inbox && noise == 0) else { return nil }
-            return spam
+            return mode == .noise || (mode == .inbox && noise == 0)
+        }
+        /// The count beside it, when there is one to show.
+        private var spamDoorCount: Int? {
+            store.sitrep.stats?.spam.flatMap { $0 > 0 ? $0 : nil }
         }
 
         private var phoneHeader: some View {
@@ -346,7 +374,7 @@ struct EmailsView: View {
                     Text("offline")
                         .font(Typo.micro).foregroundStyle(Palette.warn)
                         .help(err.message)
-                } else if let spam = spamDoorCount {
+                } else if showSpamDoor {
                     // THE PHONE'S SPAM DOOR, and it is a DRILL-DOWN rather than
                     // a second number beside the noise one: this bar has the
                     // segmented control plus room for one count, and two
@@ -358,9 +386,11 @@ struct EmailsView: View {
                     // empty noise bin does not hide the folder behind it.
                     Button { store.mailMode = .spam } label: {
                         HStack(spacing: 6) {
-                            Text("\(spam)")
-                                .font(Typo.num(12, weight: .bold))
-                                .foregroundStyle(Palette.inkFaintest)
+                            if let spam = spamDoorCount {
+                                Text("\(spam)")
+                                    .font(Typo.num(12, weight: .bold))
+                                    .foregroundStyle(Palette.inkFaintest)
+                            }
                             Text("spam").font(Typo.micro).foregroundStyle(Palette.inkFaintest)
                         }
                         .contentShape(Rectangle())
@@ -436,19 +466,28 @@ struct EmailsView: View {
                 // It sits here rather than in the segmented control because
                 // spam is a place you go looking for something, once, not one
                 // of the three lists you live in.
-                if let spam = store.sitrep.stats?.spam, spam > 0 {
+                if store.spamDoorVisible {
                     Button { store.mailMode = .spam } label: {
                         HStack(spacing: 8) {
-                            Text("\(spam)")
-                                .font(Typo.num(12, weight: .bold))
+                            // THE NUMBER ONLY WHEN THERE IS ONE. The daemon does
+                            // not track this folder, so before the first visit
+                            // there is no count to show and a "0" would be a
+                            // claim nobody has checked.
+                            if let spam = store.sitrep.stats?.spam, spam > 0 {
+                                Text("\(spam)")
+                                    .font(Typo.num(12, weight: .bold))
+                                    .foregroundStyle(
+                                        mode == .spam ? Palette.accent : Palette.inkFaintest)
+                            }
+                            Text("spam")
+                                .font(Typo.micro)
                                 .foregroundStyle(
                                     mode == .spam ? Palette.accent : Palette.inkFaintest)
-                            Text("spam").font(Typo.micro).foregroundStyle(Palette.inkFaintest)
                         }
                         .contentShape(Rectangle())
                     }
                     .buttonStyle(.plain)
-                    .help("mail your email provider filtered out — Passband never triaged it")
+                    .help("mail your email provider filtered out — opening this fetches it")
                 }
                 if let err = store.refreshError {
                     Text("· offline")

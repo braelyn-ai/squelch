@@ -679,6 +679,14 @@ pub struct StoreStats {
     /// tier=noise like everything untriaged, and folding them in would put them
     /// back in the number they were just taken out of.
     pub spam: i64,
+    /// When the on-demand spam sync last COMPLETED, `None` until one has.
+    ///
+    /// The spam folder is not walked by the poll loop, so an empty spam list
+    /// means one of two opposite things and this is what tells them apart:
+    /// nobody has fetched the folder yet, or it was fetched and there is
+    /// genuinely nothing in it. A page that guessed would be telling the reader
+    /// their provider filtered nothing on no evidence at all.
+    pub spam_synced_at: Option<DateTime<Utc>>,
     /// The persisted Gmail history cursor (mailbox='history'), if any.
     pub last_history_id: Option<u64>,
     /// Sitrep per-band counts over non-sealed rows: `standing` (past_due/

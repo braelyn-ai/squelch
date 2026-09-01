@@ -692,6 +692,15 @@ struct StoreStats: Codable, Sendable, Hashable {
     /// a client that showed a `0 spam` chip against a daemon that simply cannot
     /// answer would be inventing a fact about the mailbox.
     var spam: Int?
+    /// When the daemon last FETCHED the provider's spam folder. Nil means it
+    /// never has — which is the normal state, because the sync loop does not
+    /// track that folder and only fetches it when the page is opened.
+    ///
+    /// The page needs this to tell "still fetching" from "fetched, and there is
+    /// nothing in it": both are an empty list on the wire, and telling somebody
+    /// their provider filtered nothing when nobody has looked is a lie the UI
+    /// would have no way to take back.
+    var spam_synced_at: String?
     var last_history_id: Int?
     var bands: BandCounts
     var last_surfaced_at: String?

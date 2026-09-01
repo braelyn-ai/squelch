@@ -399,6 +399,32 @@ pub async fn refresh_now(State(state): State<ApiState>) -> impl IntoResponse {
     Json(json!({ "triggered": triggered }))
 }
 
+// --- POST /client/spam/refresh -----------------------------------------------
+
+/// ASK THE DAEMON TO GO AND FETCH THE PROVIDER'S SPAM FOLDER.
+///
+/// The sync loop never walks the SPAM label on its own: spam is the largest and
+/// least-read part of a mailbox, and tracking it continuously would spend most
+/// of the daemon's fetch budget keeping a page current that nobody has open. So
+/// the page asks, and the click pays for it.
+///
+/// FIRE AND FORGET, like `POST /client/refresh` next door. The fetch is bounded
+/// by `sync.spam_max` but still measured in tens of seconds, and holding an HTTP
+/// request open for that would trade a slow page for a timed-out one. The client
+/// polls `/client/updates?spam=only` as it already does, and reads
+/// `stats.spam_synced_at` to tell "still fetching" from "fetched, and the folder
+/// is empty" — two states that are the same empty list on the wire.
+pub async fn refresh_spam(State(state): State<ApiState>) -> impl IntoResponse {
+    let triggered = match &state.spam_refresh {
+        Some(notify) => {
+            notify.notify_one();
+            true
+        }
+        None => false,
+    };
+    Json(json!({ "triggered": triggered }))
+}
+
 // --- POST /client/retriage (developer tool) ----------------------------------
 
 #[derive(Debug, Deserialize)]

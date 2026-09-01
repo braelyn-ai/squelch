@@ -712,6 +712,17 @@ impl SqliteStore {
             |r| r.get(0),
         )?;
 
+        // WHEN THE SPAM FOLDER WAS LAST FETCHED, which the page needs in order to
+        // tell "we looked and it is empty" from "nobody has looked yet".
+        let spam_synced_at: Option<String> = conn
+            .query_row(
+                "SELECT value FROM app_settings WHERE account_id = ?1 AND key = ?2",
+                params![account_id, SPAM_SYNCED_AT_KEY],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let spam_synced_at = spam_synced_at.as_deref().and_then(|s| parse_dt(s).ok());
+
         // THE SPAM PAGE'S DOOR NUMBER. Counted the same way the page lists —
         // non-sealed, and served by `idx_messages_spam` — so the chip and the
         // page it opens cannot disagree.
@@ -774,6 +785,7 @@ impl SqliteStore {
             total,
             sealed,
             spam,
+            spam_synced_at,
             last_history_id: last_history_id.map(|v| v as u64),
             bands: BandCounts {
                 standing,

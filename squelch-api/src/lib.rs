@@ -96,6 +96,7 @@ fn client_router(state: ApiState) -> Router {
             post(handlers::set_update_reminder).delete(handlers::clear_update_reminder),
         )
         .route("/client/refresh", post(handlers::refresh_now))
+        .route("/client/spam/refresh", post(handlers::refresh_spam))
         .route("/client/thread/{thread_id}", get(handlers::get_thread))
         // "I opened this." Its own route rather than a side effect of the GET
         // above, because the client warms threads it has not shown and opens

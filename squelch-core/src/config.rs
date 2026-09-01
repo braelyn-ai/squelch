@@ -197,6 +197,19 @@ pub struct SyncConfig {
     /// How often (seconds) the incremental poll loop calls `history.list`; one
     /// poll batch is the coalesced batch.
     pub poll_secs: u64,
+    /// HOW MANY SPAM MESSAGES one on-demand spam sync will fetch, newest first.
+    ///
+    /// The spam folder is not walked by the poll loop at all (see
+    /// `SyncEngine::sync_spam_window`); it is fetched when somebody opens the
+    /// page. That makes this a bound on how long that click can take. A real
+    /// mailbox holds thousands of spam messages in a month and the fetch is one
+    /// request per message, so an uncapped sync would be a tab that spins for
+    /// twenty minutes.
+    ///
+    /// 200 because the page answers ONE question — "did something real get
+    /// filtered?" — and that question is about recent mail. Somebody hunting
+    /// further back has Gmail, which is better at it.
+    pub spam_max: u32,
 }
 
 impl Default for SyncConfig {
@@ -204,6 +217,7 @@ impl Default for SyncConfig {
         Self {
             backfill_days: 30,
             poll_secs: 5,
+            spam_max: 200,
         }
     }
 }

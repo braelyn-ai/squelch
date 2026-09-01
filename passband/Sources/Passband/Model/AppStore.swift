@@ -1980,6 +1980,84 @@ final class AppStore {
     /// and this is a lens over one of them that the Escape ladder sheds first.
     var reminderFilter = false
 
+    // MARK: - the provider's spam folder
+
+    /// When this session last ASKED the daemon to fetch the spam folder, nil
+    /// until it has. Paired with `stats.spam_synced_at` (when the daemon last
+    /// FINISHED one) it is the whole state machine for the spam page's copy:
+    /// a request newer than the stamp means a fetch is outstanding.
+    private var spamSyncRequestedAt: Date?
+
+    /// How long a spam fetch may be outstanding before the page stops saying it
+    /// is still checking and admits it did not work.
+    ///
+    /// The daemon stamps `spam_synced_at` only on SUCCESS, which is what makes
+    /// the stamp trustworthy and also what makes this cap necessary: a failed
+    /// fetch moves nothing, so without a deadline the page would spin forever
+    /// on a revoked credential. Two minutes is well past a capped fetch of a
+    /// few hundred messages and well short of a user's patience.
+    private static let spamSyncDeadline: TimeInterval = 120
+
+    /// Whether the daemon is (as far as this client can tell) still fetching.
+    var spamFetchInFlight: Bool {
+        guard let asked = spamSyncRequestedAt else { return false }
+        if Date().timeIntervalSince(asked) > Self.spamSyncDeadline { return false }
+        return !spamSyncLanded(since: asked)
+    }
+
+    /// Whether a fetch was asked for, ran out its deadline, and never landed.
+    /// The page says so rather than showing an empty list as though it were an
+    /// answer.
+    var spamFetchStalled: Bool {
+        guard let asked = spamSyncRequestedAt else { return false }
+        guard Date().timeIntervalSince(asked) > Self.spamSyncDeadline else { return false }
+        return !spamSyncLanded(since: asked)
+    }
+
+    /// Whether the folder has EVER been fetched. Nil stamp means the daemon has
+    /// not looked, which is the normal state — it does not track that folder.
+    var spamEverSynced: Bool { sitrep.stats?.spam_synced_at != nil }
+
+    private func spamSyncLanded(since: Date) -> Bool {
+        guard let stamp = sitrep.stats?.spam_synced_at, let at = Fmt.date(stamp) else {
+            return false
+        }
+        return at >= since
+    }
+
+    /// Whether to offer the spam door at all.
+    ///
+    /// ALWAYS, ONCE THE DAEMON CAN ANSWER — which is a change forced by making
+    /// the fetch lazy. The chip used to be gated on `spam > 0`, and that count
+    /// is now zero until somebody opens the page, which is only reachable
+    /// through the chip: a door that appears once you have been through it.
+    ///
+    /// So the rule is the one Gmail itself uses: the folder is a place that
+    /// exists whether or not anything is in it, and the door to it is always
+    /// there. The count rides along only when there is one. The single
+    /// condition left is that the daemon is new enough to have the field at
+    /// all — `nil` means it cannot serve the page, and offering a door to a
+    /// 400 would be worse than not offering one.
+    var spamDoorVisible: Bool { sitrep.stats?.spam != nil }
+
+    /// Ask the daemon to go and fetch the spam folder. Called when the page is
+    /// OPENED, not on the recurring poll: the daemon does not track that folder,
+    /// so this is a real round trip to Gmail and it should cost one per visit
+    /// rather than one every ten seconds.
+    func refreshSpamFolder() async {
+        let asked = Date()
+        do {
+            try await APIClient.shared.refreshSpam()
+            spamSyncRequestedAt = asked
+        } catch {
+            // A daemon too old for the route, or an unreachable one. Leave the
+            // request unrecorded so the page does not claim to be checking
+            // something nobody was asked to check; the ordinary refresh error
+            // banner already covers an unreachable daemon.
+            spamSyncRequestedAt = nil
+        }
+    }
+
     /// Parked mail, in its OWN cache for the same reason the sent page has one:
     /// these rows are all `done`, so `refreshMail`'s pages — which every list
     /// filters through `resolvedIds` — would hide every one of them the moment

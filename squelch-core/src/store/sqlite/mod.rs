@@ -39,10 +39,10 @@ use crate::store::{
     AttachmentBytes, BankingApplied, ContactEntry, Device, DeviceToken, Draft, DraftFields,
     ExtractQueued, InboxUnread, IssuedDeviceToken, MarketingApplied, MarketingOffer, MessageOpen,
     MessageUnsub, MintedPairingCode, MissingVector, NewAuditEntry, NewEvent, RevisitQueued,
-    SealedBody, SealedMessage, SearchFilter, SearchSort, SeedVerdict, SenderHistory, SentMessage,
-    SentMissingRecipients, SitrepBand, SpamScope, Stage1Applied, Stage1Queued, Stage2Applied,
-    Stage2CapOverrides, Stage2Queued, Stage2Usage, Stage2UsageDay, Store, SyncState, ThreadSibling,
-    TrackedMessage, TriageDebug, TriagedMessage, UsageTokens,
+    SPAM_SYNCED_AT_KEY, SealedBody, SealedMessage, SearchFilter, SearchSort, SeedVerdict,
+    SenderHistory, SentMessage, SentMissingRecipients, SitrepBand, SpamScope, Stage1Applied,
+    Stage1Queued, Stage2Applied, Stage2CapOverrides, Stage2Queued, Stage2Usage, Stage2UsageDay,
+    Store, SyncState, ThreadSibling, TrackedMessage, TriageDebug, TriagedMessage, UsageTokens,
 };
 use crate::types::{
     AccountId, AttachmentInfo, AttentionStatus, AttentionUpdate, AuditEntry, BandCounts, Banking,
