@@ -248,17 +248,32 @@ struct MobileSitrepView: View {
                     .updateContextMenu(verbs)
                 }
                 if overflow > 0 {
+                    // THE WHOLE ROW IS THE BUTTON, and only the pill is drawn.
+                    // A thumb aims at a line of a list, not at a 60pt chip at
+                    // the end of it, and every row above this one is already
+                    // tappable edge to edge — a control that looks like it
+                    // belongs to that stack and answers to a third of its width
+                    // reads as a miss rather than as a smaller target.
+                    //
+                    // So the glass is painted by hand (`glassCapsule`) inside a
+                    // `.plain` button and `contentShape` claims the full width:
+                    // `.buttonStyle(.glass)` would put the hit area exactly where
+                    // the pill is, which is the problem.
                     Button {
                         withAnimation(Motion.disclose) { expanded.toggle() }
                     } label: {
-                        Text(expanded ? "show less" : "\(overflow) more")
-                            .font(Typo.micro)
-                            .foregroundStyle(Palette.inkFaint)
-                            .padding(.horizontal, 11)
-                            .padding(.vertical, 5)
+                        HStack(spacing: 0) {
+                            Text(expanded ? "show less" : "\(overflow) more")
+                                .font(Typo.micro)
+                                .foregroundStyle(Palette.inkFaint)
+                                .padding(.horizontal, 11)
+                                .padding(.vertical, 5)
+                                .glassCapsule()
+                            Spacer(minLength: 0)
+                        }
+                        .contentShape(Rectangle())
                     }
-                    .buttonStyle(.glass)
-                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .buttonStyle(.plain)
                     .padding(.top, 6)
                 }
             }
