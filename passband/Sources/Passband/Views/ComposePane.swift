@@ -560,22 +560,21 @@ struct ComposePane: View {
                     .fill(Palette.canvas.opacity(0.6))
             )
 
-            if compose.guardKinds.isEmpty {
-                HStack(spacing: 4) {
-                    Text("outbound guard: not yet checked ·")
-                        .font(Typo.micro).foregroundStyle(Palette.inkFaintest)
-                    // Which act fetches the verdict, named as the reader's own
-                    // surface offers it: a key on the Mac, the button on a phone.
-                    #if os(macOS)
-                        Kbd("enter")
-                        Text("submits for the verdict")
-                            .font(Typo.micro).foregroundStyle(Palette.inkFaintest)
-                    #else
-                        Text("send submits for the verdict")
-                            .font(Typo.micro).foregroundStyle(Palette.inkFaintest)
-                    #endif
-                }
-            } else {
+            // THE GUARD SPEAKS ONLY WHEN IT HAS SOMETHING TO SAY. This slot used
+            // to carry a standing line announcing that the outbound secret scan
+            // had not run yet and that sending is what runs it — true, and no use
+            // to anybody: it named an internal subsystem, promised a "verdict" on
+            // a trial the reader never knew about, and said "not yet checked"
+            // about the one thing they could not check. A review pane's job is to
+            // state what goes out, and "a thing you have not heard of has not
+            // happened yet" is not part of that.
+            //
+            // Nothing about the scan changed. It still runs daemon-side on the
+            // send itself (squelch-api/src/guard.rs), a clean pass still means the
+            // mail is already gone, and a match still stops the send dead and
+            // brings up the box below with the redacted kinds and the override.
+            // The mechanism was never what needed explaining on a clean draft.
+            if !compose.guardKinds.isEmpty {
                 GuardVerdictBox(kinds: compose.guardKinds)
             }
         }
