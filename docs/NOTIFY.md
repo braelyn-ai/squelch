@@ -755,5 +755,9 @@ label, one `AtomicU64` per combination, every series rendered even at zero,
    already lists it in both spellings, so this is `llm sync` plus a per-tenant
    `llm mint` only where a VK predates that list. Then the daemon roll.
 4. The fast lane costs roughly a thousandth of a dollar per message on Haiku
-   against Stage-1's few cents on Opus: it is inside the noise of the $5/month
-   tenant VK budget, but it does draw from the same pool.
+   against Stage-1's few cents on Opus: it is inside the noise of the tenant
+   VK budget (live `SQUELCH_CONTROL_LLM_BUDGET_USD=75`/month on 2026-09-01,
+   not the code default of 5), but it does draw from the same pool. The
+   live `SQUELCH_CONTROL_LLM_MODELS` already lists Haiku in both spellings;
+   what `llm sync` has to confirm is that the provider key and each VK
+   actually reflect it.
