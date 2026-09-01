@@ -31,7 +31,7 @@ use crate::triage::events;
 use crate::triage::extract::{self, CategoryExtractor, RowAction, banking, marketing, shipments};
 use crate::triage::stage1_llm::{self, HEURISTIC_ONLY};
 use crate::triage::stage2::{self, ClassifyOutcome, RowContext};
-use crate::triage::{STALE_SKIP_MODEL, retriage_forced};
+use crate::triage::{NO_BODY_SKIP_MODEL, STALE_SKIP_MODEL, retriage_forced};
 use crate::triage::{Stage1RowAction, stage1_sealed_guard, stage2_sealed_guard};
 use crate::types::{AccountId, SenderRule, Sensitivity};
 
@@ -2340,7 +2340,8 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
         for row in &queued {
             // ONE ORDERED DECISION per row — sealed guard (the queue already
             // excludes sealed rows in SQL; re-check anyway, docs/SECURITY.md),
-            // then the stale skip, then the extractor lookup. It lives in
+            // then the stale skip, then the empty-body refusal, then the
+            // extractor lookup. It lives in
             // `route_extract_row` so a new specialist cannot be added behind a
             // guard that does not know about it.
             let extractor = match extract::route_extract_row(row, stale_cutoff, Utc::now()) {
@@ -2369,6 +2370,20 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
                         self.account_id,
                         row.message_id,
                         "skip-no-extractor",
+                    );
+                    skipped += 1;
+                    continue;
+                }
+                // SKIP-NO-BODY: an empty body gives an extractor nothing to
+                // read, and a model handed nothing invents something. Marked
+                // processed with its OWN stamp rather than the stale one, so
+                // "we refused to guess" and "it was too old to bother" stay
+                // two different facts in the row.
+                RowAction::NoBody => {
+                    let _ = self.store.extract_mark_processed(
+                        self.account_id,
+                        row.message_id,
+                        NO_BODY_SKIP_MODEL,
                     );
                     skipped += 1;
                     continue;

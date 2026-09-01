@@ -68,12 +68,15 @@ pub enum RowAction {
     Stale,
     /// No specialist owns this category: mark processed so it cannot loop.
     NoExtractor,
+    /// Nothing to read: mark processed without a model call.
+    NoBody,
     /// Hand the row to this specialist.
     Run(CategoryExtractor),
 }
 
 /// The per-row decision for the extract pass, as ONE ordered expression:
-/// sealed guard first, then the stale skip, then the extractor lookup. Pure, so
+/// sealed guard first, then the stale skip, then the empty-body refusal, then
+/// the extractor lookup. Pure, so
 /// the ordering is unit-testable without an LLM or a store — and so a new
 /// specialist can never be added behind a guard that does not know about it.
 ///
@@ -94,6 +97,24 @@ pub fn route_extract_row(
     }
     if row.received_at < stale_cutoff && !crate::triage::retriage_forced(row.retriage_at, now) {
         return RowAction::Stale;
+    }
+    // NOTHING TO READ IS NOT A QUESTION WORTH ASKING. An extractor pulls a
+    // structured record — an amount, an institution, a card tail — out of the
+    // BODY; handed an empty one it still answers, because that is what these
+    // models do, and the answer is invented. That is not a hypothetical: a
+    // sender shipping an empty text/plain part beside a full HTML one stored
+    // `body = ''` for its whole history, and the banking extractor came back
+    // from one of those with this crate's own prompt text in the institution
+    // field. The ingest fix means fewer rows arrive here empty; this means an
+    // empty one is never billed for a guess.
+    //
+    // The SUBJECT is deliberately not enough to proceed on. It carries a
+    // headline number often enough to look tempting ("You paid Ana $50.00"),
+    // and a record that confident about money deserves the body that backs it.
+    // Stage-1 keeps its own rules: it must see every email, and tiering a
+    // subject-only message is a judgement it can honestly make.
+    if row.body.trim().is_empty() {
+        return RowAction::NoBody;
     }
     match extractor_for_category(&row.category) {
         Some(extractor) => RowAction::Run(extractor),
@@ -366,6 +387,65 @@ mod tests {
         let cutoff = now - Duration::days(30);
         row.received_at = cutoff - Duration::days(400);
         assert_eq!(route_extract_row(&row, cutoff, now), RowAction::Sealed);
+    }
+
+    #[test]
+    fn an_empty_body_is_refused_before_any_specialist_runs() {
+        // A model handed nothing to read does not say so, it fills the gap: an
+        // empty-bodied Venmo statement came back with this crate's own prompt
+        // scaffolding in the institution field.
+        let now = Utc::now();
+        let cutoff = now - Duration::days(30);
+        for empty in ["", "   ", "\n\r\n", "\t"] {
+            let mut row = queued(Sensitivity::Normal);
+            row.body = empty.into();
+            assert_eq!(
+                route_extract_row(&row, cutoff, now),
+                RowAction::NoBody,
+                "body {empty:?} must not reach a specialist"
+            );
+        }
+    }
+
+    #[test]
+    fn a_body_with_anything_in_it_still_runs() {
+        let now = Utc::now();
+        let cutoff = now - Duration::days(30);
+        let mut row = queued(Sensitivity::Normal);
+        row.body = " x ".into();
+        assert_eq!(
+            route_extract_row(&row, cutoff, now),
+            RowAction::Run(CategoryExtractor::Banking)
+        );
+    }
+
+    #[test]
+    fn the_empty_body_refusal_never_preempts_the_sealed_guard() {
+        // Same invariant the stale skip has: an empty body must not stamp a
+        // sealed row processed. The guard is unconditionally first.
+        let now = Utc::now();
+        let cutoff = now - Duration::days(30);
+        let mut row = queued(Sensitivity::Sealed);
+        row.body = String::new();
+        assert_eq!(route_extract_row(&row, cutoff, now), RowAction::Sealed);
+    }
+
+    #[test]
+    fn an_empty_body_does_not_get_stamped_as_stale() {
+        // Two different facts, two different stamps: an old empty row reads
+        // Stale (the cheaper skip, and the one that is true first), and a fresh
+        // empty one reads NoBody. Neither may be reported as the other.
+        let now = Utc::now();
+        let cutoff = now - Duration::days(30);
+        let mut old = queued(Sensitivity::Normal);
+        old.body = String::new();
+        old.received_at = cutoff - Duration::days(1);
+        assert_eq!(route_extract_row(&old, cutoff, now), RowAction::Stale);
+        assert_ne!(
+            crate::triage::NO_BODY_SKIP_MODEL,
+            crate::triage::STALE_SKIP_MODEL,
+            "the two skips must stay distinguishable in the row"
+        );
     }
 
     #[test]
