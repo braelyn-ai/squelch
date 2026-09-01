@@ -580,6 +580,10 @@ impl Store for SqliteStore {
         self.shipments_redetect_cleanup(account_id)
     }
 
+    fn receipts_reparse_cleanup(&self, account_id: AccountId) -> Result<u64> {
+        self.receipts_reparse_cleanup(account_id)
+    }
+
     fn list_pollable_shipments(
         &self,
         account_id: AccountId,

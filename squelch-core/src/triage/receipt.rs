@@ -71,17 +71,17 @@ fn detector() -> &'static ReceiptDetector {
         ],
         amount: vec![
             // $1,234.56 or $42 or $42.10
-            rx(r"\$\s?([0-9][0-9,]*(?:\.[0-9]{2})?)"),
+            rx(r"\$\s?([0-9][0-9,]*(?:\.[0-9]+)?)"),
             // 1,234.56 USD / 42.00 usd
-            rx(r"\b([0-9][0-9,]*(?:\.[0-9]{2})?)\s?(?:USD|usd)\b"),
+            rx(r"\b([0-9][0-9,]*(?:\.[0-9]+)?)\s?(?:USD|usd)\b"),
             // USD 1,234.56
-            rx(r"\b(?:USD|usd)\s?([0-9][0-9,]*(?:\.[0-9]{2})?)"),
+            rx(r"\b(?:USD|usd)\s?([0-9][0-9,]*(?:\.[0-9]+)?)"),
         ],
         total_adjacent: vec![
             // "order total: $3.49" / "grand total $12" / "total $3.49" /
             // "amount charged: $3.49" / "you paid $3.49" / "charged $3.49".
-            rx(r"\b(?:order total|grand total|total|amount(?:\s+charged)?|paid|charged)\b[:\s]*\$\s?([0-9][0-9,]*(?:\.[0-9]{2})?)"),
-            rx(r"\b(?:order total|grand total|total|amount(?:\s+charged)?|paid|charged)\b[:\s]*([0-9][0-9,]*(?:\.[0-9]{2})?)\s?(?:USD|usd)\b"),
+            rx(r"\b(?:order total|grand total|total|amount(?:\s+charged)?|paid|charged)\b[:\s]*\$\s?([0-9][0-9,]*(?:\.[0-9]+)?)"),
+            rx(r"\b(?:order total|grand total|total|amount(?:\s+charged)?|paid|charged)\b[:\s]*([0-9][0-9,]*(?:\.[0-9]+)?)\s?(?:USD|usd)\b"),
         ],
         inbound_money: vec![
             rx(r"\brefund(ed|s|ing)?\b"),
@@ -123,9 +123,31 @@ fn has_obligation(text: &str) -> bool {
     detector().obligation.iter().any(|re| re.is_match(text))
 }
 
-/// Parse a single amount token ("1,234.56") to `f64`.
+/// Parse a single amount token ("1,234.56") to `f64`, ROUNDED TO CENTS.
+///
+/// The fraction the patterns above capture is deliberately unbounded (`[0-9]+`,
+/// not `[0-9]{2}`), and this is the other half of that decision. A two-digit
+/// fraction looks like the only thing a price can have right up until a real
+/// sender does its arithmetic in binary floating point and prints the result
+/// unrounded — Amazon's shipment mail says
+///
+/// ```text
+/// Total
+/// 67.28999999999999 USD
+/// ```
+///
+/// A pattern that admits exactly two decimals cannot match that at all, so the
+/// engine used to give up on the "67" and resume scanning INSIDE the number,
+/// where `28999999999999 USD` matches beautifully. Every affected receipt was
+/// stored as its own fractional tail: a $67.29 order became $28,999,999,999,999
+/// on the card. Taking the whole number and rounding here is what keeps the
+/// value and the cents both honest.
 fn parse_amount(raw: &str) -> Option<f64> {
-    raw.replace(',', "").parse::<f64>().ok()
+    let v = raw.replace(',', "").parse::<f64>().ok()?;
+    if !v.is_finite() {
+        return None;
+    }
+    Some((v * 100.0).round() / 100.0)
 }
 
 /// Extract the receipt TOTAL: an amount adjacent to a total-word if there is
@@ -156,6 +178,27 @@ fn extract_total(text: &str) -> Option<(f64, String)> {
     best.map(|v| (v, "USD".to_string()))
 }
 
+/// The text every rule here reads: the sender, the subject and the body, in that
+/// order. ONE definition, because [`recompute_total`] has to see character for
+/// character what [`detect_receipt`] saw or a re-parse would answer a different
+/// question than the parse it is correcting.
+fn haystack(from_addr: &str, subject: &str, body: &str) -> String {
+    format!("{from_addr}\n{subject}\n{body}")
+}
+
+/// Re-run ONLY the total extraction over a message already known to be a
+/// receipt, for the one-shot repair of rows a looser
+/// [`parse_amount`] stored wrong. `None` when nothing parses, which is a legal
+/// receipt state (the amount column is nullable).
+///
+/// Deliberately NOT [`detect_receipt`]: the row's existence already settles the
+/// classification, and re-litigating it here would let an unrelated change to
+/// the exclusion phrases silently delete somebody's purchase history during
+/// what is supposed to be an arithmetic fix.
+pub fn recompute_total(from_addr: &str, subject: &str, body: &str) -> Option<f64> {
+    extract_total(&haystack(from_addr, subject, body)).map(|(amount, _)| amount)
+}
+
 /// Detect a receipt from a message's surfaces. `None` when the message is not a
 /// purchase record, is a refund, or is a bill. Classification is driven by
 /// past-transaction phrasing, so a receipt with no parseable total still counts.
@@ -163,7 +206,7 @@ fn extract_total(text: &str) -> Option<(f64, String)> {
 /// SECURITY: callers MUST NOT invoke this for sealed mail (docs/SECURITY.md).
 pub fn detect_receipt(from_addr: &str, subject: &str, body: &str) -> Option<ReceiptInfo> {
     let d = detector();
-    let hay = format!("{from_addr}\n{subject}\n{body}");
+    let hay = haystack(from_addr, subject, body);
 
     // 0. Refund / inbound money: flowing TO the user, so not a purchase.
     if has_inbound_money(&hay) {
@@ -272,6 +315,62 @@ mod tests {
     }
 
     // ---- exclusions ------------------------------------------------------
+
+    #[test]
+    fn an_unrounded_float_total_parses_to_cents_not_to_its_tail() {
+        // AMAZON'S OWN ARITHMETIC, verbatim from a shipment email: their total
+        // is summed in binary floating point and printed unrounded. The old
+        // patterns admitted exactly two decimals, so they could not match at the
+        // "67" at all and the engine resumed scanning INSIDE the number, where
+        // "28999999999999 USD" matched perfectly. A $67.29 order was stored, and
+        // rendered on the receipts card, as $28,999,999,999,999.
+        let body = "* Gap Filler Syringe\r\n  Quantity: 1\r\n  7.97 USD\r\n\
+                    \r\n* Goat Ram Horn Devil Mask\r\n  Quantity: 2\r\n  21.99 USD\r\n\
+                    \r\nTotal\r\n67.28999999999999 USD\r\n\
+                    \r\nIf your order contains one or more items from a third party.\r\n";
+        let r = detect_receipt(
+            "shipment-tracking@amazon.com",
+            "Shipped: 2 \"Goat Ram Horn Devil Mask...\" and 2 more items",
+            body,
+        )
+        .expect("order confirmation is a receipt");
+        assert_eq!(r.amount, Some(67.29), "total must round to cents");
+    }
+
+    #[test]
+    fn every_float_artifact_seen_in_production_rounds_correctly() {
+        // The five that actually landed, with the totals they should have had.
+        for (printed, want) in [
+            ("14.530000000000001", 14.53),
+            ("40.099999999999994", 40.10),
+            ("96.63999999999999", 96.64),
+            ("77.41999999999999", 77.42),
+            ("67.28999999999999", 67.29),
+        ] {
+            let body = format!("Your order\r\nTotal\r\n{printed} USD\r\n");
+            let r = detect_receipt("orders@amazon.com", "Your order", &body)
+                .expect("receipt classified");
+            assert_eq!(r.amount, Some(want), "{printed} should store as {want}");
+        }
+    }
+
+    #[test]
+    fn a_long_fraction_after_a_dollar_sign_rounds_too() {
+        let r = detect_receipt("a@b.com", "Your receipt", "Total: $14.530000000000001")
+            .expect("receipt");
+        assert_eq!(r.amount, Some(14.53));
+    }
+
+    #[test]
+    fn ordinary_two_decimal_totals_are_unchanged() {
+        // The fix widens what the patterns accept; it must not move what they
+        // already got right.
+        let r =
+            detect_receipt("a@b.com", "Your receipt", "Order total: $1,234.56").expect("receipt");
+        assert_eq!(r.amount, Some(1234.56));
+        let r = detect_receipt("a@b.com", "Your order", "Total\r\n42 USD").expect("receipt");
+        assert_eq!(r.amount, Some(42.0));
+    }
 
     #[test]
     fn refund_is_not_a_receipt() {

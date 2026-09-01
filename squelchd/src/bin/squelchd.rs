@@ -2202,6 +2202,22 @@ fn cmd_serve(
             });
         }
 
+        // One-shot receipt re-parse: the amount patterns admitted a two-digit
+        // fraction and nothing longer, so an unrounded float printed as a total
+        // ("67.28999999999999 USD" — Amazon really does send this) matched in
+        // the MIDDLE of the number and stored its tail as the amount. Every
+        // existing row is re-parsed from its own message ONCE. Same shape as the
+        // re-detect above: store-only, no network, and the ONCE is the store's
+        // job, flag and corrections in one transaction.
+        {
+            let store = store.clone();
+            tokio::task::spawn_blocking(move || match store.receipts_reparse_cleanup(account_id) {
+                // Count only — an amount is never logged.
+                Ok(n) => eprintln!("squelchd: receipt re-parse corrected {n} receipt total(s)"),
+                Err(_) => eprintln!("squelchd: receipt re-parse failed (retries next start)"),
+            });
+        }
+
         // Auth-mail retention runs here because this process owns the write
         // credential (sync is bound to gmail.readonly by hard invariant). No-op
         // unless the shredder is enabled AND a write credential exists.

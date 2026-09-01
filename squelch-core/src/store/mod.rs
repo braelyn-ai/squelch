@@ -996,6 +996,16 @@ pub trait Store: Send + Sync {
     /// phantoms and nothing else.
     fn shipments_redetect_cleanup(&self, account_id: AccountId) -> Result<u64>;
 
+    /// One-shot repair of receipt totals mis-parsed by the pre-fix amount
+    /// patterns, which could match the FRACTIONAL TAIL of an unrounded float an
+    /// email printed as its own total ("67.28999999999999 USD" stored as
+    /// 28999999999999). Re-runs the fixed extraction over each row's message and
+    /// corrects the stored amount; returns the number of rows changed.
+    ///
+    /// EXACTLY ONCE PER ACCOUNT, enforced by the store in the same transaction as
+    /// the corrections. Callers do not gate it.
+    fn receipts_reparse_cleanup(&self, account_id: AccountId) -> Result<u64>;
+
     /// Shipments worth a carrier-API poll: not yet delivered, on a carrier that
     /// HAS an API ("ups" | "usps" | "fedex" | "dhl" — Amazon and "unknown" have
     /// none), first seen at or after `min_first_seen`, and under `max_failures`
