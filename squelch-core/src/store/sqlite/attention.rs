@@ -110,6 +110,7 @@ impl SqliteStore {
              WHERE t.account_id = ?1
                AND t.sensitivity != 'sealed'
                AND m.is_sent = 0
+               AND m.is_spam = 0
                AND m.received_at >= ?2
                AND t.importance >= ?3
              ORDER BY t.importance DESC, m.received_at DESC",
@@ -132,11 +133,13 @@ impl SqliteStore {
         status: Option<AttentionStatus>,
         band: Option<SitrepBand>,
         pending_reminders: bool,
+        spam: SpamScope,
     ) -> Result<Vec<AttentionUpdate>> {
         let conn = self.lock()?;
         let min = min_importance.unwrap_or(0) as i64;
 
-        // Base predicate: sealed excluded, sent excluded, since/importance window
+        // Base predicate: sealed excluded, sent excluded, the provider's spam
+        // verdict on whichever side `spam` asked for, since/importance window
         // (see WITHIN_WINDOW for why a reminder row is exempt from the `since`).
         // Bands:
         //   standing = dated obligation OR live correspondence, not yet done
@@ -145,10 +148,18 @@ impl SqliteStore {
         //   open     = status = 'open'
         // The `status != 'done'` on `new` keeps AUTO-RESOLVED receipts out of the
         // band — a receipt is a record, not new inbox clutter.
+        //
+        // THE BANDS NEVER PASS `SpamScope::Only`. Only the flat spam page does,
+        // and it passes no band with it: spam rows are all status='new' with
+        // importance 0 and no reminder, so every band but `new` would be empty
+        // anyway, and `new` would be the same list under a name that promises
+        // the user something needs doing about it.
+        let spam_sql = spam.predicate();
         let mut where_sql = format!(
             "WHERE t.account_id = ?1
                AND t.sensitivity != 'sealed'
                AND m.is_sent = 0
+               AND {spam_sql}
                AND {WITHIN_WINDOW}
                AND t.importance >= ?3"
         );
@@ -391,6 +402,10 @@ impl SqliteStore {
     ///
     /// - RECEIVED MAIL ONLY (`is_sent = 0`). Nobody opens their own outbox, and
     ///   counting it would dilute the rate with a number that has no opinion.
+    /// - AND NOT PROVIDER SPAM (`is_spam = 0`), which would dilute it far
+    ///   harder and in the flattering direction: spam is unopened by definition
+    ///   and there is a lot of it, so counting it would drive "mail the user had
+    ///   to open themselves" toward zero on volume alone.
     /// - SEALED MAIL IS IN THE DENOMINATOR. A login code is mail that arrived
     ///   and did not need opening, which is the most honest example there is of
     ///   the thing being measured. It can never be in the numerator, because
@@ -427,7 +442,8 @@ impl SqliteStore {
         let (received, opened): (i64, i64) = conn.query_row(
             "SELECT COUNT(*), COUNT(t.opened_at)
                FROM messages m JOIN triage t ON t.message_id = m.id
-              WHERE m.account_id = ?1 AND m.is_sent = 0 AND m.received_at >= ?2",
+              WHERE m.account_id = ?1 AND m.is_sent = 0 AND m.is_spam = 0
+                AND m.received_at >= ?2",
             params![account_id, floor_text],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )?;
@@ -436,7 +452,8 @@ impl SqliteStore {
         // has a rate; it does not have a rate worth mailing to a stranger.
         let oldest: Option<String> = conn.query_row(
             "SELECT MIN(received_at) FROM messages
-              WHERE account_id = ?1 AND is_sent = 0 AND received_at >= ?2",
+              WHERE account_id = ?1 AND is_sent = 0 AND is_spam = 0
+                AND received_at >= ?2",
             params![account_id, floor_text],
             |r| r.get(0),
         )?;
@@ -523,19 +540,22 @@ impl SqliteStore {
         // whatever the old one already said — the two stamps are the pending and
         // fired halves of ONE reminder, never a history.
         //
-        // AND NOT THE USER'S OWN SENT MAIL, by the same indistinguishability
-        // rule as sealed: sent mail carries a triage row (neutral, tier=noise)
-        // and every listing filters `m.is_sent = 0`, so a reminder stamped on
-        // one would be unreachable forever — it could never be listed, seen or
-        // cancelled, and firing it would surface nothing. No row, no `true`,
-        // and the handler 404s.
+        // AND NOT THE USER'S OWN SENT MAIL, NOR PROVIDER SPAM, by the same
+        // indistinguishability rule as sealed: both carry a triage row (neutral,
+        // tier=noise) that no band lists, so a reminder stamped on one would be
+        // unreachable forever — it could never be listed, seen or cancelled, and
+        // firing it would surface nothing. Spam is the sharper case of the two,
+        // because `reminded_at` is the one standing-band arm that carries no tier
+        // test: the stamp is meant to outrank triage's opinion, and the only
+        // thing still keeping the row out of the band would be the spam
+        // predicate. No row, no `true`, and the handler 404s.
         let stamped = tx.execute(
             "UPDATE triage
              SET remind_at = ?1, reminded_at = NULL
              WHERE account_id = ?2 AND message_id = ?3 AND sensitivity != 'sealed'
                AND EXISTS(SELECT 1 FROM messages mm
                           WHERE mm.account_id = ?2 AND mm.id = ?3
-                            AND mm.is_sent = 0)",
+                            AND mm.is_sent = 0 AND mm.is_spam = 0)",
             params![remind_at.to_rfc3339(), account_id, message_id],
         )?;
         if stamped == 0 {
@@ -662,10 +682,18 @@ impl SqliteStore {
 
         let mut tier_counts = std::collections::BTreeMap::new();
         {
+            // JOINED TO `messages` for the two exclusions, which this count did
+            // without for a long time and should not have. Sent mail and
+            // provider spam are both written tier=noise by ingest without a
+            // model ever looking at them, and neither is listed by the noise
+            // page, so counting them made the header's noise number a promise
+            // the page could not keep.
             let mut stmt = conn.prepare(
-                "SELECT tier, COUNT(*) FROM triage
-                 WHERE account_id=?1 AND sensitivity != 'sealed'
-                 GROUP BY tier",
+                "SELECT t.tier, COUNT(*) FROM triage t
+                 JOIN messages m ON m.id = t.message_id
+                 WHERE t.account_id=?1 AND t.sensitivity != 'sealed'
+                   AND m.is_sent = 0 AND m.is_spam = 0
+                 GROUP BY t.tier",
             )?;
             let rows = stmt.query_map(params![account_id], |r| {
                 Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
@@ -679,6 +707,17 @@ impl SqliteStore {
 
         let sealed: i64 = conn.query_row(
             "SELECT COUNT(*) FROM triage WHERE account_id=?1 AND sensitivity='sealed'",
+            params![account_id],
+            |r| r.get(0),
+        )?;
+
+        // THE SPAM PAGE'S DOOR NUMBER. Counted the same way the page lists —
+        // non-sealed, and served by `idx_messages_spam` — so the chip and the
+        // page it opens cannot disagree.
+        let spam: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM messages m
+             JOIN triage t ON t.message_id = m.id
+             WHERE m.account_id=?1 AND m.is_spam = 1 AND t.sensitivity != 'sealed'",
             params![account_id],
             |r| r.get(0),
         )?;
@@ -715,6 +754,7 @@ impl SqliteStore {
                        JOIN messages m ON m.id = t.message_id
                        WHERE t.account_id = ?1 AND t.sensitivity != 'sealed'
                          AND m.is_sent = 0
+                         AND m.is_spam = 0
                          AND {WITHIN_WINDOW}) t"
             ),
             params![account_id, bands_since.to_rfc3339()],
@@ -732,6 +772,7 @@ impl SqliteStore {
             tier_counts,
             total,
             sealed,
+            spam,
             last_history_id: last_history_id.map(|v| v as u64),
             bands: BandCounts {
                 standing,

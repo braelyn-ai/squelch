@@ -60,6 +60,11 @@ fn bump_unsub_violation_conn(
 /// ingest order or upstream filter quality. The reverse flip (1 -> 0) stays
 /// allowed: a message can only gain visibility, never lose it.
 ///
+/// `is_spam` is STICKY TO 0 the same way and for the same shape of reason: a
+/// message ever seen outside the spam label must not be hidden by a later
+/// sighting inside it. The SPAM walk runs last and subtracts what the other two
+/// already returned, so the clause is a backstop rather than the mechanism.
+///
 /// `to_addrs` is the one column that PREFERS THE STORED VALUE over a NULL
 /// (`COALESCE(excluded, messages)`): only a sent-path ingest parses recipients,
 /// so a re-fetch that skips them — or an old row the backfill already filled —
@@ -68,8 +73,8 @@ fn upsert_message_conn(conn: &Connection, msg: &NewMessage) -> Result<i64> {
     conn.execute(
         "INSERT INTO messages(account_id, gmail_msg_id, thread_id, from_addr, from_name,
              subject, received_at, snippet, body, body_html, is_sent, to_addrs,
-             list_unsubscribe, list_unsub_one_click, auth_pass)
-         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)
+             list_unsubscribe, list_unsub_one_click, auth_pass, is_spam)
+         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)
          ON CONFLICT(account_id, gmail_msg_id) DO UPDATE SET
              thread_id=excluded.thread_id, from_addr=excluded.from_addr,
              from_name=excluded.from_name, subject=excluded.subject,
@@ -79,7 +84,8 @@ fn upsert_message_conn(conn: &Connection, msg: &NewMessage) -> Result<i64> {
              to_addrs=COALESCE(excluded.to_addrs, messages.to_addrs),
              list_unsubscribe=excluded.list_unsubscribe,
              list_unsub_one_click=excluded.list_unsub_one_click,
-             auth_pass=excluded.auth_pass",
+             auth_pass=excluded.auth_pass,
+             is_spam=MIN(messages.is_spam, excluded.is_spam)",
         params![
             msg.account_id,
             msg.gmail_msg_id,
@@ -96,6 +102,7 @@ fn upsert_message_conn(conn: &Connection, msg: &NewMessage) -> Result<i64> {
             msg.list_unsubscribe,
             msg.list_unsub_one_click as i64,
             msg.auth_pass.map(|p| p as i64),
+            msg.is_spam as i64,
         ],
     )?;
     let id: i64 = conn.query_row(
@@ -282,10 +289,16 @@ impl SqliteStore {
         let conn = self.lock()?;
         let subject = thread_guard_and_subject(&conn, account_id, thread_id)?;
 
+        // THE AGENT DOOR GETS NO SPAM AT ALL, not spam it is told to distrust.
+        // Everything the agent reads is text it may act on, and provider spam is
+        // text written to make a reader act; the human door can afford to show
+        // it because a human is looking at a page that says who filed it. A
+        // thread of nothing but spam therefore comes back empty here and 404s
+        // below, which is the same shape sealed mail gets.
         let mut stmt = conn.prepare(
             "SELECT id, from_addr, from_name, received_at, body
              FROM messages
-             WHERE account_id=?1 AND thread_id=?2
+             WHERE account_id=?1 AND thread_id=?2 AND is_spam = 0
              ORDER BY received_at ASC",
         )?;
         let messages = stmt
@@ -368,6 +381,7 @@ impl SqliteStore {
         let mut stmt = conn.prepare(
             "SELECT m.id, m.from_addr, m.from_name, m.received_at, m.body, m.body_html,
                     t.tier, t.deadline, t.status, t.one_line, m.auth_pass, m.subject,
+                    m.is_spam,
                     (m.is_sent = 1
                      OR (TRIM(COALESCE(m.from_addr, '')) != ''
                          AND LOWER(TRIM(COALESCE(m.from_addr, ''))) =
@@ -393,7 +407,8 @@ impl SqliteStore {
                     attachments: Vec::new(), // filled below, once `stmt` is gone
                     // The computed authorship bit above: a boolean expression
                     // guarded against NULL on both sides, so every row answers.
-                    is_sent: r.get::<_, i64>(12)? != 0,
+                    is_sent: r.get::<_, i64>(13)? != 0,
+                    is_spam: r.get::<_, i64>(12)? != 0,
                     tier: r
                         .get::<_, Option<String>>(6)?
                         .as_deref()
@@ -575,8 +590,10 @@ impl SqliteStore {
         };
         // STAGE-1/STAGE-2 QUEUE MARKERS: `stage1_model_used` decides whether the
         // Stage-1 pass looks at this row, `needs_stage2` is the escalation seed.
-        //   * Sealed / Sent: never queued for any LLM ('n/a'). Sealed mail
-        //     reaching a model is the one thing this system must never do.
+        //   * Sealed / Sent / provider-spam: never queued for any LLM ('n/a').
+        //     Sealed mail reaching a model is the one thing this system must
+        //     never do; spam reaching one is the second, because spam bodies are
+        //     attacker-written text and a Stage-1 prompt is a reader of them.
         //   * Filtered rule: skip Stage-1 and go straight to Stage-2, which is
         //     the only stage that evaluates `want_text` ('rule', needs_stage2=1).
         //   * EVERYTHING ELSE, rule-decided included: enter the Stage-1 queue
@@ -594,7 +611,10 @@ impl SqliteStore {
         // rung parks NOT-confident precisely because its verdict is pending an
         // LLM read of `want_text` (see `triage::stage1`).
         let (stage1_model_used, needs_stage2): (Option<&str>, i64) =
-            if triaged.sensitivity != Sensitivity::Normal || triaged.message.is_sent {
+            if triaged.sensitivity != Sensitivity::Normal
+                || triaged.message.is_sent
+                || triaged.message.is_spam
+            {
                 (Some("n/a"), 0)
             } else if triaged.matched_rule.is_some() && !triaged.confident {
                 (Some("rule"), 1)
@@ -611,11 +631,12 @@ impl SqliteStore {
              OR (triage.stage1_model_used IS NOT NULL \
                  AND triage.stage1_model_used NOT IN ('rule', 'n/a')))";
         // SHIPMENTS-EXTRACTOR TRIGGER. 'pending' queues the row for the shipments
-        // specialist; NULL means no shipping signal at ingest. Sealed and sent
-        // mail never queue — the detector does not even run for them.
+        // specialist; NULL means no shipping signal at ingest. Sealed, sent and
+        // spam mail never queue — the detector does not even run for them.
         let ship_extract_model: Option<&str> = if triaged.ship_extract
             && triaged.sensitivity == Sensitivity::Normal
             && !triaged.message.is_sent
+            && !triaged.message.is_spam
         {
             Some("pending")
         } else {

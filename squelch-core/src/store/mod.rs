@@ -41,6 +41,44 @@ pub enum SitrepBand {
     Open,
 }
 
+/// WHICH SIDE of the provider's spam verdict a listing wants. A two-variant
+/// enum rather than a `bool` because the boolean has no honest name: `spam:
+/// true` reads as "include spam" at half the call sites and "only spam" at the
+/// other half, and the two differ by the entire inbox.
+///
+/// There is no `Both`. Spam and ordinary mail interleaved in one list is the
+/// state this feature exists to end, and offering it would make the default
+/// listing one mistaken argument away from it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SpamScope {
+    /// Everything the provider did NOT file as spam. The default, and what every
+    /// band, queue, count and search asks for.
+    #[default]
+    Exclude,
+    /// ONLY what the provider filed as spam — the human door's spam page, and
+    /// the only caller in the codebase that passes it.
+    Only,
+}
+
+impl SpamScope {
+    /// The SQL predicate over `messages` (aliased `m`) this scope stands for.
+    pub fn predicate(self) -> &'static str {
+        match self {
+            SpamScope::Exclude => "m.is_spam = 0",
+            SpamScope::Only => "m.is_spam = 1",
+        }
+    }
+
+    /// One accepted string, and `None` for anything else so the caller can 400
+    /// rather than silently serve the wrong side of the verdict.
+    pub fn parse(s: &str) -> Option<SpamScope> {
+        match s {
+            "only" => Some(SpamScope::Only),
+            _ => None,
+        }
+    }
+}
+
 /// One attachment's `(filename, mime, data)`; `data` is `None` when the bytes
 /// were not stored (the part was over the ingest cap).
 pub type AttachmentBytes = (String, String, Option<Vec<u8>>);
@@ -1349,6 +1387,7 @@ pub trait Store: Send + Sync {
         status: Option<AttentionStatus>,
         band: Option<SitrepBand>,
         pending_reminders: bool,
+        spam: SpamScope,
     ) -> Result<Vec<AttentionUpdate>>;
 
     /// SEEN-LEDGER stamp, in ONE transaction: for each non-sealed message id set

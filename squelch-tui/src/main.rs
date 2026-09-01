@@ -242,6 +242,7 @@ fn seed_fake_data(store: &SqliteStore, account: AccountId) -> Result<()> {
             body: fk.body.to_string(),
             body_html: None,
             is_sent: false,
+            is_spam: false,
             to_addrs: None,
             list_unsubscribe: None,
             list_unsub_one_click: false,

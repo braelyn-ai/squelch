@@ -281,6 +281,22 @@ pub struct ClientMessage {
     /// [`SanitizedMessage`] is untouched.
     #[serde(default)]
     pub is_sent: bool,
+    /// THE PROVIDER'S SPAM VERDICT on this message, straight off
+    /// `messages.is_spam`. On the wire because the reader has to be able to SAY
+    /// SO: mail that arrives here having been filtered by Gmail rather than
+    /// scored by squelch is the one case where the honest thing to show the user
+    /// is who made the call, and the client cannot infer it — a spam row looks
+    /// exactly like any other untriaged one (tier=noise, importance 0).
+    ///
+    /// Per MESSAGE and not per thread, because a thread can hold both: a real
+    /// correspondent's mail and a spoof of them can share a Subject and land in
+    /// the same conversation, and marking the whole thread would either libel
+    /// the real message or excuse the forgery.
+    ///
+    /// Like `is_sent`, this is the human door only — the agent door's
+    /// [`SanitizedMessage`] carries no spam at all rather than labelled spam.
+    #[serde(default)]
+    pub is_spam: bool,
     /// This message's OWN triage verdict, for in-thread attention highlighting:
     /// the band shows one row per thread, so the reader is where "which message
     /// is the reason" gets answered. All optional — absent on a pre-highlight
@@ -647,12 +663,22 @@ pub struct Event {
 /// Per-tier / sealed / sync summary counts. Human-door-facing (squelch-api).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StoreStats {
-    /// Count of non-sealed messages per tier (past_due/deadline/signal/noise).
+    /// Count of non-sealed messages per tier (past_due/deadline/signal/noise),
+    /// over RECEIVED, NON-SPAM mail only. Both exclusions are corrections: sent
+    /// mail and provider spam both land tier=noise without ever being triaged,
+    /// so counting them made the header's "noise" number — which is the door to
+    /// the noise page — describe a list several times larger than the page it
+    /// opens.
     pub tier_counts: std::collections::BTreeMap<String, i64>,
     /// Total non-sealed, triaged messages.
     pub total: i64,
     /// Count of sealed messages (metadata only).
     pub sealed: i64,
+    /// How many messages the mail provider filed as spam. Its own count rather
+    /// than a `tier_counts` entry because spam is not a tier: these rows carry
+    /// tier=noise like everything untriaged, and folding them in would put them
+    /// back in the number they were just taken out of.
+    pub spam: i64,
     /// The persisted Gmail history cursor (mailbox='history'), if any.
     pub last_history_id: Option<u64>,
     /// Sitrep per-band counts over non-sealed rows: `standing` (past_due/
@@ -712,6 +738,10 @@ pub struct NewMessage {
     /// door serves flattened `body` text (see docs/SECURITY.md).
     pub body_html: Option<String>,
     pub is_sent: bool,
+    /// `true` when Gmail had this message under its SPAM label. The provider's
+    /// verdict, never ours: it keeps the row out of every band, queue and search
+    /// (see `messages.is_spam`) and off the LLM path entirely.
+    pub is_spam: bool,
     /// Display recipients (To + Cc) of SENT mail, comma-joined `Name <addr>`
     /// (bare addr when the header carried no display name). `None` for received
     /// mail, and `None` from any caller that did not parse the headers — the

@@ -35,6 +35,12 @@ pub struct RawFetched {
     pub internal_date: Option<DateTime<Utc>>,
     /// Whether this came from the Sent mailbox (seeds the contacts table).
     pub is_sent: bool,
+    /// Whether this came from Gmail's SPAM label. Mutually exclusive with
+    /// `is_sent` in practice — the SPAM walk subtracts the ids the INBOX and
+    /// SENT walks already returned — and harmless if both were ever somehow set,
+    /// because the sent branch below runs first and lands the same neutral,
+    /// never-triaged row.
+    pub is_spam: bool,
     /// The account's own email, compared lower-cased so the user's own address can
     /// NEVER become a contact (contacts come from Sent mail's To/Cc, not From). May
     /// be empty when unknown — then only From is excluded, which on Sent mail is
@@ -1113,6 +1119,7 @@ pub fn ingest(
         body: text.clone(),
         body_html,
         is_sent: fetched.is_sent,
+        is_spam: fetched.is_spam,
         to_addrs,
         list_unsubscribe,
         list_unsub_one_click,
@@ -1167,6 +1174,44 @@ pub fn ingest(
             tier: Tier::Noise,
             one_line: String::new(),
             reason: "sent mail (contacts seeded; not triaged)".to_string(),
+            field_reasons: FieldReasons::default(),
+            matched_rule: None,
+            deadline: None,
+            shipment: None,
+            ship_extract: false,
+            receipt: None,
+            calendar: None,
+            attachments,
+            confident: true,
+        };
+    }
+
+    // ---- Provider spam: store it, show it on request, NEVER triage it -------
+    // Gmail already made this call, and re-litigating it would be the single
+    // most expensive thing this daemon does: spam is the bulk of what arrives
+    // and every row of it would buy a frontier model call to reach the answer
+    // the provider handed us for free.
+    //
+    // It is also the one branch where the body is presumed hostile. Spam is
+    // attacker-authored text selected for its ability to talk a reader into
+    // things, and a Stage-1 prompt is a reader. Not calling the model is a
+    // security property here, not only a cost one — which is why this sits with
+    // the sealed and sent branches rather than behind a config flag.
+    //
+    // AFTER the seal check, deliberately: an OTP that Gmail misfiled stays
+    // sealed, and sealed outranks everything (a sealed row is absent from the
+    // spam page too, which is correct — nothing should page through auth codes).
+    if fetched.is_spam {
+        return TriagedMessage {
+            message,
+            recipients,
+            recipient_addrs,
+            sensitivity: Sensitivity::Normal,
+            sealed_kind: None,
+            importance: 0,
+            tier: Tier::Noise,
+            one_line: String::new(),
+            reason: "spam (sorted by the mail provider; not triaged)".to_string(),
             field_reasons: FieldReasons::default(),
             matched_rule: None,
             deadline: None,
@@ -1259,9 +1304,15 @@ pub fn ingest_with_rules(
     // re-run Stage-1 WITH rules. This keeps the seal invariant in exactly one
     // place while still honoring user rules.
     let mut triaged = ingest(fetched, cfg, now, known_contact_lookup);
-    // Sealed and Sent mail never run Stage-1 (Sent is neutral tier-noise), so
-    // they must not run the rules re-pass either.
-    if triaged.sensitivity == Sensitivity::Sealed || fetched.is_sent || rules.is_empty() {
+    // Sealed, Sent and provider-spam mail never run Stage-1 (the latter two land
+    // neutral tier-noise), so they must not run the rules re-pass either. For
+    // spam that matters beyond tidiness: a `Filtered` rule's re-pass is what sets
+    // `needs_stage2`, and a spam row must never enter an LLM queue.
+    if triaged.sensitivity == Sensitivity::Sealed
+        || fetched.is_sent
+        || fetched.is_spam
+        || rules.is_empty()
+    {
         return triaged;
     }
     let is_known = triaged.matched_rule.is_none() && triaged.reason.contains("known contact");
@@ -1313,6 +1364,8 @@ pub fn ingest_sent(
         raw,
         internal_date,
         is_sent: true,
+        // The send echo, by construction: this is mail the api just sent.
+        is_spam: false,
         account_addr: account_addr.to_string(),
     };
     // Both arguments are unreachable on the sent path: Stage-1 (which cfg tunes)

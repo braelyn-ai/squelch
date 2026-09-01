@@ -40,7 +40,7 @@ use crate::store::{
     ExtractQueued, InboxUnread, IssuedDeviceToken, MarketingApplied, MarketingOffer, MessageOpen,
     MessageUnsub, MintedPairingCode, MissingVector, NewAuditEntry, NewEvent, RevisitQueued,
     SealedBody, SealedMessage, SearchFilter, SearchSort, SeedVerdict, SenderHistory, SentMessage,
-    SentMissingRecipients, SitrepBand, Stage1Applied, Stage1Queued, Stage2Applied,
+    SentMissingRecipients, SitrepBand, SpamScope, Stage1Applied, Stage1Queued, Stage2Applied,
     Stage2CapOverrides, Stage2Queued, Stage2Usage, Stage2UsageDay, Store, SyncState, ThreadSibling,
     TrackedMessage, TriageDebug, TriagedMessage, UsageTokens,
 };
@@ -842,6 +842,7 @@ impl Store for SqliteStore {
         status: Option<AttentionStatus>,
         band: Option<SitrepBand>,
         pending_reminders: bool,
+        spam: SpamScope,
     ) -> Result<Vec<AttentionUpdate>> {
         self.attention_updates(
             account_id,
@@ -850,6 +851,7 @@ impl Store for SqliteStore {
             status,
             band,
             pending_reminders,
+            spam,
         )
     }
 

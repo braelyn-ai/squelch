@@ -18,8 +18,8 @@ use serde_json::json;
 use squelch_core::CoreError;
 use squelch_core::config::{CACHE_READ_INPUT_MULT, CACHE_WRITE_INPUT_MULT};
 use squelch_core::store::{
-    ActionMessageRef, Draft, NewAuditEntry, SearchFilter, SearchSort, SitrepBand, SqliteStore,
-    Store,
+    ActionMessageRef, Draft, NewAuditEntry, SearchFilter, SearchSort, SitrepBand, SpamScope,
+    SqliteStore, Store,
 };
 use squelch_core::sync::{decode_raw_b64url, parse_internal_date};
 use squelch_core::triage::llm::Usage;
@@ -152,6 +152,19 @@ pub struct UpdatesQuery {
     /// listing that never stamps the seen-ledger: a schedule the user is
     /// reviewing is not the mail being shown to them.
     reminders: Option<String>,
+    /// THE PROVIDER'S SPAM FOLDER: `only` swaps the listing over to the mail
+    /// Gmail filed as spam, which every other listing on this route excludes.
+    /// Absent means the ordinary mailbox.
+    ///
+    /// Its own parameter and not a `tier` value, because spam is not a verdict
+    /// this system reached — nothing triaged these rows, and they all carry the
+    /// neutral tier=noise seed. A `tier=spam` would have made the provider's
+    /// call look like one of ours in the one place the difference is the point.
+    ///
+    /// One accepted value and a 400 for anything else, for the reason
+    /// `reminders` gives: a client asking for the spam folder and quietly
+    /// getting the inbox back is a failure the user would read as data loss.
+    spam: Option<String>,
     limit: Option<u32>,
     cursor: Option<String>,
     /// READ WITHOUT SURFACING. Default false, so every existing client keeps the
@@ -199,6 +212,11 @@ pub async fn get_updates(
         Some("pending") => true,
         Some(_) => return Err(ApiError::bad_request("reminders must be: pending")),
     };
+    let spam = match q.spam.as_deref() {
+        None => SpamScope::Exclude,
+        Some(s) => SpamScope::parse(s)
+            .ok_or_else(|| ApiError::bad_request("spam must be: only"))?,
+    };
     let since = q
         .since
         .unwrap_or_else(|| Utc::now() - chrono::Duration::days(DEFAULT_UPDATES_WINDOW_DAYS));
@@ -209,8 +227,10 @@ pub async fn get_updates(
     let peek = q.peek || pending_reminders;
 
     let items = store_call(&state, move |store, account_id| {
-        // attention_updates excludes sealed rows in SQL. status/band/reminders
-        // filter server-side; tier and pagination apply over the ranked slice here.
+        // attention_updates excludes sealed rows in SQL, and serves whichever
+        // side of the provider's spam verdict `spam` asked for. status/band/
+        // reminders filter server-side; tier and pagination apply over the
+        // ranked slice here.
         let mut all = store.attention_updates(
             account_id,
             since,
@@ -218,6 +238,7 @@ pub async fn get_updates(
             status_filter,
             band,
             pending_reminders,
+            spam,
         )?;
         if let Some(t) = tier_filter {
             all.retain(|u| u.update.tier == t);

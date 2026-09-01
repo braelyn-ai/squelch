@@ -44,6 +44,10 @@ pub const GMAIL_API_BASE: &str = "https://gmail.googleapis.com/gmail/v1/users/me
 pub const LABEL_INBOX: &str = "INBOX";
 /// The SENT system label.
 const LABEL_SENT: &str = "SENT";
+/// The SPAM system label — Gmail's own verdict, which squelch surfaces on its
+/// spam page and never re-litigates. `pub` because the write path's "not spam"
+/// removes exactly this label (and adds [`LABEL_INBOX`] back).
+pub const LABEL_SPAM: &str = "SPAM";
 
 /// The single `sync_state` row key for the REST engine's historyId cursor.
 const HISTORY_KEY: &str = "history";
@@ -94,6 +98,33 @@ enum IngestOrigin {
     Backfill,
     /// A history walk or a catch-up re-scan: mail that may be genuinely new.
     Incremental,
+}
+
+/// WHICH GMAIL LABEL a fetch batch came from, and therefore how the rows land.
+///
+/// An enum rather than the pair of booleans it replaces. Two bools can spell
+/// four states, only three of which mean anything, and the two that get passed
+/// most often differ from each other by argument ORDER alone — the exact shape
+/// of mistake that puts inbound mail in the sent bucket and makes it vanish from
+/// every listing. One argument cannot be transposed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Mailbox {
+    /// Ordinary received mail: the only batch that is triaged.
+    Inbox,
+    /// The user's own outbox. Neutral row, no LLM, seeds contacts.
+    Sent,
+    /// Gmail's SPAM label. Neutral row, no LLM, hidden from every surface but
+    /// the human door's spam page.
+    Spam,
+}
+
+impl Mailbox {
+    fn is_sent(self) -> bool {
+        matches!(self, Mailbox::Sent)
+    }
+    fn is_spam(self) -> bool {
+        matches!(self, Mailbox::Spam)
+    }
 }
 
 /// The SHIPMENTS extractor's own stale cutoff, from `carriers.max_age_days`.
@@ -265,11 +296,11 @@ pub fn advance_history_cursor(current: u64, observed: impl IntoIterator<Item = u
     observed.into_iter().fold(current, u64::max)
 }
 
-/// Drop from `ids` every id also in `claimed`, preserving order. Used to hand the
-/// SENT batch only what the INBOX batch did NOT already ingest: a self-addressed
-/// message carries both labels, and the store's message upsert writes
-/// `is_sent = excluded.is_sent` on conflict, so re-ingesting it as sent would
-/// hide the visible copy. Pure, so the precedence rule is unit-testable.
+/// Drop from `ids` every id also in `claimed`, preserving order. Used to hand
+/// each later label walk only what the earlier ones did NOT already ingest: a
+/// self-addressed message carries both INBOX and SENT, and re-ingesting a
+/// message under a hiding label (`is_sent`, `is_spam`) would take the visible
+/// copy off every listing. Pure, so the precedence rule is unit-testable.
 fn subtract_ids(ids: Vec<String>, claimed: &[String]) -> Vec<String> {
     if claimed.is_empty() {
         return ids;
@@ -810,7 +841,7 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
         let inbox_ids = self.list_message_ids(LABEL_INBOX, Some(&q)).await?;
         // Backfill NEVER notifies (see `IngestOrigin`).
         let n = self
-            .fetch_raw_and_ingest(&inbox_ids, /* is_sent */ false, IngestOrigin::Backfill)
+            .fetch_raw_and_ingest(&inbox_ids, Mailbox::Inbox, IngestOrigin::Backfill)
             .await?;
         eprintln!("squelch: backfilled {n} INBOX messages");
 
@@ -820,9 +851,26 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
         // triage/updates/search.
         let sent_ids = self.list_message_ids(LABEL_SENT, Some(&q)).await?;
         let seeded = self
-            .fetch_raw_and_ingest(&sent_ids, /* is_sent */ true, IngestOrigin::Backfill)
+            .fetch_raw_and_ingest(&sent_ids, Mailbox::Sent, IngestOrigin::Backfill)
             .await?;
         eprintln!("squelch: backfilled {seeded} SENT messages (bodies for recall + contacts)");
+
+        // SPAM bodies, over the same window. LAST, and with the ids the other two
+        // walks already returned subtracted, so a message that carries SPAM
+        // alongside a visible label keeps the visible reading. The upsert's
+        // `is_spam=MIN(...)` is the backstop; this is the mechanism.
+        //
+        // It is a whole extra label's worth of fetches on first run, which is
+        // real, and it is why the spam page can exist at all: Gmail's `SPAM`
+        // messages carry no `INBOX` label, so nothing about the other two walks
+        // was ever going to see them.
+        let spam_ids = self.list_message_ids(LABEL_SPAM, Some(&q)).await?;
+        let spam_only = subtract_ids(spam_ids, &inbox_ids);
+        let spam_only = subtract_ids(spam_only, &sent_ids);
+        let spammed = self
+            .fetch_raw_and_ingest(&spam_only, Mailbox::Spam, IngestOrigin::Backfill)
+            .await?;
+        eprintln!("squelch: backfilled {spammed} SPAM messages (provider-sorted; never triaged)");
 
         // Establish the historyId cursor from the profile.
         let history_id = self.fetch_profile_history_id().await?;
@@ -904,23 +952,23 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
         }
     }
 
-    /// One incremental poll: TWO label-filtered `history.list` walks from the
-    /// SAME start cursor, INBOX then SENT, with the cursor committed ONCE at the
-    /// end at the max historyId either walk observed.
+    /// One incremental poll: THREE label-filtered `history.list` walks from the
+    /// SAME start cursor, INBOX then SENT then SPAM, with the cursor committed
+    /// ONCE at the end at the max historyId any walk observed.
     ///
     /// The SENT walk is what makes mail the user writes from Gmail web or their
     /// phone land here at all: such a message never carries INBOX, so an
     /// INBOX-only walk is blind to it, and the api's post-send echo covers only
-    /// what was sent through the daemon itself. Both walks start from the same
-    /// `start_history_id` because one Gmail cursor spans the whole mailbox.
+    /// what was sent through the daemon itself. The SPAM walk is blind to the
+    /// other two for the same structural reason, which is why spam was invisible
+    /// in this client until it got a walk of its own. All three start from the
+    /// same `start_history_id` because one Gmail cursor spans the whole mailbox.
     ///
-    /// ORDER IS LOAD-BEARING. A self-addressed message carries both labels and so
-    /// appears in both walks, and the store's message upsert writes
-    /// `is_sent = excluded.is_sent` on conflict — last writer wins — so a SENT
-    /// copy landing second would flip the row to `is_sent = 1` and drop it out of
-    /// every band. The INBOX walk therefore runs FIRST and its ids are subtracted
-    /// from the SENT batch, making the visible copy authoritative no matter what
-    /// the conflict clause does.
+    /// ORDER IS LOAD-BEARING. A self-addressed message carries both INBOX and
+    /// SENT and so appears in two walks; the store's upsert keeps the MINIMUM of
+    /// each visibility flag, but the walk order is the first defense and does not
+    /// depend on that clause holding. INBOX therefore runs FIRST and its ids are
+    /// subtracted from both later batches, making the visible copy authoritative.
     ///
     /// Propagates [`CoreError::NotFound`] on an expired historyId so the caller
     /// can fall back to a catch-up.
@@ -930,7 +978,7 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
             .await?;
         if !inbox_ids.is_empty() {
             let n = self
-                .fetch_raw_and_ingest(&inbox_ids, false, IngestOrigin::Incremental)
+                .fetch_raw_and_ingest(&inbox_ids, Mailbox::Inbox, IngestOrigin::Incremental)
                 .await?;
             eprintln!("squelch: ingested {n} new INBOX messages");
         }
@@ -961,7 +1009,7 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
             // returns `None` for an `is_sent` row, and the 'n/a' stage markers
             // ingest stamps, which keep it out of both LLM queues.
             match self
-                .fetch_raw_and_ingest(&sent_only, true, IngestOrigin::Incremental)
+                .fetch_raw_and_ingest(&sent_only, Mailbox::Sent, IngestOrigin::Incremental)
                 .await
             {
                 Ok(n) => eprintln!("squelch: ingested {n} new SENT messages"),
@@ -972,9 +1020,41 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
             }
         }
 
+        // The SPAM half, best-effort against the cursor exactly like the SENT
+        // half above and for the same reasons.
+        let (spam_ids, spam_cursor) =
+            match self.history_walk_label(start_history_id, LABEL_SPAM).await {
+                Ok(v) => v,
+                Err(CoreError::NotFound) => return Err(CoreError::NotFound),
+                Err(e) => {
+                    eprintln!("squelch: spam history walk failed ({e}); holding the cursor");
+                    return Ok(());
+                }
+            };
+
+        // Against `sent_only` rather than the full SENT batch, which costs
+        // nothing: the ids the subtraction above dropped are exactly `inbox_ids`,
+        // already subtracted on the left.
+        let spam_only = subtract_ids(subtract_ids(spam_ids, &inbox_ids), &sent_only);
+        if !spam_only.is_empty() {
+            // `Incremental`, and it still never notifies: `events::worthy_kind`
+            // returns `None` for an `is_spam` row. The origin is not the silence
+            // guarantee here any more than it is for sent mail.
+            match self
+                .fetch_raw_and_ingest(&spam_only, Mailbox::Spam, IngestOrigin::Incremental)
+                .await
+            {
+                Ok(n) => eprintln!("squelch: ingested {n} new SPAM messages"),
+                Err(e) => {
+                    eprintln!("squelch: spam ingest failed ({e}); holding the cursor");
+                    return Ok(());
+                }
+            }
+        }
+
         self.store_history_cursor(advance_history_cursor(
             start_history_id,
-            [inbox_cursor, sent_cursor],
+            [inbox_cursor, sent_cursor, spam_cursor],
         ))?;
         Ok(())
     }
@@ -1079,7 +1159,7 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
         // What keeps the whole-window re-scan from storming is the freshness
         // window in `triage::events` plus the one-event-per-message key.
         let n = self
-            .fetch_raw_and_ingest(&ids, false, IngestOrigin::Incremental)
+            .fetch_raw_and_ingest(&ids, Mailbox::Inbox, IngestOrigin::Incremental)
             .await?;
         if n > 0 {
             eprintln!("squelch: catch-up ingested {n} INBOX messages");
@@ -1100,10 +1180,30 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
             sent_only.len()
         );
         let sent_n = self
-            .fetch_raw_and_ingest(&sent_only, true, IngestOrigin::Incremental)
+            .fetch_raw_and_ingest(&sent_only, Mailbox::Sent, IngestOrigin::Incremental)
             .await?;
         if sent_n > 0 {
             eprintln!("squelch: catch-up ingested {sent_n} SENT messages");
+        }
+
+        // And the SPAM window, last and subtracted from both, so a catch-up
+        // rebuilds the spam page as completely as it rebuilds the inbox. Without
+        // this leg an expired cursor would leave the page frozen at whatever the
+        // last successful history walk saw.
+        let spam_ids = self.list_message_ids(LABEL_SPAM, Some(&q)).await?;
+        let spam_only = subtract_ids(subtract_ids(spam_ids, &ids), &sent_only);
+        self.metrics.catchup_begin_extend(
+            ids.len() as u64 + sent_only.len() as u64 + spam_only.len() as u64,
+        );
+        eprintln!(
+            "squelch: catch-up re-fetching {} SPAM message(s)",
+            spam_only.len()
+        );
+        let spam_n = self
+            .fetch_raw_and_ingest(&spam_only, Mailbox::Spam, IngestOrigin::Incremental)
+            .await?;
+        if spam_n > 0 {
+            eprintln!("squelch: catch-up ingested {spam_n} SPAM messages");
         }
 
         let history_id = self.fetch_profile_history_id().await?;
@@ -1350,7 +1450,7 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
     async fn fetch_raw_and_ingest(
         &self,
         ids: &[String],
-        is_sent: bool,
+        mailbox: Mailbox,
         origin: IngestOrigin,
     ) -> Result<usize> {
         if ids.is_empty() {
@@ -1397,7 +1497,8 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
                 gmail_thread_id: msg.thread_id.clone(),
                 raw,
                 internal_date: parse_internal_date(msg.internal_date.as_deref()),
-                is_sent,
+                is_sent: mailbox.is_sent(),
+                is_spam: mailbox.is_spam(),
                 account_addr: self.account_email.clone(),
             };
             if let Some((id, text)) = self.ingest_one(&fetched, &rules, now, origin)? {
@@ -1455,6 +1556,16 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
         }
         // STRUCTURAL EXCLUSION: sealed mail is never embedded.
         if triaged.sensitivity != Sensitivity::Normal {
+            return Ok(None);
+        }
+        // NEITHER IS PROVIDER SPAM, for two reasons that point the same way. It
+        // would be the largest single consumer of embedder time in the daemon —
+        // spam outnumbers real mail — spent on the one category of message
+        // semantic recall must never return. And an embedding is a similarity
+        // claim: spam is written to imitate the mail it is impersonating, so a
+        // vector space containing it puts convincing forgeries next to the real
+        // thing in results the user reads as "your mail".
+        if triaged.message.is_spam {
             return Ok(None);
         }
         let text = crate::embed::message_embed_text(
@@ -2199,8 +2310,10 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
                                     one_line: &applied.one_line,
                                     received_at: row.received_at,
                                     sensitivity: row.sensitivity,
-                                    // The Stage-1 queue selects `m.is_sent = 0`.
+                                    // The Stage-1 queue selects `m.is_sent = 0`
+                                    // and `m.is_spam = 0`.
                                     is_sent: false,
+                                    is_spam: false,
                                     // The queue only excludes rows a rule decided
                                     // AT INGEST, so this is the rule as it stands
                                     // NOW, catching rules added since.
@@ -2855,8 +2968,10 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
                                     one_line: &applied.one_line,
                                     received_at: row.received_at,
                                     sensitivity: row.sensitivity,
-                                    // The Stage-2 queue selects `m.is_sent = 0`.
+                                    // The Stage-2 queue selects `m.is_sent = 0`
+                                    // and `m.is_spam = 0`.
                                     is_sent: false,
+                                    is_spam: false,
                                     // Read NOW, not at ingest: the row only
                                     // records the rule in force when it was
                                     // queued, so a sender squelched since then

@@ -261,6 +261,7 @@ impl SqliteStore {
                AND v.account_id = ?2
                AND v.k = ?3
                AND COALESCE(t.sensitivity, 'normal') != 'sealed'
+               AND m.is_spam = 0
              ORDER BY v.distance",
         )?;
         let rows = stmt.query_map(params![query.as_bytes(), account_id, k as i64], |r| {
@@ -377,6 +378,7 @@ impl SqliteStore {
              WHERE f.rowid = ?1
                AND m.account_id = ?2
                AND COALESCE(t.sensitivity, 'normal') != 'sealed'
+               AND m.is_spam = 0
                AND messages_fts MATCH ?3"
         );
         let mut stmt = match conn.prepare(&sql) {
@@ -458,6 +460,7 @@ impl SqliteStore {
              LEFT JOIN triage t ON t.message_id = m.id
              WHERE m.account_id = ?1
                AND COALESCE(t.sensitivity, 'normal') != 'sealed'
+               AND m.is_spam = 0
                AND messages_fts MATCH ?2
              ORDER BY rank
              LIMIT ?3",
@@ -494,7 +497,8 @@ impl SqliteStore {
                  FROM messages m
                  LEFT JOIN triage t ON t.message_id = m.id
                  WHERE m.account_id = ?1 AND m.id = ?2
-                   AND COALESCE(t.sensitivity, 'normal') != 'sealed'",
+                   AND COALESCE(t.sensitivity, 'normal') != 'sealed'
+                   AND m.is_spam = 0",
                 params![account_id, id],
                 map_search_hit,
             )
@@ -568,6 +572,7 @@ impl SqliteStore {
              WHERE m.account_id = ?
                AND COALESCE(t.sensitivity, 'normal') != 'sealed'
                AND m.is_sent = 0
+               AND m.is_spam = 0
                AND messages_fts MATCH ?"
         );
         let mut args = vec![Value::Integer(account_id), Value::Text(text.to_string())];
@@ -647,7 +652,8 @@ impl SqliteStore {
              LEFT JOIN triage t ON t.message_id = m.id
              WHERE m.account_id = ?
                AND COALESCE(t.sensitivity, 'normal') != 'sealed'
-               AND m.is_sent = 0",
+               AND m.is_sent = 0
+               AND m.is_spam = 0",
         );
         let mut args = vec![Value::Integer(account_id)];
         push_filter_clauses(&mut sql, &mut args, filter);
@@ -704,6 +710,7 @@ impl SqliteStore {
              JOIN triage t ON t.message_id = m.id
              WHERE m.account_id = ?1
                AND t.sensitivity = 'normal'
+               AND m.is_spam = 0
                AND NOT EXISTS (
                    SELECT 1 FROM message_vecs v WHERE v.message_id = m.id
                )
