@@ -91,7 +91,7 @@ fn main() {
             println!("\n=== keyword [{}] {q:?}", sort.as_str());
             let t = Instant::now();
             let hits = store
-                .search_filtered(account_id, q, &SearchFilter::default(), sort, 10, 0)
+                .search_filtered(account_id, q, &SearchFilter::default(), sort, false, 10, 0)
                 .expect("keyword search");
             print_hits(&hits, t);
         }
@@ -100,7 +100,7 @@ fn main() {
                 println!("\n=== hybrid [{}] {q:?}", sort.as_str());
                 let t = Instant::now();
                 let (hits, _full) = store
-                    .hybrid_search(account_id, q, &SearchFilter::default(), sort, 10)
+                    .hybrid_search(account_id, q, &SearchFilter::default(), sort, false, 10)
                     .expect("hybrid search");
                 print_hits(&hits, t);
             }

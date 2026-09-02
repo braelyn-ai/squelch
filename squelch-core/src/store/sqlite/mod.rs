@@ -41,13 +41,7 @@ use crate::error::{CoreError, Result};
 use crate::metrics::{NotifyDecision, NotifyLane};
 use crate::store::{
     AttachmentBytes, BankingApplied, ContactEntry, Device, DeviceToken, Draft, DraftFields,
-    ExtractQueued, InboxUnread, IssuedDeviceToken, MailActivityDay, MarketingApplied,
-    MarketingOffer, MessageOpen, MessageUnsub, MintedPairingCode, MissingVector, NewAuditEntry,
-    NewEvent, NewNotifyDecision, NotifyDecisionRow, RevisitQueued, SPAM_SYNCED_AT_KEY, SealedBody,
-    SealedMessage, SearchFilter, SearchSort, SeedVerdict, SenderEntry, SenderHistory, SentMessage,
-    SentMissingRecipients, SitrepBand, SpamScope, Stage1Applied, Stage1Queued, Stage2Applied,
-    Stage2CapOverrides, Stage2Queued, Stage2Usage, Stage2UsageDay, Store, SyncState, ThreadSibling,
-    TrackedMessage, TriageDebug, TriagedMessage, UsageTokens,
+    SPAM_SYNCED_AT_KEY, ExtractQueued, FtsQuery, InboxUnread, IssuedDeviceToken, LeggedHit, MailActivityDay, MarketingApplied, MarketingOffer, MessageOpen, MessageUnsub, MintedPairingCode, MissingVector, NewAuditEntry, NewEvent, NewNotifyDecision, NotifyDecisionRow, RevisitQueued, SealedBody, SealedMessage, SearchFilter, SearchSort, SeedVerdict, SenderEntry, SenderHistory, SentMessage, SentMissingRecipients, SitrepBand, SpamScope, Stage1Applied, Stage1Queued, Stage2Applied, Stage2CapOverrides, Stage2Queued, Stage2Usage, Stage2UsageDay, Store, SyncState, ThreadSibling, TrackedMessage, TriageDebug, TriagedMessage, UsageTokens,
 };
 use crate::types::{
     AccountId, AttachmentInfo, AttentionStatus, AttentionUpdate, AuditEntry, BandCounts, Banking,
@@ -850,10 +844,11 @@ impl Store for SqliteStore {
         text: &str,
         filter: &SearchFilter,
         sort: SearchSort,
+        partial: bool,
         limit: u32,
         offset: u32,
     ) -> Result<Vec<SearchHit>> {
-        self.search_filtered(account_id, text, filter, sort, limit, offset)
+        self.search_filtered(account_id, text, filter, sort, partial, limit, offset)
     }
 
     fn attention_updates(

@@ -968,6 +968,22 @@ pub struct MissingVector {
     pub body: String,
 }
 
+/// A hybrid-search hit plus WHICH RECALL LEG produced it: the keyword list, the
+/// vector list, or both. See
+/// [`SqliteStore::hybrid_search_legs`](crate::store::SqliteStore::hybrid_search_legs).
+///
+/// The two facts are separate bools rather than an enum because a hit really
+/// can be on both lists, and "both" is the interesting case: it is the one that
+/// says the words AND the meaning agree.
+#[derive(Debug, Clone)]
+pub struct LeggedHit {
+    pub hit: SearchHit,
+    /// The FTS5 keyword leg returned this row.
+    pub keyword: bool,
+    /// The vector KNN returned this row.
+    pub vector: bool,
+}
+
 /// A locally-stored sealed message, exposed ONLY to the TUI. This type never
 /// crosses the MCP boundary.
 #[derive(Debug, Clone)]
@@ -1654,12 +1670,17 @@ pub trait Store: Send + Sync {
     /// standing preference rather than part of the query, which is why it
     /// arrives beside `filter` instead of inside it: a filter says which mail
     /// counts, a sort says how to order whatever did.
+    /// `partial` matches the LAST word as a prefix, which is what an
+    /// as-you-type fetch wants and what a settled query must not have: an agent
+    /// sending finished words would otherwise have `password` widened to
+    /// `password*` and rank `passwordless` beside it.
     fn search_filtered(
         &self,
         account_id: AccountId,
         text: &str,
         filter: &SearchFilter,
         sort: SearchSort,
+        partial: bool,
         limit: u32,
         offset: u32,
     ) -> Result<Vec<SearchHit>>;

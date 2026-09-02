@@ -108,7 +108,7 @@ fn spam_is_absent_from_every_listing() {
     let filter = SearchFilter::default();
     has(
         store
-            .search_filtered(acct, "lunch", &filter, SearchSort::Recent, 50, 0)
+            .search_filtered(acct, "lunch", &filter, SearchSort::Recent, false, 50, 0)
             .unwrap()
             .iter()
             .map(|h| h.id)
@@ -124,7 +124,7 @@ fn spam_is_absent_from_every_listing() {
     // legs above do not touch.
     has(
         store
-            .hybrid_search(acct, "lunch", &filter, SearchSort::Recent, 50)
+            .hybrid_search(acct, "lunch", &filter, SearchSort::Recent, false, 50)
             .unwrap()
             .0
             .iter()

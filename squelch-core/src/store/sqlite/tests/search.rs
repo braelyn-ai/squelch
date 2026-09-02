@@ -4,6 +4,8 @@ use super::super::*;
 use super::support::*;
 use crate::store::{SearchFilter, SearchSort, parse_search_query};
 use crate::types::{SealedKind, Tier};
+use chrono::Duration;
+use std::collections::HashSet;
 
 #[test]
 fn search_excludes_sealed_and_delete_rule_works() {
@@ -34,6 +36,257 @@ fn search_excludes_sealed_and_delete_rule_works() {
     assert!(store.delete_sender_rule(acct, rid).unwrap());
     assert!(!store.delete_sender_rule(acct, rid).unwrap());
     assert!(store.list_sender_rules(acct).unwrap().is_empty());
+}
+
+// ---- AND, THEN OR ----------------------------------------------------
+//
+// FTS5 ANDs a bare query, so one word the right mail lacks used to mean zero
+// hits however decisive the other words were. These pin the replacement: the
+// strict block first, the any-only block below it, and an exact page cut out
+// of the two together.
+
+/// The motivating query in miniature. The mail that answers it says "abstract"
+/// and "wifi" and never says "conference" or "password", and "wifi" appears in
+/// exactly one message — which is precisely why ANDing the four words threw
+/// away the one row worth having.
+#[test]
+fn a_word_the_best_mail_lacks_no_longer_hides_it() {
+    let (store, acct) = store();
+
+    let right = triaged(acct, "g-right", "t-right")
+        .subject("Abstract is today.")
+        .body("Have your QR code ready when you get to the venue. Wifi and the FAQ are on the same page.")
+        .seed(&store);
+    // Mail that carries the common words and none of the rare ones.
+    let noise = triaged(acct, "g-noise", "t-noise")
+        .subject("Password reset")
+        .body("Someone asked to reset the password on your account.")
+        .seed(&store);
+
+    let hits = store
+        .search(acct, "abstract conference wifi password", 10, 0)
+        .unwrap();
+    let ids: Vec<i64> = hits.iter().map(|h| h.id).collect();
+    assert_eq!(
+        ids.first(),
+        Some(&right),
+        "the rare terms decide it: {ids:?}"
+    );
+    assert!(ids.contains(&noise), "the any-term pass still finds the rest");
+}
+
+#[test]
+fn a_strict_match_never_ranks_below_a_partial_one() {
+    // The strict block is served whole before the any-only block, whatever
+    // bm25 thinks of the individual rows. Here the partial match is a short,
+    // fresh, term-dense document — everything bm25 and the recency blend
+    // reward — and the strict match is a long old one, so an ordering that
+    // ranked them together would put it first.
+    let (store, acct) = store();
+    let now = Utc::now();
+
+    let strict = triaged(acct, "g-strict", "t-strict")
+        .subject("quarterly notes")
+        .body(
+            "The vendor contract came up again in passing, one line among the \
+             gardening tips, the local events, the recipes and a long reader \
+             letter about compost that nobody finishes reading.",
+        )
+        .received_at(now - Duration::days(400))
+        .seed(&store);
+    let partial = triaged(acct, "g-partial", "t-partial")
+        .subject("contract")
+        .body("contract contract contract")
+        .received_at(now)
+        .seed(&store);
+
+    for sort in [SearchSort::Recent, SearchSort::BestMatch] {
+        let ids: Vec<i64> = store
+            .search_filtered(
+                acct,
+                "vendor contract",
+                &SearchFilter::default(),
+                sort,
+                false,
+                10,
+                0,
+            )
+            .unwrap()
+            .iter()
+            .map(|h| h.id)
+            .collect();
+        assert_eq!(
+            ids,
+            vec![strict, partial],
+            "both terms beats one, under {}",
+            sort.as_str()
+        );
+    }
+}
+
+#[test]
+fn pagination_is_exact_across_the_strict_boundary() {
+    // Three messages carry both terms and three carry one, so the true
+    // ordering is a block of three followed by a block of three. Walking it a
+    // page at a time must reproduce that sequence exactly — no row served
+    // twice, none skipped at the seam — for a page smaller than the strict
+    // block, a page larger than it, and a page that starts past it.
+    let (store, acct) = store();
+
+    let mut strict_ids = Vec::new();
+    for i in 0..3 {
+        strict_ids.push(
+            triaged(acct, &format!("g-s{i}"), &format!("t-s{i}"))
+                .subject("vendor contract")
+                .body("the signed vendor contract is attached")
+                .received_at(Utc::now() - Duration::days(i))
+                .seed(&store),
+        );
+    }
+    let mut any_ids = Vec::new();
+    for i in 0..3 {
+        any_ids.push(
+            triaged(acct, &format!("g-a{i}"), &format!("t-a{i}"))
+                .subject("contract")
+                .body("a contract, and nothing about who it is with")
+                .received_at(Utc::now() - Duration::days(i))
+                .seed(&store),
+        );
+    }
+
+    let page = |limit: u32, offset: u32| -> Vec<i64> {
+        store
+            .search_filtered(
+                acct,
+                "vendor contract",
+                &SearchFilter::default(),
+                SearchSort::Recent,
+                false,
+                limit,
+                offset,
+            )
+            .unwrap()
+            .iter()
+            .map(|h| h.id)
+            .collect()
+    };
+
+    let whole = page(10, 0);
+    assert_eq!(whole.len(), 6, "every message matches at least one term");
+    assert_eq!(
+        whole[..3].iter().collect::<HashSet<_>>(),
+        strict_ids.iter().collect::<HashSet<_>>(),
+        "the strict block comes first, whole"
+    );
+
+    // A page smaller than the strict block, walked to the end.
+    let mut walked = Vec::new();
+    for offset in [0u32, 2, 4] {
+        walked.extend(page(2, offset));
+    }
+    assert_eq!(walked, whole, "limit 2 walks the same sequence");
+
+    // A page larger than the strict block: it straddles the seam and must fill
+    // from the any-only ranking at its start, not repeat what it just served.
+    assert_eq!(page(4, 0), whole[..4], "limit 4 straddles the boundary");
+    assert_eq!(page(4, 4), whole[4..], "and continues past it");
+
+    // A page starting past the strict block entirely.
+    assert_eq!(page(3, 3), whole[3..], "offset past the strict block");
+    assert!(page(3, 6).is_empty(), "nothing after the last row");
+}
+
+#[test]
+fn the_keyword_and_hybrid_legs_agree_about_what_a_query_means() {
+    // `fts_recall` (hybrid's keyword input) and `search_filtered` share the
+    // builder AND the strict-then-any order, so a partial match findable in one
+    // mode cannot be missing from the other. Keyword-only hybrid (no embedder)
+    // isolates the FTS half.
+    let (store, acct) = store();
+
+    let right = triaged(acct, "g-right", "t-right")
+        .subject("Abstract is today.")
+        .body("Wifi and the FAQ are on the same page.")
+        .seed(&store);
+
+    let keyword: Vec<i64> = store
+        .search(acct, "abstract conference wifi password", 10, 0)
+        .unwrap()
+        .iter()
+        .map(|h| h.id)
+        .collect();
+    let hybrid: Vec<i64> = store
+        .hybrid_search(
+            acct,
+            "abstract conference wifi password",
+            &SearchFilter::default(),
+            SearchSort::Recent,
+            false,
+            10,
+        )
+        .unwrap()
+        .0
+        .iter()
+        .map(|h| h.id)
+        .collect();
+    assert_eq!(keyword, vec![right]);
+    assert_eq!(hybrid, vec![right], "hybrid's keyword leg reads it the same");
+}
+
+#[test]
+fn a_query_of_pure_punctuation_finds_nothing_and_lists_nothing() {
+    // The builder produces no expression at all. With no filter that is an
+    // empty result — never "page me the whole mailbox", which is what the
+    // filter-only listing would have done if this fell through to it.
+    let (store, acct) = store();
+    triaged(acct, "g1", "t1").subject("lunch").seed(&store);
+
+    assert!(store.search(acct, "***", 10, 0).unwrap().is_empty());
+    // An operator with it still lists that operator's mail, because the
+    // operator is a real constraint the reader typed.
+    let (text, filter) = parse_search_query("*** from:alice");
+    let hits = store
+        .search_filtered(acct, &text, &filter, SearchSort::Recent, false, 10, 0)
+        .unwrap();
+    assert_eq!(hits.len(), 1, "the from: half still selects");
+}
+
+#[test]
+fn the_trailing_token_matches_as_a_prefix_only_when_asked() {
+    // The panel's as-you-type fetch. `wif` is not a word in the mailbox; with
+    // `partial` it finds "wifi", and the earlier terms stay exact so a settled
+    // word is never widened.
+    let (store, acct) = store();
+    let id = triaged(acct, "g1", "t1")
+        .subject("venue details")
+        .body("wifi and the FAQ are on the same page")
+        .seed(&store);
+    triaged(acct, "g2", "t2")
+        .subject("venue map")
+        .body("the venue is on the corner")
+        .seed(&store);
+
+    let ids = |partial: bool, q: &str| -> Vec<i64> {
+        store
+            .search_filtered(
+                acct,
+                q,
+                &SearchFilter::default(),
+                SearchSort::Recent,
+                partial,
+                10,
+                0,
+            )
+            .unwrap()
+            .iter()
+            .map(|h| h.id)
+            .collect()
+    };
+    assert!(ids(false, "wif").is_empty(), "a settled query is exact");
+    assert_eq!(ids(true, "wif"), vec![id], "as-you-type prefixes the tail");
+    // The prefix is the LAST token only: "venu" here stays exact and matches
+    // nothing, so the strict pass is empty and only the any-only pass fires.
+    assert_eq!(ids(true, "venu wif"), vec![id]);
 }
 
 // ---- MATCH-WINDOW SNIPPETS -------------------------------------------
@@ -156,7 +409,7 @@ fn keyword_search_applies_from_and_date_filters() {
 
     let (text, filter) = parse_search_query("invoice from:jane");
     let hits = store
-        .search_filtered(acct, &text, &filter, SearchSort::Recent, 10, 0)
+        .search_filtered(acct, &text, &filter, SearchSort::Recent, false, 10, 0)
         .unwrap();
     let threads: Vec<&str> = hits.iter().map(|h| h.thread_id.as_str()).collect();
     assert_eq!(
@@ -175,7 +428,7 @@ fn keyword_search_applies_from_and_date_filters() {
     let (text, filter) = parse_search_query(r#"invoice from:"jane doe""#);
     assert_eq!(
         store
-            .search_filtered(acct, &text, &filter, SearchSort::Recent, 10, 0)
+            .search_filtered(acct, &text, &filter, SearchSort::Recent, false, 10, 0)
             .unwrap()
             .len(),
         2
@@ -184,7 +437,7 @@ fn keyword_search_applies_from_and_date_filters() {
     // after: is inclusive of midnight on the named day; before: is exclusive.
     let (text, filter) = parse_search_query("invoice after:2026-02-01");
     let hits = store
-        .search_filtered(acct, &text, &filter, SearchSort::Recent, 10, 0)
+        .search_filtered(acct, &text, &filter, SearchSort::Recent, false, 10, 0)
         .unwrap();
     let threads: Vec<&str> = hits.iter().map(|h| h.thread_id.as_str()).collect();
     assert_eq!(threads.len(), 2, "february only: {threads:?}");
@@ -192,7 +445,7 @@ fn keyword_search_applies_from_and_date_filters() {
 
     let (text, filter) = parse_search_query("invoice before:2026-02-16");
     let hits = store
-        .search_filtered(acct, &text, &filter, SearchSort::Recent, 10, 0)
+        .search_filtered(acct, &text, &filter, SearchSort::Recent, false, 10, 0)
         .unwrap();
     let threads: Vec<&str> = hits.iter().map(|h| h.thread_id.as_str()).collect();
     assert_eq!(threads.len(), 2, "before the 16th: {threads:?}");
@@ -201,7 +454,7 @@ fn keyword_search_applies_from_and_date_filters() {
     // Both bounds plus a sender: exactly the february invoice from Jane.
     let (text, filter) = parse_search_query("invoice from:jane after:2026-02-01 before:2026-03-01");
     let hits = store
-        .search_filtered(acct, &text, &filter, SearchSort::Recent, 10, 0)
+        .search_filtered(acct, &text, &filter, SearchSort::Recent, false, 10, 0)
         .unwrap();
     assert_eq!(hits.len(), 1);
     assert_eq!(hits[0].thread_id, "t-feb");
@@ -216,7 +469,7 @@ fn filter_only_listing_lists_newest_first_and_keeps_the_exclusions() {
     let (text, filter) = parse_search_query("from:jane");
     assert!(text.is_empty(), "nothing to rank on");
     let hits = store
-        .search_filtered(acct, &text, &filter, SearchSort::Recent, 10, 0)
+        .search_filtered(acct, &text, &filter, SearchSort::Recent, false, 10, 0)
         .unwrap();
     let threads: Vec<&str> = hits.iter().map(|h| h.thread_id.as_str()).collect();
     assert_eq!(threads, vec!["t-feb", "t-jan"], "newest first");
@@ -224,7 +477,7 @@ fn filter_only_listing_lists_newest_first_and_keeps_the_exclusions() {
     // The listing is a search path like any other: sealed and sent stay out.
     let (text, filter) = parse_search_query("after:2026-01-01");
     let hits = store
-        .search_filtered(acct, &text, &filter, SearchSort::Recent, 10, 0)
+        .search_filtered(acct, &text, &filter, SearchSort::Recent, false, 10, 0)
         .unwrap();
     let threads: Vec<&str> = hits.iter().map(|h| h.thread_id.as_str()).collect();
     assert_eq!(threads, vec!["t-bob", "t-feb", "t-jan"]);
@@ -232,11 +485,11 @@ fn filter_only_listing_lists_newest_first_and_keeps_the_exclusions() {
 
     // And it paginates.
     let page = store
-        .search_filtered(acct, "", &filter, SearchSort::Recent, 2, 0)
+        .search_filtered(acct, "", &filter, SearchSort::Recent, false, 2, 0)
         .unwrap();
     assert_eq!(page.len(), 2);
     let page2 = store
-        .search_filtered(acct, "", &filter, SearchSort::Recent, 2, 2)
+        .search_filtered(acct, "", &filter, SearchSort::Recent, false, 2, 2)
         .unwrap();
     assert_eq!(page2.len(), 1);
     assert_eq!(page2[0].thread_id, "t-jan");
@@ -264,7 +517,7 @@ fn from_filter_treats_like_wildcards_as_literal_text() {
 
     let (text, filter) = parse_search_query("invoice from:%");
     let hits = store
-        .search_filtered(acct, &text, &filter, SearchSort::Recent, 10, 0)
+        .search_filtered(acct, &text, &filter, SearchSort::Recent, false, 10, 0)
         .unwrap();
     assert_eq!(hits.len(), 1, "a literal % matches only the odd address");
     assert_eq!(hits[0].thread_id, "t2");
@@ -273,7 +526,7 @@ fn from_filter_treats_like_wildcards_as_literal_text() {
     let (text, filter) = parse_search_query("invoice from:_");
     assert!(
         store
-            .search_filtered(acct, &text, &filter, SearchSort::Recent, 10, 0)
+            .search_filtered(acct, &text, &filter, SearchSort::Recent, false, 10, 0)
             .unwrap()
             .is_empty(),
         "a literal underscore matches neither sender"
@@ -464,6 +717,7 @@ fn hybrid_search_fuses_keyword_and_vector_and_includes_sent() {
             "signed contract vendor",
             &SearchFilter::default(),
             SearchSort::Recent,
+            false,
             5,
         )
         .unwrap()
@@ -507,6 +761,7 @@ fn hybrid_snippet_is_the_match_window_for_keyword_hits_only() {
             "pangolin",
             &SearchFilter::default(),
             SearchSort::Recent,
+            false,
             10,
         )
         .unwrap()
@@ -551,7 +806,7 @@ fn hybrid_and_semantic_apply_the_filter_post_hoc() {
 
     let (text, filter) = parse_search_query("invoice from:jane");
     let hits = store
-        .hybrid_search(acct, &text, &filter, SearchSort::Recent, 10)
+        .hybrid_search(acct, &text, &filter, SearchSort::Recent, false, 10)
         .unwrap()
         .0;
     assert!(hits.iter().any(|h| h.id == jane));
@@ -562,7 +817,7 @@ fn hybrid_and_semantic_apply_the_filter_post_hoc() {
 
     let (text, filter) = parse_search_query("invoice before:2026-02-11");
     let hits = store
-        .semantic_search_hits(acct, &text, &filter, SearchSort::Recent, 10)
+        .semantic_search_hits(acct, &text, &filter, SearchSort::Recent, false, 10)
         .unwrap()
         .0;
     assert!(hits.iter().any(|h| h.id == jane));
@@ -611,6 +866,7 @@ fn keyword_search_works_before_embedder_then_attaches_live() {
             "quarterly invoice",
             &SearchFilter::default(),
             SearchSort::Recent,
+            false,
             5,
         )
         .unwrap()
@@ -735,7 +991,6 @@ fn embed_e2e_max_tokens_reaches_the_tokenizer() {
 // `Date:` header the sender invented steering the ranking.
 
 use crate::store::recency;
-use chrono::Duration;
 
 /// Two messages that match a query IDENTICALLY, so nothing but the date can
 /// separate them. Used by the fusion legs, where a relevance tie is settled by
@@ -873,14 +1128,14 @@ fn best_match_turns_the_tilt_off_on_every_ranked_leg() {
     // KEYWORD: bm25 alone puts the stronger old match first; the tilt inverts it.
     assert_eq!(
         ids(store
-            .search_filtered(acct, "contract", &filter, SearchSort::BestMatch, 10, 0)
+            .search_filtered(acct, "contract", &filter, SearchSort::BestMatch, false, 10, 0)
             .unwrap()),
         vec![stronger_but_old, weaker_but_fresh],
         "best_match ranks the keyword leg on bm25 alone"
     );
     assert_eq!(
         ids(store
-            .search_filtered(acct, "contract", &filter, SearchSort::Recent, 10, 0)
+            .search_filtered(acct, "contract", &filter, SearchSort::Recent, false, 10, 0)
             .unwrap()),
         vec![weaker_but_fresh, stronger_but_old],
     );
@@ -888,7 +1143,7 @@ fn best_match_turns_the_tilt_off_on_every_ranked_leg() {
     // HYBRID: the same inversion through the fused path.
     assert_eq!(
         ids(store
-            .hybrid_search(acct, "contract", &filter, SearchSort::BestMatch, 10)
+            .hybrid_search(acct, "contract", &filter, SearchSort::BestMatch, false, 10)
             .unwrap()
             .0),
         vec![stronger_but_old, weaker_but_fresh],
@@ -896,7 +1151,7 @@ fn best_match_turns_the_tilt_off_on_every_ranked_leg() {
     );
     assert_eq!(
         ids(store
-            .hybrid_search(acct, "contract", &filter, SearchSort::Recent, 10)
+            .hybrid_search(acct, "contract", &filter, SearchSort::Recent, false, 10)
             .unwrap()
             .0),
         vec![weaker_but_fresh, stronger_but_old],
@@ -905,7 +1160,7 @@ fn best_match_turns_the_tilt_off_on_every_ranked_leg() {
     // SEMANTIC: the KNN window in its own order, and then not.
     let semantic = |sort| {
         ids(store
-            .semantic_search_hits(acct, STRONGER_BODY, &filter, sort, 10)
+            .semantic_search_hits(acct, STRONGER_BODY, &filter, sort, false, 10)
             .unwrap()
             .0)
     };
@@ -945,7 +1200,7 @@ fn best_match_still_binds_its_parameters_with_an_operator_in_play() {
 
     let (text, filter) = parse_search_query("contract from:jane");
     let order: Vec<i64> = store
-        .search_filtered(acct, &text, &filter, SearchSort::BestMatch, 10, 0)
+        .search_filtered(acct, &text, &filter, SearchSort::BestMatch, false, 10, 0)
         .unwrap()
         .iter()
         .map(|h| h.id)
@@ -1020,7 +1275,7 @@ fn the_blend_survives_an_operator_carrying_its_own_parameters() {
 
     let (text, filter) = parse_search_query("contract from:jane");
     let order: Vec<i64> = store
-        .search_filtered(acct, &text, &filter, SearchSort::Recent, 10, 0)
+        .search_filtered(acct, &text, &filter, SearchSort::Recent, false, 10, 0)
         .unwrap()
         .iter()
         .map(|h| h.id)
@@ -1087,6 +1342,7 @@ fn hybrid_ranking_puts_the_fresher_of_two_equal_matches_first() {
                 "quarterly contract",
                 &SearchFilter::default(),
                 SearchSort::Recent,
+                false,
                 10,
             )
             .unwrap()
@@ -1144,6 +1400,7 @@ fn semantic_ranking_lifts_the_fresher_within_the_knn_window() {
                 QUERY,
                 &SearchFilter::default(),
                 SearchSort::Recent,
+                false,
                 10,
             )
             .unwrap()

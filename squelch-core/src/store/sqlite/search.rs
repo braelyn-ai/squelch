@@ -305,8 +305,30 @@ impl SqliteStore {
         query_text: &str,
         filter: &SearchFilter,
         sort: SearchSort,
+        partial: bool,
         k: usize,
     ) -> Result<(Vec<SearchHit>, bool)> {
+        let (hits, window_full) =
+            self.hybrid_search_legs(account_id, query_text, filter, sort, partial, k)?;
+        Ok((hits.into_iter().map(|h| h.hit).collect(), window_full))
+    }
+
+    /// [`hybrid_search`](Self::hybrid_search), plus WHICH LEG produced each hit.
+    ///
+    /// The human door reports this per item, because "the keyword leg and the
+    /// vector leg both found this" and "only the vectors did" are different
+    /// answers to how much to trust a result, and a client that cannot tell
+    /// them apart cannot say so to the reader. The plain method above is the
+    /// same search with the provenance dropped.
+    pub fn hybrid_search_legs(
+        &self,
+        account_id: AccountId,
+        query_text: &str,
+        filter: &SearchFilter,
+        sort: SearchSort,
+        partial: bool,
+        k: usize,
+    ) -> Result<(Vec<LeggedHit>, bool)> {
         // ONE clock for both legs of one search.
         let now = Utc::now();
 
@@ -323,7 +345,8 @@ impl SqliteStore {
         };
 
         // FTS ranks over the SAME query text, sent mail included.
-        let fts_hits = self.fts_recall(account_id, query_text, k)?;
+        let fts = FtsQuery::build(query_text, partial);
+        let fts_hits = self.fts_recall(account_id, &fts, k)?;
 
         let mut ranked = fuse_ranked(&[&vec_hits, &fts_hits], sort, now);
         ranked.truncate(k);
@@ -331,9 +354,8 @@ impl SqliteStore {
         // the recall window, not of what survived the operators.
         let window_full = ranked.len() == k;
 
-        // Only the ids the KEYWORD leg produced have a match window to show; a
-        // vector-only hit matched by meaning, not by any term in the body.
         let from_fts: HashSet<i64> = fts_hits.iter().map(|c| c.id).collect();
+        let from_vec: HashSet<i64> = vec_hits.iter().map(|c| c.id).collect();
 
         let mut out = Vec::with_capacity(ranked.len());
         for c in ranked {
@@ -341,21 +363,32 @@ impl SqliteStore {
                 if !filter.matches(&hit) {
                     continue;
                 }
-                if from_fts.contains(&c.id)
-                    && let Some(window) = self.fts_snippet(account_id, c.id, query_text)?
-                {
+                // EVERY hit is asked for a window, not just the ones the
+                // keyword leg produced. A vector hit surfaced by meaning may
+                // still carry one of the reader's words somewhere deep in its
+                // body, and the sentence around that word is the reason to
+                // believe the result; the stored head is what a hit gets when
+                // the body holds no term at all. The ANY expression is what is
+                // asked, because a strict window would find nothing in exactly
+                // the mail this whole wave exists for.
+                if let Some(window) = self.fts_snippet(account_id, c.id, &fts.any)? {
                     hit.snippet = window;
                 }
-                out.push(hit);
+                out.push(LeggedHit {
+                    keyword: from_fts.contains(&c.id),
+                    vector: from_vec.contains(&c.id),
+                    hit,
+                });
             }
         }
         Ok((out, window_full))
     }
 
-    /// The FTS match window for ONE message, or `None` when there is nothing
-    /// better than the stored snippet to show: the row is not in the index, the
-    /// terms hit the subject rather than the body, or the MATCH expression is
-    /// malformed. Every one of those keeps the caller's existing snippet, so a
+    /// The FTS match window for ONE message under `match_expr` (an expression
+    /// [`FtsQuery`] built, never raw reader text), or `None` when there is
+    /// nothing better than the stored snippet to show: the row is not in the
+    /// index, the terms hit the subject rather than the body, or the MATCH
+    /// expression is malformed. Every one of those keeps the caller's existing snippet, so a
     /// bad query degrades the preview instead of failing the search.
     ///
     /// SECURITY: `messages_fts` indexes bodies at INGEST, before triage seals
@@ -367,8 +400,11 @@ impl SqliteStore {
         &self,
         account_id: AccountId,
         message_id: i64,
-        query: &str,
+        match_expr: &str,
     ) -> Result<Option<String>> {
+        if match_expr.is_empty() {
+            return Ok(None);
+        }
         let conn = self.lock()?;
         let sql = format!(
             "SELECT {BODY_SNIPPET}
@@ -388,7 +424,7 @@ impl SqliteStore {
         // A syntactically-invalid MATCH errors at step time, not prepare time;
         // both collapse to "no window".
         let raw = stmt
-            .query_row(params![message_id, account_id, query], |r| {
+            .query_row(params![message_id, account_id, match_expr], |r| {
                 r.get::<_, Option<String>>(0)
             })
             .optional()
@@ -421,24 +457,38 @@ impl SqliteStore {
         query_text: &str,
         filter: &SearchFilter,
         sort: SearchSort,
+        partial: bool,
         k: usize,
     ) -> Result<(Vec<SearchHit>, bool)> {
         let knn = self.semantic_knn(account_id, query_text, k)?;
         let window_full = knn.len() == k;
         let candidates: Vec<Candidate> = knn.into_iter().map(|(c, _dist)| c).collect();
         let ranked = fuse_ranked(&[&candidates], sort, Utc::now());
+        // The vector leg matched by meaning, but the mail it found may still
+        // SAY one of the reader's words, and if it does that sentence is worth
+        // more than the head of the message. Asked with the ANY expression, so
+        // a single term landing anywhere in the body wins a window.
+        let fts = FtsQuery::build(query_text, partial);
         let mut out = Vec::with_capacity(ranked.len());
         for c in ranked {
-            if let Some(hit) = self.search_hit_by_id(account_id, c.id)?
+            if let Some(mut hit) = self.search_hit_by_id(account_id, c.id)?
                 && filter.matches(&hit)
             {
+                if let Some(window) = self.fts_snippet(account_id, c.id, &fts.any)? {
+                    hit.snippet = window;
+                }
                 out.push(hit);
             }
         }
         Ok((out, window_full))
     }
 
-    /// FTS5 recall helper for [`hybrid_search`]: candidates in bm25 rank order.
+    /// FTS5 recall helper for [`hybrid_search`]: candidates in bm25 rank order,
+    /// STRICT MATCHES FIRST and then any-only ones, exactly the order
+    /// [`search_filtered`](Self::search_filtered) serves. The two legs share a
+    /// builder AND a running order, so keyword mode and hybrid mode cannot
+    /// disagree about what a query means.
+    ///
     /// Unlike [`Store::search`] it INCLUDES sent mail, because recall wants the
     /// user's own outbound mail. Sealed rows are excluded in SQL, and a malformed
     /// FTS query yields an empty list rather than an error.
@@ -446,26 +496,62 @@ impl SqliteStore {
     /// PURE RELEVANCE ORDER, unlike the keyword leg's own `ORDER BY`: this list
     /// is an INPUT to the fusion, which applies the recency vote once, across
     /// every leg. Blending it in here too would count it twice.
-    fn fts_recall(
+    fn fts_recall(&self, account_id: AccountId, fts: &FtsQuery, limit: usize) -> Result<Vec<Candidate>> {
+        if fts.is_empty() {
+            return Ok(Vec::new());
+        }
+        let conn = self.lock()?;
+        let mut out = self.fts_recall_pass(&conn, account_id, &fts.strict, None, limit)?;
+        // One term means the two expressions are identical; anything else and
+        // the any-only pass fills the rest of the window BELOW the strict hits.
+        if fts.terms.len() > 1 && out.len() < limit {
+            let rest = self.fts_recall_pass(
+                &conn,
+                account_id,
+                &fts.any,
+                Some(&fts.strict),
+                limit - out.len(),
+            )?;
+            out.extend(rest);
+        }
+        Ok(out)
+    }
+
+    /// One pass of [`fts_recall`](Self::fts_recall): the rows matching `expr`
+    /// minus those matching `exclude`, in bm25 order.
+    fn fts_recall_pass(
         &self,
+        conn: &Connection,
         account_id: AccountId,
-        query: &str,
+        expr: &str,
+        exclude: Option<&str>,
         limit: usize,
     ) -> Result<Vec<Candidate>> {
-        let conn = self.lock()?;
-        let mut stmt = conn.prepare(
+        let mut sql = String::from(
             "SELECT m.id, m.received_at
              FROM messages_fts f
              JOIN messages m ON m.id = f.rowid
              LEFT JOIN triage t ON t.message_id = m.id
-             WHERE m.account_id = ?1
+             WHERE m.account_id = ?
                AND COALESCE(t.sensitivity, 'normal') != 'sealed'
                AND m.is_spam = 0
-               AND messages_fts MATCH ?2
-             ORDER BY rank
-             LIMIT ?3",
-        )?;
-        let rows = stmt.query_map(params![account_id, query, limit as i64], |r| {
+               AND messages_fts MATCH ?",
+        );
+        let mut args = vec![Value::Integer(account_id), Value::Text(expr.to_string())];
+        if let Some(exclude) = exclude {
+            sql.push_str(
+                " AND f.rowid NOT IN (
+                     SELECT rowid FROM messages_fts WHERE messages_fts MATCH ?)",
+            );
+            args.push(Value::Text(exclude.to_string()));
+        }
+        sql.push_str(" ORDER BY f.rank LIMIT ?");
+        args.push(Value::Integer(limit as i64));
+        let mut stmt = match conn.prepare(&sql) {
+            Ok(s) => s,
+            Err(_) => return Ok(Vec::new()),
+        };
+        let rows = stmt.query_map(params_from_iter(args), |r| {
             Ok(Candidate {
                 id: r.get(0)?,
                 received_at: dt(r, 1)?,
@@ -521,40 +607,34 @@ impl SqliteStore {
             query,
             &SearchFilter::default(),
             SearchSort::default(),
+            false,
             limit,
             offset,
         )
     }
 
-    /// KEYWORD PATH with the operator half applied in SQL. `text` is already
-    /// parsed (see [`crate::store::parse_search_query`]); empty text plus a
-    /// filter routes to [`filter_only_listing`](Self::filter_only_listing).
+    /// ONE PAGE OF THE KEYWORD LEG: the messages matching `expr`, MINUS those
+    /// matching `exclude` when it is given, ranked by bm25 blended with recency
+    /// (see the sort-key comment in [`search_filtered`](Self::search_filtered)).
     ///
-    /// Ranked by bm25, SCALED BY RECENCY under [`SearchSort::Recent`] (see
-    /// [`crate::store::recency`]) and left alone under
-    /// [`SearchSort::BestMatch`]. Pagination stays exact either way: the blend
-    /// happens in SQL, so LIMIT/OFFSET still cut a page out of the true
+    /// `exclude` is what makes the any-term pass an ANY-ONLY pass: the rows the
+    /// strict pass already served are subtracted here rather than deduplicated
+    /// in Rust, so LIMIT/OFFSET keep cutting an exact page out of a real
     /// ordering instead of out of a fetched window.
-    pub(super) fn search_filtered(
+    ///
+    /// SECURITY: the sealed, spam and sent predicates live in this one place, so
+    /// both passes carry them by construction.
+    fn keyword_page(
         &self,
+        conn: &Connection,
         account_id: AccountId,
-        text: &str,
+        expr: &str,
+        exclude: Option<&str>,
         filter: &SearchFilter,
         sort: SearchSort,
         limit: u32,
         offset: u32,
     ) -> Result<Vec<SearchHit>> {
-        if text.trim().is_empty() {
-            // No text AND no filter is not a search — it is "page me the whole
-            // mailbox", which no caller means. Refusing here keeps the old
-            // `search("")`-errors contract instead of silently listing mail
-            // for the next caller who forgets to validate.
-            if filter.is_empty() {
-                return Err(CoreError::InvalidInput("empty search query".into()));
-            }
-            return self.filter_only_listing(account_id, filter, limit, offset);
-        }
-        let conn = self.lock()?;
         // SECURITY: sealed rows excluded in SQL. An untriaged message COALESCEs
         // to non-sealed so freshly-ingested mail is still findable, but a sealed
         // classification always hides the row.
@@ -575,7 +655,17 @@ impl SqliteStore {
                AND m.is_spam = 0
                AND messages_fts MATCH ?"
         );
-        let mut args = vec![Value::Integer(account_id), Value::Text(text.to_string())];
+        let mut args = vec![
+            Value::Integer(account_id),
+            Value::Text(expr.to_string()),
+        ];
+        if let Some(exclude) = exclude {
+            sql.push_str(
+                " AND f.rowid NOT IN (
+                     SELECT rowid FROM messages_fts WHERE messages_fts MATCH ?)",
+            );
+            args.push(Value::Text(exclude.to_string()));
+        }
         push_filter_clauses(&mut sql, &mut args, filter);
         // THE SORT KEY. Both branches are BIGGEST FIRST — `rank` is bm25 and
         // NEGATIVE (more negative = better), so `-f.rank` is the relevance —
@@ -612,9 +702,10 @@ impl SqliteStore {
 
         let mut stmt = conn.prepare(&sql)?;
         // A syntactically-invalid MATCH expression errors at STEP time, after a
-        // clean prepare. Its siblings (`fts_recall_ids`, `fts_snippet`) already
-        // read that as "no keyword hits"; this leg must agree, or the same bad
-        // query 200s in hybrid mode and 500s in keyword mode.
+        // clean prepare. `FtsQuery` makes that unreachable from a search box,
+        // but the sibling legs read a bad MATCH as "no keyword hits" and this
+        // one must agree, or the same bad query 200s in hybrid mode and 500s in
+        // keyword mode.
         let rows = match stmt.query_map(params_from_iter(args), map_search_hit_with_window) {
             Ok(rows) => rows,
             Err(_) => return Ok(Vec::new()),
@@ -625,6 +716,144 @@ impl SqliteStore {
                 Ok(hit) => out.push(hit),
                 Err(_) => return Ok(out),
             }
+        }
+        Ok(out)
+    }
+
+    /// How many messages the STRICT expression matches under exactly the
+    /// predicates [`keyword_page`](Self::keyword_page) applies. The offset the
+    /// any-only pass starts from is `offset - this`, so the two passes join
+    /// without a gap and without a repeat.
+    fn keyword_total(
+        &self,
+        conn: &Connection,
+        account_id: AccountId,
+        expr: &str,
+        filter: &SearchFilter,
+    ) -> Result<u32> {
+        let mut sql = String::from(
+            "SELECT COUNT(*)
+             FROM messages_fts f
+             JOIN messages m ON m.id = f.rowid
+             LEFT JOIN triage t ON t.message_id = m.id
+             WHERE m.account_id = ?
+               AND COALESCE(t.sensitivity, 'normal') != 'sealed'
+               AND m.is_sent = 0
+               AND m.is_spam = 0
+               AND messages_fts MATCH ?",
+        );
+        let mut args = vec![
+            Value::Integer(account_id),
+            Value::Text(expr.to_string()),
+        ];
+        push_filter_clauses(&mut sql, &mut args, filter);
+        let mut stmt = conn.prepare(&sql)?;
+        let n: i64 = match stmt.query_row(params_from_iter(args), |r| r.get(0)) {
+            Ok(n) => n,
+            // Same reading as every other MATCH here: unparseable means nothing
+            // matched, not "the search failed".
+            Err(_) => 0,
+        };
+        Ok(n.max(0) as u32)
+    }
+
+    /// KEYWORD PATH with the operator half applied in SQL. `text` is already
+    /// parsed (see [`crate::store::parse_search_query`]); empty text plus a
+    /// filter routes to [`filter_only_listing`](Self::filter_only_listing).
+    ///
+    /// AND, THEN OR. The page is the STRICT matches (every term) in rank order,
+    /// followed by the mail carrying only SOME of the terms, in rank order,
+    /// with the strict rows subtracted so nothing appears twice. A message that
+    /// matches everything therefore can never sink below one that matches less,
+    /// and a query with one word the right mail happens to lack stops returning
+    /// nothing at all. See [`FtsQuery::build`] for the mailbox that taught us.
+    ///
+    /// Ranked by bm25, SCALED BY RECENCY under [`SearchSort::Recent`] (see
+    /// [`crate::store::recency`]) and left alone under
+    /// [`SearchSort::BestMatch`]. PAGINATION STAYS EXACT across the boundary
+    /// between the two passes: the strict pass is counted, the page is cut out
+    /// of it by LIMIT/OFFSET, and whatever the page still owes is taken from
+    /// the any-only pass at `offset - strict_total`.
+    ///
+    /// `partial` matches the LAST term as a prefix, for the panel's
+    /// as-you-type fetch.
+    pub(super) fn search_filtered(
+        &self,
+        account_id: AccountId,
+        text: &str,
+        filter: &SearchFilter,
+        sort: SearchSort,
+        partial: bool,
+        limit: u32,
+        offset: u32,
+    ) -> Result<Vec<SearchHit>> {
+        let fts = FtsQuery::build(text, partial);
+        if fts.is_empty() {
+            // No text AND no filter is not a search — it is "page me the whole
+            // mailbox", which no caller means. Refusing here keeps the old
+            // `search("")`-errors contract instead of silently listing mail
+            // for the next caller who forgets to validate.
+            if filter.is_empty() {
+                // The reader typed SOMETHING the index cannot hold ("???"),
+                // which is an honest empty result rather than an error and
+                // definitely not an invitation to list the mailbox.
+                if text.trim().is_empty() {
+                    return Err(CoreError::InvalidInput("empty search query".into()));
+                }
+                return Ok(Vec::new());
+            }
+            return self.filter_only_listing(account_id, filter, limit, offset);
+        }
+        let conn = self.lock()?;
+        // ONE TERM means strict and any are the same expression, so there is no
+        // any-only pass to run and no count to take: the strict page IS the
+        // page. Skipping both is not just an optimisation — a `NOT IN` against
+        // an identical MATCH would correctly return nothing, and paying for two
+        // more FTS scans to learn that is silly.
+        if fts.terms.len() == 1 {
+            return self.keyword_page(
+                &conn,
+                account_id,
+                &fts.strict,
+                None,
+                filter,
+                sort,
+                limit,
+                offset,
+            );
+        }
+        let strict_total = self.keyword_total(&conn, account_id, &fts.strict, filter)?;
+        let mut out = Vec::new();
+        if offset < strict_total {
+            out = self.keyword_page(
+                &conn,
+                account_id,
+                &fts.strict,
+                None,
+                filter,
+                sort,
+                limit,
+                offset,
+            )?;
+        }
+        // What the page still owes comes off the any-only ranking. Its offset
+        // is how far past the strict block this page starts (zero when the page
+        // straddles the boundary, because the strict rows above have already
+        // been served).
+        let owed = limit as usize - out.len().min(limit as usize);
+        if owed > 0 {
+            let any_offset = offset.saturating_sub(strict_total);
+            let rest = self.keyword_page(
+                &conn,
+                account_id,
+                &fts.any,
+                Some(&fts.strict),
+                filter,
+                sort,
+                owed as u32,
+                any_offset,
+            )?;
+            out.extend(rest);
         }
         Ok(out)
     }

@@ -477,7 +477,7 @@ impl SquelchServer {
         let account_id = self.account_id;
         let query = query.to_string();
         let (hits, _window_full) = tokio::task::spawn_blocking(move || {
-            store.hybrid_search(account_id, &query, &Default::default(), sort, k)
+            store.hybrid_search(account_id, &query, &Default::default(), sort, false, k)
         })
         .await
         .map_err(|_| ErrorData::internal_error("internal error", None))?
