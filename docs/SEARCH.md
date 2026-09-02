@@ -74,7 +74,9 @@ rather than what one remembers being there.
   cannot parse (a stray `"` or a trailing `-`) makes the whole MATCH invalid,
   which every caller reads as "no keyword hits" rather than an error. bm25 is
   unweighted: a term in the subject counts the same as one in the body.
-  Recency is blended in SQL, multiplicatively (PR #135).
+  Recency is blended in SQL, multiplicatively (PR #135). Every hit query pairs
+  `is_spam = 0` with the sealed guard (PR #178): spam is a structural
+  exclusion, absent from every count and search rather than ranked last.
 - **Semantic leg**: one sqlite-vec `vec0` row per non-sealed message,
   `bge-small-en-v1.5` fp32 at 384 dimensions via fastembed 5.17 over ONNX
   Runtime, embedding the subject plus the first 1,000 characters of the body
@@ -194,7 +196,9 @@ PR's lesson: green proves nothing on a ranking change).
 8. **Diagnostics** on `SearchPage`: `strict_hits` (all terms), `any_hits`
    (any term), `terms: [{text, df}]`, and per-item `legs: ["keyword",
    "vector"]`. Additive fields; the iOS client ignores what it does not
-   decode.
+   decode. Every count is account-scoped and excludes sealed AND spam rows
+   exactly as the hit queries do: a document frequency that counted sealed
+   mail would be an oracle for what sealed mail contains.
 
 ## 5. Keyword or question: the classifier
 
