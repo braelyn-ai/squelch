@@ -385,11 +385,17 @@ struct RoutedHost<Content: View>: View {
     let view: MainView
     @ViewBuilder var content: Content
 
-    private var title: String {
+    /// Page name, and the line beside it that says what the page IS.
+    ///
+    /// Two values rather than one string with a dash in it: the subtitle is set
+    /// in the sitrep masthead's own small caps, so it has to reach the header as
+    /// its own text. (It read "Rules — sender rules", which also put an em dash
+    /// in user-facing copy, which this app does not do.)
+    private var heading: (title: String, subtitle: String?) {
         switch view {
-        case .rules: "Rules — sender rules"
-        case .audit: "Audit — agent & app actions"
-        default: view.label
+        case .rules: ("Rules", "sender rules")
+        case .audit: ("Audit", "agent & app actions")
+        default: (view.label, nil)
         }
     }
 
@@ -401,7 +407,7 @@ struct RoutedHost<Content: View>: View {
                 content
             } else {
                 VStack(alignment: .leading, spacing: 0) {
-                    RoutedHeader(title: title)
+                    RoutedHeader(title: heading.title, subtitle: heading.subtitle)
                     content
                 }
             }
@@ -419,18 +425,35 @@ struct RoutedHost<Content: View>: View {
 /// The shared page header for routed views.
 struct RoutedHeader<Trailing: View>: View {
     let title: String
+    /// The page's own description, set in the SITREP MASTHEAD'S small caps —
+    /// the same pairing as `passband` + `SITREP`, so a routed page and the
+    /// dashboard read as one app rather than as two typographic ideas.
+    var subtitle: String?
     @ViewBuilder var trailing: Trailing
 
-    init(title: String, @ViewBuilder trailing: () -> Trailing) {
+    init(title: String, subtitle: String? = nil, @ViewBuilder trailing: () -> Trailing) {
         self.title = title
+        self.subtitle = subtitle
         self.trailing = trailing()
     }
 
     var body: some View {
+        // The OUTER stack stays centre-aligned: `trailing` carries buttons and
+        // status dots, and baseline-aligning those to a text run drops them off
+        // the bar's centre line. Only the title pair is baseline-aligned, which
+        // is what sits the small caps on the title's foot.
         HStack(spacing: 10) {
-            Text(title)
-                .font(.system(size: 15, weight: .semibold))
-                .foregroundStyle(Palette.ink)
+            HStack(alignment: .firstTextBaseline, spacing: 7) {
+                Text(title)
+                    .font(.system(size: 15, weight: .semibold))
+                    .foregroundStyle(Palette.ink)
+                if let subtitle {
+                    Text(subtitle)
+                        .font(Typo.micro)
+                        .foregroundStyle(Palette.inkFaintest)
+                        .textCase(.uppercase)
+                }
+            }
             Spacer(minLength: 8)
             trailing
         }
@@ -445,8 +468,8 @@ struct RoutedHeader<Trailing: View>: View {
 }
 
 extension RoutedHeader where Trailing == EmptyView {
-    init(title: String) {
-        self.init(title: title) { EmptyView() }
+    init(title: String, subtitle: String? = nil) {
+        self.init(title: title, subtitle: subtitle) { EmptyView() }
     }
 }
 

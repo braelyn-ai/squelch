@@ -69,7 +69,7 @@ struct AuthView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            RoutedHeader(title: "Auth — codes, alerts & resets") {
+            RoutedHeader(title: "Auth", subtitle: "codes, alerts & resets") {
                 HStack(spacing: 12) {
                     StatusDot(
                         color: Palette.lock,
@@ -125,7 +125,7 @@ struct AuthView: View {
                         onArchive: { Task { await archiveFocused(focus) } })
                 } else {
                     Text(
-                        "nothing here — login codes, password resets and sign-in alerts land on this page as they arrive."
+                        "nothing here yet. login codes, password resets and sign-in alerts land on this page as they arrive."
                     )
                     .font(Typo.rowSub)
                     .foregroundStyle(Palette.inkFaintest)
@@ -419,7 +419,7 @@ private struct FocusPanel: View {
                     .tint(Palette.lock)
 
                     Button(action: onArchive) {
-                        Label("Used it — archive", systemImage: "archivebox")
+                        Label("Used it · archive", systemImage: "archivebox")
                             .font(.system(size: 12))
                             .padding(.horizontal, 10).padding(.vertical, 5)
                     }
