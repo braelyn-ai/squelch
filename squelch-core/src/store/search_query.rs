@@ -190,6 +190,132 @@ pub fn parse_search_query(raw: &str) -> (String, SearchFilter) {
     (words.join(" "), filter)
 }
 
+/// THE TWO EXPRESSIONS ONE SEARCH RUNS, built from the reader's words by
+/// [`FtsQuery::build`]. See there for why there are two.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FtsQuery {
+    /// Every term, ANDed: `"a" AND "b" AND "c"`. Empty when the reader typed
+    /// nothing an index can look up.
+    pub strict: String,
+    /// Every term, ORed: `"a" OR "b" OR "c"`. Empty under the same condition.
+    pub any: String,
+    /// The terms as they are ranked, in the order typed, stripped of syntax and
+    /// unquoted. What the door reports as `diagnostics.terms`.
+    pub terms: Vec<String>,
+}
+
+/// FTS5 syntax characters. They SPLIT a token rather than being escaped or
+/// deleted, because the reader is typing WORDS into a search box, not writing a
+/// query language: `-` starts no NOT, `*` matches no prefix, `co:` filters no
+/// column. Splitting rather than deleting is what the INDEX does with them —
+/// unicode61 treats every one of these as a separator — so `re:contract`
+/// becomes the two terms the index actually holds instead of the one word
+/// `recontract`, which it holds nowhere.
+///
+/// `"` is here too even though quoting is FTS5's own escape (`""`). A phrase
+/// the reader quoted survives as an AND of its words, which finds the same mail
+/// a rank or two differently, and that is a better trade than carrying quote
+/// state through a tokenizer that exists to make one class of error impossible.
+const FTS_SYNTAX: &[char] = &['"', '(', ')', '*', '^', ':', '-', '+'];
+
+impl FtsQuery {
+    /// Turn the reader's text into the two MATCH expressions the keyword leg
+    /// runs, in this order: STRICT (every word) first, ANY (some word) second.
+    ///
+    /// WHY TWO. FTS5 reads a bare query as an implicit AND of every token, so
+    /// one word the document lacks matches nothing however rare and decisive
+    /// the others are. The mail that started this work says "wifi" and
+    /// "abstract" and never says "conference" or "password", and "wifi" occurs
+    /// in exactly one message in the mailbox: ANDed it is unfindable, ORed and
+    /// ranked by bm25 it is the top hit. So the leg serves the strict matches
+    /// first and then, below them, the mail that carries only some of the
+    /// words. Nothing that matches everything can ever sink below something
+    /// that matches less.
+    ///
+    /// WHY QUOTED. Every surviving token is wrapped in double quotes, which
+    /// makes it a PHRASE — the one FTS5 construct that reads its contents as
+    /// text rather than as syntax. Together with [`FTS_SYNTAX`] that means the
+    /// reader's words can no longer form an expression FTS5 refuses to parse,
+    /// and "a malformed MATCH silently means zero hits" stops being reachable
+    /// from a search box. The defensive empty-on-error handling downstream
+    /// stays anyway: this is not the only caller SQLite has.
+    ///
+    /// `partial` prefixes the LAST token only (`"wif"*`), which is the word
+    /// still being typed. The panel's debounced fetch asks for it; the agent
+    /// door never does, because an agent sends settled words.
+    pub fn build(text: &str, partial: bool) -> FtsQuery {
+        let terms: Vec<String> = text
+            .split(|c: char| c.is_whitespace() || FTS_SYNTAX.contains(&c))
+            // A token with no letter or digit in it is not a word the index
+            // holds — and `""` is not even a legal FTS5 phrase, so passing one
+            // on would fail the whole MATCH. Dropping it is what makes a query
+            // of pure punctuation an empty expression rather than a syntax
+            // error.
+            .filter(|t| t.chars().any(char::is_alphanumeric))
+            .map(|t| t.to_string())
+            .collect();
+        if terms.is_empty() {
+            return FtsQuery {
+                strict: String::new(),
+                any: String::new(),
+                terms,
+            };
+        }
+        let last = terms.len() - 1;
+        let quoted: Vec<String> = terms
+            .iter()
+            .enumerate()
+            .map(|(i, t)| {
+                if partial && i == last {
+                    format!("\"{t}\"*")
+                } else {
+                    format!("\"{t}\"")
+                }
+            })
+            .collect();
+        FtsQuery {
+            strict: quoted.join(" AND "),
+            any: quoted.join(" OR "),
+            terms,
+        }
+    }
+
+    /// Nothing to look up: the reader typed only operators, or only
+    /// punctuation. Callers run NO MATCH at all rather than an empty one.
+    pub fn is_empty(&self) -> bool {
+        self.terms.is_empty()
+    }
+}
+
+/// What retrieval made of the reader's words, reported on the wire beside the
+/// hits (`GET /client/search`'s `diagnostics`).
+///
+/// The classifier that decides whether a query is a lookup or a question reads
+/// these: three or more terms with `strict_hits == 0` means the words are right
+/// and no single message uses all of them, which is exactly the shape a
+/// question has. Facts beat a guess, and these are cheap.
+///
+/// SECURITY: every count here is account-scoped and excludes sealed and spam
+/// rows, for the same reason the hit queries do. A term frequency is a yes/no
+/// oracle over message text, so a count that saw sealed mail would answer
+/// questions about sealed mail one word at a time.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SearchDiagnostics {
+    /// Messages matching EVERY term.
+    pub strict_hits: u32,
+    /// Messages matching AT LEAST ONE term.
+    pub any_hits: u32,
+    /// Per-term document frequency, in the order the terms were typed.
+    pub terms: Vec<TermDf>,
+}
+
+/// One term and how many messages contain it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TermDf {
+    pub text: String,
+    pub df: u32,
+}
+
 /// Whitespace-split, except inside double quotes. Quote characters are KEPT in
 /// the token: a plain `"exact phrase"` has to reach FTS5 intact (there it means
 /// a phrase query), and a token bounced back into the search text should read
@@ -280,6 +406,102 @@ mod tests {
         ] {
             assert_eq!(SearchSort::parse(bad), None, "{bad:?} must not parse");
         }
+    }
+
+    // ---- THE FTS EXPRESSION BUILDER ------------------------------------
+
+    #[test]
+    fn every_term_is_quoted_and_joined_both_ways() {
+        let q = FtsQuery::build("abstract conference wifi password", false);
+        assert_eq!(
+            q.strict,
+            r#""abstract" AND "conference" AND "wifi" AND "password""#
+        );
+        assert_eq!(
+            q.any,
+            r#""abstract" OR "conference" OR "wifi" OR "password""#
+        );
+        assert_eq!(q.terms, vec!["abstract", "conference", "wifi", "password"]);
+        assert!(!q.is_empty());
+    }
+
+    #[test]
+    fn a_single_term_is_the_same_expression_twice() {
+        // Nothing to AND and nothing to OR: strict and any are one phrase, so
+        // the any-only pass finds nothing the strict pass did not.
+        let q = FtsQuery::build("wifi", false);
+        assert_eq!(q.strict, r#""wifi""#);
+        assert_eq!(q.any, r#""wifi""#);
+    }
+
+    #[test]
+    fn fts_syntax_characters_are_stripped_not_escaped() {
+        // Each of these is an operator to FTS5 and a word to the reader. None
+        // of them may survive into the expression.
+        let q = FtsQuery::build(r#"-invoice re:contract "quoted" (paren) star* ^caret +plus"#, false);
+        assert_eq!(
+            q.terms,
+            vec![
+                "invoice", "re", "contract", "quoted", "paren", "star", "caret", "plus"
+            ],
+            "a syntax character SPLITS, exactly as unicode61 splits it in the index"
+        );
+        for expr in [&q.strict, &q.any] {
+            for bad in ['*', '(', ')', '^', ':', '-', '+'] {
+                assert!(!expr.contains(bad), "{bad:?} survived into {expr:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn partial_prefixes_only_the_last_token() {
+        // The word still being typed, and only that one: prefixing the earlier
+        // terms would widen a settled word the reader has finished with.
+        let q = FtsQuery::build("abstract wif", true);
+        assert_eq!(q.strict, r#""abstract" AND "wif"*"#);
+        assert_eq!(q.any, r#""abstract" OR "wif"*"#);
+        assert_eq!(q.terms, vec!["abstract", "wif"], "the term itself is bare");
+
+        let one = FtsQuery::build("wif", true);
+        assert_eq!(one.strict, r#""wif"*"#);
+        assert_eq!(one.any, r#""wif"*"#);
+    }
+
+    #[test]
+    fn a_query_of_pure_punctuation_builds_no_expression_at_all() {
+        // `""` is not a legal FTS5 phrase, so a token that strips to nothing
+        // has to be dropped rather than quoted — otherwise the one class of
+        // error this builder exists to remove comes back through the door it
+        // came in by.
+        for text in ["***", "-- ++", "\"\"", "( )", "^", ":::"] {
+            let q = FtsQuery::build(text, false);
+            assert!(q.is_empty(), "{text:?} must build nothing");
+            assert_eq!(q.strict, "");
+            assert_eq!(q.any, "");
+            assert!(q.terms.is_empty());
+        }
+        assert!(FtsQuery::build("   ", true).is_empty());
+    }
+
+    #[test]
+    fn unicode_words_survive_intact() {
+        // The tokenizer is unicode61: non-ASCII letters are letters. Stripping
+        // by an ASCII rule would have turned these into nothing.
+        let q = FtsQuery::build("café 会議 naïve", false);
+        assert_eq!(q.terms, vec!["café", "会議", "naïve"]);
+        assert_eq!(q.strict, r#""café" AND "会議" AND "naïve""#);
+    }
+
+    #[test]
+    fn the_builder_runs_after_the_operator_parse() {
+        // The two halves in the order the door uses them: operators lifted out
+        // first, then whatever words are left become the expression. A bounced
+        // operator (`after:soon`) reaches the builder as a quoted phrase and
+        // comes out as its two ordinary words.
+        let (text, filter) = parse_search_query("invoice from:jane after:soon");
+        assert_eq!(filter.from.as_deref(), Some("jane"));
+        let q = FtsQuery::build(&text, false);
+        assert_eq!(q.terms, vec!["invoice", "after", "soon"]);
     }
 
     fn day(y: i32, m: u32, d: u32) -> DateTime<Utc> {

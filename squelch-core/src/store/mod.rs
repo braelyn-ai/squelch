@@ -8,7 +8,9 @@ pub mod recency;
 pub mod search_query;
 pub mod sqlite;
 
-pub use search_query::{SearchFilter, SearchSort, parse_search_query};
+pub use search_query::{
+    FtsQuery, SearchDiagnostics, SearchFilter, SearchSort, TermDf, parse_search_query,
+};
 pub use sqlite::SqliteStore;
 
 use crate::error::Result;
