@@ -205,11 +205,18 @@ struct AttentionUpdate: Codable, Sendable, Identifiable, Hashable {
     /// Both are flattened here rather than at ingest. A body's own newlines are
     /// its formatting, and a snippet that keeps them turns a one-line row into
     /// a paragraph shaped by whoever sent it.
+    ///
+    /// The caps are a GUARD, not a layout decision — deliberately past what any
+    /// row can show, so the visible cut is the one the row's own width makes.
+    /// A cap tight enough to bite would put an ellipsis in the middle of a row
+    /// with space left on it. What they are actually for is the subject with no
+    /// upper bound at all: the daemon caps the snippet at 200 characters and
+    /// caps a `Subject` header at nothing.
     var mailText: (subject: String, preview: String)? {
         guard one_line.isEmpty, subject != nil || preview != nil else { return nil }
         return (
-            (subject ?? "").displaySubject.flattenedLine(cap: 120),
-            (preview ?? "").flattenedLine(cap: 160)
+            (subject ?? "").displaySubject.flattenedLine(cap: 300),
+            (preview ?? "").flattenedLine(cap: 300)
         )
     }
 }
