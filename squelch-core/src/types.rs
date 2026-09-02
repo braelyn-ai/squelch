@@ -167,6 +167,30 @@ pub struct Update {
     /// address it can actually verify.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub from_name: Option<String>,
+    /// The mail's OWN `Subject`, and the opening of its body — the stored
+    /// `messages.snippet`, which is the first 200 characters of the flattened
+    /// text.
+    ///
+    /// THESE EXIST FOR THE SPAM PAGE, and only the spam page sets them. A spam
+    /// row is never triaged, so its `one_line` is the empty string by
+    /// construction (see the `is_spam` branch in `sync/ingest.rs`), and a list
+    /// whose every row says nothing in the middle is a list you cannot read.
+    /// The fill has to come from the mail itself because nothing else ever
+    /// looked at it.
+    ///
+    /// The bands leave both `None` rather than paying 200 characters a row, on
+    /// every poll, for text no band renders: they have a summary already, which
+    /// is the whole point of having triaged them.
+    ///
+    /// HUMAN-DOOR ONLY, and for the sharpest version of `from_name`'s reason:
+    /// this is attacker-authored text out of the corpus selected for talking
+    /// readers into things. A person reading their own spam folder expects
+    /// exactly that and can weigh it; an agent making decisions must never see
+    /// it at all (docs/SECURITY.md §4b).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subject: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preview: Option<String>,
 }
 
 str_enum! {
@@ -1101,7 +1125,31 @@ mod tests {
             field_reasons: None,
             has_attachments: None,
             from_name: None,
+            subject: None,
+            preview: None,
         }
+    }
+
+    /// The spam page's two fields hold the same contract as `from_name`: absent
+    /// is ABSENT, so the agent door's shape never grows a null key, and a
+    /// client that decodes them as optionals reads "no subject was sent" and
+    /// "the subject was null" the same way.
+    #[test]
+    fn update_without_the_spam_row_text_omits_both_keys() {
+        let v = serde_json::to_value(base_update()).unwrap();
+        assert!(
+            v.get("subject").is_none() && v.get("preview").is_none(),
+            "agent-door Update must carry neither key: {v}"
+        );
+
+        let spam = Update {
+            subject: Some("You have won".into()),
+            preview: Some("Claim your prize now.".into()),
+            ..base_update()
+        };
+        let v = serde_json::to_value(spam).unwrap();
+        assert_eq!(v["subject"], serde_json::json!("You have won"));
+        assert_eq!(v["preview"], serde_json::json!("Claim your prize now."));
     }
 
     /// The agent door leaves `from_name` unset, and an absent display name must

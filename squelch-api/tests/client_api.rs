@@ -8358,6 +8358,9 @@ fn seed_inbox_and_spam(store: &SqliteStore, acct: i64) -> (i64, i64) {
     let good = seed_one_signal(store, acct, "g-good", "t-good", "lunch tomorrow");
     let mut m = msg(acct, "g-spam", "t-spam", "you have won", "claim your prize");
     m.is_spam = true;
+    // Distinct from the subject, so the row-text test can tell the two fields
+    // apart — the shared fixture spells the snippet as the subject.
+    m.snippet = "claim your prize".to_string();
     let spam = store.upsert_message(&m).unwrap();
     store
         .set_triage(
@@ -8411,6 +8414,39 @@ async fn updates_serve_only_spam_when_asked_for_it() {
     let items = json["items"].as_array().unwrap();
     assert_eq!(items.len(), 1, "only the filtered message");
     assert_eq!(items[0]["id"].as_i64().unwrap(), spam_id);
+}
+
+/// AND THE PAGE'S ROWS CARRY THE MAIL'S OWN WORDS. Nothing triaged a spam row,
+/// so `one_line` is the empty string on every one of them; without the subject
+/// and the opening of the body the page is a column of senders against a blank.
+///
+/// The inbox half of the assertion is the load-bearing one: those keys must be
+/// STRUCTURALLY ABSENT off the spam page, or every band on every poll pays two
+/// hundred characters a row for a fill its summary already made unnecessary.
+#[tokio::test]
+async fn the_spam_page_serves_the_subject_and_the_opening_line() {
+    let Harness { app, .. } = harness(|store, acct| {
+        seed_inbox_and_spam(store, acct);
+    });
+
+    let resp = app
+        .clone()
+        .oneshot(authed("GET", "/client/updates?spam=only"))
+        .await
+        .unwrap();
+    let json = body_json(resp).await;
+    let row = &json["items"].as_array().unwrap()[0];
+    assert_eq!(row["one_line"], serde_json::json!(""), "nothing triaged it");
+    assert_eq!(row["subject"], serde_json::json!("you have won"));
+    assert_eq!(row["preview"], serde_json::json!("claim your prize"));
+
+    let resp = app.oneshot(authed("GET", "/client/updates")).await.unwrap();
+    let json = body_json(resp).await;
+    let row = &json["items"].as_array().unwrap()[0];
+    assert!(
+        row.get("subject").is_none() && row.get("preview").is_none(),
+        "an ordinary row must carry neither key: {row}"
+    );
 }
 
 /// AN UNKNOWN VALUE IS A 400, never a silent full listing. A client asking for

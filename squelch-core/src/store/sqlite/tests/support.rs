@@ -113,7 +113,6 @@ impl TriagedBuilder {
         self.msg.body = body.to_string();
         self
     }
-    #[allow(dead_code)] // builder completeness; no current test sets a snippet
     pub(super) fn snippet(mut self, snippet: &str) -> Self {
         self.msg.snippet = snippet.to_string();
         self

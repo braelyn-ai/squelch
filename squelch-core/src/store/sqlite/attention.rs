@@ -23,7 +23,19 @@ fn update_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Update> {
         field_reasons: None,
         has_attachments: None,
         from_name: None,
+        subject: None,
+        preview: None,
     })
+}
+
+/// BLANK IS THE SAME AS ABSENT for every optional string this listing serves.
+/// A display name of `""` renders as `"" <addr>`, which parses back to a
+/// nameless sender anyway; a subject of one non-breaking space (what a mailer
+/// that "cleared" the field sends) draws a row with nothing on it, which reads
+/// as a bug rather than as blank mail. One spelling of the rule, so the three
+/// fields cannot drift into three answers.
+fn non_blank(s: Option<String>) -> Option<String> {
+    s.filter(|v| !v.trim().is_empty())
 }
 
 /// The recency window every human-door listing runs under (`?2` is the caller's
@@ -246,6 +258,8 @@ impl SqliteStore {
                       m.received_at AS received_at,
                       t.remind_at AS remind_at,
                       t.reminded_at AS reminded_at,
+                      m.subject AS subject,
+                      m.snippet AS snippet,
                       ROW_NUMBER() OVER (
                           PARTITION BY {thread_key}
                           ORDER BY {inner_order}
@@ -261,7 +275,7 @@ impl SqliteStore {
         let mut stmt = conn.prepare(&sql)?;
         let map_row = |r: &rusqlite::Row| {
             let mut update = update_from_row(r)?;
-            // HUMAN DOOR: the two extra columns the agent door never sees. A NULL
+            // HUMAN DOOR: the extra columns the agent door never sees. A NULL
             // or malformed reasons blob yields None — one bad row must never fail
             // the whole updates read.
             update.field_reasons = r
@@ -269,11 +283,18 @@ impl SqliteStore {
                 .as_deref()
                 .and_then(|s| serde_json::from_str(s).ok());
             update.has_attachments = Some(r.get::<_, i64>(13)? != 0);
-            // Blank is the same as absent: an empty display name must not
-            // render as "" <addr>, which parses to a nameless sender anyway.
-            update.from_name = r
-                .get::<_, Option<String>>(14)?
-                .filter(|n| !n.trim().is_empty());
+            update.from_name = non_blank(r.get::<_, Option<String>>(14)?);
+            // THE SPAM PAGE'S ROW TEXT, on the spam page and nowhere else.
+            // Every row here was skipped by triage, so `one_line` is empty on
+            // all of them and the middle of the row would be blank; the mail's
+            // own subject and opening words are the only thing left to put
+            // there. Reading these columns for the bands too would be 200
+            // characters a row, on every poll, for a fill their summaries
+            // already made unnecessary — see `Update::subject`.
+            if spam == SpamScope::Only {
+                update.subject = non_blank(r.get::<_, Option<String>>(18)?);
+                update.preview = non_blank(r.get::<_, Option<String>>(19)?);
+            }
             Ok(AttentionUpdate {
                 update,
                 status: AttentionStatus::parse(&r.get::<_, String>(9)?)

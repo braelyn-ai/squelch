@@ -34,6 +34,10 @@ struct SpamWireTests {
         statsCarryTheSpamCountAndStamp()
         aDaemonTooOldSaysNothingRatherThanZero()
         theStampParsesAsADate()
+        aSpamRowCarriesTheMailsOwnText()
+        anOrdinaryRowKeepsItsSummary()
+        aBlankSubjectStillDrawsARow()
+        aMultiLineOpeningIsFlattened()
 
         if failures > 0 {
             print("FAILED: \(failures) of \(checks) checks")
@@ -111,5 +115,96 @@ struct SpamWireTests {
         expect(Fmt.date("2026-09-01T21:05:09.897666Z") != nil, "the fractional stamp parses")
         expect(Fmt.date("2026-09-01T21:05:09Z") != nil, "and a plain one still does")
         expect(Fmt.date(nil) == nil, "and absence stays absence")
+    }
+
+    /// One row off `GET /client/updates?spam=only`, verbatim. Note `one_line`:
+    /// it is the empty string on every row of that page, because nothing
+    /// triaged any of them. The subject and the opening line are what the row
+    /// has to say instead, and without them the page is a list of senders
+    /// against a blank column.
+    static func aSpamRowCarriesTheMailsOwnText() {
+        let json = """
+            {"id":4213,"thread_id":"t-spam","tier":"noise","importance":0,\
+            "sender":"winner@lottery.example","one_line":"","reason":\
+            "spam (sorted by the mail provider; not triaged)","deadline":null,\
+            "matched_rule":null,"has_attachments":false,"from_name":"Prize Team",\
+            "subject":"You have won","preview":"Claim your prize now.",\
+            "status":"new","surfaced_at":null,"resolved_at":null,\
+            "remind_at":null,"reminded_at":null}
+            """
+        guard let u = try? JSONDecoder().decode(AttentionUpdate.self, from: Data(json.utf8))
+        else {
+            return expect(false, "a spam row decodes")
+        }
+        expect(u.subject == "You have won", "the subject arrives")
+        expect(u.preview == "Claim your prize now.", "and the opening of the body")
+        guard let mail = u.mailText else {
+            return expect(false, "a row with no summary falls back to the mail")
+        }
+        expect(mail.subject == "You have won", "the row shows the subject")
+        expect(mail.preview == "Claim your prize now.", "and the opening beside it")
+    }
+
+    /// AND THE OTHER HALF, which is the one that can rot silently: every other
+    /// page sends neither key, and a row that HAS a summary must keep showing
+    /// it. If `mailText` ever answered on a triaged row, the bands would start
+    /// rendering raw subjects in place of the triage they exist to show.
+    static func anOrdinaryRowKeepsItsSummary() {
+        let json = """
+            {"id":7,"thread_id":"t-good","tier":"signal","importance":60,\
+            "sender":"alice@example.com","one_line":"Alice asks about lunch",\
+            "reason":"known contact","deadline":null,"matched_rule":null,\
+            "has_attachments":false,"from_name":"Alice","status":"new",\
+            "surfaced_at":null,"resolved_at":null,"remind_at":null,"reminded_at":null}
+            """
+        guard let u = try? JSONDecoder().decode(AttentionUpdate.self, from: Data(json.utf8))
+        else {
+            return expect(false, "an ordinary row decodes without the two keys")
+        }
+        expect(u.subject == nil && u.preview == nil, "no mail text was sent")
+        expect(u.mailText == nil, "so the row keeps its summary")
+    }
+
+    /// A CLEARED SUBJECT IS STILL A ROW. The daemon declines to send a blank at
+    /// all, so the client sees an absent subject beside a present preview — and
+    /// a row that rendered nothing there would read as a bug rather than as
+    /// mail with no subject.
+    static func aBlankSubjectStillDrawsARow() {
+        let json = """
+            {"id":9,"thread_id":"t-x","tier":"noise","importance":0,\
+            "sender":"nobody@example.com","one_line":"","reason":"spam",\
+            "deadline":null,"matched_rule":null,"has_attachments":false,\
+            "preview":"Открыть вложение","status":"new","surfaced_at":null,\
+            "resolved_at":null,"remind_at":null,"reminded_at":null}
+            """
+        guard let u = try? JSONDecoder().decode(AttentionUpdate.self, from: Data(json.utf8)),
+            let mail = u.mailText
+        else {
+            return expect(false, "a subjectless spam row still has text")
+        }
+        expect(mail.subject == "(no subject)", "the blank subject is named")
+        expect(mail.preview == "Открыть вложение", "and the body still speaks")
+    }
+
+    /// The stored snippet is the first 200 characters of the FLATTENED body,
+    /// but flattened only of markup — its own newlines and runs of spaces
+    /// survive, and a row that kept them would be a paragraph shaped by
+    /// whoever sent it rather than a line.
+    static func aMultiLineOpeningIsFlattened() {
+        let json = """
+            {"id":11,"thread_id":"t-y","tier":"noise","importance":0,\
+            "sender":"deals@example.com","one_line":"","reason":"spam",\
+            "deadline":null,"matched_rule":null,"has_attachments":false,\
+            "subject":"Weekly\\ndeals","preview":"Hi there,\\n\\n   50% off\\teverything",\
+            "status":"new","surfaced_at":null,"resolved_at":null,\
+            "remind_at":null,"reminded_at":null}
+            """
+        guard let u = try? JSONDecoder().decode(AttentionUpdate.self, from: Data(json.utf8)),
+            let mail = u.mailText
+        else {
+            return expect(false, "a multi-line spam row decodes")
+        }
+        expect(mail.subject == "Weekly deals", "the subject is one line")
+        expect(mail.preview == "Hi there, 50% off everything", "and so is the opening")
     }
 }
