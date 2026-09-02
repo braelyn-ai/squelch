@@ -1884,6 +1884,9 @@ struct UsageRow {
     output_tokens: u64,
     cache_creation_tokens: u64,
     cache_read_tokens: u64,
+    /// This day's spend, priced like the window total. Per day so a client can
+    /// chart spend over time rather than only sum it.
+    est_cost_usd: f64,
 }
 
 /// Totals across the returned window, costed from the same per-MTok prices
@@ -1928,6 +1931,15 @@ pub async fn get_usage(
                   price_in: f64,
                   price_out: f64|
      -> (Vec<UsageRow>, UsageTotals) {
+        // tokens/1e6 * per-MTok price, the prompt-cache split at its
+        // multipliers — the arithmetic `get_stats` runs for today, applied to
+        // each day and then to the window's sums.
+        let cost = |input: u64, output: u64, cache_w: u64, cache_r: u64| -> f64 {
+            (input as f64 / 1_000_000.0) * price_in
+                + (output as f64 / 1_000_000.0) * price_out
+                + (cache_w as f64 / 1_000_000.0) * price_in * CACHE_WRITE_INPUT_MULT
+                + (cache_r as f64 / 1_000_000.0) * price_in * CACHE_READ_INPUT_MULT
+        };
         let (mut in_tok, mut out_tok, mut calls) = (0u64, 0u64, 0u64);
         let (mut cache_w, mut cache_r) = (0u64, 0u64);
         let out_rows: Vec<UsageRow> = rows
@@ -1939,6 +1951,12 @@ pub async fn get_usage(
                 cache_w += r.cache_creation_tokens;
                 cache_r += r.cache_read_tokens;
                 UsageRow {
+                    est_cost_usd: cost(
+                        r.input_tokens,
+                        r.output_tokens,
+                        r.cache_creation_tokens,
+                        r.cache_read_tokens,
+                    ),
                     day: r.day,
                     calls: r.calls,
                     input_tokens: r.input_tokens,
@@ -1948,10 +1966,7 @@ pub async fn get_usage(
                 }
             })
             .collect();
-        let est_cost_usd = (in_tok as f64 / 1_000_000.0) * price_in
-            + (out_tok as f64 / 1_000_000.0) * price_out
-            + (cache_w as f64 / 1_000_000.0) * price_in * CACHE_WRITE_INPUT_MULT
-            + (cache_r as f64 / 1_000_000.0) * price_in * CACHE_READ_INPUT_MULT;
+        let est_cost_usd = cost(in_tok, out_tok, cache_w, cache_r);
         (
             out_rows,
             UsageTotals {
@@ -2034,6 +2049,66 @@ pub async fn get_usage(
         "provider": state.stage2_provider.as_deref(),
         "model": state.stage2_model.as_ref(),
         "categories": categories,
+    })))
+}
+
+// --- GET /client/mail-activity ----------------------------------------------
+
+#[derive(Debug, Deserialize)]
+pub struct MailActivityQuery {
+    /// How many UTC days back from today, today included. Default 30.
+    days: Option<u32>,
+}
+
+/// GET /client/mail-activity — what the mailbox itself did, per UTC day: mail
+/// in and out, and how the incoming split by tier. The usage page draws it
+/// beside the model spend so the two read against each other — spend per email,
+/// signal share over time — and the days are keyed like the usage ledger's so
+/// the two series line up column for column.
+///
+/// The window is `days` UTC days ENDING TODAY, today included, which is the
+/// same shape a reader gets from `?days=` on `/client/usage`; `since`/`until`
+/// in the body say exactly which days that was, so the client zero-fills the
+/// gaps against the server's calendar rather than its own.
+pub async fn get_mail_activity(
+    State(state): State<ApiState>,
+    Query(q): Query<MailActivityQuery>,
+) -> Result<impl IntoResponse, ApiError> {
+    let days = q
+        .days
+        .unwrap_or(DEFAULT_USAGE_DAYS)
+        .clamp(1, MAX_USAGE_DAYS);
+    let today = Utc::now().date_naive();
+    let since_day = today - chrono::Duration::days(i64::from(days) - 1);
+    let since = since_day.and_hms_opt(0, 0, 0).unwrap_or_default().and_utc();
+    let until = (today + chrono::Duration::days(1))
+        .and_hms_opt(0, 0, 0)
+        .unwrap_or_default()
+        .and_utc();
+    let rows = store_call(&state, move |store, account_id| {
+        store.mail_activity(account_id, since, until)
+    })
+    .await?;
+    let rows: Vec<serde_json::Value> = rows
+        .into_iter()
+        .map(|r| {
+            json!({
+                "day": r.day,
+                "received": r.received,
+                "sent": r.sent,
+                "sealed": r.sealed,
+                "past_due": r.past_due,
+                "deadline": r.deadline,
+                "signal": r.signal,
+                "noise": r.noise,
+            })
+        })
+        .collect();
+    Ok(Json(json!({
+        "days": days,
+        "since": since_day.format("%Y-%m-%d").to_string(),
+        "until": today.format("%Y-%m-%d").to_string(),
+        "rows": rows,
     })))
 }
 

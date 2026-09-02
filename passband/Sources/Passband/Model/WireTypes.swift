@@ -882,6 +882,10 @@ struct UsageRow: Codable, Sendable, Hashable, Identifiable {
     var calls: Int
     var input_tokens: Int
     var output_tokens: Int
+    /// This day's spend, priced like the window total. ABSENT from a daemon
+    /// older than per-day pricing; `UsageSeries` then pro-rates the total by
+    /// tokens so the chart still draws.
+    var est_cost_usd: Double?
     var id: String { day }
 }
 
@@ -905,6 +909,35 @@ struct UsageResponse: Codable, Sendable, Hashable {
     var provider: String?
     var model: String
     var categories: [String: UsageCategory]?
+}
+
+// MARK: - mail activity
+
+/// One UTC day of the mailbox's own traffic (GET /client/mail-activity).
+/// `received` is everything that arrived — sealed included, spam never — and
+/// the four tiers partition the non-sealed part of it; mail the pipeline has
+/// not reached yet is received and in no tier.
+struct MailActivityDay: Codable, Sendable, Hashable, Identifiable {
+    var day: String
+    var received: Int
+    var sent: Int
+    var sealed: Int
+    var past_due: Int
+    var deadline: Int
+    var signal: Int
+    var noise: Int
+    var id: String { day }
+}
+
+struct MailActivityResponse: Codable, Sendable, Hashable {
+    /// The window actually served, clamped by the daemon.
+    var days: Int
+    /// First and last day keys of that window, inclusive — the daemon's
+    /// calendar, which is what the rows are keyed against.
+    var since: String
+    var until: String
+    /// Sparse: only days with mail, ascending.
+    var rows: [MailActivityDay]
 }
 
 // MARK: - triage config

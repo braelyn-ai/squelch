@@ -1526,3 +1526,98 @@ fn sender_probes_seek_their_collated_indexes() {
         "the BINARY index served a NOCASE probe?\n{p:#?}"
     );
 }
+
+/// The activity report's buckets, one day at a time, and the edges of its
+/// window. Spam and sent mail are the two rows that LOOK like received mail
+/// in the table and must not read as it.
+#[test]
+fn mail_activity_buckets_a_day_and_bounds_the_window() {
+    use chrono::TimeZone;
+    let (store, acct) = store();
+    let at = |d: u32, h: u32| Utc.with_ymd_and_hms(2026, 8, d, h, 0, 0).unwrap();
+
+    // Aug 10: a signal, a past-due, a noise, a sealed code, a sent reply, a
+    // spam row, and one message the pipeline has not triaged yet.
+    triaged(acct, "s1", "t1")
+        .received_at(at(10, 9))
+        .tier(Tier::Signal)
+        .seed(&store);
+    triaged(acct, "s2", "t2")
+        .received_at(at(10, 10))
+        .tier(Tier::PastDue)
+        .seed(&store);
+    triaged(acct, "n1", "t3")
+        .received_at(at(10, 11))
+        .tier(Tier::Noise)
+        .seed(&store);
+    triaged(acct, "otp", "t4")
+        .received_at(at(10, 12))
+        .sealed(SealedKind::Otp)
+        .seed(&store);
+    triaged(acct, "out", "t5")
+        .received_at(at(10, 13))
+        .is_sent(true)
+        .tier(Tier::Noise)
+        .seed(&store);
+    triaged(acct, "spam", "t6")
+        .received_at(at(10, 14))
+        .is_spam(true)
+        .tier(Tier::Noise)
+        .seed(&store);
+    triaged(acct, "raw", "t7")
+        .received_at(at(10, 15))
+        .upsert(&store);
+    // Aug 11: one noise. Aug 12: the first instant OUTSIDE a window ending
+    // there, so it must not appear.
+    triaged(acct, "n2", "t8")
+        .received_at(at(11, 8))
+        .tier(Tier::Noise)
+        .seed(&store);
+    triaged(acct, "late", "t9")
+        .received_at(at(12, 0))
+        .tier(Tier::Signal)
+        .seed(&store);
+
+    let rows = store.mail_activity(acct, at(10, 0), at(12, 0)).unwrap();
+    assert_eq!(
+        rows,
+        vec![
+            MailActivityDay {
+                day: "2026-08-10".into(),
+                // Everything inbound that is not spam: 3 triaged + 1 sealed
+                // + 1 untriaged. The sent reply is out, not in.
+                received: 5,
+                sent: 1,
+                sealed: 1,
+                past_due: 1,
+                deadline: 0,
+                signal: 1,
+                // ONE noise: the sent reply's neutral noise row and the spam
+                // row's must not count.
+                noise: 1,
+            },
+            MailActivityDay {
+                day: "2026-08-11".into(),
+                received: 1,
+                sent: 0,
+                sealed: 0,
+                past_due: 0,
+                deadline: 0,
+                signal: 0,
+                noise: 1,
+            },
+        ]
+    );
+
+    // The lower bound is inclusive and the upper exclusive, on the instant.
+    let tail = store.mail_activity(acct, at(11, 8), at(12, 1)).unwrap();
+    assert_eq!(
+        tail.iter().map(|r| r.day.as_str()).collect::<Vec<_>>(),
+        ["2026-08-11", "2026-08-12"]
+    );
+    let none = store.mail_activity(acct, at(13, 0), at(14, 0)).unwrap();
+    assert!(
+        none.is_empty(),
+        "an empty window is an empty list, not zero rows"
+    );
+}
