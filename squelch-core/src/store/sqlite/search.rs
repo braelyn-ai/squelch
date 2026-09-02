@@ -19,6 +19,21 @@ use zerocopy::AsBytes;
 /// client paints highlights itself rather than decoding markup we invented.
 const BODY_SNIPPET: &str = "snippet(messages_fts, 1, char(1), '', '…', 24)";
 
+/// THE RELEVANCE SCORE for every keyword-leg query: bm25 with the SUBJECT
+/// weighted four times the body.
+///
+/// A word in the subject is the sender saying what the mail is about; the same
+/// word two hundred words into a newsletter is a coincidence. Unweighted bm25
+/// cannot tell those apart — it only counts, and a long body can out-count a
+/// three-word subject on term frequency alone. Four is a judgement, not a
+/// measurement: enough that a subject match wins a near tie, small enough that
+/// a body that is genuinely about the term still beats a subject that mentions
+/// it once in passing.
+///
+/// Like `rank`, this is NEGATIVE and more negative is better, so `-bm25(...)`
+/// is the relevance and every ORDER BY here reads biggest-first.
+const BM25: &str = "bm25(messages_fts, 4.0, 1.0)";
+
 /// The marker `BODY_SNIPPET` plants on each matched term.
 const SNIPPET_MARK: char = '\u{1}';
 
@@ -545,7 +560,10 @@ impl SqliteStore {
             );
             args.push(Value::Text(exclude.to_string()));
         }
-        sql.push_str(" ORDER BY f.rank LIMIT ?");
+        // bm25 ascending is best-first (the score is negative), which is what
+        // `ORDER BY rank` meant before the subject weight moved the ranking off
+        // the table's default.
+        sql.push_str(&format!(" ORDER BY {BM25} LIMIT ?"));
         args.push(Value::Integer(limit as i64));
         let mut stmt = match conn.prepare(&sql) {
             Ok(s) => s,
@@ -667,10 +685,9 @@ impl SqliteStore {
             args.push(Value::Text(exclude.to_string()));
         }
         push_filter_clauses(&mut sql, &mut args, filter);
-        // THE SORT KEY. Both branches are BIGGEST FIRST — `rank` is bm25 and
-        // NEGATIVE (more negative = better), so `-f.rank` is the relevance —
-        // which is what lets the tiebreakers below read the same way under
-        // either one.
+        // THE SORT KEY. Both branches are BIGGEST FIRST — bm25 is NEGATIVE
+        // (more negative = better), so `-bm25(...)` is the relevance, which is
+        // what lets the tiebreakers below read the same way under either one.
         //
         // RECENCY IS BLENDED IN SQL, not in Rust. This leg paginates with
         // LIMIT/OFFSET and must keep doing that exactly; re-ranking a fetched
@@ -683,9 +700,9 @@ impl SqliteStore {
         // additive recency bonus would therefore drown one query and vanish
         // under the next; a factor means the same thing at every scale.
         let relevance = if sort.considers_recency() {
-            format!("(-f.rank) * {}", recency::boost_sql("m.received_at", "?"))
+            format!("(-{BM25}) * {}", recency::boost_sql("m.received_at", "?"))
         } else {
-            "(-f.rank)".to_string()
+            format!("(-{BM25})")
         };
         sql.push_str(&format!(
             " ORDER BY {relevance} DESC, m.received_at DESC, m.id DESC LIMIT ? OFFSET ?"

@@ -290,6 +290,52 @@ fn the_trailing_token_matches_as_a_prefix_only_when_asked() {
     assert_eq!(ids(true, "details wif"), vec![id]);
 }
 
+#[test]
+fn a_term_in_the_subject_outranks_the_same_term_in_the_body() {
+    // The subject is the sender saying what the mail is about, so bm25 weights
+    // it four times the body. Everything else here is held equal: two-word
+    // subjects, four-word bodies, one occurrence each. The body match is the
+    // FRESHER of the two, so an unweighted score (which would tie these) breaks
+    // toward it and the assertion would fail — the weight is the only thing
+    // that can put the subject first.
+    let (store, acct) = store();
+    let now = Utc::now();
+
+    let in_subject = triaged(acct, "g-sub", "t-sub")
+        .subject("contract update")
+        .body("the meeting is tomorrow")
+        .received_at(now - Duration::hours(1))
+        .seed(&store);
+    let in_body = triaged(acct, "g-body", "t-body")
+        .subject("meeting update")
+        .body("the contract is tomorrow")
+        .received_at(now)
+        .seed(&store);
+
+    for sort in [SearchSort::Recent, SearchSort::BestMatch] {
+        let ids: Vec<i64> = store
+            .search_filtered(
+                acct,
+                "contract",
+                &SearchFilter::default(),
+                sort,
+                false,
+                10,
+                0,
+            )
+            .unwrap()
+            .iter()
+            .map(|h| h.id)
+            .collect();
+        assert_eq!(
+            ids,
+            vec![in_subject, in_body],
+            "the subject match leads under {}",
+            sort.as_str()
+        );
+    }
+}
+
 // ---- MATCH-WINDOW SNIPPETS -------------------------------------------
 //
 // The hit's snippet is cut around the matched terms rather than being the
