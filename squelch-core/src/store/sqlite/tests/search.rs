@@ -776,9 +776,11 @@ fn hybrid_search_fuses_keyword_and_vector_and_includes_sent() {
 }
 
 #[test]
-fn hybrid_snippet_is_the_match_window_for_keyword_hits_only() {
-    // A hit that came off the FTS list gets its window; a vector-only hit has no
-    // matched term to cut around, so it keeps the stored head-of-message text.
+fn hybrid_snippet_is_the_match_window_and_falls_back_only_with_no_term() {
+    // EVERY hit is asked for a window now, whichever leg found it. What decides
+    // is the mail, not the leg: a body carrying one of the reader's words shows
+    // the sentence around it, and only a body carrying no term at all keeps the
+    // stored head-of-message text.
     let embedder = Arc::new(StubEmbedder::new(VEC_DIMS));
     let (store, acct) = store_with_embedder(embedder.clone());
 
@@ -823,9 +825,76 @@ fn hybrid_snippet_is_the_match_window_for_keyword_hits_only() {
     if let Some(v) = hits.iter().find(|h| h.id == vector_only) {
         assert_eq!(
             v.snippet, "stored head for the vector hit",
-            "vector-only hit keeps the stored snippet"
+            "a body with no query term at all keeps the stored snippet"
         );
     }
+}
+
+#[test]
+fn a_vector_hit_shows_the_sentence_that_carries_the_term() {
+    // THE MOTIVATING FAILURE. The vector leg found the right mail and the panel
+    // showed the head of the message, which said nothing about what was asked —
+    // the right row with no reason to believe it. In `mode=semantic` every hit
+    // is vector-only by construction, so this is the isolated case: the body
+    // holds one of the reader's words deep inside it, and the window has to cut
+    // around THAT rather than around the start.
+    let embedder = Arc::new(StubEmbedder::new(VEC_DIMS));
+    let (store, acct) = store_with_embedder(embedder.clone());
+
+    let id = triaged(acct, "g-vec", "t-vec")
+        .subject("weekly digest")
+        .snippet("Thanks for subscribing to the weekly digest.")
+        .body(DEEP_BODY)
+        .seed(&store);
+    for m in store.messages_missing_vectors(acct, 10).unwrap() {
+        embed_and_store(&store, &*embedder, acct, m.message_id, &m.subject, &m.body);
+    }
+
+    let hits = store
+        .semantic_search_hits(
+            acct,
+            "pangolin conservation",
+            &SearchFilter::default(),
+            SearchSort::Recent,
+            false,
+            10,
+        )
+        .unwrap()
+        .0;
+    let hit = hits.iter().find(|h| h.id == id).expect("the vector hit");
+    assert!(
+        hit.snippet.contains("pangolin"),
+        "a vector hit shows the term its body does carry, got {:?}",
+        hit.snippet
+    );
+    assert!(
+        !hit.snippet.starts_with("Thanks for subscribing"),
+        "not the stored head"
+    );
+}
+
+#[test]
+fn a_stemmed_term_still_wins_a_window() {
+    // The window is asked with the same expression the ranking used, so the
+    // porter tokenizer applies to it too: searching the singular cuts around
+    // the plural the sender actually wrote.
+    let (store, acct) = store();
+    triaged(acct, "g1", "t1")
+        .subject("venue details")
+        .snippet("stored head")
+        .body(
+            "Doors open at nine and the coffee is by the stairs. The wifi \
+             passwords are printed on the back of your badge.",
+        )
+        .seed(&store);
+
+    let hits = store.search(acct, "password", 10, 0).unwrap();
+    assert_eq!(hits.len(), 1, "the stem matches the plural");
+    assert!(
+        hits[0].snippet.contains("passwords"),
+        "the window carries the sender's own word: {:?}",
+        hits[0].snippet
+    );
 }
 
 #[test]
