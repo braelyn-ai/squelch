@@ -264,3 +264,9 @@ run_suite sealed-event \
 run_suite settings-search \
   Sources/Passband/Lib/SettingsSearch.swift \
   Tests/SettingsSearchTests.swift
+
+# The search field's `from:` operator: when the sender menu is open and what
+# accepting a sender does to the text. Pure string work, Foundation only.
+run_suite from-operator \
+  Sources/Passband/Lib/FromOperator.swift \
+  Tests/FromOperatorTests.swift

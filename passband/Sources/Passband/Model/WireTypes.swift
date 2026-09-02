@@ -1223,6 +1223,18 @@ struct ContactHit: Codable, Sendable, Equatable, Identifiable {
     var id: String { addr }
 }
 
+/// One row of the daemon's sender directory (GET /client/senders): somebody who
+/// has written to this account, for the search field's `from:` menu. The other
+/// direction of mail from `ContactHit`, which is who the user writes TO.
+struct SenderHit: Codable, Sendable, Equatable, Identifiable {
+    var addr: String
+    var display_name: String?
+    var msg_count: Int
+    var last_received_at: String
+
+    var id: String { addr }
+}
+
 struct StatusResult: Codable, Sendable {
     var status: String
     var message_id: Int?

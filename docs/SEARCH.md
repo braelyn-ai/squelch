@@ -200,6 +200,49 @@ PR's lesson: green proves nothing on a ranking change).
    exactly as the hit queries do: a document frequency that counted sealed
    mail would be an oracle for what sealed mail contains.
 
+### 4.1 `from:` gets a sender menu
+
+The operators exist (`from:`, `after:`, `before:`), and `f` seeds `from:` for a
+row, but typing one is unassisted. Typing `from:` in the search field now opens
+a menu of senders under the field, the way the composer's To field offers
+contacts, and accepting one completes the operator (`from:dan@example.com `)
+and keeps the caret in the field. The trailing token is the caret: the menu is
+open exactly while the last token starts with `from:` and the text does not
+end in a space, so a space closes it and an earlier `from:` in the query is
+finished business (`FromOperator.swift`, with its own swiftc suite).
+
+**Contacts cannot serve it.** `contacts` is the people the user writes TO,
+seeded from Sent recipients; the people who write to you are a much larger set
+and `from:dan` has to find the Dan who has only ever replied. So there is a
+**sender directory**, `senders`, one row per address that has written to the
+account, served by `GET /client/senders?q=`. Three decisions in it:
+
+- **Maintained at ingest, not computed per keystroke.** The obvious query, a
+  GROUP BY over `messages` with a substring LIKE on address and name, measured
+  110-160 ms at 100k rows while holding the store's single connection mutex,
+  which is the shape of the p95 floor the kill-p95 branch had to remove. The
+  message upsert bumps the directory (inbound, non-spam only), recomputing
+  `msg_count` from `messages` so a re-sighting cannot double count; the
+  not-spam action bumps it too, because that is the other way a message
+  becomes visible. Existing installs backfill once, on the open that finds
+  the table empty beside a non-empty mailbox (228 ms for 1,313 messages).
+- **Sealed is decided after ingest**, so a sender whose only mail is sealed
+  has a row. `search_senders` refuses to offer one until at least one
+  non-sealed, non-spam inbound message exists behind it, and it probes LAZILY:
+  the inner query ranks, the outer query probes ranked rows until `limit`
+  survive (a co-routine; the inner LIMIT is what stops SQLite flattening the
+  probe back before the sort). 2 ms against 6 ms eager at 4k senders, same
+  top eight.
+- **An empty fragment answers.** The reader has just typed `from:` and has
+  not said who; the menu lists the senders with the most mail rather than
+  waiting for the next keystroke. The door's limit cap (25) keeps that from
+  being a directory dump.
+
+Ranking is the contacts menu's: prefix match on address or display name first,
+then volume, then recency, then address. The menu's keys (arrows, Enter, Tab,
+Esc) mount only while it is showing, so they take those keys from the results
+list only for as long as there is a list to take them for.
+
 ## 5. Keyword or question: the classifier
 
 The iOS surface counts spaces (`MobileSearchView.swift`: four spaces, five

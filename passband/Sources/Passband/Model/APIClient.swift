@@ -275,6 +275,13 @@ actor APIClient {
         try await get("/client/contacts", query: ["q": q, "limit": String(limit)])
     }
 
+    /// The search field's `from:` menu: who has written to this account, ranked
+    /// for `q`. An EMPTY `q` is a real question here (the senders with the most
+    /// mail), unlike `contacts`, so it is sent rather than short-circuited.
+    func senders(_ q: String, limit: Int = 8) async throws -> [SenderHit] {
+        try await get("/client/senders", query: ["q": q, "limit": String(limit)])
+    }
+
     /// The sent page: mail the user WROTE, newest first, already ordered by the
     /// daemon. HUMAN DOOR ONLY, like everything else on this client — the agent
     /// door has no route that enumerates what its principal has sent.
