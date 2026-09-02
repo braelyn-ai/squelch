@@ -276,6 +276,7 @@ struct SearchView: View {
             store.search.error = nil
             store.search.fetchedQuery = nil
             store.search.fetchedSort = nil
+            store.search.diagnostics = nil
             store.search.nextCursor = nil
             loading = false
             return
@@ -305,8 +306,13 @@ struct SearchView: View {
         // used to be covering for).
         guard !Task.isCancelled else { return }
         do {
-            let page = try await APIClient.shared.search(term, limit: 50, sort: sort)
+            // PARTIAL, because this fetch fires while somebody is still typing:
+            // the trailing token is matched as a prefix, so "wif" finds "wifi"
+            // instead of nothing. The agent's own searches never ask for it.
+            let page = try await APIClient.shared.search(
+                term, limit: 50, sort: sort, partial: true)
             store.search.hits = page.items
+            store.search.diagnostics = page.diagnostics
             store.search.nextCursor = page.next_cursor
             // Fresh results land un-armed: Enter straight from the bar means
             // "show me more", not "open whatever floated to the top".
@@ -331,6 +337,10 @@ struct SearchView: View {
             // resurrecting a stale error over stale hits.
             store.search.fetchedQuery = nil
             store.search.fetchedSort = nil
+            // The diagnostics go with the query they described: judging the
+            // next search on the last one's counts is exactly the mistake
+            // pairing them prevents.
+            store.search.diagnostics = nil
             // And drop the cursor with it: it belongs to a page set this view
             // is no longer showing.
             store.search.nextCursor = nil
@@ -357,7 +367,7 @@ struct SearchView: View {
         defer { loadingMore = false }
         do {
             let page = try await APIClient.shared.search(
-                term, limit: 50, cursor: cursor, sort: sort)
+                term, limit: 50, cursor: cursor, sort: sort, partial: true)
             guard term == store.search.fetchedQuery, store.search.nextCursor == cursor else {
                 return
             }

@@ -208,6 +208,12 @@ struct SearchSession: Sendable, Equatable {
     /// has to re-rank, or the setting silently does nothing until the reader
     /// edits their query.
     var fetchedSort: SearchSortChoice?
+    /// What retrieval did with `fetchedQuery`, as the daemon reported it: the
+    /// strict/any counts and each term's document frequency. Parked BESIDE the
+    /// fetched query because it describes exactly that fetch — the classifier
+    /// reads the pair, and a diagnostic outliving the query it belongs to would
+    /// judge the wrong words. nil against an older daemon, which sends none.
+    var diagnostics: SearchDiagnostics?
     /// Cursor for the page AFTER the ones in `hits`. nil = the server has no
     /// more (or nothing authoritative is on screen). Parked here with the rest
     /// so reopening resumes mid-scroll instead of dropping back to page one.
