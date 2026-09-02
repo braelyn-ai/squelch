@@ -1268,3 +1268,74 @@ fn migrate_backfills_the_sender_directory_from_existing_mail_exactly_once() {
     assert_eq!(hits.len(), 1);
     assert_eq!(hits[0].last_received_at, at(3));
 }
+
+#[test]
+fn migrate_rebuilds_the_fts_index_with_the_porter_tokenizer() {
+    // An install whose `messages_fts` predates the stemmer. The migration has
+    // to notice from the stored CREATE text, rebuild the table, and refill it
+    // from `messages` — losing a row here would make mail silently unfindable,
+    // which is the one failure a search index can have that nobody reports.
+    let conn = Connection::open_in_memory().unwrap();
+    conn.execute_batch(
+        "CREATE TABLE messages(
+             id INTEGER PRIMARY KEY, account_id INTEGER NOT NULL,
+             gmail_msg_id TEXT NOT NULL, subject TEXT NOT NULL DEFAULT '',
+             body TEXT NOT NULL DEFAULT '');
+         CREATE VIRTUAL TABLE messages_fts USING fts5(subject, body);
+         INSERT INTO messages(id, account_id, gmail_msg_id, subject, body)
+             VALUES (1, 1, 'g1', 'venue details', 'the wifi passwords are on the agenda page'),
+                    (2, 1, 'g2', 'shipping update', 'your parcel shipped this morning');
+         INSERT INTO messages_fts(rowid, subject, body)
+             SELECT id, subject, body FROM messages;",
+    )
+    .unwrap();
+
+    // Before: the exact word only.
+    let matches = |conn: &Connection, q: &str| -> i64 {
+        conn.query_row(
+            "SELECT COUNT(*) FROM messages_fts WHERE messages_fts MATCH ?1",
+            params![q],
+            |r| r.get(0),
+        )
+        .unwrap()
+    };
+    assert_eq!(matches(&conn, "\"password\""), 0, "no stemming yet");
+
+    migrate(&conn).unwrap();
+    migrate(&conn).unwrap(); // idempotent: the second open rebuilds nothing
+
+    let created: String = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE name = 'messages_fts'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(created.contains("porter"), "tokenizer replaced: {created}");
+
+    assert_eq!(
+        matches(&conn, "\"password\""),
+        1,
+        "singular now finds the plural"
+    );
+    assert_eq!(matches(&conn, "\"shipping\""), 1, "and shipped/shipping");
+    let rows: i64 = conn
+        .query_row("SELECT COUNT(*) FROM messages_fts", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(rows, 2, "every message survived the rebuild");
+
+    // The window still reads back the ORIGINAL text, not a stem: `snippet()`
+    // cuts the stored column, and the stemmer only ever touched the index.
+    let window: String = conn
+        .query_row(
+            "SELECT snippet(messages_fts, 1, '', '', '…', 24)
+             FROM messages_fts WHERE messages_fts MATCH ?1",
+            params!["\"password\""],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(
+        window.contains("passwords"),
+        "snippet returns the sender's own word: {window:?}"
+    );
+}

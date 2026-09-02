@@ -284,9 +284,10 @@ fn the_trailing_token_matches_as_a_prefix_only_when_asked() {
     };
     assert!(ids(false, "wif").is_empty(), "a settled query is exact");
     assert_eq!(ids(true, "wif"), vec![id], "as-you-type prefixes the tail");
-    // The prefix is the LAST token only: "venu" here stays exact and matches
-    // nothing, so the strict pass is empty and only the any-only pass fires.
-    assert_eq!(ids(true, "venu wif"), vec![id]);
+    // With a settled word ahead of it: "details" is matched as typed (it is a
+    // word the reader finished), the tail is the prefix, and only the message
+    // carrying both comes back.
+    assert_eq!(ids(true, "details wif"), vec![id]);
 }
 
 // ---- MATCH-WINDOW SNIPPETS -------------------------------------------

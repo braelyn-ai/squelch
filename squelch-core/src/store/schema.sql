@@ -795,7 +795,22 @@ CREATE TABLE IF NOT EXISTS attachments (
 
 CREATE INDEX IF NOT EXISTS idx_attachments_message ON attachments(account_id, message_id);
 
-CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(subject, body);
+-- KEYWORD SEARCH INDEX, mirroring `messages(subject, body)` — the upsert keeps
+-- the two in step, so it can be rebuilt from `messages` at any time.
+--
+-- `porter unicode61`: unicode61 is the tokenizer fts5 would default to (folds
+-- case and diacritics, splits on punctuation), with the Porter stemmer in front
+-- of it so "passwords" finds "password" and "shipping" finds "shipped". A
+-- mailbox is written in prose by people who did not know what you would later
+-- search for, and an exact-word index makes the reader guess which form they
+-- used. Stemming is applied to the QUERY as well by fts5 itself, so both sides
+-- meet at the same stem, and `snippet()` still returns the ORIGINAL text.
+--
+-- Changing this line means an existing index has to be rebuilt: `migrate.rs`
+-- detects the old definition in `sqlite_master` and does exactly that.
+CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
+    subject, body, tokenize = 'porter unicode61'
+);
 
 -- ON-BOX SEMANTIC RECALL. A sqlite-vec `vec0` table holding one embedding per
 -- NON-SEALED message; the rowid is `messages.id`, so a KNN hit joins straight

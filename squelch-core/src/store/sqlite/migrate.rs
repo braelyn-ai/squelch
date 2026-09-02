@@ -459,6 +459,56 @@ pub(super) fn migrate(conn: &Connection) -> Result<()> {
     // gate — a plain re-run is free.
     backfill_message_recipients(conn)?;
 
+    // ---- THE FTS TOKENIZER GREW A STEMMER ---------------------------------
+    //
+    // `messages_fts` was created with fts5's default tokenizer, so the index
+    // held whichever form of a word the sender happened to type: a reader
+    // searching "password" found nothing in the two messages that say
+    // "passwords". `schema.sql` now asks for `porter unicode61`, but its
+    // `CREATE VIRTUAL TABLE IF NOT EXISTS` is a no-op against a table that
+    // already exists — so the old definition would live forever on every
+    // mailbox that predates this line.
+    //
+    // A tokenizer is not alterable, so the fix is DROP + CREATE + refill, in
+    // ONE transaction: an interrupted rebuild must not leave a mailbox with an
+    // empty search index. Refilling from `messages(subject, body)` is exact,
+    // not approximate — the message upsert writes the FTS row from those same
+    // two columns, so this reproduces the index rather than reinterpreting it.
+    //
+    // The trigger is the CREATE text in `sqlite_master`, which is what SQLite
+    // itself stored when the table was made, so this is idempotent by
+    // construction: the next open reads a definition that says `porter` and
+    // does nothing. Guarded on both tables existing, because the migration unit
+    // tests build partial schemas.
+    if tables_exist(conn, &["messages_fts", "messages"])? {
+        let created: Option<String> = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'messages_fts'",
+                [],
+                |r| r.get(0),
+            )
+            .optional()?;
+        // A NULL/absent definition reads as "already current": there is nothing
+        // to act on, and rebuilding an index we cannot describe is the riskier
+        // guess.
+        let stemmed = created
+            .as_deref()
+            .map(|sql| sql.to_ascii_lowercase().contains("porter"))
+            .unwrap_or(true);
+        if !stemmed {
+            conn.execute_batch(
+                "BEGIN;
+                 DROP TABLE messages_fts;
+                 CREATE VIRTUAL TABLE messages_fts USING fts5(
+                     subject, body, tokenize = 'porter unicode61'
+                 );
+                 INSERT INTO messages_fts(rowid, subject, body)
+                     SELECT id, subject, body FROM messages;
+                 COMMIT;",
+            )?;
+        }
+    }
+
     // Re-launder every stored institution through the extractor's OWN sanitizer,
     // which grew a shape check after a model returned a valid-looking JSON object
     // whose institution ran from a correct bank name straight into this crate's
