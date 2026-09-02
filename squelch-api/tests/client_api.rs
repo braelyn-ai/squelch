@@ -943,9 +943,19 @@ async fn search_bad_mode_is_400() {
 #[tokio::test]
 async fn search_sort_is_honoured_echoed_and_validated() {
     // A stronger old match and a weaker fresh one, so the two sorts genuinely
-    // disagree about which comes first.
+    // disagree about which comes first. The gap is deliberately MODEST — a real
+    // sentence about a contract, not the bare word twice — because recency is a
+    // tilt with a ceiling (~1/FLOOR, see `store::recency`) and a pair further
+    // apart than that would rank the same way under both sorts and prove
+    // nothing. The same pair the store's own recency tests use.
     let Harness { app, .. } = harness(|store, acct| {
-        let old = msg(acct, "g-old", "t-old", "contract", "contract");
+        let old = msg(
+            acct,
+            "g-old",
+            "t-old",
+            "contract",
+            "The signed contract with the vendor is attached for your records.",
+        );
         let mut old = old;
         old.received_at = chrono::Utc::now() - chrono::Duration::days(500);
         let n = store.upsert_message(&old).unwrap();
@@ -8714,4 +8724,364 @@ async fn senders_autocomplete_ranks_prefix_then_volume_and_hides_spam_and_sent()
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+    );
+}
+
+// --- search: diagnostics, legs and the as-you-type prefix -------------------
+//
+// The additions of docs/SEARCH.md §4.8. They are what lets a client tell "no
+// mail says this" from "no mail says all of this at once", so they are asserted
+// on the wire rather than in the store alone.
+
+/// Seed for the diagnostics tests: one message with every term, one with some,
+/// one SEALED carrying a word that appears nowhere else, and one SPAM likewise.
+/// The last two are the security half — a term frequency is an oracle over
+/// message text, so neither may contribute to any count.
+fn seed_diagnostics_corpus(store: &SqliteStore, acct: i64) {
+    let triage = |id: i64, sensitivity, kind| {
+        store
+            .set_triage(id, acct, 50, Tier::Signal, sensitivity, kind, "", "", None)
+            .unwrap();
+    };
+
+    let all = store
+        .upsert_message(&msg(
+            acct,
+            "g-all",
+            "t-all",
+            "vendor contract",
+            "the signed vendor contract is attached",
+        ))
+        .unwrap();
+    triage(all, Sensitivity::Normal, None);
+
+    let some = store
+        .upsert_message(&msg(
+            acct,
+            "g-some",
+            "t-some",
+            "contract",
+            "a contract, with nobody named",
+        ))
+        .unwrap();
+    triage(some, Sensitivity::Normal, None);
+
+    let sealed = store
+        .upsert_message(&msg(
+            acct,
+            "g-sealed",
+            "t-sealed",
+            "verification code",
+            "your pangolin passcode is 123456",
+        ))
+        .unwrap();
+    triage(sealed, Sensitivity::Sealed, Some(SealedKind::Otp));
+
+    let mut spam = msg(
+        acct,
+        "g-spam",
+        "t-spam",
+        "you have won",
+        "claim your aardvark prize now",
+    );
+    spam.is_spam = true;
+    let spam = store.upsert_message(&spam).unwrap();
+    triage(spam, Sensitivity::Normal, None);
+}
+
+#[tokio::test]
+async fn search_reports_diagnostics_and_legs() {
+    let Harness { app, .. } = harness(seed_diagnostics_corpus);
+
+    let resp = app
+        .clone()
+        .oneshot(authed("GET", "/client/search?q=vendor%20contract"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+
+    let d = &json["diagnostics"];
+    assert_eq!(d["strict_hits"], 1, "one message carries both words");
+    assert_eq!(d["any_hits"], 2, "two carry at least one");
+    let terms = d["terms"].as_array().unwrap();
+    assert_eq!(terms.len(), 2, "one entry per term, in the order typed");
+    assert_eq!(terms[0]["text"], "vendor");
+    assert_eq!(terms[0]["df"], 1);
+    assert_eq!(terms[1]["text"], "contract");
+    assert_eq!(terms[1]["df"], 2);
+
+    // Every item says which leg produced it. Without an embedder the door runs
+    // keyword, so that is the only leg there is.
+    let items = json["items"].as_array().unwrap();
+    assert_eq!(items.len(), 2);
+    for item in items {
+        assert_eq!(item["legs"], serde_json::json!(["keyword"]));
+        // The existing fields are still flat beside it: this is additive.
+        assert!(item["thread_id"].is_string());
+        assert!(item["snippet"].is_string());
+    }
+
+    // A query that looked NOTHING up still reports the object, zeroed. A field
+    // that only sometimes exists is two code paths in every client.
+    let resp = app
+        .oneshot(authed("GET", "/client/search?q=from:alice"))
+        .await
+        .unwrap();
+    let json = body_json(resp).await;
+    assert_eq!(json["diagnostics"]["strict_hits"], 0);
+    assert_eq!(json["diagnostics"]["any_hits"], 0);
+    assert_eq!(json["diagnostics"]["terms"], serde_json::json!([]));
+}
+
+/// SECURITY: term frequencies must never see sealed or spam mail. A df is a
+/// yes/no oracle over message text — "does any sealed message contain this
+/// word" answered one word at a time is a read of sealed mail without a single
+/// row ever being returned.
+#[tokio::test]
+async fn search_diagnostics_never_count_sealed_or_spam_mail() {
+    let Harness { app, .. } = harness(seed_diagnostics_corpus);
+
+    // "pangolin" appears ONLY in the sealed message; "aardvark" only in spam.
+    for word in ["pangolin", "aardvark"] {
+        let resp = app
+            .clone()
+            .oneshot(authed("GET", &format!("/client/search?q={word}")))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = body_json(resp).await;
+        let d = &json["diagnostics"];
+        assert_eq!(d["strict_hits"], 0, "{word}: no visible message has it");
+        assert_eq!(d["any_hits"], 0, "{word}");
+        assert_eq!(d["terms"][0]["text"], word);
+        assert_eq!(
+            d["terms"][0]["df"], 0,
+            "{word}: the count must not read hidden mail"
+        );
+        assert!(json["items"].as_array().unwrap().is_empty());
+    }
+}
+
+/// The diagnostics follow the leg that ran: keyword search excludes the
+/// reader's own sent mail, so its counts do too. Counts taken under the other
+/// rule would read as a missing page rather than a different question.
+#[tokio::test]
+async fn keyword_diagnostics_exclude_sent_mail_exactly_as_the_leg_does() {
+    let Harness { app, .. } = harness(|store, acct| {
+        let n = store
+            .upsert_message(&sent_msg(
+                acct,
+                "g-sent",
+                "t-sent",
+                "quarterly",
+                "bob@x.test",
+            ))
+            .unwrap();
+        store
+            .set_triage(
+                n,
+                acct,
+                50,
+                Tier::Signal,
+                Sensitivity::Normal,
+                None,
+                "",
+                "",
+                None,
+            )
+            .unwrap();
+    });
+
+    let resp = app
+        .oneshot(authed("GET", "/client/search?q=quarterly"))
+        .await
+        .unwrap();
+    let json = body_json(resp).await;
+    assert_eq!(json["match_kind"], "keyword");
+    assert!(
+        json["items"].as_array().unwrap().is_empty(),
+        "sent excluded"
+    assert_eq!(
+        json["diagnostics"]["any_hits"], 0,
+        "the count agrees with the list beside it"
+    );
+    assert_eq!(json["diagnostics"]["terms"][0]["df"], 0);
+
+/// `partial` is the panel's as-you-type flag: the LAST word matches as a
+/// prefix, and only then. An unreadable value is refused rather than guessed.
+#[tokio::test]
+async fn search_partial_prefixes_the_trailing_word_and_validates_its_value() {
+    let Harness { app, .. } = harness(|store, acct| {
+        let n = store
+            .upsert_message(&msg(
+                acct,
+                "g1",
+                "t1",
+                "venue details",
+                "wifi and the FAQ are on the same page",
+            ))
+            .unwrap();
+        store
+            .set_triage(
+                n,
+                acct,
+                50,
+                Tier::Signal,
+                Sensitivity::Normal,
+                None,
+                "",
+                "",
+                None,
+            )
+            .unwrap();
+    });
+
+    // Settled: "wif" is not a word anybody wrote.
+    let resp = app
+        .clone()
+        .oneshot(authed("GET", "/client/search?q=wif"))
+        .await
+        .unwrap();
+    let json = body_json(resp).await;
+    assert!(json["items"].as_array().unwrap().is_empty());
+    assert_eq!(json["diagnostics"]["any_hits"], 0);
+
+    // Still typing: the prefix finds it, and the diagnostics count the search
+    // that actually ran rather than a bare-word one nobody asked for.
+    for value in ["1", "true"] {
+        let resp = app
+            .clone()
+            .oneshot(authed(
+                "GET",
+                &format!("/client/search?q=wif&partial={value}"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = body_json(resp).await;
+        assert_eq!(
+            json["items"].as_array().unwrap().len(),
+            1,
+            "partial={value} must prefix-match"
+        );
+        assert_eq!(json["diagnostics"]["any_hits"], 1);
+        assert_eq!(json["diagnostics"]["terms"][0]["text"], "wif");
+        assert_eq!(json["diagnostics"]["terms"][0]["df"], 1);
+    }
+
+    // Off explicitly, and a value nobody serves.
+    let resp = app
+        .clone()
+        .oneshot(authed("GET", "/client/search?q=wif&partial=0"))
+        .await
+        .unwrap();
+    let json = body_json(resp).await;
+    assert!(json["items"].as_array().unwrap().is_empty());
+
+    let resp = app
+        .oneshot(authed("GET", "/client/search?q=wif&partial=yes"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+/// A word the right mail simply does not contain used to mean zero hits. The
+/// door now serves the strict matches first and the partial ones below them,
+/// and says so in the diagnostics.
+#[tokio::test]
+async fn search_serves_partial_matches_below_the_strict_ones() {
+    let Harness { app, .. } = harness(seed_diagnostics_corpus);
+
+    let resp = app
+        .oneshot(authed(
+            "GET",
+            "/client/search?q=vendor%20contract%20invoice",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+    assert_eq!(
+        json["diagnostics"]["strict_hits"], 0,
+        "no message has all three words"
+    );
+    assert_eq!(json["diagnostics"]["any_hits"], 2);
+    let items = json["items"].as_array().unwrap();
+    assert_eq!(items.len(), 2, "and yet the mail is findable");
+    assert_eq!(items[0]["thread_id"], "t-all", "two terms beats one");
+}
+
+/// In hybrid mode `legs` reports which recall list a hit came from, and a hit
+/// both legs found says both.
+#[tokio::test]
+async fn hybrid_items_report_the_legs_that_found_them() {
+    use squelch_core::embed::StubEmbedder;
+
+    let store = SqliteStore::open_in_memory()
+        .unwrap()
+        .with_embedder(Arc::new(StubEmbedder::new(384)))
+        .unwrap();
+    let acct = store.ensure_account("me@example.com").unwrap();
+    let store = Arc::new(store);
+
+    let n = store
+        .upsert_message(&msg(
+            acct,
+            "g1",
+            "t1",
+            "acme invoice for services",
+            "please pay the acme invoice",
+        ))
+        .unwrap();
+    store
+        .set_triage(
+            n,
+            acct,
+            60,
+            Tier::Signal,
+            Sensitivity::Normal,
+            None,
+            "",
+            "",
+            None,
+        )
+        .unwrap();
+    let v = store
+        .embedder()
+        .unwrap()
+        .embed("acme invoice for services please pay the acme invoice")
+        .unwrap();
+    store.upsert_message_vector(acct, n, &v).unwrap();
+
+    let app = router(ApiState::new(store.clone(), acct, TOKEN));
+
+    let resp = app
+        .clone()
+        .oneshot(authed("GET", "/client/search?q=acme%20invoice"))
+        .await
+        .unwrap();
+    let json = body_json(resp).await;
+    assert_eq!(json["match_kind"], "hybrid");
+    let legs = json["items"][0]["legs"].as_array().unwrap().clone();
+    assert!(
+        legs.contains(&Value::from("keyword")) && legs.contains(&Value::from("vector")),
+        "both legs found it: {legs:?}"
+    );
+
+    // Semantic mode is vector by construction.
+    let resp = app
+        .oneshot(authed(
+            "GET",
+            "/client/search?q=acme%20invoice&mode=semantic",
+        ))
+        .await
+        .unwrap();
+    let json = body_json(resp).await;
+    assert_eq!(json["match_kind"], "semantic");
+    assert_eq!(json["items"][0]["legs"], serde_json::json!(["vector"]));
+    // Recall legs INCLUDE sent mail, so their diagnostics do too — the counts
+    // follow whichever leg ran.
+    assert_eq!(json["diagnostics"]["terms"][0]["text"], "acme");
 }

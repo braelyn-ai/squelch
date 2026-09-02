@@ -82,7 +82,10 @@ fn main() {
         println!("embedder loaded: {:?}", t.elapsed());
         store.with_embedder(embedder).expect("attach")
     } else {
-        println!("NO MODEL CACHE at {} — vector legs skipped", cfg.cache_dir.display());
+        println!(
+            "NO MODEL CACHE at {} — vector legs skipped",
+            cfg.cache_dir.display()
+        );
         store
     };
 

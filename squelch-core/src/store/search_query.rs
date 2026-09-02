@@ -438,7 +438,10 @@ mod tests {
     fn fts_syntax_characters_are_stripped_not_escaped() {
         // Each of these is an operator to FTS5 and a word to the reader. None
         // of them may survive into the expression.
-        let q = FtsQuery::build(r#"-invoice re:contract "quoted" (paren) star* ^caret +plus"#, false);
+        let q = FtsQuery::build(
+            r#"-invoice re:contract "quoted" (paren) star* ^caret +plus"#,
+            false,
+        );
         assert_eq!(
             q.terms,
             vec![

@@ -72,7 +72,10 @@ fn a_word_the_best_mail_lacks_no_longer_hides_it() {
         Some(&right),
         "the rare terms decide it: {ids:?}"
     );
-    assert!(ids.contains(&noise), "the any-term pass still finds the rest");
+    assert!(
+        ids.contains(&noise),
+        "the any-term pass still finds the rest"
+    );
 }
 
 #[test]
@@ -230,7 +233,11 @@ fn the_keyword_and_hybrid_legs_agree_about_what_a_query_means() {
         .map(|h| h.id)
         .collect();
     assert_eq!(keyword, vec![right]);
-    assert_eq!(hybrid, vec![right], "hybrid's keyword leg reads it the same");
+    assert_eq!(
+        hybrid,
+        vec![right],
+        "hybrid's keyword leg reads it the same"
+    );
 }
 
 #[test]
@@ -1255,7 +1262,15 @@ fn best_match_turns_the_tilt_off_on_every_ranked_leg() {
     // KEYWORD: bm25 alone puts the stronger old match first; the tilt inverts it.
     assert_eq!(
         ids(store
-            .search_filtered(acct, "contract", &filter, SearchSort::BestMatch, false, 10, 0)
+            .search_filtered(
+                acct,
+                "contract",
+                &filter,
+                SearchSort::BestMatch,
+                false,
+                10,
+                0
+            )
             .unwrap()),
         vec![stronger_but_old, weaker_but_fresh],
         "best_match ranks the keyword leg on bm25 alone"

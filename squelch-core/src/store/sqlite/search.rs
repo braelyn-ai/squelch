@@ -513,7 +513,12 @@ impl SqliteStore {
     /// PURE RELEVANCE ORDER, unlike the keyword leg's own `ORDER BY`: this list
     /// is an INPUT to the fusion, which applies the recency vote once, across
     /// every leg. Blending it in here too would count it twice.
-    fn fts_recall(&self, account_id: AccountId, fts: &FtsQuery, limit: usize) -> Result<Vec<Candidate>> {
+    fn fts_recall(
+        &self,
+        account_id: AccountId,
+        fts: &FtsQuery,
+        limit: usize,
+    ) -> Result<Vec<Candidate>> {
         if fts.is_empty() {
             return Ok(Vec::new());
         }
@@ -675,10 +680,7 @@ impl SqliteStore {
                AND m.is_spam = 0
                AND messages_fts MATCH ?"
         );
-        let mut args = vec![
-            Value::Integer(account_id),
-            Value::Text(expr.to_string()),
-        ];
+        let mut args = vec![Value::Integer(account_id), Value::Text(expr.to_string())];
         if let Some(exclude) = exclude {
             sql.push_str(
                 " AND f.rowid NOT IN (
@@ -761,10 +763,7 @@ impl SqliteStore {
                AND m.is_spam = 0
                AND messages_fts MATCH ?",
         );
-        let mut args = vec![
-            Value::Integer(account_id),
-            Value::Text(expr.to_string()),
-        ];
+        let mut args = vec![Value::Integer(account_id), Value::Text(expr.to_string())];
         push_filter_clauses(&mut sql, &mut args, filter);
         let mut stmt = conn.prepare(&sql)?;
         let n: i64 = match stmt.query_row(params_from_iter(args), |r| r.get(0)) {
@@ -875,6 +874,93 @@ impl SqliteStore {
             out.extend(rest);
         }
         Ok(out)
+    }
+
+    /// WHAT RETRIEVAL MADE OF THE READER'S WORDS: how many messages match every
+    /// term, how many match any term, and the document frequency of each term
+    /// on its own. The door reports this beside the hits; §5 of docs/SEARCH.md
+    /// is what reads it.
+    ///
+    /// `include_sent` FOLLOWS THE LEG THAT RAN, and the caller passes what its
+    /// own mode did: keyword mode excludes the user's sent mail from its hits,
+    /// the recall legs include it. Counts that disagreed with the list beside
+    /// them would be worse than no counts, because they would look like a
+    /// missing page rather than a different question.
+    ///
+    /// SECURITY: account-scoped, sealed rows excluded, spam rows excluded —
+    /// exactly the predicates the hit queries carry, and for a sharper reason
+    /// here. A document frequency is a yes/no oracle over message text, so a
+    /// count that could see sealed mail would answer questions about sealed
+    /// mail one word at a time, without ever returning a row.
+    pub fn search_diagnostics(
+        &self,
+        account_id: AccountId,
+        text: &str,
+        partial: bool,
+        include_sent: bool,
+    ) -> Result<SearchDiagnostics> {
+        let fts = FtsQuery::build(text, partial);
+        if fts.is_empty() {
+            // Operators only, or punctuation only: nothing was looked up, and
+            // zero is the honest report rather than a count of the mailbox.
+            return Ok(SearchDiagnostics::default());
+        }
+        let conn = self.lock()?;
+        let mut terms = Vec::with_capacity(fts.terms.len());
+        let last = fts.terms.len() - 1;
+        for (i, term) in fts.terms.iter().enumerate() {
+            // Each term is counted AS IT WAS RANKED, prefix included: with
+            // `partial` on, the tail term matched every word starting with it,
+            // and a df for the bare word would describe a search nobody ran.
+            let expr = if partial && i == last {
+                format!("\"{term}\"*")
+            } else {
+                format!("\"{term}\"")
+            };
+            terms.push(TermDf {
+                text: term.clone(),
+                df: self.fts_count(&conn, account_id, &expr, include_sent)?,
+            });
+        }
+        Ok(SearchDiagnostics {
+            strict_hits: self.fts_count(&conn, account_id, &fts.strict, include_sent)?,
+            any_hits: self.fts_count(&conn, account_id, &fts.any, include_sent)?,
+            terms,
+        })
+    }
+
+    /// How many non-sealed, non-spam messages of this account match `expr`.
+    /// The counting half of [`search_diagnostics`](Self::search_diagnostics);
+    /// no operators, because a count of "what the index holds" is not a count
+    /// of one filtered page.
+    fn fts_count(
+        &self,
+        conn: &Connection,
+        account_id: AccountId,
+        expr: &str,
+        include_sent: bool,
+    ) -> Result<u32> {
+        let sent = if include_sent {
+            ""
+        } else {
+            " AND m.is_sent = 0"
+        };
+        let sql = format!(
+            "SELECT COUNT(*)
+             FROM messages_fts f
+             JOIN messages m ON m.id = f.rowid
+             LEFT JOIN triage t ON t.message_id = m.id
+             WHERE m.account_id = ?1
+               AND COALESCE(t.sensitivity, 'normal') != 'sealed'
+               AND m.is_spam = 0{sent}
+               AND messages_fts MATCH ?2"
+        );
+        let n: i64 = match conn.query_row(&sql, params![account_id, expr], |r| r.get(0)) {
+            Ok(n) => n,
+            // Same reading as every other MATCH on this leg.
+            Err(_) => 0,
+        };
+        Ok(n.max(0) as u32)
     }
 
     /// FILTER-ONLY LISTING: the reader typed operators and nothing else

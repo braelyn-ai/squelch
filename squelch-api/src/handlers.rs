@@ -726,6 +726,26 @@ pub struct SearchQuery {
     /// with recency blended in. This is the READER'S standing preference, held
     /// by the client and sent on every search, not something parsed out of `q`.
     sort: Option<String>,
+    /// `1`/`true`: match the LAST word of the query as a prefix, because the
+    /// reader is still typing it. The panel's debounced as-you-type fetch sends
+    /// it; a settled query (the agent's, or a submitted one) does not, and
+    /// should not — an agent sending finished words would get `password`
+    /// widened to `password*`.
+    partial: Option<String>,
+}
+
+/// Parse the `partial` flag. Unknown values 400 for the same reason `sort` and
+/// `mode` do: a client that sends `partial=yes` and silently gets exact
+/// matching has a bug it cannot see from the response.
+fn parse_partial(raw: Option<&str>) -> Result<bool, ApiError> {
+    match raw {
+        None => Ok(false),
+        Some("1") | Some("true") => Ok(true),
+        Some("0") | Some("false") => Ok(false),
+        Some(_) => Err(ApiError::bad_request(
+            "partial must be one of: 1, 0, true, false",
+        )),
+    }
 }
 
 /// The three retrieval modes for `/client/search`.
@@ -765,8 +785,66 @@ struct SearchPage<T> {
     items: Vec<T>,
     match_kind: &'static str,
     sort: &'static str,
+    /// ALWAYS PRESENT, even for a query that looked nothing up (then it is
+    /// zeroes and an empty term list). A field that appears only sometimes is a
+    /// field every client has to write two code paths for.
+    diagnostics: Diagnostics,
     #[serde(skip_serializing_if = "Option::is_none")]
     next_cursor: Option<String>,
+}
+
+/// WHAT RETRIEVAL MADE OF THE READER'S WORDS, reported beside the hits.
+///
+/// A search box shows a list and nothing else, so a reader cannot tell "no mail
+/// says this" from "no mail says all of this at once" — and those want opposite
+/// next moves. These are the facts that separate them, and they are what the
+/// deeper-search classifier (docs/SEARCH.md §5) decides on: three or more terms
+/// with `strict_hits == 0` is the shape of a question rather than a lookup.
+///
+/// Every count is account-scoped and blind to sealed and spam mail; see
+/// `SqliteStore::search_diagnostics` for why that is a security property and
+/// not tidiness.
+#[derive(Debug, Serialize)]
+struct Diagnostics {
+    /// Messages matching EVERY term.
+    strict_hits: u32,
+    /// Messages matching AT LEAST ONE term.
+    any_hits: u32,
+    /// Each term as it was ranked, with how many messages contain it.
+    terms: Vec<TermStat>,
+}
+
+#[derive(Debug, Serialize)]
+struct TermStat {
+    text: String,
+    df: u32,
+}
+
+impl From<squelch_core::store::SearchDiagnostics> for Diagnostics {
+    fn from(d: squelch_core::store::SearchDiagnostics) -> Self {
+        Diagnostics {
+            strict_hits: d.strict_hits,
+            any_hits: d.any_hits,
+            terms: d
+                .terms
+                .into_iter()
+                .map(|t| TermStat {
+                    text: t.text,
+                    df: t.df,
+                })
+                .collect(),
+        }
+    }
+}
+
+/// One hit plus WHICH LEG produced it. The hit's own fields are flattened, so
+/// this is the same object the client already decodes with one array added
+/// beside them: `["keyword"]`, `["vector"]`, or both when both legs agreed.
+#[derive(Debug, Serialize)]
+struct SearchItem {
+    #[serde(flatten)]
+    hit: squelch_core::types::SearchHit,
+    legs: Vec<&'static str>,
 }
 
 /// The recall window semantic/hybrid rank before the page is cut out of it.
@@ -846,35 +924,70 @@ pub async fn search(
     };
 
     let k = recall_k(limit, offset, &filter);
+    let partial = parse_partial(query.partial.as_deref())?;
 
     // Keyword paginates and filters in SQL; semantic/hybrid rank a top-k window,
     // filter the hydrated hits, and offset the fused slice. EVERY leg excludes
     // sealed rows in SQL. The bool is the recall legs' WINDOW FULL signal (see
     // below); the keyword leg paginates exactly, so it never needs one.
-    let (items, window_full) = store_call(&state, move |store, account_id| match effective {
-        SearchMode::Keyword => store
-            .search_filtered(account_id, &term, &filter, sort, limit, offset)
-            .map(|hits| (hits, false)),
-        SearchMode::Semantic => {
-            let (mut hits, window_full) =
-                store.semantic_search_hits(account_id, &term, &filter, sort, k)?;
-            let page: Vec<_> = hits
-                .drain(..)
-                .skip(offset as usize)
-                .take(limit as usize)
-                .collect();
-            Ok((page, window_full))
-        }
-        SearchMode::Hybrid => {
-            let (mut hits, window_full) =
-                store.hybrid_search(account_id, &term, &filter, sort, k)?;
-            let page: Vec<_> = hits
-                .drain(..)
-                .skip(offset as usize)
-                .take(limit as usize)
-                .collect();
-            Ok((page, window_full))
-        }
+    //
+    // The diagnostics are counted in the SAME store call, under the same lock,
+    // and told which leg ran: the keyword leg excludes the reader's own sent
+    // mail and the recall legs include it, so counts taken under the other rule
+    // would contradict the list they sit beside.
+    let (items, window_full, diagnostics) = store_call(&state, move |store, account_id| {
+        let include_sent = effective != SearchMode::Keyword;
+        let diagnostics = store.search_diagnostics(account_id, &term, partial, include_sent)?;
+        let (items, window_full): (Vec<SearchItem>, bool) = match effective {
+            SearchMode::Keyword => {
+                let hits = store
+                    .search_filtered(account_id, &term, &filter, sort, partial, limit, offset)?;
+                (
+                    hits.into_iter()
+                        .map(|hit| SearchItem {
+                            hit,
+                            legs: vec!["keyword"],
+                        })
+                        .collect(),
+                    false,
+                )
+            }
+            SearchMode::Semantic => {
+                let (mut hits, window_full) =
+                    store.semantic_search_hits(account_id, &term, &filter, sort, partial, k)?;
+                let page: Vec<SearchItem> = hits
+                    .drain(..)
+                    .skip(offset as usize)
+                    .take(limit as usize)
+                    .map(|hit| SearchItem {
+                        hit,
+                        legs: vec!["vector"],
+                    })
+                    .collect();
+                (page, window_full)
+            }
+            SearchMode::Hybrid => {
+                let (mut hits, window_full) =
+                    store.hybrid_search_legs(account_id, &term, &filter, sort, partial, k)?;
+                let page: Vec<SearchItem> = hits
+                    .drain(..)
+                    .skip(offset as usize)
+                    .take(limit as usize)
+                    .map(|h| {
+                        let mut legs = Vec::with_capacity(2);
+                        if h.keyword {
+                            legs.push("keyword");
+                        }
+                        if h.vector {
+                            legs.push("vector");
+                        }
+                        SearchItem { hit: h.hit, legs }
+                    })
+                    .collect();
+                (page, window_full)
+            }
+        };
+        Ok((items, window_full, diagnostics))
     })
     .await?;
 
@@ -896,6 +1009,7 @@ pub async fn search(
         items,
         match_kind: effective.as_str(),
         sort: sort.as_str(),
+        diagnostics: diagnostics.into(),
         next_cursor: next,
     }))
 }
