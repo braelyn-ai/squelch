@@ -2341,15 +2341,21 @@ final class AppStore {
 
     /// Tear the deeper-search conversation down and forget that one ever ran
     /// for this panel session. The band's "new" control and a seeded search
-    /// both land here, and so does every account teardown: one door, because
-    /// the session and the four values that describe it must never disagree
-    /// about whether a lane is running.
-    func resetSearchLane() {
+    /// both land here: one door, because the session and the values that
+    /// describe it must never disagree about whether a lane is running.
+    ///
+    /// `keepingVerdict` is the difference between the two callers. The band's
+    /// "new" is about the CONVERSATION, not about the query: the words in the
+    /// bar are still the same question, so the verdict stays and the band stays
+    /// with it, offering to run again. A seed is a different search altogether
+    /// (`f` asks "what else is from this person"), so its verdict goes too and
+    /// the band unmounts until the new query has been judged.
+    func resetSearchLane(keepingVerdict: Bool = false) {
         searchLane.clear()
         search.laneStarted = false
         search.laneTrigger = nil
         search.laneQuery = ""
-        search.lastVerdict = nil
+        if !keepingVerdict { search.lastVerdict = nil }
         search.refinementCount = 0
     }
 

@@ -99,7 +99,9 @@ struct DeeperSearchBand: View {
                     .help("Held where it was. It picks up from there, nothing is lost.")
             }
             if search.laneStarted {
-                Button("new") { store.resetSearchLane() }
+                // The conversation goes; the query and its verdict stay, so the
+                // band stays too and can be asked again without retyping.
+                Button("new") { store.resetSearchLane(keepingVerdict: true) }
                     .buttonStyle(.textAction)
                     .font(Typo.micro)
                     .help("Forget this conversation and start the deeper search over")
