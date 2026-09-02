@@ -104,6 +104,14 @@ final class Notifier {
     /// account-blind — the display copy is the same wherever the mail landed —
     /// and the account is folded into the two IDENTIFIERS below plus userInfo.
     func post(_ event: Event, accountId: UUID) {
+        // A SEALED EVENT IS NOT MAIL WITH A THREAD TO OPEN. `EventStream` already
+        // routes it to the auth path and never reaches here, and this guard is
+        // the belt on top of that: the banner below would name the sender of a
+        // login code, and its tap would ask for a thread the daemon refuses to
+        // serve. Defensive on purpose — routing lives in ONE pure function
+        // (`EventBanner.routing`) and a future caller that forgets to consult it
+        // must fail closed rather than leak an auth arrival into the thread lane.
+        guard case .threadBanner = EventBanner.routing(for: event) else { return }
         let account = accountId.uuidString
         let copy = EventBanner.copy(for: event)
         let content = UNMutableNotificationContent()
@@ -174,31 +182,24 @@ final class Notifier {
     /// The live account never comes through here — its auth mail gets the ring,
     /// the audited auto-reveal and the code modal instead.
     ///
-    /// WHAT IS DELIBERATELY NOT IN IT: the code, and the subject line that so
-    /// often IS the code ("725104 is your Acme code" is a real subject). A
-    /// reveal is audited server-side and belongs to the account the human is
-    /// looking at; a notification is not a place to leave a credential.
+    /// The copy is `EventBanner.authCopy`, shared with the iOS extension, which
+    /// posts the same banner for the same mail off a push. What it deliberately
+    /// leaves out is argued there.
     func postAuth(_ meta: SealedMeta, accountId: UUID, accountName: String) {
         let account = accountId.uuidString
+        let copy = EventBanner.authCopy(
+            kind: meta.kind, sender: meta.sender, accountName: accountName)
         let content = UNMutableNotificationContent()
-        // The kind leads, the mailbox follows: WHICH account this is happening
-        // in is the entire reason the banner is worth reading, and `AuthCopy`
-        // is the app's one vocabulary for the other half ("sealed" is internal
-        // jargon and never reaches a human).
-        content.title = "\(AuthCopy.label(meta.kind)) · \(accountName)"
-        let sender = EventBanner.flatten(SenderID.displayName(meta.sender), max: 64)
-        content.body = sender.isEmpty ? "New auth mail." : "from \(sender)"
-        // One group per account's auth mail: a login code and the sign-in alert
-        // behind it are the same conversation, and account-prefixed because two
-        // daemons' auth mail is not.
-        content.threadIdentifier = "\(account).passband.auth"
+        content.title = copy.title
+        content.body = copy.body
+        // Account-prefixed because two daemons' auth mail is not one
+        // conversation, exactly as an event's group is.
+        content.threadIdentifier = "\(account).\(copy.threadIdentifier)"
         content.userInfo = [
             EventBanner.accountKey: account,
             EventBanner.routeKey: EventBanner.authRoute,
         ]
-        // Always a chime. A login code is the definition of time-bound — it
-        // expires while you are not looking at it.
-        content.sound = Self.sound(for: Prefs.shared.notificationSound)
+        if copy.sound { content.sound = Self.sound(for: Prefs.shared.notificationSound) }
 
         // Message ids are per-daemon SQLite ints, so the account prefix is
         // load-bearing here for the same reason it is on an event's identifier:

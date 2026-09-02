@@ -123,6 +123,54 @@ final class NotificationService: UNNotificationServiceExtension {
     /// The banner the app itself would have posted for this event, built from
     /// the same mapping so a push and a live frame are indistinguishable.
     private static func content(for event: Event, accountId: UUID) -> UNNotificationContent {
+        switch EventBanner.routing(for: event) {
+        case .threadBanner: return threadContent(for: event, accountId: accountId)
+        case .authSignal(let kind): return authContent(kind: kind, event: event, accountId: accountId)
+        }
+    }
+
+    /// AUTH MAIL. The phone cannot poll in the background, so this push is the
+    /// only way a login code reaches a phone at all — and it is the one banner
+    /// here that is NOT built from what the mail says. Two fields of the event
+    /// are read, the kind and the from address, and both are metadata of the
+    /// class `/client/sealed` already serves; `one_line` is not read, because a
+    /// subject is so often the code itself and a lock screen is not a place to
+    /// leave a credential. (The daemon writes a fixed per-kind phrase into that
+    /// field for exactly this row, but the rule here does not lean on it.)
+    ///
+    /// The route marker is what keeps the tap off a thread fetch: a sealed
+    /// thread is one the daemon refuses to serve, so an ordinary event banner
+    /// would open the app onto nothing. `handleAuthTap` lands on the Auth list,
+    /// where asking for the code is the human's own audited act.
+    ///
+    /// No account name: this process reads credentials out of the shared
+    /// keychain and has no access to the app's account labels, so the kind
+    /// stands alone. `EventBanner.authCopy` takes nil for that and says so.
+    private static func authContent(
+        kind: SealedKind, event: Event, accountId: UUID
+    ) -> UNNotificationContent {
+        let account = accountId.uuidString
+        let copy = EventBanner.authCopy(kind: kind, sender: event.sender, accountName: nil)
+        let content = UNMutableNotificationContent()
+        content.title = copy.title
+        content.body = copy.body
+        content.threadIdentifier = "\(account).\(copy.threadIdentifier)"
+        content.userInfo = [
+            EventBanner.accountKey: account,
+            EventBanner.routeKey: EventBanner.authRoute,
+        ]
+        // Always a chime, and the system's rather than the user's chosen one:
+        // the app's sound preference lives in ITS UserDefaults, which this
+        // process does not share.
+        content.sound = copy.sound ? .default : nil
+        return content
+    }
+
+    /// The ordinary event's banner: who the mail is from, what triage made of
+    /// it, and a tap that opens the thread.
+    private static func threadContent(for event: Event, accountId: UUID)
+        -> UNNotificationContent
+    {
         let copy = EventBanner.copy(for: event)
         let account = accountId.uuidString
         let content = UNMutableNotificationContent()

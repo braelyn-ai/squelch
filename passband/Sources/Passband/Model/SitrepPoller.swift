@@ -1,6 +1,8 @@
 // Keeps the sitrep read model fresh: the three bands + stats + sealed metadata,
 // every 10s and on window focus, written into the store for views to read. A
-// failing daemon widens that interval — see `run()`.
+// failing daemon widens that interval — see `run()`. The sealed leg has one
+// extra trigger of its own (`refreshSealed`), because a login code cannot wait
+// out a ten-second tick.
 //
 // Each band carries its own server-side `band` filter so the buckets match the
 // server's definitions exactly. Sealed is metadata-only — never bodies.
@@ -87,6 +89,38 @@ final class SitrepPoller {
         let ok = await task.value
         if inFlight == task { inFlight = nil }
         return ok
+    }
+
+    /// The SEALED LEG ONLY, now. Driven by a sealed event off the live feed
+    /// (docs/NOTIFY.md §11.6): a login code has landed and the ten-second poll
+    /// that would have found it is nine seconds too slow for mail that expires.
+    ///
+    /// One request rather than `pull()`'s five, because nothing else about the
+    /// sitrep has news — and because this can fire per sealed message, which is
+    /// a rate the full pull has no business being run at.
+    ///
+    /// It writes the read model and stops there: `AuthArrival` is driven by the
+    /// CHANGE to `store.sitrep.sealed` (see ShellWatchers), so the ring, the
+    /// audited auto-reveal and the code modal all come out of the same one door
+    /// whether a poll or an event found the mail. Calling `observe` from here
+    /// as well would be a second writer of one seen-set for no gain.
+    ///
+    /// Silent on every failure, and it does not touch `refreshError`: this is
+    /// an opportunistic extra ask, and the poll loop above is what decides
+    /// whether the daemon is reachable.
+    func refreshSealed() async {
+        guard store.connStatus == .connected else { return }
+        // The account this ask is ABOUT. A switch bumps the epoch, and the ids
+        // in a sealed list are one daemon's SQLite ints — writing an answer
+        // from the mailbox just left into the read model of the one arriving
+        // would seed the new account's seen-set from the old account's mail.
+        let e = store.epoch
+        guard let sealed = try? await APIClient.shared.listSealed() else { return }
+        guard store.isCurrent(e) else { return }
+        // ASSIGN ONLY ON CHANGE, for the same reason `performPull` does:
+        // @Observable notifies on assignment, not on difference, and the
+        // watcher downstream of this is an `onChange`.
+        if sealed != store.sitrep.sealed { store.sitrep.sealed = sealed }
     }
 
     /// Re-read every surface a triage correction can move mail between, NOW —

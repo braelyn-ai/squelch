@@ -1,5 +1,6 @@
 // THE RESIDENT NOTIFICATION FEED: one long-lived SSE connection to
-// `GET /client/events`, every frame handed to the notifier.
+// `GET /client/events`, every frame handed to the notifier — except the sealed
+// ones, which are handed to the auth path instead (see `consume`).
 //
 // ONE INSTANCE PER ACCOUNT, owned by `AccountManager` — and that includes the
 // accounts that are NOT live, because being told about mail in a mailbox
@@ -249,6 +250,25 @@ final class EventStream {
             let event = try? Self.decoder.decode(Event.self, from: data)
         {
             note(seen: event.id)
+            // AUTH MAIL LEAVES HERE. A sealed event is not a notification, it is
+            // the FAST WORD that a login code has landed — the app has polled
+            // `/client/sealed` for that since long before the feed carried it,
+            // and this only stops the poll being up to 30s late. Nothing about
+            // the banner is built from the frame: the row has no subject, and
+            // `created_at` is when triage emitted it rather than when the mail
+            // arrived, so a `SealedMeta` synthesized here would be wrong in the
+            // one field the freshness window reads. The fetch is the source of
+            // truth and `AuthSeenSet` stays the only dedup, which is what makes
+            // this safe to fire as often as the daemon likes.
+            //
+            // The account is HANDED OVER rather than compared, for the same
+            // reason `noteLiveEvent` takes it as an argument: this stream has no
+            // opinion about which mailbox is on screen, and `AccountManager` is
+            // the one place that knows which ear is listening for this one.
+            if case .authSignal = EventBanner.routing(for: event) {
+                AccountManager.shared.noteSealedEvent(for: accountId)
+                return
+            }
             // THE THREAD ON SCREEN HEARS FIRST. Mail arriving in the email
             // somebody is reading is the one event with somewhere to go besides
             // a banner — and the banner is suppressed in exactly that case, so

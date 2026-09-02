@@ -222,6 +222,12 @@ targets:
       # subject; the helper lives here.
       - path: Sources/Passband/Model/SubjectText.swift
       - path: Sources/Passband/Lib/SenderIdentity.swift
+      # The word for a piece of auth mail. A sealed event routes to an
+      # auth-shaped banner here exactly as it does in the app (docs/NOTIFY.md
+      # §11.6), and the label is what it leads with — so AuthCopy.label lives in
+      # its own Foundation-only file rather than beside the code extractor,
+      # which imports SwiftUI and could never be on this list.
+      - path: Sources/Passband/Lib/AuthLabels.swift
       - path: Sources/Passband/Lib/Format.swift
       - path: Sources/Passband/Lib/AsyncMemo.swift
       - path: Sources/Passband/Lib/Sessions.swift

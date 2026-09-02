@@ -116,8 +116,14 @@ enum EventKind: String, LenientRawEnum {
 /// core::types::Event — one row of the durable notification log, delivered as
 /// SSE frames on GET /client/events. Every field is a snapshot taken at
 /// emission time, so a client renders the whole notification from this row with
-/// no second round trip. SEALED MAIL CAN NEVER APPEAR HERE (enforced
-/// server-side; see docs/SECURITY.md §4).
+/// no second round trip.
+///
+/// SEALED MAIL DOES APPEAR HERE, as of the notify lane (docs/NOTIFY.md §11.6) —
+/// it used to be the one category that could not, which is why auth mail had to
+/// be polled for. What is still true, and is the invariant that made the change
+/// safe at all, is that a sealed row carries NO BODY-DERIVED TEXT: `one_line` is
+/// a fixed phrase generated from `sealed_kind` alone ("Login code arrived"),
+/// never the subject and never the code. See docs/SECURITY.md §4.
 struct Event: Codable, Sendable, Identifiable, Hashable {
     var id: Int
     var kind: EventKind
@@ -130,6 +136,17 @@ struct Event: Codable, Sendable, Identifiable, Hashable {
     /// Snapshotted RFC3339 text, or nil. Display copy only.
     var deadline: String?
     var created_at: String
+    /// Why the message was sealed, when it was. ABSENT on every ordinary event
+    /// and on every row a pre-notify-lane daemon serves — which is why it is
+    /// optional rather than merely nullable, and why nothing else about this
+    /// type moved: the synthesized decoder must go on accepting a frame that
+    /// has never heard of the key.
+    ///
+    /// NOT display copy and not a body: it is the ROUTING signal. Non-nil means
+    /// this event is the fast word that auth mail has landed, and the client
+    /// answers it by going and asking `/client/sealed` — see
+    /// `EventBanner.routing(for:)`.
+    var sealed_kind: SealedKind?
 }
 
 // MARK: - updates

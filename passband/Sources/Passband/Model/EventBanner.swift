@@ -8,6 +8,11 @@
 // Pure by construction: same event in, same banner out. Nothing here posts,
 // reads the keychain, or knows an account exists — `Notifier` and the extension
 // each fold the account in on their own side.
+//
+// It also answers the question that comes BEFORE the copy, and for the same
+// reason: `routing(for:)`. A sealed event is not an event banner at all (see
+// docs/NOTIFY.md §11.6), and the two posters plus the live feed have to agree
+// about that or one of them puts a dead tap on a lock screen.
 
 import Foundation
 
@@ -34,6 +39,36 @@ enum EventBanner {
     /// a tap on it is not a human opening their mail and must not be counted
     /// as one.
     static let testRoute = "test"
+
+    // MARK: - routing
+
+    /// What one frame off the event feed IS. The whole decision, in one pure
+    /// function, because it is the fork the notify lane added and the two
+    /// answers could hardly be further apart: one opens a thread, the other
+    /// must never touch one.
+    enum Routing: Equatable, Sendable {
+        /// The ordinary event: a banner naming the sender, whose tap opens the
+        /// thread the mail is in.
+        case threadBanner
+        /// Auth mail. The event is a TRIGGER and not a notification: the row
+        /// carries no subject and its `created_at` is when triage emitted it,
+        /// not when the mail arrived, so nothing about the banner may be built
+        /// from it beyond the kind and the sender. `/client/sealed` is the
+        /// source of truth and `AuthSeenSet` is the one dedup.
+        case authSignal(SealedKind)
+    }
+
+    /// Route one event. `sealed_kind` present is the entire test — see
+    /// docs/NOTIFY.md §11.6. Deliberately NOT a check on tier, kind or
+    /// importance: the daemon stamps a sealed row `urgent`/`signal` like any
+    /// other urgent mail, so those fields cannot tell the two apart, and a
+    /// sealed event routed as a thread banner would put a dead tap on screen
+    /// (`thread_guard_and_subject` 404s a sealed thread) beside the poller's
+    /// own banner for the same code.
+    static func routing(for event: Event) -> Routing {
+        guard let kind = event.sealed_kind else { return .threadBanner }
+        return .authSignal(kind)
+    }
 
     // MARK: - content mapping
 
@@ -94,6 +129,51 @@ enum EventBanner {
             // is how a notification stream gets muted wholesale.
             sound: event.kind != .surfaced)
     }
+
+    /// The AUTH banner's copy: a mailbox has just been sent a login code (or a
+    /// reset, or a sign-in alert), and the only thing this notification exists
+    /// to say is which mailbox to go to and who wants the code.
+    ///
+    /// WHAT IS DELIBERATELY NOT IN IT: the code, and the subject line that so
+    /// often IS the code ("725104 is your Acme code" is a real subject). The
+    /// only two inputs are the kind and the from address — both metadata, both
+    /// the same class `/client/sealed` already serves — so there is no way for
+    /// a body to reach a lock screen through here even by accident. A reveal is
+    /// audited server-side and belongs to the account the human is looking at.
+    ///
+    /// THREE POSTERS, ONE COPY: the background watcher's poll (`postAuth`), the
+    /// live feed's sealed event, and the notification service extension
+    /// rewriting a push that arrived while the app was not running. Nothing in
+    /// the wording may depend on which of them got there first.
+    ///
+    /// `accountName` is nil where the poster does not have one — the extension
+    /// reads credentials out of the shared keychain and has no access to the
+    /// app's account labels — and then the label stands alone rather than
+    /// trailing an empty separator.
+    static func authCopy(kind: SealedKind?, sender: String, accountName: String?) -> Copy {
+        // The kind leads, the mailbox follows: WHICH account this is happening
+        // in is the entire reason the banner is worth reading, and `AuthCopy`
+        // is the app's one vocabulary for the other half ("sealed" is internal
+        // jargon and never reaches a human).
+        let label = AuthCopy.label(kind)
+        let who = flatten(SenderID.displayName(sender), max: 64)
+        return Copy(
+            title: accountName.map { "\(label) · \($0)" } ?? label,
+            subtitle: "",
+            body: who.isEmpty ? "New auth mail." : "from \(who)",
+            // One group per account's auth mail: a login code and the sign-in
+            // alert behind it are the same conversation. Account-prefixed by
+            // the poster, exactly as an event's group is, because two daemons'
+            // auth mail is not one conversation.
+            threadIdentifier: authGroup,
+            // Always a chime. A login code is the definition of time-bound — it
+            // expires while you are not looking at it.
+            sound: true)
+    }
+
+    /// The coalescing group every auth banner shares, before the poster
+    /// prefixes it with the account.
+    static let authGroup = "passband.auth"
 
     /// Collapse to one line and cap the length: notification text is a small
     /// fixed box.
