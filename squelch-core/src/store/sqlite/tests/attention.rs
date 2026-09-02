@@ -794,6 +794,151 @@ fn standing_correspondence_arms_do_not_cross_accounts() {
 }
 
 #[test]
+fn standing_refuses_marketing_from_a_sender_the_user_has_written_to() {
+    // THE SHOP YOU EMAILED ONCE: one order question to `info@` writes a contacts
+    // row, and the having-written-to-them arm carries no tier floor, so without
+    // the category gate every promo that shop ever sends holds a permanent seat
+    // in the band at importance 0. The arm is for below-threshold mail from a
+    // correspondent; a blast is not that mail.
+    let (store, acct) = store();
+    let since = Utc::now() - chrono::Duration::days(30);
+    contact(&store, acct, "info@mudsweet.com", 1);
+    contact(&store, acct, "johanna@wvfc.org", 12);
+
+    // `.ingest()` and not `.seed()`: the category is written by the Stage-1
+    // apply path, and the seed terminal drops it on the floor — a `.seed()` here
+    // asserts nothing at all.
+    let promo = triaged(acct, "g1", "t1")
+        .from("info@mudsweet.com")
+        .received_at(Utc::now())
+        .category("marketing")
+        .ingest(&store);
+    // Same sender, same arm, ordinary category: the order confirmation the shop
+    // sends from the same address must still stand.
+    let order = triaged(acct, "g2", "t2")
+        .from("info@mudsweet.com")
+        .received_at(Utc::now())
+        .category("general")
+        .ingest(&store);
+    // A row triage never reached carries a NULL category. `!= 'marketing'` is
+    // NULL there, not TRUE, so a bare comparison would silently drop it.
+    let untriaged = dateless(&store, acct, "g3", "t3", "johanna@wvfc.org");
+
+    let standing = standing_ids(&store, acct, since);
+    assert!(
+        !standing.contains(&promo),
+        "marketing rode the correspondence arm into the band: {standing:?}"
+    );
+    assert!(
+        standing.contains(&order),
+        "the gate took a non-marketing row from the same sender: {standing:?}"
+    );
+    assert!(
+        standing.contains(&untriaged),
+        "a NULL category is not marketing: {standing:?}"
+    );
+    // Header and list agree over the narrowed definition, not just the list.
+    assert_eq!(
+        store
+            .stats(acct, Utc::now() - chrono::Duration::days(30))
+            .unwrap()
+            .bands
+            .standing,
+        2
+    );
+}
+
+#[test]
+fn standing_admits_marketing_the_user_replied_to_or_asked_to_see_again() {
+    // The gate is on the WEAKEST arm only. Writing in the thread and setting a
+    // reminder are both the user acting on that specific mail, which outranks
+    // what the classifier called it on arrival — otherwise a promo the user
+    // deliberately parked until Friday can never come back.
+    let (store, acct) = store();
+    let since = Utc::now() - chrono::Duration::days(30);
+    contact(&store, acct, "info@mudsweet.com", 1);
+
+    triaged(acct, "g-sent", "thr-replied")
+        .from("me@example.com")
+        .is_sent(true)
+        .seed(&store);
+    let replied = triaged(acct, "g1", "thr-replied")
+        .from("info@mudsweet.com")
+        .received_at(Utc::now())
+        .category("marketing")
+        .ingest(&store);
+    let recalled = triaged(acct, "g2", "thr-recalled")
+        .from("info@mudsweet.com")
+        .received_at(Utc::now())
+        .category("marketing")
+        .ingest(&store);
+    store
+        .set_reminder(acct, recalled, Utc::now() - chrono::Duration::hours(1))
+        .unwrap();
+    store.fire_due_reminders(acct, Utc::now()).unwrap();
+
+    let standing = standing_ids(&store, acct, since);
+    assert!(
+        standing.contains(&replied),
+        "a thread the user wrote in stands whatever its category: {standing:?}"
+    );
+    assert!(
+        standing.contains(&recalled),
+        "a fired reminder stands whatever its category: {standing:?}"
+    );
+}
+
+#[test]
+fn standing_never_serves_provider_spam_even_when_asked_for_it() {
+    // `band` and `spam` are independent query parameters, so nothing upstream
+    // stops `?band=standing&spam=only`. The band is the one listing that must
+    // never answer with the provider's junk, so it forces the scope rather than
+    // trusting every caller to pass the sane one.
+    let (store, acct) = store();
+    let since = Utc::now() - chrono::Duration::days(30);
+    contact(&store, acct, "info@mudsweet.com", 1);
+
+    let junk = triaged(acct, "g1", "t1")
+        .from("info@mudsweet.com")
+        .received_at(Utc::now())
+        .importance(0)
+        .tier(Tier::Noise)
+        .is_spam(true)
+        .seed(&store);
+    let real = dateless(&store, acct, "g2", "t2", "info@mudsweet.com");
+
+    for scope in [SpamScope::Exclude, SpamScope::Only] {
+        let ids: Vec<i64> = store
+            .attention_updates(
+                acct,
+                since,
+                None,
+                None,
+                Some(SitrepBand::Standing),
+                false,
+                scope,
+            )
+            .unwrap()
+            .into_iter()
+            .map(|u| u.update.id)
+            .collect();
+        assert!(
+            !ids.contains(&junk),
+            "the standing band served provider spam under {scope:?}: {ids:?}"
+        );
+        assert_eq!(ids, vec![real], "under {scope:?}");
+    }
+    // The flat spam page is untouched: it passes no band, and still gets the row.
+    let page: Vec<i64> = store
+        .attention_updates(acct, since, None, None, None, false, SpamScope::Only)
+        .unwrap()
+        .into_iter()
+        .map(|u| u.update.id)
+        .collect();
+    assert_eq!(page, vec![junk], "the spam page still lists the spam");
+}
+
+#[test]
 fn standing_never_admits_sealed_mail_from_a_correspondent() {
     // SECURITY: participation widens the band's DEFINITION, never its clearance.
     let (store, acct) = store();
