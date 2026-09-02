@@ -1479,6 +1479,56 @@ pub async fn get_contacts(
 }
 
 #[derive(Debug, Deserialize)]
+pub struct SendersQuery {
+    q: String,
+    #[serde(default)]
+    limit: Option<u32>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SenderView {
+    addr: String,
+    display_name: Option<String>,
+    msg_count: i64,
+    last_received_at: String,
+}
+
+/// GET /client/senders?q=fragment — the search field's `from:` autocomplete:
+/// who has written to this account, ranked for the typed fragment. The twin of
+/// `get_contacts` over the other direction of mail; contacts are the people the
+/// user writes TO and cannot answer `from:`.
+///
+/// HUMAN DOOR ONLY, like contacts. An empty fragment is an empty list without a
+/// store round-trip, and the response is `no-store`: this is a list of the
+/// user's correspondents.
+pub async fn get_senders(
+    State(state): State<ApiState>,
+    Query(params): Query<SendersQuery>,
+) -> Result<impl IntoResponse, ApiError> {
+    let q = params.q.trim().to_string();
+    if q.is_empty() {
+        return Ok((no_store(), Json(Vec::<SenderView>::new())));
+    }
+    // Menu-sized by default; capped so no caller turns this into a directory
+    // dump endpoint.
+    let limit = params.limit.unwrap_or(8).min(25);
+    let hits = store_call(&state, move |store, account_id| {
+        store.search_senders(account_id, &q, limit)
+    })
+    .await?;
+    let items: Vec<SenderView> = hits
+        .into_iter()
+        .map(|s| SenderView {
+            addr: s.addr,
+            display_name: s.display_name,
+            msg_count: s.msg_count,
+            last_received_at: s.last_received_at.to_rfc3339(),
+        })
+        .collect();
+    Ok((no_store(), Json(items)))
+}
+
+#[derive(Debug, Deserialize)]
 pub struct DraftBody {
     /// The message being replied to; absent or null addresses the account's
     /// single new-message draft.

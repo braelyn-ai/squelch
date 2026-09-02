@@ -145,6 +145,20 @@ pub struct ContactEntry {
     pub last_sent_at: Option<DateTime<Utc>>,
 }
 
+/// One row of the sender directory (`senders`): an address that has written to
+/// the account, as the search field's `from:` autocomplete hit shape.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SenderEntry {
+    pub addr: String,
+    /// The newest display name seen on this sender's mail, when any was.
+    pub display_name: Option<String>,
+    /// Inbound, non-spam messages from this address. Sealed ones are counted
+    /// (sealing is decided after the count is taken); a sender with ONLY sealed
+    /// mail is never returned at all.
+    pub msg_count: i64,
+    pub last_received_at: DateTime<Utc>,
+}
+
 /// A fully-triaged message committed in one transaction by
 /// [`Store::ingest_message`]: message row and triage row together, so a sealed
 /// message is never observable as normal mail (docs/SECURITY.md §4).
@@ -1478,6 +1492,16 @@ pub trait Store: Send + Sync {
     /// idempotent across harvest re-runs and overlap with ingest seeding).
     fn merge_harvested_contacts(&self, account_id: AccountId, batch: &[ContactEntry])
     -> Result<()>;
+
+    /// HUMAN-DOOR ONLY (`/client/senders`): rank the sender directory for a
+    /// typed fragment — the search field's `from:` autocomplete. MUST NOT be
+    /// reachable from MCP, for the reason `search_contacts` gives.
+    fn search_senders(
+        &self,
+        account_id: AccountId,
+        q: &str,
+        limit: u32,
+    ) -> Result<Vec<SenderEntry>>;
 
     /// Read the sync cursor for a mailbox key, if one has been persisted.
     fn sync_state(&self, account_id: AccountId, mailbox: &str) -> Result<Option<SyncState>>;

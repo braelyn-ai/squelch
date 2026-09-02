@@ -521,6 +521,49 @@ pub(super) fn migrate(conn: &Connection) -> Result<()> {
            )",
         [],
     )?;
+    // THE SENDER DIRECTORY'S BACKFILL. `senders` is kept by the message upsert
+    // from here on; an install that predates the table has a whole mailbox of
+    // senders the upsert never saw. schema.sql has already created it (empty)
+    // by the time this runs, so "empty directory beside a non-empty mailbox" is
+    // the just-created signal: filled once, from every listing's own rule
+    // (`is_sent = 0 AND is_spam = 0`), with each sender's NEWEST name. A fresh
+    // install is both-empty and a no-op that ingest fills; the next open finds
+    // rows and leaves them alone. Guarded like every other block here, so the
+    // partial-schema unit tests keep passing.
+    if tables_exist(conn, &["senders", "messages"])?
+        && has_columns(
+            conn,
+            "messages",
+            &[
+                "from_addr",
+                "from_name",
+                "received_at",
+                "is_sent",
+                "is_spam",
+            ],
+        )?
+    {
+        let empty: bool =
+            conn.query_row("SELECT NOT EXISTS(SELECT 1 FROM senders)", [], |r| r.get(0))?;
+        if empty {
+            conn.execute(
+                "INSERT INTO senders(account_id, addr, display_name, msg_count, first_seen,
+                                     last_received_at)
+                 SELECT m.account_id, m.from_addr,
+                        (SELECT NULLIF(m2.from_name, '') FROM messages m2
+                          WHERE m2.account_id = m.account_id AND m2.from_addr = m.from_addr
+                            AND m2.is_sent = 0 AND m2.is_spam = 0
+                            AND NULLIF(m2.from_name, '') IS NOT NULL
+                          ORDER BY m2.received_at DESC LIMIT 1),
+                        COUNT(*), MIN(m.received_at), MAX(m.received_at)
+                 FROM messages m
+                 WHERE m.is_sent = 0 AND m.is_spam = 0 AND TRIM(m.from_addr) <> ''
+                 GROUP BY m.account_id, m.from_addr",
+                [],
+            )?;
+        }
+    }
+
     Ok(())
 }
 

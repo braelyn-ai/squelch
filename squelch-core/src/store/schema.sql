@@ -104,6 +104,37 @@ CREATE TABLE IF NOT EXISTS contacts (
 CREATE INDEX IF NOT EXISTS idx_contacts_addr_nocase
     ON contacts(account_id, addr COLLATE NOCASE);
 
+-- THE SENDER DIRECTORY: one row per address that has written to this account,
+-- for the search field's `from:` autocomplete (`/client/senders`). The twin of
+-- `contacts` over the other direction of mail: contacts are the people the user
+-- writes TO, seeded from Sent recipients, and cannot answer `from:` for the Dan
+-- who has only ever replied.
+--
+-- MAINTAINED AT INGEST (`senders::bump_sender_conn`, from the message upsert
+-- and the not-spam action), not computed per keystroke: a GROUP BY over
+-- `messages` with a substring LIKE on two columns measured 110-160 ms at 100k
+-- rows, taken while holding the store's single connection mutex. `msg_count`
+-- is RECOMPUTED from `messages` on each bump rather than incremented, so a
+-- re-sighting of the same gmail_msg_id cannot double count, and it follows the
+-- same `is_sent = 0 AND is_spam = 0` rule every listing does.
+--
+-- SEALED IS NOT KNOWN HERE. Sensitivity is triage's verdict, after ingest, so
+-- a sender whose only mail is sealed still has a row; `search_senders` requires
+-- at least one non-sealed, non-spam inbound message before offering one. The
+-- primary key is the lookup: the reader's LIKE cannot use an index anyway, and
+-- a mailbox has thousands of senders, not millions.
+CREATE TABLE IF NOT EXISTS senders (
+    account_id       INTEGER NOT NULL,
+    addr             TEXT NOT NULL,
+    -- The newest display name seen on this sender's mail, NULL if never one.
+    display_name     TEXT,
+    msg_count        INTEGER NOT NULL DEFAULT 0,
+    -- Both RFC3339 UTC, so MAX() and ORDER BY read them as time.
+    first_seen       TEXT NOT NULL,
+    last_received_at TEXT NOT NULL,
+    PRIMARY KEY(account_id, addr)
+);
+
 CREATE TABLE IF NOT EXISTS sender_rules (
     id            INTEGER PRIMARY KEY,
     account_id    INTEGER NOT NULL,

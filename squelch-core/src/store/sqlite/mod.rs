@@ -21,6 +21,7 @@ mod migrate;
 mod notify;
 mod rules;
 mod search;
+mod senders;
 mod specialists;
 #[cfg(test)]
 mod tests;
@@ -43,7 +44,7 @@ use crate::store::{
     ExtractQueued, InboxUnread, IssuedDeviceToken, MailActivityDay, MarketingApplied,
     MarketingOffer, MessageOpen, MessageUnsub, MintedPairingCode, MissingVector, NewAuditEntry,
     NewEvent, NewNotifyDecision, NotifyDecisionRow, RevisitQueued, SPAM_SYNCED_AT_KEY, SealedBody,
-    SealedMessage, SearchFilter, SearchSort, SeedVerdict, SenderHistory, SentMessage,
+    SealedMessage, SearchFilter, SearchSort, SeedVerdict, SenderEntry, SenderHistory, SentMessage,
     SentMissingRecipients, SitrepBand, SpamScope, Stage1Applied, Stage1Queued, Stage2Applied,
     Stage2CapOverrides, Stage2Queued, Stage2Usage, Stage2UsageDay, Store, SyncState, ThreadSibling,
     TrackedMessage, TriageDebug, TriagedMessage, UsageTokens,
@@ -797,6 +798,15 @@ impl Store for SqliteStore {
         batch: &[ContactEntry],
     ) -> Result<()> {
         self.merge_harvested_contacts(account_id, batch)
+    }
+
+    fn search_senders(
+        &self,
+        account_id: AccountId,
+        q: &str,
+        limit: u32,
+    ) -> Result<Vec<SenderEntry>> {
+        self.search_senders(account_id, q, limit)
     }
 
     fn sync_state(&self, account_id: AccountId, mailbox: &str) -> Result<Option<SyncState>> {

@@ -8591,3 +8591,114 @@ async fn spam_refresh_answers_the_triggered_shape() {
         "and NOT a `status` field — the client type that wanted one was the bug"
     );
 }
+
+#[tokio::test]
+async fn senders_autocomplete_ranks_prefix_then_volume_and_hides_spam_and_sent() {
+    // WIRE CONTRACT: GET /client/senders?q= returns a flat array of
+    // {addr, display_name, msg_count, last_received_at}, ranked prefix-match
+    // first, then by volume; an empty fragment is [], the limit is capped, and
+    // the response is no-store. Sent mail and spam register nobody.
+    let Harness { app, .. } = harness(|store, acct| {
+        let seed = |gmail: &str, from: &str, name: Option<&str>| {
+            let mut m = msg(acct, gmail, gmail, "hello", "body");
+            m.from_addr = from.to_string();
+            m.from_name = name.map(String::from);
+            m
+        };
+        store
+            .upsert_message(&seed("g1", "dan@example.com", Some("Dan Smith")))
+            .unwrap();
+        store
+            .upsert_message(&seed("g2", "dan@example.com", Some("Dan Smith")))
+            .unwrap();
+        store
+            .upsert_message(&seed("g3", "joanne@example.com", None))
+            .unwrap();
+        store
+            .upsert_message(&seed("g4", "ann@example.com", None))
+            .unwrap();
+        let mut spam = seed("g5", "winner@lottery.example", Some("Ann Lottery"));
+        spam.is_spam = true;
+        store.upsert_message(&spam).unwrap();
+        let mut sent = seed("g6", "me@example.com", Some("Me"));
+        sent.is_sent = true;
+        store.upsert_message(&sent).unwrap();
+    });
+
+    // "an" is a substring of dan@ and joanne@ (2 vs 1 messages) and the start
+    // of ann@: prefix first, then volume.
+    let resp = app
+        .clone()
+        .oneshot(authed("GET", "/client/senders?q=an"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        resp.headers().get(header::CACHE_CONTROL).unwrap(),
+        "no-store"
+    );
+    let items = body_json(resp).await;
+    let addrs: Vec<&str> = items
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| i["addr"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        addrs,
+        vec!["ann@example.com", "dan@example.com", "joanne@example.com"]
+    );
+    assert_eq!(items[1]["display_name"], "Dan Smith");
+    assert_eq!(items[1]["msg_count"], 2);
+    assert!(items[1]["last_received_at"].is_string());
+    assert!(items[2]["display_name"].is_null());
+
+    // Neither the spam sender (matched on her display name) nor the user's own
+    // sent copy is in the directory.
+    for q in ["lottery", "Ann%20L", "me@"] {
+        let resp = app
+            .clone()
+            .oneshot(authed("GET", &format!("/client/senders?q={q}")))
+            .await
+            .unwrap();
+        let items = body_json(resp).await;
+        let offered: Vec<String> = items
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|i| i["addr"].as_str().unwrap().to_string())
+            .collect();
+        assert!(
+            !offered
+                .iter()
+                .any(|a| a.contains("lottery") || a == "me@example.com"),
+            "{q}: {offered:?}"
+        );
+    }
+
+    // An empty fragment is an empty list, and the limit is honoured and capped.
+    let resp = app
+        .clone()
+        .oneshot(authed("GET", "/client/senders?q=%20%20"))
+        .await
+        .unwrap();
+    assert_eq!(body_json(resp).await, Value::Array(vec![]));
+    let resp = app
+        .clone()
+        .oneshot(authed("GET", "/client/senders?q=example&limit=1"))
+        .await
+        .unwrap();
+    assert_eq!(body_json(resp).await.as_array().unwrap().len(), 1);
+
+    // No token, no directory.
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/client/senders?q=dan")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}

@@ -1199,3 +1199,72 @@ fn the_no_body_sweep_survives_a_messages_table_with_no_body_column() {
         .unwrap();
     assert_eq!(stamp.as_deref(), Some("skip-no-body"));
 }
+
+#[test]
+fn migrate_backfills_the_sender_directory_from_existing_mail_exactly_once() {
+    // An install predating `senders`: schema.sql creates the table empty while
+    // `messages` is full. The migration fills it under every listing's rule
+    // (sent and spam excluded), with each sender's newest name, and does NOT
+    // touch a directory that already has rows.
+    use chrono::TimeZone;
+    let at = |day: u32| Utc.with_ymd_and_hms(2026, 8, day, 12, 0, 0).unwrap();
+    let (store, acct) = store();
+    triaged(acct, "g1", "t")
+        .from("dan@example.com")
+        .from_name(Some("Dan Smith"))
+        .received_at(at(1))
+        .upsert(&store);
+    triaged(acct, "g2", "t")
+        .from("dan@example.com")
+        .from_name(Some("Dan"))
+        .received_at(at(3))
+        .upsert(&store);
+    triaged(acct, "g3", "t")
+        .from("me@example.com")
+        .is_sent(true)
+        .upsert(&store);
+    triaged(acct, "g4", "t")
+        .from("spam@x.example")
+        .is_spam(true)
+        .upsert(&store);
+    {
+        let conn = store.lock().unwrap();
+        // Simulate the pre-table install: the rows ingest wrote never existed.
+        conn.execute("DELETE FROM senders", []).unwrap();
+        migrate(&conn).unwrap();
+        let rows: Vec<(String, Option<String>, i64, String, String)> = conn
+            .prepare(
+                "SELECT addr, display_name, msg_count, first_seen, last_received_at
+                 FROM senders ORDER BY addr",
+            )
+            .unwrap()
+            .query_map([], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+            })
+            .unwrap()
+            .collect::<std::result::Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            rows.len(),
+            1,
+            "sent and spam mail register nobody: {rows:?}"
+        );
+        assert_eq!(rows[0].0, "dan@example.com");
+        assert_eq!(rows[0].1.as_deref(), Some("Dan"), "the newest name wins");
+        assert_eq!(rows[0].2, 2);
+        assert_eq!(rows[0].3, at(1).to_rfc3339());
+        assert_eq!(rows[0].4, at(3).to_rfc3339());
+        // A populated directory is left exactly as it is.
+        conn.execute("UPDATE senders SET msg_count = 99", [])
+            .unwrap();
+        migrate(&conn).unwrap();
+        let count: i64 = conn
+            .query_row("SELECT msg_count FROM senders", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 99, "a second open must not rebuild the directory");
+    }
+    // And the reader sees what the backfill wrote.
+    let hits = store.search_senders(acct, "dan", 8).unwrap();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].last_received_at, at(3));
+}
