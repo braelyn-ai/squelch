@@ -89,6 +89,38 @@ enum NotificationSound: String, CaseIterable, Sendable {
     }
 }
 
+/// WHETHER A SEARCH MAY SPEND MONEY BY ITSELF. The deeper-search lane runs a
+/// model over the reader's mail when a query looks like a question the results
+/// list cannot answer (docs/SEARCH.md §5), on the user's own key or on the
+/// hosted plan's budget. That is spend nobody tapped for, so it is a setting.
+///
+/// `automatic` is the default because the lane is worth having: the query that
+/// motivated the whole design was answered by an agent in one pass and by the
+/// search panel not at all.
+enum DeeperSearchChoice: String, CaseIterable, Sendable {
+    case automatic, onRequest = "on_request", off
+
+    var label: String {
+        switch self {
+        case .automatic: "Automatic"
+        case .onRequest: "On request"
+        case .off: "Off"
+        }
+    }
+
+    /// What the setting promises, in one line, under the picker.
+    var blurb: String {
+        switch self {
+        case .automatic:
+            "A question-shaped search reads your mail and answers it, unasked."
+        case .onRequest:
+            "A question-shaped search offers a button, and waits for you to press it."
+        case .off:
+            "Search stays keyword and meaning only. No model reads your mail."
+        }
+    }
+}
+
 /// Two palettes selected explicitly; `system` follows the OS and is the default.
 enum ThemeChoice: String, CaseIterable, Sendable {
     case system, light, dark
@@ -133,6 +165,8 @@ final class Prefs {
         static let signature = "passband.pref.signature"
         static let assistantModel = "passband.assistant.model"
         static let assistantTransport = "passband.assistant.transport"
+        static let searchLaneModel = "passband.search.lane.model"
+        static let deeperSearch = "passband.search.deeper"
         static let telemetry = TelemetryLevel.prefKey
     }
 
@@ -148,6 +182,7 @@ final class Prefs {
             Key.searchSort: SearchSortChoice.recent.rawValue,
             Key.notificationSound: NotificationSound.system.rawValue,
             Key.telemetry: TelemetryLevel.full.rawValue,
+            Key.deeperSearch: DeeperSearchChoice.automatic.rawValue,
         ])
         _loadRemoteImages = defaults.bool(forKey: Key.loadRemoteImages)
         _settingsSection =
@@ -181,6 +216,13 @@ final class Prefs {
         _assistantTransport =
             AssistantTransport(rawValue: defaults.string(forKey: Key.assistantTransport) ?? "")
             ?? .relay
+        _searchLaneModel =
+            AssistantModel.migrating(rawValue: defaults.string(forKey: Key.searchLaneModel) ?? "")
+            ?? .haiku
+        _deeperSearch =
+            DeeperSearchChoice(rawValue: defaults.string(forKey: Key.deeperSearch) ?? "")
+            ?? .automatic
+
         // LAST, because it writes: the verdict above has to be PINNED on the
         // launch that reaches it, not re-derived on the next one. A seed lands
         // in the name key with no flag beside it, so a re-derivation would read
@@ -415,6 +457,30 @@ final class Prefs {
         set {
             _assistantTransport = newValue
             defaults.set(newValue.rawValue, forKey: Key.assistantTransport)
+        }
+    }
+
+    /// The model the SEARCH LANE runs on, independent of the ⌘K chat's. Its own
+    /// preference because the two spend differently: the lane runs on every
+    /// deeper query, unasked, while the chat runs when somebody types a
+    /// question — so Haiku is the honest default here even for a reader who
+    /// picked Opus for their chat.
+    private var _searchLaneModel: AssistantModel
+    var searchLaneModel: AssistantModel {
+        get { _searchLaneModel }
+        set {
+            _searchLaneModel = newValue
+            defaults.set(newValue.rawValue, forKey: Key.searchLaneModel)
+        }
+    }
+
+    /// Whether a question-shaped search may start the agent lane by itself.
+    private var _deeperSearch: DeeperSearchChoice
+    var deeperSearch: DeeperSearchChoice {
+        get { _deeperSearch }
+        set {
+            _deeperSearch = newValue
+            defaults.set(newValue.rawValue, forKey: Key.deeperSearch)
         }
     }
 
