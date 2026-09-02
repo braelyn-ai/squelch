@@ -110,7 +110,9 @@ struct UsageView: View {
             Text("Fun charts")
                 .font(.system(size: 20, weight: .semibold))
                 .foregroundStyle(Palette.ink)
-            Text("We didn't need to build this but graphs are fun ¯\\_(ツ)_/¯")
+            // VERBATIM: a literal handed to Text is Markdown, and Markdown
+            // reads the shrug's `\\_` as an escaped underscore and eats the arm.
+            Text(verbatim: "We didn't need to build this but graphs are fun ¯\\_(ツ)_/¯")
                 .font(Typo.rowSub)
                 .foregroundStyle(Palette.inkFaint)
         }
