@@ -129,8 +129,18 @@ struct MarkdownTextView: UIViewRepresentable {
         /// button types the same characters a keyboard would, into the same
         /// source the scanner reads, so there is no second representation of a
         /// document that has only ever been markdown text.
+        ///
+        /// THE BAR DOES NOT SIT ON THE KEYBOARD. An `inputAccessoryView` is
+        /// flush against the keyboard by construction, which put iOS 26's glass
+        /// capsules directly on the predictive row: two rounded control strips
+        /// touching, reading as one crowded band rather than as the app's bar
+        /// above the system's. So the accessory is a CLEAR HOST with the toolbar
+        /// pinned to its top and `markdownBarGap` of nothing underneath. The gap
+        /// belongs to the accessory rather than to the composer's layout on
+        /// purpose: it is then part of what the keyboard carries up and down, so
+        /// it holds through the animation instead of arriving a frame late.
         func accessory() -> UIView {
-            let bar = UIToolbar(frame: CGRect(x: 0, y: 0, width: 0, height: 44))
+            let bar = UIToolbar(frame: CGRect(x: 0, y: 0, width: 0, height: markdownBarHeight))
             bar.tintColor = PlatformColor(Palette.accent)
             let flexible = UIBarButtonItem(
                 barButtonSystemItem: .flexibleSpace, target: nil, action: nil)
@@ -142,8 +152,19 @@ struct MarkdownTextView: UIViewRepresentable {
                 flexible,
                 item("keyboard.chevron.compact.down", #selector(tapDismiss), "Hide keyboard"),
             ]
-            bar.sizeToFit()
-            return bar
+
+            let host = AccessoryHost(
+                frame: CGRect(x: 0, y: 0, width: 0, height: markdownBarHeight + markdownBarGap))
+            host.backgroundColor = .clear
+            host.addSubview(bar)
+            bar.translatesAutoresizingMaskIntoConstraints = false
+            NSLayoutConstraint.activate([
+                bar.topAnchor.constraint(equalTo: host.topAnchor),
+                bar.leadingAnchor.constraint(equalTo: host.leadingAnchor),
+                bar.trailingAnchor.constraint(equalTo: host.trailingAnchor),
+                bar.heightAnchor.constraint(equalToConstant: markdownBarHeight),
+            ])
+            return host
         }
 
         private func item(_ symbol: String, _ action: Selector, _ label: String) -> UIBarButtonItem {
@@ -282,4 +303,25 @@ final class MarkdownFocus {
 
     func began() { editing += 1 }
     func ended() { editing = max(0, editing - 1) }
+}
+
+/// A toolbar's own height, unchanged — the gap is added around it rather than
+/// taken out of it, so the buttons keep their standard target.
+private let markdownBarHeight: CGFloat = 44
+/// The breathing room between the bar and the keyboard's top edge.
+private let markdownBarGap: CGFloat = 10
+
+/// The `inputAccessoryView` itself: a transparent strip that is taller than the
+/// toolbar it holds, so the markdown bar floats clear of the keyboard.
+///
+/// IT MUST DECLARE ITS OWN HEIGHT, AS A CONSTANT. UIKit sizes an accessory view
+/// from its intrinsic content size, and a plain `UIView` has none — the frame
+/// passed to the initializer is a starting suggestion that autolayout is free to
+/// collapse the moment the toolbar inside is constrained. Reading `bounds` here
+/// would be worse than nothing: bounds come FROM layout, which comes from this,
+/// so the two would chase each other. The number is the answer.
+private final class AccessoryHost: UIView {
+    override var intrinsicContentSize: CGSize {
+        CGSize(width: UIView.noIntrinsicMetric, height: markdownBarHeight + markdownBarGap)
+    }
 }

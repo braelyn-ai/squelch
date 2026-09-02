@@ -256,7 +256,16 @@ struct InlineReply: View {
             Spacer(minLength: 8)
             // Edit phase only, same as the pane composer: review is for reading
             // what is about to go out, not for changing it.
-            if !inReview { TrackerToggle(on: bindFlag(\.includeTracker)) }
+            //
+            // AND DESKTOP ONLY, also same as the pane. This header is one line
+            // in a reader column on a phone, already carrying the recipients
+            // door and the subject; a switch nobody came here to touch is what
+            // gets cut when that line has to hold three things at phone width.
+            // The account default still decides, and review still says so when
+            // a pixel is armed.
+            #if os(macOS)
+                if !inReview { TrackerToggle(on: bindFlag(\.includeTracker)) }
+            #endif
             if compose.sending {
                 Text("sending…")
                     .font(Typo.micro)

@@ -64,7 +64,15 @@ struct ComposePane: View {
                 .padding(.vertical, 14)
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
 
-                footer(compose)
+                // EDIT HAS NO FOOTER ON A PHONE. Its two buttons went to the
+                // header and to the drag-down gesture, and a bar left behind
+                // with nothing in it would still cost its own height and
+                // hairline between the editor and the keyboard.
+                #if os(macOS)
+                    footer(compose)
+                #else
+                    if inReview { footer(compose) }
+                #endif
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             // A pane is an EDGE in a window: glass, and a shadow thrown left
@@ -104,12 +112,34 @@ struct ComposePane: View {
                 .font(Typo.micro)
                 .foregroundStyle(Palette.inkFaintest)
             Spacer()
-            // The key chip is the Mac's promise that a key does this. A phone
-            // closes the sheet by dragging it or by the footer's own button.
+            // The key chip is the Mac's promise that a key does this.
             #if os(macOS)
                 HStack(spacing: 4) {
                     Kbd("Esc")
                     Text("close").font(Typo.micro).foregroundStyle(Palette.inkFaintest)
+                }
+            #else
+                // THE PHONE'S PRIMARY ACTION, IN THE CORNER IT LIVES IN. On a
+                // phone the edit phase is a sheet with the keyboard up, and the
+                // bottom of the screen is spoken for three times over — the
+                // keyboard, its predictive row, and the markdown bar above both.
+                // A footer under all of that is the one strip of chrome the
+                // thumb has to reach PAST its own keyboard to use, so the verb
+                // moves to the bar, where every other phone puts it.
+                //
+                // AND CANCEL IS NOT BESIDE IT, because the sheet already is
+                // cancel: a drag down runs `closeCompose()` through the same
+                // binding the button called, and the drag indicator is showing.
+                // Two doors out, one of them costing a corner of the bar, was a
+                // button spent on something the gesture already did.
+                //
+                // Review keeps its footer: no keyboard is up there, and `send`
+                // is the one irreversible thing in the app — it stays a wide,
+                // deliberate target rather than a chip in the corner.
+                if !inReview {
+                    Button("review →") { toReview() }
+                        .buttonStyle(.glassProminent)
+                        .tint(Palette.accent)
                 }
             #endif
         }
@@ -233,15 +263,24 @@ struct ComposePane: View {
                     .disabled(compose.sending)
                 }
             } else {
-                // Edit phase only: what goes out is settled by the time review
-                // is up, and a switch beside the send button is a switch nobody
-                // meant to touch.
-                TrackerToggle(on: bindFlag(\.includeTracker))
-                Button(ComposeLabels.cancel) { store.closeCompose() }
-                    .buttonStyle(.glass)
-                Button("review →") { toReview() }
-                    .buttonStyle(.glassProminent)
-                    .tint(Palette.accent)
+                // EDIT PHASE, DESKTOP ONLY — the phone never renders this bar
+                // (see the call site) and must not start: the tracker switch is
+                // what a phone would have to give the row for, and one switch
+                // nobody came here to touch is not worth a strip of chrome
+                // between the editor and the keyboard. A phone that wants the
+                // pixel changes the account default; review still SAYS when one
+                // is armed, so a tracked send is never a silent one.
+                #if os(macOS)
+                    // What goes out is settled by the time review is up, and a
+                    // switch beside the send button is a switch nobody meant to
+                    // touch.
+                    TrackerToggle(on: bindFlag(\.includeTracker))
+                    Button(ComposeLabels.cancel) { store.closeCompose() }
+                        .buttonStyle(.glass)
+                    Button("review →") { toReview() }
+                        .buttonStyle(.glassProminent)
+                        .tint(Palette.accent)
+                #endif
             }
         }
         .padding(.horizontal, 18)
@@ -521,22 +560,21 @@ struct ComposePane: View {
                     .fill(Palette.canvas.opacity(0.6))
             )
 
-            if compose.guardKinds.isEmpty {
-                HStack(spacing: 4) {
-                    Text("outbound guard: not yet checked ·")
-                        .font(Typo.micro).foregroundStyle(Palette.inkFaintest)
-                    // Which act fetches the verdict, named as the reader's own
-                    // surface offers it: a key on the Mac, the button on a phone.
-                    #if os(macOS)
-                        Kbd("enter")
-                        Text("submits for the verdict")
-                            .font(Typo.micro).foregroundStyle(Palette.inkFaintest)
-                    #else
-                        Text("send submits for the verdict")
-                            .font(Typo.micro).foregroundStyle(Palette.inkFaintest)
-                    #endif
-                }
-            } else {
+            // THE GUARD SPEAKS ONLY WHEN IT HAS SOMETHING TO SAY. This slot used
+            // to carry a standing line announcing that the outbound secret scan
+            // had not run yet and that sending is what runs it — true, and no use
+            // to anybody: it named an internal subsystem, promised a "verdict" on
+            // a trial the reader never knew about, and said "not yet checked"
+            // about the one thing they could not check. A review pane's job is to
+            // state what goes out, and "a thing you have not heard of has not
+            // happened yet" is not part of that.
+            //
+            // Nothing about the scan changed. It still runs daemon-side on the
+            // send itself (squelch-api/src/guard.rs), a clean pass still means the
+            // mail is already gone, and a match still stops the send dead and
+            // brings up the box below with the redacted kinds and the override.
+            // The mechanism was never what needed explaining on a clean draft.
+            if !compose.guardKinds.isEmpty {
                 GuardVerdictBox(kinds: compose.guardKinds)
             }
         }
