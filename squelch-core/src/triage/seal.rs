@@ -24,7 +24,7 @@ const CONCRETE_CODE: &[&str] = &[
     // The code must be followed by a word naming it as one. Without that, any
     // year clears the bar: "2027 is your year" in a conference blast sealed as
     // a login code, and it beat the marketing guard on the way past.
-    r"\b\d{4,8}\s+is your\b[^\n]{0,40}?\b(code|otp|passcode|password|pin|token)\b",
+    r"\b\d{4,8}\s+is your\b[\s\S]{0,40}?\b(code|otp|passcode|password|pin|token)\b",
     // Likewise the code itself must follow, shaped like one (case-sensitive:
     // codes are upper/digits). "Your code is simpler with only one auth
     // pattern" is a developer newsletter talking about SOURCE code.
@@ -63,11 +63,16 @@ struct Detector {
     /// Phrases POINTING at a code rendered elsewhere in the mail. They name no
     /// code themselves, which is why a discount blast wears the same words
     /// ("use the code LUMA for 20% off"), so they seal only with a code-shaped
-    /// number near them.
+    /// token near them and no [`Self::discount`] marker as close.
     code_pointer: Vec<Regex>,
-    /// Any code-shaped number, wherever it sits. Only ever read as the thing a
+    /// A code-shaped token, wherever it sits: digits, or the mixed alphanumeric
+    /// a code generator emits (FHLSB8, Q7WKZ2). Case-sensitive, because prose
+    /// words are not codes. Only ever read as the thing a
     /// [`Self::code_pointer`] points at.
     code_run: Vec<Regex>,
+    /// Discount markers. A promo code is pointed at in exactly the words a
+    /// login code is, so one of these beside a pointer takes it away.
+    discount: Vec<Regex>,
     /// Marketing / newsletter markers. When these fire, topical auth mentions are
     /// ignored: an auth vendor's newsletter discusses 2FA/SSO/magic-links as
     /// PRODUCTS, and a real auth email is transactional, never a blast.
@@ -146,8 +151,26 @@ fn detector() -> &'static Detector {
         code_pointer: vec![
             rx(r"\buse (this|the)( following)? code\b"),
             rx(r"\b(the )?code below\b"),
+            // Loose on purpose: "your code is below/attached/here" points at a
+            // code this battery cannot see. The strict inline form lives in
+            // CONCRETE_CODE and seals on its own.
+            rx(r"\byour code is\b"),
+            rx(r"\bhere('?s| is) your code\b"),
         ],
-        code_run: vec![rx(r"\b\d{4,8}\b")],
+        code_run: vec![
+            rx(r"\b\d{4,8}\b"),
+            rx(r"(?-i:\b[A-Z]{1,9}\d[A-Z0-9]{0,8}\b)"),
+            rx(r"(?-i:\b\d[A-Z][A-Z0-9]{2,8}\b)"),
+        ],
+        discount: vec![
+            rx(r"\b\d{1,3}%\s*(off|discount)\b"),
+            rx(r"\boff (your|the) (first |next )?(order|purchase|ticket|booking|stay)\b"),
+            rx(r"\bpromo(tional)? code\b"),
+            rx(r"\bcoupon\b"),
+            rx(r"\bdiscount\b"),
+            rx(r"\bat checkout\b"),
+            rx(r"\bearly bird\b"),
+        ],
         marketing: vec![
             rx(r"\bunsubscribe\b"),
             rx(r"\bview (this )?(email|message)?\s*in (your )?browser\b"),
@@ -202,10 +225,23 @@ pub fn detect_sealed(input: &SealInput) -> Option<SealedKind> {
                 near(&hits, &near_by, CODE_PHRASE_WINDOW)
             })
     };
-    if vouched(&[&d.otp, &d.magic_link, &d.verification], &d.code_line)
-        || vouched(&[&d.code_pointer], &d.code_run)
-    {
+    if vouched(&[&d.otp, &d.magic_link, &d.verification], &d.code_line) {
         return Some(SealedKind::Otp);
+    }
+    // The pointer arm measures both surfaces on one ruler, since a pointer in
+    // the subject points at a code near the top of the body. Joining them costs
+    // a copy of the message, so it happens only once a pointer is actually
+    // there.
+    if any(&d.code_pointer, &hay) {
+        let joined = format!("{}\n{}", subject.as_ref(), body.as_ref());
+        let discounts = spans(&d.discount, &joined);
+        let live: Vec<_> = spans(&d.code_pointer, &joined)
+            .into_iter()
+            .filter(|p| !near(&[*p], &discounts, CODE_PHRASE_WINDOW))
+            .collect();
+        if near(&live, &spans(&d.code_run, &joined), CODE_PHRASE_WINDOW) {
+            return Some(SealedKind::Otp);
+        }
     }
 
     // Auth-vendor newsletters discuss 2FA / SSO / magic-links as PRODUCTS; those
@@ -634,16 +670,39 @@ mod tests {
             )),
             None,
         );
-        // The same pointer with an actual code near it still seals.
+        // A discount marker beside the pointer takes it away even when the
+        // promo code IS code-shaped.
         assert_eq!(
-            detect_sealed(&inp(
-                "Sign in",
-                "Use the code below to continue.\n\n482913\n",
+            detect_sealed(&inp_from(
+                "promo@shop.com",
+                "Weekend sale",
+                "Use the code SAVE20 for 20% off at checkout.",
             )),
-            Some(SealedKind::Otp),
+            None,
         );
+        // The same pointers with a real code near them still seal, including
+        // the alphanumeric a generator emits and the codes a pointer phrase
+        // leaves on their own line.
+        for b in [
+            "Use the code below to continue.\n\n482913\n",
+            "Use this code to continue: 482913",
+            "Use the code below to finish signing in:\n\nQ7WKZ2",
+            "Your code is below:\n\nFHLSB8\n\nIt expires in 10 minutes.",
+            "Here is your code:\n\nHX9PLM",
+        ] {
+            assert_eq!(
+                detect_sealed(&inp("Sign in", b)),
+                Some(SealedKind::Otp),
+                "pointed-at code missed: {b:?}"
+            );
+        }
+    }
+
+    /// A code split from its phrasing by the HTML flattener still seals.
+    #[test]
+    fn a_line_break_between_code_and_phrasing_still_seals() {
         assert_eq!(
-            detect_sealed(&inp("Sign in", "Use this code to continue: 482913")),
+            detect_sealed(&inp("", "482913 is your\nverification code")),
             Some(SealedKind::Otp),
         );
     }
