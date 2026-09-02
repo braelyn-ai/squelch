@@ -256,6 +256,23 @@ run_suite sealed-event \
   Sources/Passband/Model/EventBanner.swift \
   Tests/SealedEventTests.swift
 
+# Whether a search is a lookup or a question, the single-slot queue that keeps
+# the agent lane narrowing one need instead of restarting, and the prompt it
+# does that under. All three are pure by design (docs/SEARCH.md §5, §6): the
+# classifier decides to spend money on somebody's key, the slot's rule is only
+# ever wrong later, and a prompt's dashes and data markers are invisible on
+# screen. WireTypes rides along for SearchDiagnostics, SubjectText for the
+# marker sanitizer the hits block frames every subject with.
+run_suite search-intent \
+  Sources/Passband/Model/SubjectText.swift \
+  Sources/Passband/Model/WireTypes.swift \
+  Sources/Passband/Lib/Format.swift \
+  Sources/Passband/Lib/AsyncMemo.swift \
+  Sources/Passband/Lib/SearchIntent.swift \
+  Sources/Passband/Lib/RefinementSlot.swift \
+  Sources/Passband/Lib/SearchLanePrompt.swift \
+  Tests/SearchIntentTests.swift
+
 # The settings search. A ranking is the one kind of code where a green build
 # says nothing at all: the matcher compiles whatever weights it is given, and
 # only a fixture says whether "dark mode" lands on the theme switch. One file,
