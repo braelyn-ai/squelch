@@ -5216,6 +5216,18 @@ async fn stats_carry_the_capability_flags_the_client_gates_on() {
 }
 
 #[tokio::test]
+async fn stats_name_the_mailbox_this_daemon_serves() {
+    // The app has no other way to learn its own address, and it seeds the
+    // greeting's display name from the local part on a first run. Absence is
+    // reserved for a daemon too old to say, so this key is ALWAYS present.
+    let Harness { app, .. } = harness(|_, _| {});
+    let resp = app.oneshot(authed("GET", "/client/stats")).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+    assert_eq!(json["account_email"], Value::String("me@example.com".into()));
+}
+
+#[tokio::test]
 async fn stats_carry_gmail_inbox_unread_only_once_the_sync_loop_has_fetched_it() {
     // Never fetched (old DB, or every fetch so far failed): the key is ABSENT.
     // A zeroed object would read as "your inbox is clear", which is a claim this

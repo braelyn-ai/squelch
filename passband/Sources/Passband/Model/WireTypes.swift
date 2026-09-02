@@ -675,6 +675,13 @@ struct InboxUnread: Codable, Sendable, Hashable {
 
 struct StoreStats: Codable, Sendable, Hashable {
     var tier_counts: [String: Int]
+    /// The mailbox this daemon serves. The client's ONLY source for its own
+    /// address — nothing else on the human door names the account — and it is
+    /// what seeds the greeting's display name on a first run. ABSENT on a
+    /// daemon too old to say, so nil means "we do not know who this is", which
+    /// is not the same as an anonymous mailbox: nothing is seeded and the
+    /// greeting stays bare, exactly as it did before this field existed.
+    var account_email: String?
     var total: Int
     var sealed: Int
     var last_history_id: Int?

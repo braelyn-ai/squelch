@@ -1701,11 +1701,12 @@ pub async fn get_stats(State(state): State<ApiState>) -> Result<impl IntoRespons
     let day = Utc::now().format("%Y-%m-%d").to_string();
     // Band counts run under the same default window as the lists they head.
     let bands_since = Utc::now() - chrono::Duration::days(DEFAULT_UPDATES_WINDOW_DAYS);
-    let (stats, usage, unread) = store_call(&state, move |store, account_id| {
+    let (stats, usage, unread, email) = store_call(&state, move |store, account_id| {
         let stats = store.stats(account_id, bands_since)?;
         let usage = store.stage2_usage_today(account_id, &day)?;
         let unread = store.inbox_unread(account_id)?;
-        Ok((stats, usage, unread))
+        let email = store.account_email(account_id)?;
+        Ok((stats, usage, unread, email))
     })
     .await?;
 
@@ -1732,6 +1733,14 @@ pub async fn get_stats(State(state): State<ApiState>) -> Result<impl IntoRespons
         "cache_read_tokens_today": usage.cache_read_tokens,
         "est_cost_usd_today": est_cost_usd_today,
     });
+    // WHICH MAILBOX THIS IS. The client has never had a way to ask: every other
+    // door answers about mail, not about the account behind it, so the app knew
+    // the daemon's host and nothing about the human. It needs the address to
+    // seed a display name on a first run (the local part, until the human says
+    // otherwise), and it is the account's own address — the same string the
+    // send path already puts in `From` — so no confidence is spent telling the
+    // human door about it. ALWAYS PRESENT: absence means an older daemon.
+    body["account_email"] = json!(email);
     // Gmail's own unread counts, as of the sync loop's last successful fetch.
     // The key is OMITTED when the counts were never fetched (older DB, or the
     // fetch has never succeeded) so a client reads absence, not "0 unread" —

@@ -174,11 +174,7 @@ struct MobileSitrepView: View {
     /// phone's measure — the brand's voice, said once, then out of the way.
     private var hero: some View {
         VStack(alignment: .leading, spacing: 3) {
-            Text(Self.greeting() + (prefs.userName.isEmpty ? "" : ", \(prefs.userName)"))
-                .font(Typo.micro)
-                .foregroundStyle(Palette.accent)
-                .textCase(.uppercase)
-                .tracking(0.6)
+            GreetingLine()
             Text(headline)
                 .font(Typo.hero(30))
                 .foregroundStyle(Palette.ink)
@@ -197,13 +193,6 @@ struct MobileSitrepView: View {
     /// dashboard metric, which is the opposite of the intent.
     private static func spell(_ n: Int) -> String {
         (0..<smallWords.count).contains(n) ? smallWords[n] : String(n)
-    }
-
-    private static func greeting(now: Date = Date()) -> String {
-        let h = Calendar.current.component(.hour, from: now)
-        if h < 12 { return "Good morning" }
-        if h < 18 { return "Good afternoon" }
-        return "Good evening"
     }
 
     private var headline: String {
