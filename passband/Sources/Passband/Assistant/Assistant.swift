@@ -401,6 +401,28 @@ final class AssistantSession {
     /// suspended tool call: it MUST be resumed before it can be dropped.
     private var parked: [PendingAction.ID: CheckedContinuation<ActionResolution, Never>] = [:]
 
+    /// HELD, NOT STOPPED. True from `pause()` until `resume()`, and `running`
+    /// stays true right through it: the conversation is open, its history and
+    /// cards are intact, and the loop is simply sitting at a boundary. See
+    /// `pause()` for why there are exactly two of those.
+    private(set) var isPaused = false
+    /// The loop, suspended at a boundary. Same contract as `parked`: a
+    /// continuation in here MUST be resumed before it can be dropped, or the
+    /// run task is leaked, suspended forever, holding its history.
+    private var pauseWaiter: CheckedContinuation<Void, Never>?
+
+    /// The one refinement waiting to be delivered, and the count that decides
+    /// when a conversation has been narrowed so often that it is a different
+    /// search. See RefinementSlot and docs/SEARCH.md §6.2.
+    private var refinements = RefinementSlot<Refinement>()
+
+    /// One narrowing of the same search: the reader's newer words, and what the
+    /// local list has found for them by now.
+    private struct Refinement: Sendable {
+        var text: String
+        var hits: [SearchLanePrompt.Hit]
+    }
+
     /// Where `history` stood before the live run appended anything, so a failed
     /// run can put it back (see `end`).
     private var rollbackMark = 0
@@ -438,6 +460,13 @@ final class AssistantSession {
     /// the moment the question was asked. Empty for the chat, which has no such
     /// thing, and defaulted so every existing caller reads unchanged.
     func send(_ text: String, openEmail: OpenEmailContext?, hits: [SearchHit] = []) {
+        start(text, openEmail: openEmail, hits: Self.promptHits(hits))
+    }
+
+    /// The one door every question goes through, first or refined, with the
+    /// local hits already reduced to what the prompt states.
+    private func start(_ text: String, openEmail: OpenEmailContext?, hits: [SearchLanePrompt.Hit])
+    {
         let question = text.trimmed
         guard !question.isEmpty, !running else { return }
         // The switch note keys off questions ASKED, not bars glanced at:
@@ -452,11 +481,65 @@ final class AssistantSession {
             email: openEmail,
             sanitizedSubject: openEmail?.summary?.subject.markerSafeLine(cap: Self.subjectCap),
             switched: switched,
-            hits: Self.promptHits(hits))
+            hits: hits)
         activeAskEmail = openEmail
         running = true
         let gen = generation
         runTask = Task { [weak self] in await self?.run(question, pin: pin, gen: gen) }
+    }
+
+    /// THE SAME SEARCH, NARROWED. The reader keeps typing, the local list keeps
+    /// refetching, and the lane does not restart: every settled query after the
+    /// first reaches the conversation as a refinement (docs/SEARCH.md §6.2).
+    ///
+    /// Two doors, because there are two states to be in:
+    ///   * IDLE — a turn has finished — and it is simply the next user turn.
+    ///   * RUNNING, and it is queued for the next tool-result boundary, which
+    ///     is the only place a message can be inserted without breaking the
+    ///     tool_use/tool_result pairing this file is so insistent about.
+    ///
+    /// Refinements COALESCE: only the newest pending one is delivered, so
+    /// "abstract conf" then "abstract conference wifi" is one refinement, the
+    /// second. Past the twelfth the conversation is started fresh: somebody who
+    /// has narrowed a dozen times has changed the subject, and the history is
+    /// costing tokens to carry a search nobody is running any more.
+    func refine(_ text: String, hits: [SearchHit]) {
+        let words = text.trimmed
+        guard !words.isEmpty else { return }
+        let refinement = Refinement(text: words, hits: Self.promptHits(hits))
+        switch refinements.offer(refinement) {
+        case .restart:
+            clear()
+            start(words, openEmail: nil, hits: refinement.hits)
+        case .queued:
+            // Idle: nothing will reach a boundary, so this IS the next turn.
+            // Running: it waits, and `drainRefinement` delivers it — or, if the
+            // turn ends before any boundary comes, the run's own ending sends
+            // it as the next question.
+            guard !running else { return }
+            deliverPendingAsSend()
+        }
+    }
+
+    /// HOLD AT THE LOOP BOUNDARY. There is no such thing as pausing an HTTP
+    /// stream, so this does not try: the in-flight model turn is allowed to
+    /// finish (it is bounded by max_tokens and has already been paid for), and
+    /// then nothing else happens until `resume()`.
+    ///
+    /// A no-op when nothing is running, and that is load-bearing rather than
+    /// merely tidy: an idle session that latched this flag would hold its NEXT
+    /// question at the first boundary, with nobody left to press resume.
+    func pause() {
+        guard running else { return }
+        isPaused = true
+    }
+
+    /// Carry on from wherever the loop is sitting.
+    func resume() {
+        isPaused = false
+        guard let waiter = pauseWaiter else { return }
+        pauseWaiter = nil
+        waiter.resume()
     }
 
     /// Answer a confirm card. Idempotent: a second tap finds nothing parked.
@@ -481,6 +564,16 @@ final class AssistantSession {
         generation &+= 1
         for (_, continuation) in parked { continuation.resume(returning: .declined) }
         parked.removeAll()
+        // AND THE PAUSE, for exactly the same reason: a loop suspended at a
+        // boundary is a task waiting on a continuation, and one dropped without
+        // being resumed never runs its defer, never releases its history, and
+        // never ends. Resumed here it wakes into a stale generation and returns
+        // at the next `alive` check, which is the whole point of that check.
+        isPaused = false
+        if let waiter = pauseWaiter {
+            pauseWaiter = nil
+            waiter.resume()
+        }
         // LLMProxy.stream's onTermination takes the upstream connection down
         // with the consumer, so cancelling here really does stop the tokens.
         runTask?.cancel()
@@ -496,8 +589,15 @@ final class AssistantSession {
         citeOrder.removeAll()
         readIds.removeAll()
         shownIds.removeAll()
+        // A fresh conversation has been narrowed zero times, and the words
+        // somebody typed into the old one are not the new one's business.
+        refinements.reset()
         streamTick = 0
     }
+
+    /// How often this conversation has been narrowed, for the panel to show
+    /// without keeping a second counter of its own.
+    var refinementCount: Int { refinements.count }
 
     /// True while a turn is in flight with nothing written for it yet — the
     /// tray's "working…" row. Suppressed wherever the row above ALREADY says
@@ -523,6 +623,14 @@ final class AssistantSession {
             if gen == generation {
                 running = false
                 runTask = nil
+                // A HOLD BELONGS TO A RUNNING LOOP. This one has ended, so a
+                // flag still set here would hold the NEXT question at its first
+                // boundary with nothing on screen asking anybody to resume.
+                isPaused = false
+                // A refinement that arrived after the last boundary is simply
+                // the next question — §6.2's idle rule, applied to the case
+                // where the turn ended before any boundary came.
+                deliverPendingAsSend()
             }
         }
 
@@ -588,6 +696,15 @@ final class AssistantSession {
         let encoder = JSONEncoder()
 
         for _ in 0..<Self.maxTurns {
+            guard alive(gen) else { return }
+            // PAUSE BOUNDARY 1 OF 2: before the next provider request. Together
+            // with the one before each tool call these are the ONLY two places
+            // a hold can sit, because they are the only two where this loop is
+            // about to START something new — everything between them is either
+            // an HTTP stream that cannot be paused (only cancelled, which loses
+            // what has been paid for) or bookkeeping about what already
+            // happened. See `pause()`.
+            await holdWhilePaused()
             guard alive(gen) else { return }
 
             let body: Data
@@ -676,12 +793,34 @@ final class AssistantSession {
                                     "generation was cut off before this call could run"),
                                 isError: true))
                     } else {
+                        // PAUSE BOUNDARY 2 OF 2: before each tool call. A tool
+                        // call is work with a side effect somewhere (a daemon
+                        // read, and in the chat lane a card the human is asked
+                        // to answer), so a held session must not start one. The
+                        // results already collected stay collected: the loop
+                        // resumes into this same iteration and finishes
+                        // answering every tool_use, which is the invariant
+                        // above.
+                        await holdWhilePaused()
+                        guard alive(gen) else { return }
                         results.append(
                             await execute(
                                 call, malformed: turn.malformed.contains(call.id), gen: gen))
                     }
                 }
                 guard alive(gen) else { return }
+                // THE ONE PLACE A REFINEMENT CAN BE INSERTED. It rides as a
+                // text block on the SAME user message as this turn's
+                // tool_result blocks — the provider takes text after results —
+                // because anywhere else would either split the results from
+                // their tool_use or arrive as a second user turn in a row.
+                if let refinement = refinements.take() {
+                    append(.user, text: refinement.text)
+                    results.append(
+                        .text(
+                            SearchLanePrompt.refinement(
+                                text: refinement.text, hits: refinement.hits)))
+                }
                 history.append(.init(role: "user", content: .blocks(results)))
                 if cutOff {
                     fail(Self.cutOffText(turn.stopReason))
@@ -866,6 +1005,31 @@ final class AssistantSession {
             readIds.append(threadId)
         }
         return answer
+    }
+
+    /// Sit still while the session is paused. Returns immediately when it is
+    /// not, which is every call in the ⌘K chat: nothing pauses that lane.
+    ///
+    /// ONE WAITER AT A TIME, and the loop is what guarantees it: a session runs
+    /// a single run task, and that task is inside this await for as long as it
+    /// holds. `resume()` and `clear()` are the only two things that resume it,
+    /// and both nil the slot before they do.
+    private func holdWhilePaused() async {
+        guard isPaused else { return }
+        await withCheckedContinuation { continuation in
+            pauseWaiter = continuation
+        }
+    }
+
+    /// Send the pending refinement as the next question, if there is one and
+    /// nothing is running. The idle half of §6.2, in one place because two
+    /// callers reach it: `refine` on an idle session, and a run ending with a
+    /// refinement that never met a boundary.
+    private func deliverPendingAsSend() {
+        guard !running, let refinement = refinements.take() else { return }
+        // Through the same door a first question uses, so a refined search and
+        // a fresh one are the same run from here on.
+        start(refinement.text, openEmail: nil, hits: refinement.hits)
     }
 
     private func gate() -> ActionGate {
