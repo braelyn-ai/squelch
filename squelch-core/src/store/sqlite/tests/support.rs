@@ -541,6 +541,8 @@ pub(super) fn new_event(acct: AccountId, message_id: i64) -> NewEvent {
         sender: "alice@example.com".to_string(),
         one_line: format!("line {message_id}"),
         deadline: None,
+        // An ordinary event. The sealed-routing tests set this explicitly.
+        sealed_kind: None,
     }
 }
 

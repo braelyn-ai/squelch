@@ -63,6 +63,15 @@ pub struct ApiState {
     /// The CONFIG/ENV-layer Stage-1 GLOBAL daily cap (Stage-1's only scope),
     /// reported by `/client/triage-config` when no runtime override row exists.
     pub(crate) stage1_global_daily_cap: u32,
+    /// The configured NOTIFY model id, surfaced as the label on `/client/usage`'s
+    /// `notify` category.
+    pub(crate) notify_model: Arc<str>,
+    /// Per-MTok prices of [`ApiState::notify_model`]. THEIR OWN NUMBERS: the
+    /// fast lane is the one ledger category that runs neither the Stage-2 model
+    /// nor the Stage-1 one, so pricing it off either would misreport the lane by
+    /// the whole ratio between a small model and a capable one.
+    pub(crate) notify_price_in_per_mtok: f64,
+    pub(crate) notify_price_out_per_mtok: f64,
     /// Manual-refresh signal shared with the Gmail sync loop, fired by
     /// `POST /client/refresh`. `None` when no sync loop is wired in, which the
     /// endpoint reports as `triggered: false` rather than faking a poke.
@@ -343,6 +352,14 @@ impl ApiState {
             stage1_price_out_per_mtok: squelch_core::config::Stage1Config::default()
                 .price_out_per_mtok,
             stage1_global_daily_cap: squelch_core::config::Stage1Config::default().global_daily_cap,
+            notify_model: {
+                let n = squelch_core::config::NotifyConfig::default();
+                Arc::from(n.model.as_str())
+            },
+            notify_price_in_per_mtok: squelch_core::config::NotifyConfig::default()
+                .price_in_per_mtok,
+            notify_price_out_per_mtok: squelch_core::config::NotifyConfig::default()
+                .price_out_per_mtok,
             refresh: None,
             spam_refresh: None,
             event_notifier: None,
@@ -650,6 +667,22 @@ impl ApiState {
         self
     }
 
+    /// Set the NOTIFY model + its per-MTok prices, which `/client/usage` costs
+    /// the `notify` category with. Its OWN entry point rather than a fourth and
+    /// fifth argument on [`ApiState::with_stage1_config`], because the whole
+    /// point of the category is that it is not Stage-1's model.
+    pub fn with_notify_config(
+        mut self,
+        model: impl Into<String>,
+        price_in_per_mtok: f64,
+        price_out_per_mtok: f64,
+    ) -> Self {
+        self.notify_model = Arc::from(model.into().as_str());
+        self.notify_price_in_per_mtok = price_in_per_mtok;
+        self.notify_price_out_per_mtok = price_out_per_mtok;
+        self
+    }
+
     /// TEST HOOK: attach a write-credential store AND a mock Gmail API base so
     /// action handlers run end-to-end without live Gmail. Never used in production.
     #[doc(hidden)]
@@ -778,6 +811,14 @@ impl ApiState {
                 cfg.stage1.price_in_per_mtok,
                 cfg.stage1.price_out_per_mtok,
                 cfg.stage1.global_daily_cap,
+            )
+            // The notify fast lane's model and prices. Threaded here for the
+            // same reason every other knob is: a price left at its default while
+            // the model moved is how a ledger starts lying quietly.
+            .with_notify_config(
+                cfg.notify.model.clone(),
+                cfg.notify.price_in_per_mtok,
+                cfg.notify.price_out_per_mtok,
             )
             .with_tracking_base_url(cfg.tracking.base_url.clone())
             .with_console_allow_insecure_cookie(cfg.console.allow_insecure_cookie)

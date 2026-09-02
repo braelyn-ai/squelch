@@ -213,7 +213,8 @@ carry no body-derived content**. `one_line` is generated from `sealed_kind`
 alone: "Login code arrived", "Password reset requested". Never the subject,
 never the code. This belongs in SECURITY.md's "Do not break" list, because it
 is exactly the kind of thing a later change "improves" by making the
-notification more useful.
+notification more useful. It is there now: docs/SECURITY.md §4, "Sealed
+notifications, and the five things that keep them safe".
 
 The code itself stays behind `/client/sealed/{id}/reveal`, which already writes
 the audit row before returning. Tap, Face ID, code.
@@ -301,14 +302,20 @@ the disagreement rate before shipping rather than arguing about it.
 
 ## 10. Do not break
 
+The first two live in docs/SECURITY.md §4 as well, which is the copy a security
+review reads; they must stay the same rule in both places.
+
 - Seal detection stays the first thing that touches a parsed body. The fast
-  lane runs *after* it and never sees a sealed body.
+  lane runs *after* it and never sees a sealed body: `Candidate::Sealed` has no
+  body field, so the sealed path cannot read what it does not have.
 - A sealed event row carries `sealed_kind`-derived text only. No subject, no
   body, no code. `events` is not gated on `sensitivity` and must not need to be.
 - The fast lane may only add a buzz. Nothing it does may mark a row in a way
   that stops Stage-1 from emitting its own.
-- `suppressed` is not `declined_by_model`. Only the latter is rescuable.
-- The decline ledger is append-only.
+- `suppressed` is not `declined_by_model`. Only the latter is rescuable. They
+  are separate refusals in the code (`events::Refusal`) rather than a
+  distinction the call sites re-derive.
+- The decline ledger is append-only, and carries no email-derived text.
 
 ## 11. Locked contract
 
@@ -699,6 +706,38 @@ label, one `AtomicU64` per combination, every series rendered even at zero,
 - **Wave 2b: wiring.** `NotifyLane`, the spawn in `fetch_raw_and_ingest`, the
   deliberate-lane ledger writes at the three refine sites, metrics, the
   `docs/SECURITY.md` §4 "Do not break" additions, this doc's §10 kept true.
+
+  **Four deliberate departures from §11.5, all with their rationale in
+  `sync/notify_lane.rs` at the point of departure.** The build found things the
+  design missed; the code is right and this list is the record, not a TODO:
+
+  1. **`candidate` gates on `is_spam`**, which §11.5's gate list does not have.
+     The contract's order would have paid a model call to answer a question the
+     provider already answered, and §11.11's `GROUP BY lane, decision` therefore
+     has a silent class: spam produces no ledger row in either lane.
+  2. **No variant carries `eligible_at`**, which §11.5 puts on all three.
+     `candidate` still gates on the ingest-computed stamp; the value everything
+     is MEASURED from is the STORED one, which `run` reads once. They differ on
+     a re-ingest, and buzzing off the computed one would hand a backfilled row
+     (stamped NULL, silent forever) a fresh rescue window.
+  3. **`fast_enabled` is checked in `run_model`, after the no-model arm, not
+     in `candidate`.** It is the kill switch for the MODEL path: with a model
+     configured and the switch off the lane records `unavailable` (nobody
+     named, nobody asked) and the deliberate lane owns the buzz. Checked in
+     the gate it would also delete the seed fallback, which on a daemon with
+     no LLM at all is every notification the daemon has; and the seed must
+     never decide while a model IS configured, switch or no switch, per
+     §11.1's second call.
+  4. **The gateway model qualification tests the PROVIDER as well as the URL.**
+     `is_gateway_url` is `url != API_URL`, so an OpenAI endpoint reads as a
+     gateway and §11.5's one-liner would staple `anthropic/` onto the id, 400,
+     and park the lane forever on every OpenAI-configured daemon.
+
+  And two guards the contract has one of where the code needs two: the fast
+  lane's re-entry gate is the ledger probe **plus** an in-process in-flight set
+  (the probe's row is written last, so overlapping runs both pass it), and the
+  seal re-read happens **before the request** as well as before the event (see
+  docs/SECURITY.md §4).
 - **Wave 3 (Swift, independent of 2b):** the client half of §11.6. Runs
   beside Wave 2 because it touches only `passband/`.
 

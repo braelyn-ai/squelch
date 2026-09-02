@@ -222,8 +222,15 @@ impl Default for SyncConfig {
     }
 }
 
-/// Notification-event tunables: these three numbers are the whole
-/// non-structural policy for what earns a row in the `events` table.
+/// Notification tunables: the whole non-structural policy for what earns a row
+/// in the `events` table, plus the FAST LANE's own knobs (docs/NOTIFY.md §11.5).
+///
+/// The block splits in two. The first three numbers answer "is this verdict
+/// worth a buzz, and did we get to it in time" and are read by
+/// [`crate::triage::events`] at every emission site, deliberate lane included.
+/// Everything after them belongs to the ingest-time fast lane: which model it
+/// asks, how long it may take, how much of it may run at once, and what it
+/// costs. A daemon with no LLM configured reads only the first three.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct NotifyConfig {
@@ -256,6 +263,83 @@ pub struct NotifyConfig {
     /// from turning into a notification storm the moment it clears. Default
     /// 3600. Env: `SQUELCH_NOTIFY_RESCUE_WINDOW_SECS`.
     pub rescue_window_secs: u64,
+
+    // ---- the fast lane (docs/NOTIFY.md §11.5) ------------------------------
+    /// THE KILL SWITCH for the fast lane's MODEL path only. Off, the lane still
+    /// records what it can decide without asking anyone — a sealed ping and a
+    /// squelched sender — and for everything else it records `unavailable` and
+    /// steps aside: the deliberate lane keeps emitting as it does today, so
+    /// turning this off costs latency, never a notification.
+    ///
+    /// IT DOES NOT TOUCH THE SEED PATH. A daemon with no LLM configured has
+    /// only the heuristic seed, and the deliberate lane never runs there
+    /// (`stage1_pass`/`stage2_pass` need a `pass_setup()`), so the seed decides
+    /// whatever this switch says; that is docs/NOTIFY.md §11.1's second call,
+    /// and it is why the switch is read in
+    /// [`crate::sync::notify_lane::NotifyLane::run_model`] AFTER the no-model
+    /// arm rather than in the candidate gate. With a model configured the seed
+    /// must never decide, switch or no switch: a regex verdict nothing can
+    /// retract is exactly what the model path replaced.
+    /// Default true. Env: `SQUELCH_NOTIFY_FAST_ENABLED`.
+    pub fast_enabled: bool,
+    /// Whether a SEALED message may ring at all (docs/NOTIFY.md §11.6). Off
+    /// means the sealed path records nothing and emits nothing.
+    ///
+    /// DEFAULT FALSE, AND THAT IS AN ORDERING GUARD RATHER THAN A DESIGN HEDGE:
+    /// an app that predates `Event.sealed_kind` renders a sealed event as an
+    /// ordinary thread banner whose tap fetches a thread the seal makes the
+    /// daemon 404. It flips to true in the release that pairs this daemon with
+    /// a client that routes the tap to the auth flow. The daemon side is
+    /// complete either way. Env: `SQUELCH_NOTIFY_SEALED_ENABLED`.
+    pub sealed_enabled: bool,
+    /// The model the fast lane asks. A SMALL one on purpose: the question it
+    /// answers ("does this deserve to interrupt the phone right now") is asked
+    /// on every eligible message, at ingest, in front of a user waiting for a
+    /// buzz, and the deliberate lane is right behind it with the capable model.
+    /// Qualified with the gateway's provider prefix at call time, never here,
+    /// because the prefix is a property of the endpoint (see
+    /// [`crate::triage::llm::qualify_gateway_model`]). Default
+    /// `claude-haiku-4-5`. Env: `SQUELCH_NOTIFY_MODEL`.
+    pub model: String,
+    /// Reasoning depth for the notify call, sent as `output_config.effort`.
+    /// `None` by default, which is what the default model REQUIRES: Haiku 4.5
+    /// 400s on every call that carries the field. Env: `SQUELCH_NOTIFY_EFFORT`
+    /// (`none`/`off` clears it).
+    pub effort: Option<String>,
+    /// Body characters the notify prompt may carry, through the same fence
+    /// every other prompt uses. 1500 rather than Stage-1's several thousand:
+    /// the interrupt-worthiness of a message is decided by its opening, and
+    /// tokens here are latency a user is waiting on. Env:
+    /// `SQUELCH_NOTIFY_MAX_BODY_CHARS`.
+    pub max_body_chars: usize,
+    /// Hard ceiling on ONE fast-lane model call, retries included (there are
+    /// none: the lane makes a single attempt and the deliberate lane is the
+    /// retry). Past it the lane records `unavailable` and gets out of the way.
+    /// 8 seconds is chosen from the other side: a notification that lands a
+    /// quarter minute after the mail did is not a notification, it is a
+    /// surprise. Env: `SQUELCH_NOTIFY_FAST_TIMEOUT_SECS`.
+    pub fast_timeout_secs: u64,
+    /// Fast-lane calls allowed in flight at once (semaphore permits). Bounds a
+    /// burst of mail into a bounded number of sockets and a bounded share of
+    /// the gateway's rate limit; anything over it waits rather than fails.
+    /// Env: `SQUELCH_NOTIFY_FAST_CONCURRENCY`.
+    pub fast_concurrency: usize,
+    /// Per-account-per-day cap on fast-lane calls, counted in the same
+    /// `wake_budget` ledger as the stages but on its OWN key. Like
+    /// [`RevisitPassConfig::daily_cap`] it takes NO `app_settings` override:
+    /// this is a runaway guard, not a working budget. 1000 messages a day is
+    /// well past a real mailbox's eligible volume, and at the default model's
+    /// prices it is small change. Env: `SQUELCH_NOTIFY_DAILY_CAP`.
+    pub daily_cap: u32,
+    /// Per-MTok input price of [`NotifyConfig::model`], for the usage ledger.
+    /// ITS OWN NUMBER, not Stage-1's: the `notify` category runs a different
+    /// model, and pricing it at the stage-1 rates every extractor shares would
+    /// bill Haiku calls at Opus prices and overstate the lane by ~25x. Default
+    /// 1.0 (Haiku 4.5). Env: `SQUELCH_NOTIFY_PRICE_IN_PER_MTOK`.
+    pub price_in_per_mtok: f64,
+    /// Per-MTok output price of [`NotifyConfig::model`]. Default 5.0. Env:
+    /// `SQUELCH_NOTIFY_PRICE_OUT_PER_MTOK`.
+    pub price_out_per_mtok: f64,
 }
 
 impl Default for NotifyConfig {
@@ -264,6 +348,20 @@ impl Default for NotifyConfig {
             min_importance: 50,
             freshness_window_secs: 900,
             rescue_window_secs: 3600,
+            fast_enabled: true,
+            // OFF until a client ships that routes a sealed event's tap to the
+            // auth flow; see the field doc.
+            sealed_enabled: false,
+            model: "claude-haiku-4-5".to_string(),
+            // Haiku 4.5 has no effort support, and sending the field is a 400.
+            effort: None,
+            max_body_chars: 1500,
+            fast_timeout_secs: 8,
+            fast_concurrency: 4,
+            daily_cap: 1000,
+            // claude-haiku-4-5 per-MTok (input / output).
+            price_in_per_mtok: 1.0,
+            price_out_per_mtok: 5.0,
         }
     }
 }
@@ -1132,6 +1230,25 @@ pub struct ResolvedLlm {
     pub url: String,
 }
 
+/// WRITTEN BY HAND, and only `Clone`.
+///
+/// The fast lane (docs/NOTIFY.md §11.5) is an `Arc`-held struct built once from
+/// clones of what the engine already resolved, so it needs a copy of this. A
+/// `#[derive]` would be the obvious way to get one and is exactly what must not
+/// happen here: a derive list is where `Debug` gets added later, by someone
+/// adding a field and reaching for the usual attribute, and `Debug` on this
+/// struct puts an API key in whatever log line formats it. Spelling the one
+/// wanted impl out leaves nothing to append to.
+impl Clone for ResolvedLlm {
+    fn clone(&self) -> Self {
+        Self {
+            api_key: self.api_key.clone(),
+            provider: self.provider,
+            url: self.url.clone(),
+        }
+    }
+}
+
 /// The hosted assistant relay's credential + endpoint, resolved by
 /// [`Stage2Config::resolve_assistant`]. Like [`ResolvedLlm`], no `Debug` on
 /// purpose: `api_key` is key material and must never reach a log line.
@@ -1635,6 +1752,43 @@ impl Config {
         env_override(
             "SQUELCH_NOTIFY_RESCUE_WINDOW_SECS",
             &mut self.notify.rescue_window_secs,
+        );
+        // ---- the fast lane -------------------------------------------------
+        // Every knob reachable from the environment, because the deployment
+        // that most needs to move one is hosted, where there is no config file
+        // to edit. The two switches take the lenient bool parse the other flags
+        // do, so an unreadable value leaves the setting where it was rather
+        // than silently inverting it.
+        env_override("SQUELCH_NOTIFY_FAST_ENABLED", &mut self.notify.fast_enabled);
+        env_override(
+            "SQUELCH_NOTIFY_SEALED_ENABLED",
+            &mut self.notify.sealed_enabled,
+        );
+        env_override("SQUELCH_NOTIFY_MODEL", &mut self.notify.model);
+        // `env_override_effort`, not the plain one: repointing the lane at a
+        // model with no effort support has to be able to CLEAR the field, since
+        // sending it to such a model is a 400 on every call.
+        env_override_effort("SQUELCH_NOTIFY_EFFORT", &mut self.notify.effort);
+        env_override(
+            "SQUELCH_NOTIFY_MAX_BODY_CHARS",
+            &mut self.notify.max_body_chars,
+        );
+        env_override(
+            "SQUELCH_NOTIFY_FAST_TIMEOUT_SECS",
+            &mut self.notify.fast_timeout_secs,
+        );
+        env_override(
+            "SQUELCH_NOTIFY_FAST_CONCURRENCY",
+            &mut self.notify.fast_concurrency,
+        );
+        env_override("SQUELCH_NOTIFY_DAILY_CAP", &mut self.notify.daily_cap);
+        env_override(
+            "SQUELCH_NOTIFY_PRICE_IN_PER_MTOK",
+            &mut self.notify.price_in_per_mtok,
+        );
+        env_override(
+            "SQUELCH_NOTIFY_PRICE_OUT_PER_MTOK",
+            &mut self.notify.price_out_per_mtok,
         );
         // Which embedding weights this daemon loads. An env var so a fleet-wide
         // pin can be moved without cutting a new image, and validated where
@@ -3199,6 +3353,98 @@ backfill_days = 90
         // not the notify threshold; they must not alias.
         assert_eq!(c.default_min_importance, 0);
         unsafe { std::env::remove_var("SQUELCH_NOTIFY_MIN_IMPORTANCE") }
+    }
+
+    /// THE FAST LANE'S DEFAULTS, asserted one by one because two of them are
+    /// safety properties rather than taste: `sealed_enabled` is FALSE (a sealed
+    /// event on a client that predates `Event.sealed_kind` is a banner with a
+    /// dead tap, docs/NOTIFY.md §11.6), and `effort` is ABSENT because the
+    /// default model 400s on every call that carries the field.
+    #[test]
+    fn the_notify_fast_lane_ships_off_for_sealed_and_effortless_by_default() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let c = Config::default();
+        assert!(c.notify.fast_enabled, "the model path is on");
+        assert!(
+            !c.notify.sealed_enabled,
+            "sealed rings only once a client can route the tap"
+        );
+        assert_eq!(c.notify.model, "claude-haiku-4-5");
+        assert_eq!(
+            c.notify.effort, None,
+            "Haiku 4.5 rejects the effort field outright"
+        );
+        assert_eq!(c.notify.max_body_chars, 1500);
+        assert_eq!(c.notify.fast_timeout_secs, 8);
+        assert_eq!(c.notify.fast_concurrency, 4);
+        assert_eq!(c.notify.daily_cap, 1000);
+        assert_eq!(c.notify.price_in_per_mtok, 1.0);
+        assert_eq!(c.notify.price_out_per_mtok, 5.0);
+        // NOT Stage-1's prices. The lane runs a different model, and pricing it
+        // at the rates every extractor shares is how the ledger would bill a
+        // Haiku call at Opus rates.
+        assert_ne!(c.notify.price_in_per_mtok, c.stage1.price_in_per_mtok);
+
+        // A TOML that never mentions the fast lane gets exactly these values:
+        // `#[serde(default)]` on the struct means an existing config file needs
+        // no edit to keep working.
+        let c: Config = toml::from_str("[notify]\nmin_importance = 60\n").unwrap();
+        assert_eq!(c.notify.min_importance, 60, "the file's own value");
+        assert_eq!(c.notify.model, "claude-haiku-4-5");
+        assert!(c.notify.fast_enabled);
+        assert!(!c.notify.sealed_enabled);
+        assert_eq!(c.notify.fast_timeout_secs, 8);
+    }
+
+    /// The knobs a hosted operator has to be able to move without a config
+    /// file: the model, the effort field (INCLUDING clearing it), and the
+    /// sealed switch that gates a whole notification class.
+    #[test]
+    fn notify_fast_lane_env_overrides_reach_the_model_effort_and_sealed_switch() {
+        let _g = ENV_LOCK.lock().unwrap();
+        // SAFETY: guarded by ENV_LOCK.
+        unsafe {
+            std::env::set_var("SQUELCH_NOTIFY_MODEL", "claude-sonnet-5");
+            std::env::set_var("SQUELCH_NOTIFY_EFFORT", "low");
+            std::env::set_var("SQUELCH_NOTIFY_SEALED_ENABLED", "true");
+            std::env::set_var("SQUELCH_NOTIFY_FAST_ENABLED", "false");
+            std::env::set_var("SQUELCH_NOTIFY_DAILY_CAP", "25");
+            std::env::set_var("SQUELCH_NOTIFY_PRICE_IN_PER_MTOK", "3.0");
+        }
+        let mut c: Config =
+            toml::from_str("[notify]\nmodel = \"from-the-file\"\nsealed_enabled = false\n")
+                .unwrap();
+        assert_eq!(c.notify.model, "from-the-file", "the file, before env");
+        c.apply_env_overrides();
+        assert_eq!(c.notify.model, "claude-sonnet-5", "env beats the file");
+        assert_eq!(c.notify.effort.as_deref(), Some("low"));
+        assert!(c.notify.sealed_enabled, "the release knob flips from env");
+        assert!(!c.notify.fast_enabled, "and so does the kill switch");
+        assert_eq!(c.notify.daily_cap, 25);
+        assert_eq!(c.notify.price_in_per_mtok, 3.0);
+
+        // CLEARING the effort is the case that matters: an operator repointing
+        // the lane at a model with no effort support must be able to drop the
+        // field, since sending it is a 400 on every call.
+        unsafe { std::env::set_var("SQUELCH_NOTIFY_EFFORT", "none") }
+        let mut c = Config {
+            notify: NotifyConfig {
+                effort: Some("high".to_string()),
+                ..NotifyConfig::default()
+            },
+            ..Config::default()
+        };
+        c.apply_env_overrides();
+        assert_eq!(c.notify.effort, None);
+
+        unsafe {
+            std::env::remove_var("SQUELCH_NOTIFY_MODEL");
+            std::env::remove_var("SQUELCH_NOTIFY_EFFORT");
+            std::env::remove_var("SQUELCH_NOTIFY_SEALED_ENABLED");
+            std::env::remove_var("SQUELCH_NOTIFY_FAST_ENABLED");
+            std::env::remove_var("SQUELCH_NOTIFY_DAILY_CAP");
+            std::env::remove_var("SQUELCH_NOTIFY_PRICE_IN_PER_MTOK");
+        }
     }
 
     /// Both notify WINDOWS take an env override, and they are separate knobs:

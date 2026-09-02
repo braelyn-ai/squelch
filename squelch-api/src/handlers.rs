@@ -1973,9 +1973,13 @@ pub async fn get_usage(
         state.stage2_price_out_per_mtok,
     );
 
-    // One entry per ledger category. Only Stage-2 runs the capable model and its
-    // prices; EVERYTHING ELSE — Stage-1 and every extractor — runs the stage-1
-    // small model and shares its config, so it costs at stage-1 rates. See
+    // One entry per ledger category, priced by THREE arms. Stage-2 runs the
+    // capable model and its prices. `notify` runs the fast lane's own small
+    // model and ITS prices (docs/NOTIFY.md §11.5): it is the one category that
+    // is neither, and folding it into the arm below would bill a Haiku call at
+    // Opus rates and overstate the cheapest pass in the pipeline by ~25x.
+    // EVERYTHING ELSE — Stage-1 and every extractor — runs the stage-1 small
+    // model and shares its config, so it costs at stage-1 rates. See
     // `extract_pass`: "Extractors run on the STAGE-1 (small) model and share its
     // config + cap."
     //
@@ -1994,22 +1998,27 @@ pub async fn get_usage(
 
     let mut categories = serde_json::Map::new();
     for (name, rows) in &listed {
-        let is_stage2 = name == "stage2";
-        let (price_in, price_out) = if is_stage2 {
+        // ONE match, so the model label and the prices can never come from
+        // different arms: a category priced as Stage-1 but labelled with the
+        // notify model would read as a 25x cost regression in the app.
+        let (model, price_in, price_out) = if name == "stage2" {
             (
+                state.stage2_model.as_ref(),
                 state.stage2_price_in_per_mtok,
                 state.stage2_price_out_per_mtok,
             )
+        } else if name == squelch_core::metrics::NOTIFY_USAGE_CATEGORY {
+            (
+                state.notify_model.as_ref(),
+                state.notify_price_in_per_mtok,
+                state.notify_price_out_per_mtok,
+            )
         } else {
             (
+                state.stage1_model.as_ref(),
                 state.stage1_price_in_per_mtok,
                 state.stage1_price_out_per_mtok,
             )
-        };
-        let model = if is_stage2 {
-            state.stage2_model.as_ref()
-        } else {
-            state.stage1_model.as_ref()
         };
         let (out_rows, totals) = rollup(rows.clone(), price_in, price_out);
         categories.insert(

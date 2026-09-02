@@ -165,70 +165,79 @@ pub enum RevisitVerdict {
     Fallback,
 }
 
-/// WHICH LANE decided a notification. The two answer different questions and
-/// want opposite error profiles: the fast lane is recall-biased and runs at
-/// ingest, the deliberate lane is the triage verdict that comes behind it and
-/// can only ADD a buzz the fast lane declined (docs/NOTIFY.md §3).
-///
-/// A closed enum, like every other label axis in this file: a label is a series,
-/// and a series is forever.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum NotifyLane {
-    /// At ingest, on the notify model. Not wired up until Wave 2; its series
-    /// exist from this wave so a dashboard reads correctly from the first
-    /// scrape after they start moving.
-    Fast,
-    /// The triage passes' own emission sites (Stage-1 apply, the seed fallback,
-    /// Stage-2 apply).
-    Deliberate,
-}
-
-impl NotifyLane {
-    /// Exposition order.
-    const ALL: [Self; 2] = [Self::Fast, Self::Deliberate];
-
-    fn label(self) -> &'static str {
-        match self {
-            Self::Fast => "fast",
-            Self::Deliberate => "deliberate",
-        }
+// Declared through `str_enum!` rather than by hand because these labels are ALSO
+// the stored vocabulary; see the doc comment on the enum itself.
+crate::types::str_enum! {
+    /// WHICH LANE decided a notification. The two answer different questions and
+    /// want opposite error profiles: the fast lane is recall-biased and runs at
+    /// ingest, the deliberate lane is the triage verdict that comes behind it
+    /// and can only ADD a buzz the fast lane declined (docs/NOTIFY.md §3).
+    ///
+    /// A closed enum, like every other label axis in this file: a label is a
+    /// series, and a series is forever.
+    ///
+    /// IT IS ALSO THE STORED VOCABULARY. `notify_decisions.lane` holds exactly
+    /// these strings (docs/NOTIFY.md §11.4), so `as_str`/`parse` come from the
+    /// ONE variant→literal table `str_enum!` builds rather than from a metrics
+    /// label and a separate SQL literal free to drift from it. A drift there
+    /// would not be a wrong graph, it would be a ledger whose rows the eval
+    /// query cannot read back.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum NotifyLane {
+        /// At ingest, on the notify model (`sync::notify_lane`).
+        Fast => "fast",
+        /// The triage passes' own emission sites (Stage-1 apply, the seed
+        /// fallback, Stage-2 apply).
+        Deliberate => "deliberate",
     }
 }
 
-/// What one lane decided about one message. ONE closed set for both lanes, so
-/// the cross-lane questions (rescued, overturned, confirmed) are joins over the
-/// same vocabulary rather than two vocabularies that have to be reconciled.
-///
-/// `Suppressed` IS NOT `DeclinedByModel`, and the split is load-bearing: a
-/// structural gate (a Squelch/Filtered rule, the user's own sent copy) is "never
-/// a candidate", not "the model said no". Folding them together would make the
-/// notify model's false-negative rate read catastrophic for no reason, and would
-/// let a rescue path that asks only "was this declined?" fire on a row it must
-/// never touch.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum NotifyDecision {
-    /// This lane appended the `events` row.
-    Sent,
-    /// Buzz-worthy, but an event already existed (the other lane got there
-    /// first). `UNIQUE(message_id)` means a sent buzz is never rewritten.
-    WouldSend,
-    /// A model scored it and it fell below the line. RESCUABLE.
-    DeclinedByModel,
-    /// No model answer at all: no key, timeout, budget, transport, config
-    /// failure. RESCUABLE.
-    Unavailable,
-    /// A structural gate silenced an ELIGIBLE message (Squelch/Filtered rule).
-    Suppressed,
-    /// Eligible and worthy, but past `notify.rescue_window_secs` by the time
-    /// this lane reached it. THE DROP THAT USED TO BE SILENT: 24.7% of
-    /// notify-worthy mail produced no event ever, with no counter and no log
-    /// line to say so (docs/NOTIFY.md §2a).
-    Expired,
+impl NotifyLane {
+    /// Exposition order, and the index into a lane's decision row.
+    pub const ALL: [Self; 2] = [Self::Fast, Self::Deliberate];
+}
+
+crate::types::str_enum! {
+    /// What one lane decided about one message. ONE closed set for both lanes,
+    /// so the cross-lane questions (rescued, overturned, confirmed) are joins
+    /// over the same vocabulary rather than two that have to be reconciled.
+    ///
+    /// `Suppressed` IS NOT `DeclinedByModel`, and the split is load-bearing: a
+    /// structural gate (a Squelch/Filtered rule, the user's own sent copy) is
+    /// "never a candidate", not "the model said no". Folding them together would
+    /// make the notify model's false-negative rate read catastrophic for no
+    /// reason, and would let a rescue path that asks only "was this declined?"
+    /// fire on a row it must never touch.
+    ///
+    /// Like [`NotifyLane`], this is ALSO the stored vocabulary:
+    /// `notify_decisions.decision` holds exactly these strings, one closed set
+    /// for both the metric and the ledger.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum NotifyDecision {
+        /// This lane appended the `events` row.
+        Sent => "sent",
+        /// Buzz-worthy, but an event already existed (the other lane got there
+        /// first). `UNIQUE(message_id)` means a sent buzz is never rewritten.
+        WouldSend => "would_send",
+        /// A model scored it and it fell below the line. RESCUABLE.
+        DeclinedByModel => "declined_by_model",
+        /// No model answer at all: no key, timeout, budget, transport, config
+        /// failure. RESCUABLE.
+        Unavailable => "unavailable",
+        /// A structural gate silenced an ELIGIBLE message (Squelch/Filtered
+        /// rule).
+        Suppressed => "suppressed",
+        /// Eligible and worthy, but past `notify.rescue_window_secs` by the time
+        /// this lane reached it. THE DROP THAT USED TO BE SILENT: 24.7% of
+        /// notify-worthy mail produced no event ever, with no counter and no log
+        /// line to say so (docs/NOTIFY.md §2a).
+        Expired => "expired",
+    }
 }
 
 impl NotifyDecision {
     /// Exposition order; the index into a lane's decision row.
-    const ALL: [Self; 6] = [
+    pub const ALL: [Self; 6] = [
         Self::Sent,
         Self::WouldSend,
         Self::DeclinedByModel,
@@ -236,17 +245,6 @@ impl NotifyDecision {
         Self::Suppressed,
         Self::Expired,
     ];
-
-    fn label(self) -> &'static str {
-        match self {
-            Self::Sent => "sent",
-            Self::WouldSend => "would_send",
-            Self::DeclinedByModel => "declined_by_model",
-            Self::Unavailable => "unavailable",
-            Self::Suppressed => "suppressed",
-            Self::Expired => "expired",
-        }
-    }
 }
 
 /// What one row's trip through the Stage-2 escalation pass produced.
@@ -327,6 +325,17 @@ pub struct SyncMetrics {
     /// carries a sender, a subject or an id, which is what lets an
     /// unauthenticated scrape have it at all.
     notify_decisions: [[AtomicU64; NotifyDecision::ALL.len()]; NotifyLane::ALL.len()],
+
+    /// FIRST SIGHT TO EVENT ROW for the fast lane, in seconds: the number the
+    /// whole notify-lane redesign is judged on. One series, no labels — the
+    /// question is "how long after mail arrives does the phone buzz", and there
+    /// is nothing to break it down BY that would not be a message.
+    ///
+    /// Observed ONLY on a fast-lane `sent`. A decline has no latency worth
+    /// measuring (nothing was delivered), and folding one in would drag the
+    /// percentile toward whatever the model costs to say no, which is not what
+    /// anybody reading this graph is asking.
+    notify_fast: NotifyFastHistogram,
 
     /// Config-level LLM failures (a 4xx shared by every row: bad key,
     /// disallowed model, spent gateway budget — see
@@ -533,6 +542,18 @@ impl SyncMetrics {
         self.notify_decisions[lane as usize][decision as usize].fetch_add(1, Ordering::Relaxed);
     }
 
+    /// One fast-lane notification's age at the moment its `events` row landed,
+    /// measured from `triage.notify_eligible_at` — WHEN WE FIRST SAW the
+    /// message, not when the sender says they sent it.
+    ///
+    /// Call it on a `sent` and nowhere else: see [`SyncMetrics::notify_fast`].
+    /// A non-finite or negative value records as 0 rather than poisoning the
+    /// sum, because a clock that went backwards must not make a dashboard
+    /// unreadable for the rest of the process's life.
+    pub fn observe_notify_fast(&self, secs: f64) {
+        self.notify_fast.observe(secs);
+    }
+
     /// One config-level LLM failure (see [`crate::triage::llm::is_config_failure`]):
     /// the pass stopped, rows stayed queued, and no verdict landed. Every pass
     /// that breaks on a config failure counts here, so one series answers "is
@@ -583,6 +604,91 @@ impl SyncMetrics {
     fn get(&self, slot: &AtomicU64) -> f64 {
         slot.load(Ordering::Relaxed) as f64
     }
+}
+
+// --- notify fast-lane latency ---------------------------------------------------
+
+/// Upper bounds of the fast-lane notification histogram, in seconds, ascending.
+///
+/// A HUMAN-SCALE ladder, not the HTTP one: this measures mail arriving to a
+/// phone buzzing, where the interesting range is "immediate" to "too late" and
+/// nobody cares about the difference between 300ms and 400ms. 0.5 and 1 are the
+/// deterministic paths (a sealed ping, a suppressed row) and the fast happy
+/// case; 2, 4 and 8 bracket a model call, with 8 sitting exactly on
+/// `notify.fast_timeout_secs` so the bucket boundary and the timeout are the
+/// same number; and 16, 32, 60 are the tail that a `+Inf` alone would hide.
+/// Anything past 60s is the rescue window's problem, not this histogram's.
+pub const NOTIFY_FAST_BUCKETS: [f64; 8] = [0.5, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 60.0];
+
+/// One unlabeled histogram: fast-lane first sight to `events` row.
+///
+/// Buckets are stored NON-cumulative (an observation lands in exactly one) and
+/// cumulated at render, the same shape [`HttpSeries`] uses, so an observe is one
+/// atomic add rather than one per bound.
+#[derive(Debug, Default)]
+struct NotifyFastHistogram {
+    buckets: [AtomicU64; NOTIFY_FAST_BUCKETS.len()],
+    /// Observations above the top bound: the `+Inf` bucket's own share.
+    overflow: AtomicU64,
+    count: AtomicU64,
+    /// The sum in MILLISECONDS, so it stays an integer under an atomic;
+    /// rendered as seconds. Milliseconds rather than the HTTP histogram's
+    /// microseconds because this scale is seconds, not milliseconds, and a
+    /// microsecond sum would be counting to a trillion for no resolution
+    /// anybody reads.
+    sum_millis: AtomicU64,
+}
+
+impl NotifyFastHistogram {
+    fn observe(&self, seconds: f64) {
+        // A negative or non-finite duration is a clock that moved, not a fast
+        // notification: clamp rather than poison every percentile after it.
+        let seconds = if seconds.is_finite() {
+            seconds.max(0.0)
+        } else {
+            0.0
+        };
+        match NOTIFY_FAST_BUCKETS
+            .iter()
+            .position(|bound| seconds <= *bound)
+        {
+            Some(i) => self.buckets[i].fetch_add(1, Ordering::Relaxed),
+            None => self.overflow.fetch_add(1, Ordering::Relaxed),
+        };
+        self.count.fetch_add(1, Ordering::Relaxed);
+        self.sum_millis
+            .fetch_add((seconds * 1e3).round() as u64, Ordering::Relaxed);
+    }
+}
+
+/// The fast-lane latency histogram. PRESENT AT ZERO, like every other family
+/// here: a daemon that has not buzzed yet and a daemon whose scrape is broken
+/// must not look the same, and `histogram_quantile` over an absent family
+/// evaluates to nothing rather than to "no data yet".
+fn render_notify_fast(e: &mut Exposition, h: &NotifyFastHistogram) {
+    const NAME: &str = "squelchd_notify_fast_seconds";
+    e.family(
+        NAME,
+        MetricKind::Histogram,
+        "Fast-lane notification latency: from when the daemon first saw the message \
+         (triage.notify_eligible_at) to the events row landing. Observed on a fast-lane \
+         `sent` only, so a decline never drags the percentile.",
+    );
+    let bucket = format!("{NAME}_bucket");
+    let mut cumulative = 0u64;
+    for (i, bound) in NOTIFY_FAST_BUCKETS.iter().enumerate() {
+        cumulative += h.buckets[i].load(Ordering::Relaxed);
+        let le = fmt_value(*bound);
+        e.sample(&bucket, &[("le", le.as_str())], cumulative as f64);
+    }
+    let total = h.count.load(Ordering::Relaxed);
+    e.sample(&bucket, &[("le", "+Inf")], total as f64);
+    e.sample(
+        &format!("{NAME}_sum"),
+        &[],
+        h.sum_millis.load(Ordering::Relaxed) as f64 / 1e3,
+    );
+    e.sample(&format!("{NAME}_count"), &[], total as f64);
 }
 
 // --- HTTP latency --------------------------------------------------------------
@@ -977,11 +1083,26 @@ pub fn usage_from_ledger(rows: Vec<(String, Vec<Stage2UsageDay>)>) -> Vec<LlmCat
         .collect()
 }
 
-/// Estimated spend for a ledger rollup, costed exactly as `/client/usage` does:
-/// only `stage2` runs the capable model and its prices; Stage-1 and EVERY
-/// extractor share the stage-1 small model's config, so they cost at stage-1
-/// rates. Switching a model without updating its `price_*_per_mtok` makes this
-/// drift, there as here.
+/// The usage-ledger category the notify fast lane bills under, and the ONE
+/// spelling of it: the sync engine writes rows with it, and both cost estimators
+/// (here and `/client/usage`) price it off it. It exists as a shared const
+/// because it is the only category whose prices are neither Stage-1's nor
+/// Stage-2's, so a typo would not be a missing row, it would be a row costed at
+/// 25x by falling through to the Stage-1 arm.
+pub const NOTIFY_USAGE_CATEGORY: &str = "notify";
+
+/// Estimated spend for a ledger rollup, costed exactly as `/client/usage` does.
+/// THREE arms, not two: `stage2` runs the capable model and its prices,
+/// [`NOTIFY_USAGE_CATEGORY`] runs the small notify model and ITS prices, and
+/// everything else — Stage-1, every extractor, revisits — shares the stage-1
+/// small model's config, so it costs at stage-1 rates.
+///
+/// The notify arm is not a nicety. The fast lane runs on Haiku at roughly a
+/// thousandth of a dollar a message while Stage-1 runs Opus; folding it into the
+/// stage-1 arm would bill every notify call at ~25x what it cost and make the
+/// one lane cheap enough to run on every message look like the expensive one.
+/// Switching a model without updating its `price_*_per_mtok` makes this drift,
+/// there as here.
 pub fn estimate_cost_usd(usage: &[LlmCategoryUsage], config: &Config) -> f64 {
     usage
         .iter()
@@ -990,6 +1111,11 @@ pub fn estimate_cost_usd(usage: &[LlmCategoryUsage], config: &Config) -> f64 {
                 (
                     config.stage2.price_in_per_mtok,
                     config.stage2.price_out_per_mtok,
+                )
+            } else if u.category == NOTIFY_USAGE_CATEGORY {
+                (
+                    config.notify.price_in_per_mtok,
+                    config.notify.price_out_per_mtok,
                 )
             } else {
                 (
@@ -1136,10 +1262,13 @@ pub fn render(metrics: &SyncMetrics, db: Option<&StoreSnapshot>) -> String {
     }
 
     // ALL TWELVE SERIES, zeros included, and for the usual reason plus one of
-    // its own: the fast lane does not exist yet, so every `lane="fast"` series
-    // is 0 until Wave 2 wires it up — and a dashboard built now must keep
-    // reading correctly the day they start moving, rather than gaining panels
-    // that were silently empty because the series were absent.
+    // its own: most of these combinations are rare by design (a healthy daemon
+    // records almost nothing but `sent` and `would_send`), and an absent series
+    // and a zero one are the same picture on a graph and opposite facts in a
+    // query — `rate()` over a series that only appears once it moves has no
+    // baseline to rise from. `notify.sealed_enabled` and `notify.fast_enabled`
+    // are also knobs, so a whole lane can legitimately sit at zero for a
+    // release and must still graph.
     e.family(
         "squelchd_notify_decisions_total",
         MetricKind::Counter,
@@ -1151,11 +1280,16 @@ pub fn render(metrics: &SyncMetrics, db: Option<&StoreSnapshot>) -> String {
         for decision in NotifyDecision::ALL {
             e.sample(
                 "squelchd_notify_decisions_total",
-                &[("lane", lane.label()), ("decision", decision.label())],
+                &[("lane", lane.as_str()), ("decision", decision.as_str())],
                 metrics.get(&metrics.notify_decisions[lane as usize][decision as usize]),
             );
         }
     }
+
+    // Rendered right after the decisions family it belongs to: the count of
+    // `fast/sent` and the latency of those same sends are one story, and a
+    // dashboard that puts them side by side is reading the exposition in order.
+    render_notify_fast(&mut e, &metrics.notify_fast);
 
     e.scalar(
         "squelchd_llm_config_failures_total",
@@ -1412,10 +1546,9 @@ mod tests {
         ));
     }
 
-    /// THE DROP THAT USED TO BE SILENT gets a sample line, from this wave on.
-    /// Both axes are closed, so all twelve series are exported at zero and a
-    /// dashboard built before the fast lane exists keeps reading correctly the
-    /// day it starts moving.
+    /// THE DROP THAT USED TO BE SILENT gets a sample line. Both axes are
+    /// closed, so all twelve series are exported at zero and a dashboard reads
+    /// correctly through a release where a knob holds one lane quiet.
     #[test]
     fn notify_decisions_export_every_lane_and_decision_pair() {
         // A FRESH REGISTRY EXPORTS ALL TWELVE, AT ZERO. An absent series and a
@@ -1428,8 +1561,8 @@ mod tests {
             for decision in NotifyDecision::ALL {
                 let line = format!(
                     "squelchd_notify_decisions_total{{lane=\"{}\",decision=\"{}\"}} 0\n",
-                    lane.label(),
-                    decision.label()
+                    lane.as_str(),
+                    decision.as_str()
                 );
                 assert!(fresh.contains(&line), "missing at zero: {line}");
             }
@@ -1481,6 +1614,74 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    /// THE SAME STRINGS GO ON DISK. `notify_decisions.lane`/`.decision` store
+    /// these labels verbatim (docs/NOTIFY.md §11.4), so a variant whose written
+    /// form does not read back is not a cosmetic bug: it is a ledger row the
+    /// eval query silently drops. Round-tripping every variant is what makes
+    /// the metric label and the stored value one vocabulary rather than two.
+    #[test]
+    fn the_notify_labels_round_trip_because_they_are_also_the_stored_vocabulary() {
+        for lane in NotifyLane::ALL {
+            assert_eq!(NotifyLane::parse(lane.as_str()), Some(lane));
+        }
+        for decision in NotifyDecision::ALL {
+            assert_eq!(NotifyDecision::parse(decision.as_str()), Some(decision));
+        }
+        // An unknown string is None, never a default: a ledger row written by a
+        // newer daemon must read as unrecognized rather than as some other
+        // lane's decision.
+        assert_eq!(NotifyLane::parse("slow"), None);
+        assert_eq!(NotifyDecision::parse("declined"), None);
+    }
+
+    /// THE NUMBER THE WHOLE REDESIGN IS JUDGED ON, and it is present at zero
+    /// from the first scrape: `histogram_quantile` over an absent family
+    /// evaluates to nothing, so a daemon that has not buzzed yet would be
+    /// indistinguishable from a broken scrape on exactly the panel somebody
+    /// built to watch this land.
+    #[test]
+    fn the_fast_lane_histogram_is_present_at_zero_and_cumulates() {
+        let m = SyncMetrics::new();
+        let text = render(&m, None);
+        assert!(text.contains("# TYPE squelchd_notify_fast_seconds histogram\n"));
+        for le in ["0.5", "1", "2", "4", "8", "16", "32", "60", "+Inf"] {
+            let want = format!("squelchd_notify_fast_seconds_bucket{{le=\"{le}\"}} 0\n");
+            assert!(text.contains(&want), "missing {want:?} in\n{text}");
+        }
+        assert!(text.contains("squelchd_notify_fast_seconds_sum 0\n"));
+        assert!(text.contains("squelchd_notify_fast_seconds_count 0\n"));
+
+        // 0.4s = a sealed ping or a suppression, 3s = a model call, 90s = past
+        // every bound and therefore visible only in +Inf.
+        m.observe_notify_fast(0.4);
+        m.observe_notify_fast(3.0);
+        m.observe_notify_fast(90.0);
+        let text = render(&m, None);
+        for (le, n) in [
+            ("0.5", 1),
+            ("1", 1),
+            ("2", 1),
+            ("4", 2),
+            ("8", 2),
+            ("60", 2),
+            ("+Inf", 3),
+        ] {
+            let want = format!("squelchd_notify_fast_seconds_bucket{{le=\"{le}\"}} {n}\n");
+            assert!(text.contains(&want), "missing {want:?} in\n{text}");
+        }
+        assert!(text.contains("squelchd_notify_fast_seconds_sum 93.4\n"));
+        assert!(text.contains("squelchd_notify_fast_seconds_count 3\n"));
+
+        // A clock that moved backwards records as 0 rather than poisoning the
+        // sum for the life of the process.
+        m.observe_notify_fast(-5.0);
+        m.observe_notify_fast(f64::NAN);
+        let text = render(&m, None);
+        assert!(text.contains("squelchd_notify_fast_seconds_sum 93.4\n"));
+        assert!(text.contains("squelchd_notify_fast_seconds_count 5\n"));
+        assert!(text.contains("squelchd_notify_fast_seconds_bucket{le=\"0.5\"} 3\n"));
     }
 
     /// The LLM-health pair the 2026-08-19 outage went two days without: the
@@ -1667,6 +1868,42 @@ mod tests {
         ];
         let expected = config.stage2.price_in_per_mtok + config.stage1.price_in_per_mtok;
         assert!((estimate_cost_usd(&usage, &config) - expected).abs() < f64::EPSILON);
+    }
+
+    /// THE THIRD ARM. `notify` runs a different model from everything else in
+    /// the ledger and is priced off `notify.price_*`, not Stage-1's. Without
+    /// this arm the category falls through to the stage-1 rates every extractor
+    /// shares and the lane bills at ~25x what it cost, which would make the one
+    /// pass cheap enough to run on every message read as the expensive one.
+    #[test]
+    fn cost_prices_the_notify_category_off_its_own_model() {
+        let config = Config::default();
+        let one_mtok_in = |category: &str| {
+            vec![LlmCategoryUsage {
+                category: category.to_string(),
+                calls: 1,
+                input_tokens: 1_000_000,
+                output_tokens: 1_000_000,
+                cache_creation_tokens: 0,
+                cache_read_tokens: 0,
+            }]
+        };
+        let expected = config.notify.price_in_per_mtok + config.notify.price_out_per_mtok;
+        assert!(
+            (estimate_cost_usd(&one_mtok_in(NOTIFY_USAGE_CATEGORY), &config) - expected).abs()
+                < 1e-9
+        );
+        // And it is genuinely a different number from the arm it would have
+        // fallen through to, so this test cannot pass by coincidence.
+        assert!(
+            estimate_cost_usd(&one_mtok_in(NOTIFY_USAGE_CATEGORY), &config)
+                < estimate_cost_usd(&one_mtok_in("stage1"), &config),
+            "the small model must cost less than Stage-1's"
+        );
+        // A neighbouring category still costs at stage-1 rates: the arm is
+        // exact-match on the category, not a prefix.
+        let neighbour = estimate_cost_usd(&one_mtok_in("notify_something_else"), &config);
+        assert!((neighbour - estimate_cost_usd(&one_mtok_in("stage1"), &config)).abs() < 1e-9);
     }
 
     #[test]

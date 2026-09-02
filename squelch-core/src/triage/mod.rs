@@ -15,6 +15,7 @@ pub mod deadline;
 pub mod events;
 pub mod extract;
 pub mod llm;
+pub mod notify_llm;
 pub mod receipt;
 pub mod receipt_match;
 pub mod revisit;

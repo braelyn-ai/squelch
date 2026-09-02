@@ -865,6 +865,107 @@ fn migrate_adds_notify_eligible_at_null_to_a_preexisting_triage_table() {
 }
 
 #[test]
+fn migrate_adds_sealed_kind_null_to_a_preexisting_events_table() {
+    // An `events` table predating the sealed routing tag. The column has to land
+    // through the migration seam rather than schema.sql, because schema.sql's
+    // `CREATE TABLE IF NOT EXISTS` is a no-op against a table that already
+    // exists — and both event SELECTs plus `append_event` NAME the column, so a
+    // missing one is a hard "no such column" on the very first notification.
+    let conn = Connection::open_in_memory().unwrap();
+    conn.execute_batch(
+        "CREATE TABLE events(
+             id INTEGER PRIMARY KEY, account_id INTEGER NOT NULL,
+             message_id INTEGER NOT NULL UNIQUE, thread_id TEXT NOT NULL,
+             kind TEXT NOT NULL, tier TEXT NOT NULL, importance INTEGER NOT NULL,
+             sender TEXT NOT NULL, one_line TEXT NOT NULL, deadline TEXT,
+             created_at TEXT NOT NULL);
+         INSERT INTO events(id, account_id, message_id, thread_id, kind, tier, importance,
+                            sender, one_line, created_at)
+             VALUES (1, 1, 1, 't1', 'surfaced', 'signal', 70, 'a@x.com', 'old',
+                     '2026-08-01T00:00:00Z');",
+    )
+    .unwrap();
+    migrate(&conn).unwrap();
+    migrate(&conn).unwrap(); // idempotent
+    let mut stmt = conn.prepare("PRAGMA table_info(events)").unwrap();
+    let cols: Vec<String> = stmt
+        .query_map([], |r| r.get::<_, String>(1))
+        .unwrap()
+        .collect::<std::result::Result<_, _>>()
+        .unwrap();
+    assert!(cols.iter().any(|c| c == "sealed_kind"), "sealed_kind added");
+
+    // NOT BACKFILLED, and NULL is the honest reading rather than merely the
+    // convenient one: no historical event came from a sealed message, because
+    // the old emission path required sensitivity='normal'. There is no kind to
+    // recover, and a client reads NULL as "an ordinary event" — which is what
+    // every one of these rows is.
+    let kind: Option<String> = conn
+        .query_row("SELECT sealed_kind FROM events WHERE id=1", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(kind, None, "every pre-existing event rests at NULL");
+}
+
+/// The LEDGER needs no migration seam at all — it is a new TABLE, and
+/// `schema.sql` is all `CREATE ... IF NOT EXISTS` and runs in full on every
+/// open. This asserts the thing that claim depends on: an install that predates
+/// the table gets it, with its UNIQUE and its index, from `init` alone.
+#[test]
+fn init_creates_notify_decisions_on_a_db_that_predates_it() {
+    let (store, acct) = store();
+    let conn = store.lock().unwrap();
+
+    let mut stmt = conn.prepare("PRAGMA table_info(notify_decisions)").unwrap();
+    let cols: Vec<String> = stmt
+        .query_map([], |r| r.get::<_, String>(1))
+        .unwrap()
+        .collect::<std::result::Result<_, _>>()
+        .unwrap();
+    for expected in [
+        "id",
+        "account_id",
+        "message_id",
+        "lane",
+        "decision",
+        "notify_importance",
+        "model_used",
+        "latency_ms",
+        "created_at",
+    ] {
+        assert!(cols.iter().any(|c| c == expected), "missing {expected}");
+    }
+
+    // The UNIQUE is the append-only rule made structural, so it is worth an
+    // assertion of its own: a second row for the same (message, lane) is what
+    // `INSERT OR IGNORE` relies on to be a no-op instead of a duplicate.
+    let now = Utc::now().to_rfc3339();
+    conn.execute(
+        "INSERT INTO notify_decisions(account_id, message_id, lane, decision, created_at)
+         VALUES(?1, 1, 'fast', 'sent', ?2)",
+        params![acct, now],
+    )
+    .unwrap();
+    let dup = conn.execute(
+        "INSERT INTO notify_decisions(account_id, message_id, lane, decision, created_at)
+         VALUES(?1, 1, 'fast', 'expired', ?2)",
+        params![acct, now],
+    );
+    assert!(dup.is_err(), "UNIQUE(message_id, lane) is enforced");
+
+    let index: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master
+             WHERE type='index' AND name='idx_notify_decisions_account_created'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(index, 1, "the eval read's index ships with the table");
+}
+
+#[test]
 fn migrate_adds_content_id_null_to_a_preexisting_attachments_table() {
     // An install predating the cid column. The migration adds it, and every
     // already-synced attachment rests at NULL: the Content-ID only exists in the

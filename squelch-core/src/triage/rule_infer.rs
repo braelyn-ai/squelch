@@ -258,6 +258,9 @@ pub async fn classify_at(
         // owner just typed and picks one enum value. There is nothing here for a
         // reasoning budget to buy.
         effort: Some("low"),
+        // The usual retry budget: this is one interactive call, but its caller
+        // has no second lane to fall back on, so a 429 is worth waiting out.
+        max_tries: llm::MAX_TRIES,
     };
     llm::classify_into(
         http,

@@ -953,6 +953,25 @@ impl SqliteStore {
         Ok(row)
     }
 
+    pub(super) fn notify_eligible_at(
+        &self,
+        account_id: AccountId,
+        message_id: i64,
+    ) -> Result<Option<DateTime<Utc>>> {
+        let conn = self.lock()?;
+        // NO `sensitivity` PREDICATE. See the trait doc: a sealed row carries a
+        // stamp like any other and `triage_seed_verdict` cannot see it.
+        let at = conn
+            .query_row(
+                "SELECT notify_eligible_at FROM triage
+                 WHERE message_id = ?1 AND account_id = ?2",
+                params![message_id, account_id],
+                |r| dt_opt(r, 0),
+            )
+            .optional()?;
+        Ok(at.flatten())
+    }
+
     pub(super) fn stage1_mark_processed(
         &self,
         account_id: AccountId,

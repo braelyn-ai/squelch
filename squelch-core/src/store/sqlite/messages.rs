@@ -706,7 +706,24 @@ impl SqliteStore {
              ON CONFLICT(message_id) DO UPDATE SET
                  importance=CASE WHEN {PROCESSED} THEN triage.importance ELSE excluded.importance END,
                  tier=CASE WHEN {PROCESSED} THEN triage.tier ELSE excluded.tier END,
-                 sensitivity=excluded.sensitivity, sealed_kind=excluded.sealed_kind,
+                 -- A HUMAN SEAL OUTRANKS A RE-INGEST, which every other verdict
+                 -- column has always said via the PROCESSED predicate above and
+                 -- this one did not.
+                 -- A re-ingest carries only heuristic SEED values, and the seed
+                 -- detector never saw whatever made a person call this mail
+                 -- auth, so `excluded.sensitivity` here reverts the seal — on a
+                 -- catch-up, or on the routine INBOX re-walk a held cursor
+                 -- causes. That is not a bookkeeping loss: an unsealed row is a
+                 -- row the fast lane will send to a model and turn into an
+                 -- events row, minted AFTER `correct_triage` ran its redaction
+                 -- and so with nothing left that can redact it (docs/SECURITY.md
+                 -- §4). `model_used = 'human'` rather than PROCESSED because
+                 -- only a PERSON outranks a person: an LLM-classified row
+                 -- refreshes from the fresh detection as before, which is what
+                 -- lets a detector fix newly seal an old message.
+                 sensitivity=CASE WHEN triage.model_used = 'human'
+                     THEN triage.sensitivity ELSE excluded.sensitivity END,
+                 sealed_kind=excluded.sealed_kind,
                  one_line=CASE WHEN {PROCESSED} THEN triage.one_line ELSE excluded.one_line END,
                  reason=CASE WHEN {PROCESSED} THEN triage.reason ELSE excluded.reason END,
                  field_reasons=CASE WHEN {PROCESSED} THEN triage.field_reasons ELSE excluded.field_reasons END,

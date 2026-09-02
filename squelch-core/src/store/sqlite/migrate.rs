@@ -97,6 +97,16 @@ pub(super) fn migrate(conn: &Connection) -> Result<()> {
     // Per-property triage reasons (JSON object). NULL on pre-existing rows.
     add_column_if_missing(conn, "triage", "field_reasons", "TEXT")?;
 
+    // WHICH AUTH SHAPE a notification is about (docs/NOTIFY.md §11.6). NULL on
+    // every pre-existing row and NOT backfilled, which is both honest and the
+    // only safe direction: no historical event came from a sealed message (the
+    // old emission path required sensitivity='normal'), so there is no kind to
+    // recover, and a client reads NULL as "an ordinary event" — exactly what
+    // those rows are. Every SELECT here names the column, so it has to land
+    // through this seam: schema.sql's `CREATE TABLE IF NOT EXISTS` is a no-op
+    // against an `events` table that already exists.
+    add_column_if_missing(conn, "events", "sealed_kind", "TEXT")?;
+
     // Two-stage triage markers: `stage1_model_used` gates the Stage-1 LLM queue
     // (NULL == still needs Stage-1), `needs_stage2` is the escalation flag.
     let added_stage1 = add_column_if_missing(conn, "triage", "stage1_model_used", "TEXT")?;

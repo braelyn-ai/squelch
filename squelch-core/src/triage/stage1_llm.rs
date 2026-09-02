@@ -132,6 +132,42 @@ must be real, specific, and about the user's OWN account, payment, or \
 delivery; urgency language in marketing or a generic security newsletter is \
 never an exception.";
 
+/// The ONE_LINE rules, as [`SYSTEM_PROMPT`] states them, kept as their own const
+/// so a THIRD prompt can state them identically instead of paraphrasing them.
+///
+/// Byte-for-byte a substring of [`SYSTEM_PROMPT`], which
+/// `the_one_line_rules_are_a_verbatim_slice_of_the_stage1_prompt` asserts: this
+/// is a copy rather than a `concat!` because `SYSTEM_PROMPT`'s bytes must not
+/// move (prompt caching keys on them), and a test that fails the moment the two
+/// drift is worth more here than an abstraction that would have to touch the
+/// stage-1 literal to exist.
+///
+/// The NOTIFY prompt is the third caller (docs/NOTIFY.md §11.5). Its one_line
+/// lands on a lock screen, which is the surface where an em dash renders worst,
+/// so the dash rule mattering there is not incidental.
+pub const ONE_LINE_RULES: &str = "\
+ONE_LINE: a single terse line (<=120 chars), no leading label, describing what \
+this email is and why it matters. NEVER use an em dash or en dash in any \
+user-visible text (one_line, importance_reason, deadline_reason) - use a \
+comma, semicolon, or period instead. Never name the email's GENRE - do not write \
+\"promotional email\", \"promotion for\", \"newsletter\", \"marketing\", or \
+similar: the surface the line appears on already conveys that. State the actual \
+content or offer (\"Weekend club nights in SF; free tickets\" - not \"Event \
+promotion for weekend club nights\").";
+
+/// The importance anchors, as [`SYSTEM_PROMPT`] states them, kept as their own
+/// const for the same reason [`ONE_LINE_RULES`] is: the notify prompt scores on
+/// the SAME 0-100 scale, and a second set of anchors describing that scale in
+/// slightly different words is how two models end up meaning different things by
+/// "70". The header line naming the field is the caller's, since the notify
+/// schema calls the field `notify_importance`.
+pub const IMPORTANCE_ANCHORS: &str = "\
+- 0-20   noise: newsletters, promotions, receipts, cold sales, automated bulk.
+- 21-45  low: mildly relevant but not actionable.
+- 46-69  medium: worth a look; a real person or a soft ask.
+- 70-89  signal: from someone the user knows, or clearly needs a response.
+- 90-100 urgent: a real bill/deadline or a time-critical personal message.";
+
 /// The prompt-injection fence, kept as its own const so it always renders LAST,
 /// after every section that gets appended above it. Shared by both stages.
 pub const TRUST_RULE: &str = "\
@@ -379,6 +415,8 @@ pub async fn classify_revisit_at(
         user: &user,
         schema: output_schema(),
         effort: cfg.effort.as_deref(),
+        // A BATCH pass: it is grinding a queue, so a 429 is worth sleeping on.
+        max_tries: llm::MAX_TRIES,
     };
     llm::classify_into(http, url, api_key, provider, &req, |out: Stage1Output| {
         check_importance(out.importance).map(|()| Box::new(out))
@@ -466,6 +504,8 @@ pub async fn classify_at(
         user: &user,
         schema: output_schema(),
         effort: cfg.effort.as_deref(),
+        // A BATCH pass: it is grinding a queue, so a 429 is worth sleeping on.
+        max_tries: llm::MAX_TRIES,
     };
     llm::classify_into(http, url, api_key, provider, &req, |out: Stage1Output| {
         check_importance(out.importance).map(|()| Box::new(out))
@@ -708,6 +748,25 @@ mod tests {
             exception: false,
             revisit: Vec::new(),
         }
+    }
+
+    /// The two shared slices really are slices. They exist so the notify prompt
+    /// (docs/NOTIFY.md §11.5) can state the SAME rules with the same bytes; the
+    /// moment somebody edits one copy and not the other, two models start
+    /// meaning different things by "70" and by "no em dashes", and nothing else
+    /// would notice.
+    #[test]
+    fn the_one_line_rules_are_a_verbatim_slice_of_the_stage1_prompt() {
+        assert!(
+            SYSTEM_PROMPT.contains(ONE_LINE_RULES),
+            "ONE_LINE_RULES drifted from the stage-1 prompt"
+        );
+        assert!(
+            SYSTEM_PROMPT.contains(IMPORTANCE_ANCHORS),
+            "IMPORTANCE_ANCHORS drifted from the stage-1 prompt"
+        );
+        // And the dash rule is IN the slice, not merely in the prompt around it.
+        assert!(ONE_LINE_RULES.contains("NEVER use an em dash or en dash"));
     }
 
     #[test]

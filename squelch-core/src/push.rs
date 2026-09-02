@@ -495,6 +495,7 @@ mod tests {
             sender: "alice@example.com".to_string(),
             one_line: "wire transfer needs approval today".to_string(),
             deadline: Some("2026-08-01T00:00:00Z".to_string()),
+            sealed_kind: None,
             created_at: Utc::now(),
         }
     }

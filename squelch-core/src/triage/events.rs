@@ -3,9 +3,22 @@
 //!
 //! Pure and store-free — the sync engine owns the call sites, the store owns the
 //! append — so the whole policy is unit-testable without a database. Kind
-//! precedence is `urgent` > `deadline` > `surfaced`; sealed mail is never
-//! notified, since even a contentless ping on a lock screen would undo the seal
-//! (see docs/SECURITY.md).
+//! precedence is `urgent` > `deadline` > `surfaced`.
+//!
+//! SEALED MAIL, AND WHAT THE SEAL ACTUALLY FORBIDS. This module used to say a
+//! sealed message is never notified at all. That was one reading of the seal
+//! invariant and it turned out to be the wrong one: it made the single most
+//! time-critical class of mail in the inbox — the login code that expires in
+//! sixty seconds — the one class that could not ring (docs/NOTIFY.md §2c). The
+//! invariant is narrower and sharper than "stay quiet". A sealed BODY must never
+//! reach a model and must never reach an `events` row (docs/SECURITY.md §4), so
+//! no subject, no snippet, no extracted code, and nothing derived from any of
+//! them. A ping derived from the KIND alone carries none of that: see
+//! [`sealed_event`], whose entire input is a `SealedKind`, a thread id and a
+//! sender address, and which shares no code with the verdict path below
+//! precisely so it cannot read an email's words even by accident. `worthy_kind`
+//! still refuses every sealed row, and that stays true: the ordinary path is
+//! the one that reads a one_line.
 //!
 //! ELIGIBILITY IS NOT DECIDED HERE. Whether a message may EVER notify is
 //! answered once, at ingest, by the one caller that knows which sync path it is
@@ -18,7 +31,7 @@ use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use crate::config::NotifyConfig;
 use crate::store::{NewEvent, TriagedMessage};
 use crate::triage::DeadlineHit;
-use crate::types::{AccountId, Disposition, EventKind, SenderRule, Sensitivity, Tier};
+use crate::types::{AccountId, Disposition, EventKind, SealedKind, SenderRule, Sensitivity, Tier};
 
 /// Every fact the emission decision needs about one triaged message, gathered at
 /// whichever verdict site produced it (ingest heuristic, Stage-1 apply, Stage-2
@@ -58,18 +71,30 @@ pub struct EventContext<'a> {
 /// tolerance for a wrong sender clock only, never a licence to notify.
 const MAX_FUTURE_SKEW_SECS: i64 = 3600;
 
-/// Why an emission was refused, when it was. TWO refusals, kept apart because
-/// they mean opposite things to whoever asked: `NotWorthy` is the system working
-/// (this mail does not deserve a buzz), while `Expired` is a notification the
-/// user WOULD have wanted and did not get because we were too slow — the drop
-/// that ran at 24.7% with no counter and no log line to say so (docs/NOTIFY.md
-/// §2a). Only the caller can record it, so only the caller may be told, and it
-/// must not have to re-derive the window to work it out.
+/// Why an emission was refused, when it was. THREE refusals, kept apart because
+/// they mean different things to whoever asked, and the ledger spends a
+/// different word on each (docs/NOTIFY.md §11.4): `NotWorthy` is the system
+/// working (this mail does not deserve a buzz), `Suppressed` is a standing
+/// instruction from the user rather than a judgement about the mail, and
+/// `Expired` is a notification the user WOULD have wanted and did not get
+/// because we were too slow — the drop that ran at 24.7% with no counter and no
+/// log line to say so (docs/NOTIFY.md §2a). Only the caller can record any of
+/// them, so only the caller may be told, and it must not have to re-derive the
+/// window or re-read the rule list to work out which it got.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Refusal {
-    /// Never a candidate (sealed, sent, squelched, never eligible) or simply
-    /// below the line. Silent, and correctly so.
+    /// Never a candidate (sealed, sent, spam, never eligible) or simply below
+    /// the line. Silent, and correctly so.
     NotWorthy,
+    /// A standing Squelch/Filtered rule silenced it. SPLIT OUT FROM
+    /// `NotWorthy` because §11.4's vocabulary insists on the distinction and
+    /// hangs a decision on it: `suppressed` is NOT rescuable and
+    /// `declined_by_model` is, so folding the two would let a rescue path fire
+    /// on the one row class the user explicitly asked never to hear from. It
+    /// would also read as a catastrophic model false-negative rate on the
+    /// §11.11 rollout query, which is the number that decides whether the
+    /// threshold moves.
+    Suppressed,
     /// Eligible AND worthy, but past [`NotifyConfig::rescue_window_secs`] by the
     /// time this site reached it. Counted, never silent.
     Expired,
@@ -121,12 +146,14 @@ pub fn worthy_kind(
     if ctx.is_spam {
         return Err(Refusal::NotWorthy);
     }
-    // A squelch/filtered rule is a standing "not from this sender".
+    // A squelch/filtered rule is a standing "not from this sender". Its own
+    // refusal, because it is the user's instruction rather than our judgement:
+    // see [`Refusal::Suppressed`].
     if matches!(
         ctx.rule,
         Some(Disposition::Squelch) | Some(Disposition::Filtered)
     ) {
-        return Err(Refusal::NotWorthy);
+        return Err(Refusal::Suppressed);
     }
     // NEVER ELIGIBLE: no stamp means backfill, a sent copy, or mail that was
     // already stale the first time we saw it. Structural, and unrescuable.
@@ -175,7 +202,67 @@ pub fn event_for(
         sender: ctx.sender.to_string(),
         one_line: ctx.one_line.to_string(),
         deadline: ctx.deadline.map(|d| d.due_at.to_rfc3339()),
+        // ALWAYS None here. This is the ordinary path, and it reads the mail's
+        // own one_line and deadline; a sealed message reaches its event through
+        // the kind-derived path (docs/NOTIFY.md §11.6), which shares no code
+        // with this function precisely so it cannot read either.
+        sealed_kind: None,
     })
+}
+
+/// THE KIND-DERIVED PING for a sealed message (docs/NOTIFY.md §11.6). A pure
+/// table: `kind` picks the wording and the score, and NOTHING ELSE about the
+/// email is read, because nothing else is passed in.
+///
+/// THE SIGNATURE IS THE ENFORCEMENT. There is no `subject` parameter and no
+/// `body` parameter, so no future edit here can leak one without first changing
+/// a call site that has nothing to give it: the fast lane's sealed candidate
+/// carries no body field at all. `thread_id` and `sender` are metadata of
+/// exactly the class `/client/sealed` already serves to an authenticated
+/// client, and neither is derived from the sealed content.
+///
+/// All five kinds are `urgent`, which is not a shrug at the tiering: all five
+/// want a time-sensitive interruption. The requested ones (a code, a link, a
+/// reset) because the thing expires while the user is looking for it, and
+/// `login_alert` because somebody may be past the password RIGHT NOW. The
+/// "different shape" a sealed notification needs is the wording, not the tier.
+///
+/// The one_line strings are constants and stay constants. A sealed
+/// notification saying "Login code arrived" is useful; one saying "Your code is
+/// 481920" is the seal undone on a lock screen in front of whoever is standing
+/// there.
+pub fn sealed_event(
+    account_id: AccountId,
+    message_id: i64,
+    thread_id: &str,
+    sender: &str,
+    kind: SealedKind,
+) -> NewEvent {
+    let (one_line, importance) = match kind {
+        SealedKind::Otp => ("Login code arrived", 90),
+        SealedKind::MagicLink => ("Sign-in link arrived", 90),
+        SealedKind::Verification => ("Verification email arrived", 80),
+        SealedKind::PasswordReset => ("Password reset requested", 90),
+        SealedKind::LoginAlert => ("New sign-in alert", 85),
+    };
+    NewEvent {
+        account_id,
+        message_id,
+        thread_id: thread_id.to_string(),
+        kind: EventKind::Urgent,
+        tier: Tier::Signal,
+        importance,
+        sender: sender.to_string(),
+        one_line: one_line.to_string(),
+        // A sealed ping is never a dated obligation, and a deadline column is
+        // one more place email-derived text could land.
+        deadline: None,
+        // THE ROUTING HINT, and the reason this column exists: a client reads it
+        // to send the tap to the sealed reveal flow instead of a thread fetch
+        // the seal makes the daemon 404, and to pick an icon. It is NOT a gate
+        // (docs/NOTIFY.md §11.6): no query reads it to decide what to serve.
+        sealed_kind: Some(kind),
+    }
 }
 
 /// Gather the [`EventContext`] for an INGEST-path verdict, resolving
@@ -185,6 +272,14 @@ pub fn event_for(
 /// for waking anyone. Non-confident rows wait for Stage-1/Stage-2 to refine them
 /// and emit from those sites instead, carrying the SAME eligibility stamp — one
 /// answer to "may this message ever notify", written here and read there.
+///
+/// UNCALLED SINCE THE FAST LANE LANDED. The ingest-path emission this gathered a
+/// context for lives in [`crate::sync::notify_lane`] now (docs/NOTIFY.md §11.5),
+/// which builds its own [`EventContext`] because it has to apply a LIVE rule
+/// lookup and a model's score rather than the row's own — see the provisional
+/// note on `notify_eligible_at` below for the trap that move had to carry with
+/// it. Kept because it is the one worked example of assembling this struct from
+/// a `TriagedMessage`; delete it if a second wave goes by without a caller.
 pub fn ingest_context<'a>(
     triaged: &'a TriagedMessage,
     message_id: i64,
@@ -374,7 +469,9 @@ mod tests {
         c.is_sent = true;
         assert_eq!(worthy_kind(&c, &cfg, now), Err(Refusal::NotWorthy));
 
-        // Squelched / filtered senders are silent even when urgent.
+        // Squelched / filtered senders are silent even when urgent — and they
+        // say WHICH silence it is, because the ledger word for a standing rule
+        // is `suppressed` and it is the one that is never rescued.
         for disp in [Disposition::Squelch, Disposition::Filtered] {
             let mut c = ctx(now);
             c.rule = Some(disp);
@@ -382,7 +479,7 @@ mod tests {
             c.deadline = Some(&d);
             assert_eq!(
                 worthy_kind(&c, &cfg, now),
-                Err(Refusal::NotWorthy),
+                Err(Refusal::Suppressed),
                 "{disp:?}"
             );
         }
@@ -444,11 +541,12 @@ mod tests {
             "below the line is not a missed notification"
         );
         // Same for a structural gate: a squelched sender's aged-out row is not
-        // a rescue anybody wanted.
+        // a rescue anybody wanted, and it stays `Suppressed` rather than
+        // decaying into `Expired` just because it sat in a queue.
         let mut c = ctx(now);
         c.notify_eligible_at = Some(now - ChronoDuration::hours(9));
         c.rule = Some(Disposition::Squelch);
-        assert_eq!(worthy_kind(&c, &cfg, now), Err(Refusal::NotWorthy));
+        assert_eq!(worthy_kind(&c, &cfg, now), Err(Refusal::Suppressed));
     }
 
     /// THE FIRST-SIGHT TEST, now asked exactly once (at ingest) rather than at
@@ -542,7 +640,7 @@ mod tests {
         let ctx = seed_context(&row, &confident, None, Some(Disposition::Squelch)).unwrap();
         assert_eq!(
             worthy_kind(&ctx, &cfg, now),
-            Err(Refusal::NotWorthy),
+            Err(Refusal::Suppressed),
             "squelched, so silent"
         );
 
@@ -593,7 +691,7 @@ mod tests {
         let cfg = NotifyConfig::default();
         let mut c = ctx(now);
         c.rule = current_rule("alerts@monitoring.example", &rules);
-        assert_eq!(worthy_kind(&c, &cfg, now), Err(Refusal::NotWorthy));
+        assert_eq!(worthy_kind(&c, &cfg, now), Err(Refusal::Suppressed));
     }
 
     /// A FILTERED rule suppresses on its DISPOSITION alone, never on
@@ -623,14 +721,20 @@ mod tests {
         c.importance = 100;
         assert_eq!(
             worthy_kind(&c, &cfg, now),
-            Err(Refusal::NotWorthy),
+            Err(Refusal::Suppressed),
             "filtered stays silent, want_text or not"
         );
     }
 
-    /// SEAL INVARIANT: a sealed message can NEVER produce an event, whatever its
-    /// tier, deadline, or score. No path constructs those values for sealed
-    /// mail; this proves the decision would refuse them even if one did.
+    /// SEAL INVARIANT, the half this decision owns: a sealed message can never
+    /// come out of THE ORDINARY PATH, whatever its tier, deadline, or score. No
+    /// path constructs those values for sealed mail; this proves the decision
+    /// would refuse them even if one did.
+    ///
+    /// A sealed message CAN reach an `events` row, through [`sealed_event`] and
+    /// only through it (docs/NOTIFY.md §11.6). The two are unrelated code, which
+    /// is the point: this one reads a one_line off the verdict, and that is
+    /// exactly what a sealed row must not have.
     #[test]
     fn sealed_can_never_produce_an_event() {
         let now = Utc::now();
@@ -676,6 +780,89 @@ mod tests {
         assert_eq!(ev.sender, "a@b.com");
         assert_eq!(ev.one_line, "hi");
         assert_eq!(ev.deadline.as_deref(), Some(d.due_at.to_rfc3339().as_str()));
+    }
+
+    /// AND THE DOC HEADER SAYS SO. This module's header used to state, as an
+    /// invariant, that a sealed message is never notified — which is now false,
+    /// and a false invariant in a header is worse than none: the next person to
+    /// touch [`sealed_event`] would read it as a rule they were breaking.
+    ///
+    /// Asserting on the source text is unusual and deliberate. The seal is the
+    /// one place in this codebase where the prose IS the specification, and a
+    /// header can go stale for years with every test still green. The needle is
+    /// assembled at runtime so this test does not match itself.
+    #[test]
+    fn the_module_header_no_longer_claims_sealed_mail_stays_silent() {
+        let src = include_str!("events.rs");
+        let lines: Vec<&str> = src.lines().take_while(|l| l.starts_with("//!")).collect();
+        assert!(lines.len() > 5, "the header should still be there");
+        // Unwrapped into one line: the sentences below are wrapped in the
+        // source, and a needle that straddles a line break would never match.
+        let header: String = lines
+            .iter()
+            .flat_map(|l| l.trim_start_matches("//!").split_whitespace())
+            .collect::<Vec<_>>()
+            .join(" ");
+
+        let stale = ["sealed mail is never", " notified"].concat();
+        assert!(
+            !header.contains(&stale),
+            "the header still states the old, now-false invariant"
+        );
+        // And it states the real one, in both halves.
+        assert!(header.contains("A sealed BODY must never reach a model"));
+        assert!(header.contains("docs/SECURITY.md §4"));
+        assert!(header.contains("sealed_event"));
+    }
+
+    /// THE SEALED PING CARRIES NOTHING OF THE EMAIL. Every kind's `one_line` is
+    /// the fixed phrase, contains no digit, and contains none of the input — and
+    /// the inputs here are deliberately shaped like the thing that must never
+    /// leak, a six-digit code, so a `format!` that spliced one in would fail
+    /// this rather than merely look wrong in review.
+    #[test]
+    fn a_sealed_event_says_only_what_kind_of_auth_mail_arrived() {
+        // Shaped like leakage: an id and an address that read as a code.
+        let thread_id = "481920";
+        let sender = "code-481920@auth.example";
+
+        for (kind, phrase, importance) in [
+            (SealedKind::Otp, "Login code arrived", 90u8),
+            (SealedKind::MagicLink, "Sign-in link arrived", 90),
+            (SealedKind::Verification, "Verification email arrived", 80),
+            (SealedKind::PasswordReset, "Password reset requested", 90),
+            (SealedKind::LoginAlert, "New sign-in alert", 85),
+        ] {
+            let ev = sealed_event(1, 7, thread_id, sender, kind);
+            assert_eq!(ev.one_line, phrase, "{kind:?}");
+            assert_eq!(ev.importance, importance, "{kind:?}");
+            // All five interrupt: a code expires, and a login alert may be
+            // somebody in the account right now.
+            assert_eq!(ev.kind, EventKind::Urgent, "{kind:?}");
+            assert_eq!(ev.tier, Tier::Signal, "{kind:?}");
+            assert_eq!(ev.deadline, None, "{kind:?}");
+            // The routing hint the client reads to send the tap at the auth
+            // flow instead of a thread fetch the seal 404s.
+            assert_eq!(ev.sealed_kind, Some(kind));
+
+            // NOTHING FROM THE MESSAGE. No digit at all, and not a byte of
+            // either input, however code-shaped they were.
+            assert!(
+                !ev.one_line.chars().any(|c| c.is_ascii_digit()),
+                "a digit in a sealed one_line is a code on a lock screen: {}",
+                ev.one_line
+            );
+            assert!(!ev.one_line.contains("481920"), "{kind:?}");
+            assert!(!ev.one_line.contains("auth.example"), "{kind:?}");
+
+            // The two metadata fields pass through verbatim, and they are the
+            // only two: `/client/sealed` already serves this class to an
+            // authenticated client.
+            assert_eq!(ev.thread_id, thread_id);
+            assert_eq!(ev.sender, sender);
+            assert_eq!(ev.account_id, 1);
+            assert_eq!(ev.message_id, 7);
+        }
     }
 
     /// A raised `min_importance` moves the line; env/config drives it.

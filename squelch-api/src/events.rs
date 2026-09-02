@@ -1,9 +1,18 @@
 //! Notification delivery on the human door: `GET /client/events` (SSE) and
 //! `GET /client/events/{id}`, the iOS NSE's by-id fetch after an opaque push.
 //! A pure READER of core's `events` table: no delivered/cursor flag is written
-//! here, every client carries its own `after=<id>`. Sealed mail can never appear
-//! — emission requires `sensitivity='normal'` and sealing REDACTS the row
-//! upstream — so this module has no sealed-handling of its own.
+//! here, every client carries its own `after=<id>`.
+//!
+//! SEALED MAIL DOES APPEAR HERE, and this module is the path it appears on
+//! (docs/NOTIFY.md §11.6). The fast lane's sealed ping is an ordinary `events`
+//! row with `sealed_kind` set, whose `one_line` is derived FROM THE KIND ALONE
+//! ("Login code arrived") and whose `sender` is the from-address `/client/sealed`
+//! already serves: no subject, no body, no code, so there is nothing here to
+//! gate and no query may start gating on `sealed_kind`. What the field is for is
+//! ROUTING, and it is the client's job, not this module's: a frame carrying
+//! `sealed_kind` is NOT a thread arrival and must not be treated as one — the tap
+//! belongs on the auth reveal flow, because `thread_guard_and_subject` 404s a
+//! sealed thread. See docs/NOTIFY.md §11.6 for the full client contract.
 
 use std::convert::Infallible;
 use std::sync::Arc;

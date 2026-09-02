@@ -2,7 +2,7 @@
 
 use super::super::*;
 use super::support::*;
-use crate::types::Tier;
+use crate::types::{SealedKind, Tier};
 use chrono::TimeZone;
 
 #[test]
@@ -112,6 +112,57 @@ fn event_by_id_round_trips_the_snapshot_and_scopes_by_account() {
     // Unknown id, and another account's id, are both indistinguishable misses.
     assert!(store.event_by_id(acct, id + 1).unwrap().is_none());
     assert!(store.event_by_id(other, id).unwrap().is_none());
+}
+
+/// The sealed ROUTING TAG survives the round trip, and its absence is invisible
+/// on the wire.
+///
+/// Both halves matter for the same reason: this key is how a client sends the
+/// tap to the sealed reveal flow instead of a thread fetch the human door 404s,
+/// and every event that exists today has no such kind. `skip_serializing_if`
+/// means an old client decoding a new daemon's replay sees exactly the bytes it
+/// has always seen, which is not a nicety — the SSE consumer ADVANCES ITS CURSOR
+/// on a frame it cannot decode, so a wire change is a notification lost forever.
+#[test]
+fn sealed_kind_round_trips_and_is_absent_from_the_wire_when_there_is_none() {
+    let (store, acct) = store();
+
+    let mut sealed = new_event(acct, 1);
+    sealed.kind = EventKind::Urgent;
+    sealed.sealed_kind = Some(SealedKind::Otp);
+    sealed.one_line = "Login code arrived".into();
+    let sealed_id = store.append_event(&sealed).unwrap().unwrap();
+    let plain_id = store.append_event(&new_event(acct, 2)).unwrap().unwrap();
+
+    let got = store.event_by_id(acct, sealed_id).unwrap().expect("event");
+    assert_eq!(got.sealed_kind, Some(SealedKind::Otp));
+    let plain = store.event_by_id(acct, plain_id).unwrap().expect("event");
+    assert_eq!(plain.sealed_kind, None, "an ordinary event carries no kind");
+
+    // The replay read sees it too — the NSE fetches by id, the Mac pages the
+    // cursor, and the routing decision has to be available on both doors.
+    let replayed = store.events_after(acct, 0, 100).unwrap();
+    assert_eq!(replayed[0].sealed_kind, Some(SealedKind::Otp));
+    assert_eq!(replayed[1].sealed_kind, None);
+
+    // THE WIRE. Present as the stored string when there is a kind, and the key
+    // is ABSENT entirely when there is not.
+    let json = serde_json::to_value(&got).unwrap();
+    assert_eq!(json["sealed_kind"], serde_json::json!("otp"));
+    let plain_json = serde_json::to_value(&plain).unwrap();
+    assert!(
+        plain_json.get("sealed_kind").is_none(),
+        "an ordinary event must serialize byte-identically to before this column existed: {plain_json}"
+    );
+
+    // And it decodes back, in both directions, so a client of ours can read it.
+    let back: crate::types::Event = serde_json::from_value(json).unwrap();
+    assert_eq!(back.sealed_kind, Some(SealedKind::Otp));
+    let back_plain: crate::types::Event = serde_json::from_value(plain_json).unwrap();
+    assert_eq!(
+        back_plain.sealed_kind, None,
+        "`default` covers the old shape"
+    );
 }
 
 #[test]

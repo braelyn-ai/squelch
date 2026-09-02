@@ -21,14 +21,21 @@ const S1_IN: f64 = 0.8;
 const S1_OUT: f64 = 4.0;
 const S2_IN: f64 = 3.0;
 const S2_OUT: f64 = 15.0;
+/// The NOTIFY fast lane's prices, a third distinct pair for the same reason:
+/// the lane is the one ledger category that runs neither stage's model, so a
+/// cost costed off either stage's numbers has to be visible in the assertion.
+const N_IN: f64 = 0.1;
+const N_OUT: f64 = 0.5;
 
-/// A harness whose state carries known models and prices for both stages.
+/// A harness whose state carries known models and prices for both stages and
+/// for the notify lane.
 fn priced_harness(seed: impl FnOnce(&squelch_core::store::SqliteStore, i64)) -> Harness {
     let (state, store, acct) = common::state_with(seed);
     let state: ApiState = state
         .with_stage2_model("sonnet-test", Some("anthropic".into()))
         .with_stage2_prices(S2_IN, S2_OUT)
-        .with_stage1_config("haiku-test", S1_IN, S1_OUT, 500);
+        .with_stage1_config("haiku-test", S1_IN, S1_OUT, 500)
+        .with_notify_config("notify-test", N_IN, N_OUT);
     Harness {
         app: router(state),
         store,
@@ -175,6 +182,60 @@ async fn extractors_cost_at_stage1_rates_and_only_stage2_uses_stage2_rates() {
     // And each category is labelled with the model that actually produced it.
     assert_eq!(body["categories"]["extract_banking"]["model"], "haiku-test");
     assert_eq!(body["categories"]["stage2"]["model"], "sonnet-test");
+}
+
+/// THE THIRD ARM. `notify` is the fast lane (docs/NOTIFY.md §11.5) and it runs
+/// its OWN small model, not the stage-1 one every extractor shares. Falling
+/// through to the stage-1 arm would bill a Haiku call at the capable model's
+/// rates and overstate the cheapest pass in the pipeline by the whole ratio
+/// between them, which is exactly the shape of bug that hid for ten days when
+/// `extract_banking` was missing from this endpoint.
+#[tokio::test]
+async fn the_notify_category_costs_at_its_own_model_not_stage1s() {
+    let app = priced_harness(|store, acct| {
+        for category in ["notify", "extract_banking"] {
+            store
+                .extract_bump_usage(
+                    acct,
+                    "2026-07-09",
+                    category,
+                    UsageTokens {
+                        input: 1_000_000,
+                        output: 1_000_000,
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+        }
+    })
+    .app;
+
+    let body = get_usage(app).await;
+    let cost = |name: &str| {
+        body["categories"][name]["totals"]["est_cost_usd"]
+            .as_f64()
+            .unwrap()
+    };
+
+    // Exactly 1 MTok each way, so the cost IS the price pair summed.
+    assert!(
+        (cost("notify") - (N_IN + N_OUT)).abs() < 1e-9,
+        "notify costs at the notify prices, got {}",
+        cost("notify")
+    );
+    // ...and not at the arm it would otherwise have fallen through to. The
+    // control is the extractor sitting beside it in the same ledger.
+    assert!(
+        (cost("extract_banking") - (S1_IN + S1_OUT)).abs() < 1e-9,
+        "the neighbouring category still costs at stage-1 rates"
+    );
+    assert!(cost("notify") < cost("extract_banking"));
+
+    // And the label names the model that actually produced the spend, from the
+    // SAME arm as the prices: a category priced as Stage-1 but labelled with
+    // the notify model would read as a cost regression in the app.
+    assert_eq!(body["categories"]["notify"]["model"], "notify-test");
+    assert_eq!(body["categories"]["extract_banking"]["model"], "haiku-test");
 }
 
 /// The flat top-level fields predate `categories` and stay Stage-2, so an older

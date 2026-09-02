@@ -814,13 +814,17 @@ CREATE INDEX IF NOT EXISTS idx_audit_account_ts ON audit_log(account_id, ts);
 -- a backfill row is structurally unable to reach this table, and a re-scan
 -- re-ingests rows that already carry their stamp, so it cannot manufacture one.
 --
--- SECURITY: sealed mail is never represented here — the emission decision
--- requires sensitivity='normal', and sealed rows carry no Stage-1 pass. An OTP
--- on a lock screen would undo the entire seal design. A human sealing a message
--- AFTER it notified makes `correct_triage` REDACT the row (sender/one_line/
--- deadline blanked, structure kept). It does NOT delete: `id` is the rowid, and
--- deleting the newest row would let the next insert reuse that id, which every
--- durable cursor would then skip forever.
+-- SECURITY: NO SEALED CONTENT IS EVER REPRESENTED HERE. A sealed message may
+-- now produce a row, but only a KIND-DERIVED one: `sealed_kind` plus a fixed
+-- sentence from the table in docs/NOTIFY.md §11.6 ("Login code arrived"), the
+-- sender address, and nothing the mail said. The subject, the body and the code
+-- itself never reach this table, because the lane that writes the row is handed
+-- a value with no field to carry them. An OTP on a lock screen would undo the
+-- entire seal design; a phone that buzzes to say a code has landed does not.
+-- A human sealing a message AFTER it notified makes `correct_triage` REDACT the
+-- row (sender/one_line/deadline blanked, structure kept). It does NOT delete:
+-- `id` is the rowid, and deleting the newest row would let the next insert reuse
+-- that id, which every durable cursor would then skip forever.
 CREATE TABLE IF NOT EXISTS events (
     id          INTEGER PRIMARY KEY,   -- monotonic; the clients' cursor
     account_id  INTEGER NOT NULL,
@@ -832,11 +836,84 @@ CREATE TABLE IF NOT EXISTS events (
     sender      TEXT NOT NULL,
     one_line    TEXT NOT NULL,
     deadline    TEXT,                  -- RFC3339 snapshot, or NULL
+    -- WHICH AUTH SHAPE this row is about (otp | password_reset | magic_link |
+    -- login_alert | verification), NULL for every ordinary event. It exists so a
+    -- client can ROUTE the tap to the sealed reveal flow instead of a thread
+    -- fetch the human door 404s, and pick an icon. It is NOT A GATE: no query
+    -- reads it to decide what to serve, and none may — the serving rules are
+    -- `triage.sensitivity`, as they have always been.
+    sealed_kind TEXT,
     created_at  TEXT NOT NULL
 );
 
 -- The read pattern is exactly "rows after my cursor, for my account".
 CREATE INDEX IF NOT EXISTS idx_events_account_id ON events(account_id, id);
+
+-- THE NOTIFY DECISION LEDGER: one row per (message, lane) recording what that
+-- lane decided about notifying, and nothing else (docs/NOTIFY.md §11.4).
+--
+-- A TABLE, NOT COLUMNS ON `triage`. Two lanes decide independently about the
+-- same message — the fast lane at ingest, the deliberate lane behind it — and
+-- the questions worth asking are cross-lane: rescued (`deliberate/sent` over a
+-- `fast/declined_by_model`), overturned, confirmed. Those are JOINS over rows.
+-- Folded into `triage` they would be a widening pair of columns per lane that
+-- every unrelated read carries, and the second lane's write would be an UPDATE
+-- over the first lane's answer rather than a fact standing beside it.
+--
+-- APPEND-ONLY. Written with INSERT OR IGNORE, NEVER UPDATEd, NEVER DELETEd: the
+-- UNIQUE below makes a re-triage, or a Stage-2 pass over a row Stage-1 already
+-- recorded, a silent no-op instead of a rewrite of history. What one lane
+-- decided the first time it reached a message IS the labeled example; a row that
+-- moves is not evidence of anything.
+--
+-- A row exists ONLY for a message carrying a `triage.notify_eligible_at` stamp,
+-- so backfill and mail already stale at first sight produce nothing at all. That
+-- is what keeps the table from being 95% rows about mail that was never a
+-- candidate.
+--
+-- SECURITY: NO EMAIL-DERIVED TEXT. Not the one_line, not the subject, not the
+-- sender. Every column is an id, a closed-vocabulary string, a score or a
+-- duration, so this table cannot leak by construction — which is why it needs no
+-- sensitivity gate and why a sealed message may be recorded here by kind.
+CREATE TABLE IF NOT EXISTS notify_decisions (
+    id                INTEGER PRIMARY KEY,
+    account_id        INTEGER NOT NULL,
+    message_id        INTEGER NOT NULL,
+    -- 'fast' | 'deliberate' (crate::metrics::NotifyLane).
+    lane              TEXT NOT NULL,
+    -- sent | would_send | declined_by_model | unavailable | suppressed | expired
+    -- (crate::metrics::NotifyDecision). ONE closed set for both lanes, so the
+    -- cross-lane questions are joins over one vocabulary rather than two that
+    -- have to be reconciled.
+    decision          TEXT NOT NULL,
+    -- 0-100: THE SCORE THAT WAS ON THE TABLE WHEN THIS DECISION WAS MADE,
+    -- whatever the decision, and NULL only when there was none. So a
+    -- `declined_by_model` always carries one, a `sent` carries the applied
+    -- importance (known-contact floor included), an `expired` or a `suppressed`
+    -- reached at emission time carries the score it was about to act on, and
+    -- `unavailable` — plus a `suppressed` settled at `candidate` time, before
+    -- anything scored it — carries NULL. Never invented: a 0 stood in for
+    -- "nobody scored this" would read as "the model said no", which is the one
+    -- distinction the eval query in docs/NOTIFY.md §11.11 turns on. Filter on
+    -- `decision`, not on this column being NULL.
+    notify_importance INTEGER,
+    -- Model id | 'sealed' | 'heuristic' | NULL. Which ANSWER decided, which is
+    -- what makes a decline a labeled example of a particular model's judgement
+    -- rather than of the daemon's mood that day.
+    model_used        TEXT,
+    -- First sight (`triage.notify_eligible_at`) to this decision, milliseconds.
+    -- Fast lane only: the deliberate lane's latency is the triage pipeline's,
+    -- which the triage metrics already own.
+    latency_ms        INTEGER,
+    created_at        TEXT NOT NULL,
+    -- ONE DECISION PER LANE PER MESSAGE, forever. This is the append-only rule
+    -- expressed where it cannot be forgotten by a caller.
+    UNIQUE(message_id, lane)
+);
+
+-- The eval read is exactly "this account's rows since <date>, in order".
+CREATE INDEX IF NOT EXISTS idx_notify_decisions_account_created
+    ON notify_decisions(account_id, created_at);
 
 -- REGISTERED PUSH DEVICES. One row per APNs device token the user's phone handed
 -- to their own daemon over the human door. Only the pusher task reads it.
