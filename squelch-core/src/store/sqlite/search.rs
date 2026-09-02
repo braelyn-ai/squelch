@@ -244,7 +244,7 @@ impl SqliteStore {
         let embedder = self
             .embedder()
             .ok_or_else(|| CoreError::InvalidInput("no embedder attached".into()))?;
-        let qvec = embedder.embed(query_text)?;
+        let qvec = embedder.embed(&crate::embed::query_embed_text(query_text))?;
         self.knn_by_vector(account_id, &qvec, k)
     }
 
@@ -350,7 +350,9 @@ impl SqliteStore {
         // No embedder (e.g. before the background attach) => keyword-only.
         let vec_hits: Vec<Candidate> = match self.embedder() {
             Some(embedder) => {
-                let qvec = embedder.embed(query_text)?;
+                // The instruction is the QUERY side of BGE's asymmetry; the
+                // corpus vectors were embedded without it, on purpose.
+                let qvec = embedder.embed(&crate::embed::query_embed_text(query_text))?;
                 self.knn_by_vector(account_id, &qvec, k)?
                     .into_iter()
                     .map(|(c, _dist)| c)

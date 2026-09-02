@@ -980,6 +980,17 @@ fn embed_e2e_real_model_ranks_relevant_first() {
         hits.iter().any(|(id, _)| *id == dec),
         "decoy present but lower"
     );
+
+    // THE SHORT QUERY, which is what a search box actually holds. Two words,
+    // no sentence around them: this is the case BGE's query instruction exists
+    // for (`crate::embed::QUERY_INSTRUCTION`), and the case a raw embedding
+    // handles worst, because two words look like a fragment rather than like
+    // the passage they are meant to find.
+    let hits = store.semantic_search(acct, "invoice month", 5).unwrap();
+    assert_eq!(
+        hits[0].0, rel,
+        "a two-word query must still find the invoice mail"
+    );
 }
 
 /// E2E against the REAL fastembed model: `max_tokens` must reach the tokenizer.

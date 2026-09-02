@@ -49,9 +49,9 @@ pub struct EmbedSettings {
 }
 
 /// Flatten a message into the canonical text embedded AT INGEST (and by the
-/// backfill, which reuses this). Query text does NOT come through here:
-/// `semantic_search` and `hybrid_search` embed the raw query, so `max_chars`
-/// never applies to it and the tokenizer cut is all a long query gets.
+/// backfill, which reuses this). Query text does NOT come through here: it goes
+/// through [`query_embed_text`] instead, so `max_chars` never applies to it and
+/// the tokenizer cut is all a long query gets.
 pub fn message_embed_text(subject: &str, body: &str, max_chars: usize) -> String {
     let mut s = String::with_capacity(subject.len() + body.len() + 2);
     s.push_str(subject.trim());
@@ -60,6 +60,28 @@ pub fn message_embed_text(subject: &str, body: &str, max_chars: usize) -> String
         s.push_str(body.trim());
     }
     truncate_chars(&s, max_chars)
+}
+
+/// THE RETRIEVAL INSTRUCTION BGE v1.5 ASKS FOR ON THE QUERY SIDE, and only
+/// there. Its model card is explicit: prepend this to a short query when you
+/// are matching it against passages, and prepend nothing to the passages.
+///
+/// The asymmetry is the point. A search box holds two or three words; a message
+/// holds a subject and a paragraph. Embedded raw, the query lands in the part
+/// of the space where short fragments live rather than where the mail it is
+/// looking for lives. The instruction is what the model was trained to read as
+/// "this end is the question".
+///
+/// QUERY SIDE ONLY MEANS NO BACKFILL. Corpus vectors are untouched
+/// ([`message_embed_text`] never sees this), so nothing has to be re-embedded
+/// and a mailbox mid-backfill stays consistent with itself.
+pub const QUERY_INSTRUCTION: &str = "Represent this sentence for searching relevant passages: ";
+
+/// The reader's query as the embedder should see it: [`QUERY_INSTRUCTION`] then
+/// the words. The one place the instruction is applied, so a leg cannot forget
+/// it and quietly rank against a differently-embedded query than its sibling.
+pub fn query_embed_text(query: &str) -> String {
+    format!("{QUERY_INSTRUCTION}{}", query.trim())
 }
 
 /// Default number of characters of `subject + body` fed to the embedder at
@@ -169,6 +191,18 @@ mod tests {
         // Under the budget, nothing is cut.
         let short = message_embed_text("subject", "short body", DEFAULT_EMBED_MAX_CHARS);
         assert_eq!(short, "subject\n\nshort body");
+    }
+
+    #[test]
+    fn the_query_instruction_is_prepended_once_and_carries_no_dashes() {
+        let out = query_embed_text("  wifi password  ");
+        assert_eq!(out, format!("{QUERY_INSTRUCTION}wifi password"));
+        // Text a model reads follows the same rule as text a user reads: no em
+        // or en dashes anywhere in it (see the triage prompt guard).
+        assert!(!QUERY_INSTRUCTION.contains('\u{2014}'), "em dash");
+        assert!(!QUERY_INSTRUCTION.contains('\u{2013}'), "en dash");
+        // The corpus side is untouched: nothing about this reaches a message.
+        assert!(!message_embed_text("subject", "body", 100).contains("Represent"));
     }
 
     /// The two defaults are a pair: chars ~ tokens x 4, so the char cut and the
