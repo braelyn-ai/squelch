@@ -838,6 +838,7 @@ impl Store for SqliteStore {
         self.search(account_id, query, limit, offset)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn search_filtered(
         &self,
         account_id: AccountId,

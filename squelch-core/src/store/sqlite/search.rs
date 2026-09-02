@@ -649,6 +649,7 @@ impl SqliteStore {
     ///
     /// SECURITY: the sealed, spam and sent predicates live in this one place, so
     /// both passes carry them by construction.
+    #[allow(clippy::too_many_arguments)] // one keyword query, one argument per part
     fn keyword_page(
         &self,
         conn: &Connection,
@@ -766,12 +767,11 @@ impl SqliteStore {
         let mut args = vec![Value::Integer(account_id), Value::Text(expr.to_string())];
         push_filter_clauses(&mut sql, &mut args, filter);
         let mut stmt = conn.prepare(&sql)?;
-        let n: i64 = match stmt.query_row(params_from_iter(args), |r| r.get(0)) {
-            Ok(n) => n,
-            // Same reading as every other MATCH here: unparseable means nothing
-            // matched, not "the search failed".
-            Err(_) => 0,
-        };
+        // Same reading as every other MATCH here: unparseable means nothing
+        // matched, not "the search failed".
+        let n: i64 = stmt
+            .query_row(params_from_iter(args), |r| r.get(0))
+            .unwrap_or(0);
         Ok(n.max(0) as u32)
     }
 
@@ -795,6 +795,7 @@ impl SqliteStore {
     ///
     /// `partial` matches the LAST term as a prefix, for the panel's
     /// as-you-type fetch.
+    #[allow(clippy::too_many_arguments)] // the query, the operators, the order, the page
     pub(super) fn search_filtered(
         &self,
         account_id: AccountId,
@@ -955,11 +956,10 @@ impl SqliteStore {
                AND m.is_spam = 0{sent}
                AND messages_fts MATCH ?2"
         );
-        let n: i64 = match conn.query_row(&sql, params![account_id, expr], |r| r.get(0)) {
-            Ok(n) => n,
-            // Same reading as every other MATCH on this leg.
-            Err(_) => 0,
-        };
+        // Same reading as every other MATCH on this leg.
+        let n: i64 = conn
+            .query_row(&sql, params![account_id, expr], |r| r.get(0))
+            .unwrap_or(0);
         Ok(n.max(0) as u32)
     }
 

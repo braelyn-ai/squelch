@@ -1674,6 +1674,7 @@ pub trait Store: Send + Sync {
     /// as-you-type fetch wants and what a settled query must not have: an agent
     /// sending finished words would otherwise have `password` widened to
     /// `password*` and rank `passwordless` beside it.
+    #[allow(clippy::too_many_arguments)] // the query, the operators, the order, the page
     fn search_filtered(
         &self,
         account_id: AccountId,
