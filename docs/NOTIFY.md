@@ -214,7 +214,7 @@ alone: "Login code arrived", "Password reset requested". Never the subject,
 never the code. This belongs in SECURITY.md's "Do not break" list, because it
 is exactly the kind of thing a later change "improves" by making the
 notification more useful. It is there now: docs/SECURITY.md §4, "Sealed
-notifications, and the five things that keep them safe".
+notifications, and the six things that keep them safe".
 
 The code itself stays behind `/client/sealed/{id}/reveal`, which already writes
 the audit row before returning. Tap, Face ID, code.
@@ -707,9 +707,11 @@ label, one `AtomicU64` per combination, every series rendered even at zero,
   deliberate-lane ledger writes at the three refine sites, metrics, the
   `docs/SECURITY.md` §4 "Do not break" additions, this doc's §10 kept true.
 
-  **Four deliberate departures from §11.5, all with their rationale in
-  `sync/notify_lane.rs` at the point of departure.** The build found things the
-  design missed; the code is right and this list is the record, not a TODO:
+  **Five deliberate departures from §11.5, each with its rationale in the code
+  at the point of departure** (in `sync/notify_lane.rs`, except the fifth,
+  which is at the field in `sync/mod.rs` that carries it). The build found
+  things the design missed; the code is right and this list is the record, not
+  a TODO:
 
   1. **`candidate` gates on `is_spam`**, which §11.5's gate list does not have.
      The contract's order would have paid a model call to answer a question the
@@ -732,12 +734,24 @@ label, one `AtomicU64` per combination, every series rendered even at zero,
      `is_gateway_url` is `url != API_URL`, so an OpenAI endpoint reads as a
      gateway and §11.5's one-liner would staple `anthropic/` onto the id, 400,
      and park the lane forever on every OpenAI-configured daemon.
+  5. **`NotifyLane` is built LAZILY, in a `OnceLock` on first candidate**, not
+     by `SyncEngine::new` as §11.5 says. `with_metrics` and `without_stage2_llm`
+     replace exactly the two things the lane clones — the metrics registry and
+     the resolved LLM — so a lane built in `new` would count into an orphan
+     registry in production and take the model path in the no-model tests.
+     Those builders are `mut self` and can only run before the engine moves
+     into `run()`, which is what makes the ordering safe. The rationale lives
+     at the field in `sync/mod.rs` rather than in `notify_lane.rs`, because
+     that is where the hazard is.
 
   And two guards the contract has one of where the code needs two: the fast
   lane's re-entry gate is the ledger probe **plus** an in-process in-flight set
   (the probe's row is written last, so overlapping runs both pass it), and the
   seal re-read happens **before the request** as well as before the event (see
-  docs/SECURITY.md §4).
+  docs/SECURITY.md §4). The sealed path re-reads too, in the other direction:
+  `candidate` is pure and reads the fresh heuristic triage, so a row a person
+  un-sealed is a `Candidate::Sealed` again on the next re-walk, and only the
+  store knows better.
 - **Wave 3 (Swift, independent of 2b):** the client half of §11.6. Runs
   beside Wave 2 because it touches only `passband/`.
 
@@ -769,7 +783,13 @@ label, one `AtomicU64` per combination, every series rendered even at zero,
 - Sealed: feed a subject and body containing a six-digit code; assert the
   event row's `one_line`, `sender`, and the ledger row contain neither the
   code nor a word of the subject, and that `Candidate::Sealed` cannot be
-  constructed with a body (it has no field for one).
+  constructed with a body (it has no field for one). And the other direction:
+  a row a person un-sealed is still a `Candidate::Sealed` on the next re-walk
+  and must emit nothing.
+- The STORED stamp, not the computed one (§11.9's second departure): a row
+  first seen on the backfill path, then re-walked incrementally inside the
+  freshness window, is a `Candidate::Model` whose `run` makes zero requests,
+  appends no event and writes no ledger row.
 - Ledger: a second insert for the same (message, lane) is ignored and the
   first row is byte-identical afterwards; backfill and stale rows produce
   no ledger row at all; the four cross-lane joins in §11.4 come out right

@@ -121,6 +121,8 @@ pub enum Candidate {
         thread_id: String,
         sender: String,
         subject: String,
+        /// ALREADY CUT TO WHAT THE PROMPT CAN USE (see [`candidate`]), not the
+        /// flattened body ingest holds.
         body: String,
         /// Someone the user has written to. Read at ingest through the same
         /// lookup Stage-1's floor uses, so the [[known-contact guarantee]] holds
@@ -242,7 +244,26 @@ pub fn candidate(
         thread_id: triaged.message.thread_id.clone(),
         sender: triaged.message.from_addr.clone(),
         subject: triaged.message.subject.clone(),
-        body: triaged.message.body.clone(),
+        // CUT HERE, NOT AT THE PROMPT. `build_user_message` reads at most
+        // `max_body_chars` (1500) of this and throws the rest away, but the
+        // candidate is what a spawned task HOLDS while it waits: the timeout
+        // bounds the call and the semaphore bounds concurrency, and neither
+        // bounds the queue, so an endpoint that hangs rather than erroring
+        // costs `fast_timeout_secs` per permit and lets tasks pile up to the
+        // daily cap. Retaining a full flattened body per queued task — a size
+        // the SENDER picks, and a large HTML marketing mail flattens to tens of
+        // KB — is a megabyte-scale idle footprint on a daemon that has been
+        // OOM-killed on a 4 GB box, in exchange for bytes no prompt will read.
+        //
+        // `+ 1` ON PURPOSE: `truncate_flagged` marks the cut with
+        // "[body truncated to N chars]" only when what it is handed is LONGER
+        // than the cap, so cutting to exactly the cap here would silently drop
+        // that marker and tell the model a clipped body was the whole mail.
+        // One extra scalar keeps the "there is more" signal intact.
+        body: crate::text::truncate_chars(
+            &triaged.message.body,
+            cfg.max_body_chars.saturating_add(1),
+        ),
         is_known_contact: known_contact(&triaged.message.from_addr),
         seed: Seed {
             tier: triaged.tier,
@@ -457,6 +478,53 @@ impl<S: Store + 'static> NotifyLane<S> {
                 sender,
                 kind,
             } => {
+                // STILL SEALED? The mirror of the model path's guard, from the
+                // other side of the same read, and it protects the same thing:
+                // an `events` row `correct_triage` cannot reach.
+                //
+                // `candidate` is PURE and reads the FRESH heuristic triage, and
+                // the seed detector has no idea a person ruled on this message.
+                // So a row a user un-sealed ("this is not a login code") is
+                // still a `Candidate::Sealed` on the next re-ingest inside
+                // `freshness_window_secs`, and without this the lane would mint
+                // an Urgent, importance-90 "Login code arrived" ping — pushed
+                // to a lock screen and routed to the Auth list, where the
+                // message is not — for mail the user has explicitly called
+                // ordinary. The stored row is the record of that ruling; the
+                // candidate is a snapshot of what a regex thought at ingest.
+                //
+                // `Unsealed` is therefore the REFUSAL here, exactly inverting
+                // the model path's use of the same helper: `triage_seed_verdict`
+                // selects `sensitivity = 'normal'`, so a row it can see is a row
+                // that is no longer sealed. Recorded `suppressed` rather than
+                // dropped, for the reason [`NotifyLane::emit`] records it: the
+                // row is what arms the re-entry probe, and a silent return would
+                // hand the next tick the same candidate.
+                match self.seal_state(message_id) {
+                    // "Or gone" cannot be this arm in practice: the
+                    // `notify_eligible_at` read above found the triage row and
+                    // nothing awaits between there and here, so the row is
+                    // still there. Even if it were not, a `sealed_event` names
+                    // no content and `append_event` would carry a dead
+                    // message id, which is the same thing a deletion mid-ping
+                    // already produces.
+                    SealState::SealedOrGone => {}
+                    SealState::Unsealed => {
+                        self.record(
+                            message_id,
+                            NotifyDecision::Suppressed,
+                            None,
+                            Some(SEALED),
+                            eligible_at,
+                            Utc::now(),
+                        );
+                        return;
+                    }
+                    // A store error is a fact about the database, not about the
+                    // message: nothing emitted and nothing recorded, so the next
+                    // re-ingest re-reads.
+                    SealState::Unknown => return,
+                }
                 let ev =
                     events::sealed_event(self.account_id, message_id, &thread_id, &sender, kind);
                 let importance = ev.importance;
@@ -735,7 +803,11 @@ impl<S: Store + 'static> NotifyLane<S> {
                 self.budget()
                     .refund(NOTIFY_FAST_BUDGET_KEY, &day, "notify fast lane");
                 self.metrics.record_llm_config_failure();
-                if self.budget().warn_once(CapKind::NotifyFast, &day) {
+                // ITS OWN WARN SLOT, not the daily cap's: see
+                // [`CapKind::NotifyFastConfig`]. These two notices are the only
+                // two diagnoses for a lane that stopped notifying, and a shared
+                // slot means the first one of the day silences the other.
+                if self.budget().warn_once(CapKind::NotifyFastConfig, &day) {
                     eprintln!(
                         "squelch: notify fast lane config-level failure ({kind}); pausing the \
                          lane for 10 minutes (the triage passes still notify)"
@@ -997,6 +1069,10 @@ impl<S: Store + 'static> NotifyLane<S> {
     /// and the `events` row) across different windows (the permit queue and the
     /// call itself).
     ///
+    /// AND ONCE ON THE SEALED PATH, where the answer is read the other way
+    /// round: there `Unsealed` is the refusal, because a person who un-sealed a
+    /// row outranks the seed detector that keeps calling it auth.
+    ///
     /// `triage_seed_verdict` is the read because its `WHERE` carries
     /// `sensitivity = 'normal'`: `Ok(None)` is "sealed, or gone", which want the
     /// same silence, and neither can be told from the other by this query — nor
@@ -1083,9 +1159,15 @@ impl<'a> InFlight<'a> {
 
 impl Drop for InFlight<'_> {
     fn drop(&mut self) {
-        if let Ok(mut set) = self.set.lock() {
-            set.remove(&self.message_id);
-        }
+        // THE SAME RECOVERY `claim` MAKES, and it has to be: the two are one
+        // guard, and disagreeing about poisoning is how the claim leaks. `claim`
+        // keeps succeeding over a poisoned-but-intact set while a `Ok(..)`-only
+        // release quietly does nothing, so the id stays in the set and every
+        // later `run` for that message returns at the claim — the fast lane
+        // silent for it for the life of the process, which is the exact failure
+        // the RAII comment in `run` promises this type prevents.
+        let mut set = self.set.lock().unwrap_or_else(|p| p.into_inner());
+        set.remove(&self.message_id);
     }
 }
 
@@ -1576,6 +1658,89 @@ mod tests {
         assert_eq!(store.events_after(acct, 0, 10).unwrap().len(), 1);
     }
 
+    /// A CLAIM IS ALWAYS RELEASED, poisoned lock included. `claim` recovers
+    /// from poisoning on purpose (the set is a plain `HashSet` and cannot be
+    /// left half-modified, and refusing would take the lane dark), so the
+    /// release has to make the same call: a `Drop` that gave up on `Err` would
+    /// leave the id in the set forever, and every later `run` for that message
+    /// would return at the claim — the fast lane permanently silent for it,
+    /// which is exactly what the RAII guard exists to prevent.
+    ///
+    /// The panic below is deliberate and prints; it is the only way a
+    /// `std::sync::Mutex` becomes poisoned.
+    #[test]
+    fn a_poisoned_in_flight_set_still_releases_its_claim() {
+        let set: Arc<Mutex<std::collections::HashSet<i64>>> =
+            Arc::new(Mutex::new(std::collections::HashSet::new()));
+        let victim = set.clone();
+        let _ = std::thread::spawn(move || {
+            let _held = victim.lock().unwrap();
+            panic!("another task died holding the guard");
+        })
+        .join();
+        assert!(set.is_poisoned(), "the set is poisoned but intact");
+
+        {
+            let _claim = InFlight::claim(&set, 7).expect("a claim over a poisoned but intact set");
+            assert!(InFlight::claim(&set, 7).is_none(), "and it excludes");
+        }
+        assert!(
+            InFlight::claim(&set, 7).is_some(),
+            "the claim was released: a message must not go dark for the life of \
+             the process because some unrelated task panicked"
+        );
+    }
+
+    /// A SPAWNED TASK CARRIES ONLY WHAT THE PROMPT CAN READ. The candidate is
+    /// what a task HOLDS while it waits for a permit, and neither the timeout
+    /// nor the semaphore bounds the queue: an endpoint that hangs rather than
+    /// erroring costs `fast_timeout_secs` per permit and lets tasks pile up to
+    /// `daily_cap`. A full flattened body per queued task is a size the SENDER
+    /// picks, on a daemon that has been OOM-killed on a 4 GB box, in exchange
+    /// for bytes `build_user_message` throws away.
+    ///
+    /// AND THE TRUNCATION MARKER SURVIVES, which is the half a naive cut
+    /// breaks: `truncate_flagged` marks the cut only when what it is handed is
+    /// LONGER than the cap, so trimming to exactly the cap here would tell the
+    /// model a clipped body was the whole mail. Both are asserted, because the
+    /// second is invisible from the first.
+    #[tokio::test]
+    async fn a_long_body_is_cut_at_the_gate_and_still_reads_as_truncated() {
+        let (store, acct) = store();
+        let now = Utc::now();
+        let (url, seen) = mock(200, verdict(80), false).await;
+        let long = format!(
+            "From: Marketing <news@shop.example>\r\n\
+             To: me@example.com\r\n\
+             Subject: our biggest sale\r\n\
+             Date: {}\r\n\
+             \r\n\
+             {}\r\n",
+            now.to_rfc2822(),
+            "everything must go and here is another sentence about it. ".repeat(400)
+        );
+        let cfg = cfg();
+        let (_, c) = ingest(&store, acct, "g-long", &long, now, &cfg);
+        let c = c.expect("a model candidate");
+        let Candidate::Model { ref body, .. } = c else {
+            panic!("expected a model candidate");
+        };
+        assert!(
+            body.chars().count() <= cfg.max_body_chars + 1,
+            "the candidate holds {} chars of a body the prompt reads {} of",
+            body.chars().count(),
+            cfg.max_body_chars
+        );
+
+        lane(&store, acct, Some(&url), cfg.clone()).run(c).await;
+
+        let req = seen.lock().unwrap().first().cloned().expect("one request");
+        assert!(
+            req.contains(&format!("[body truncated to {} chars]", cfg.max_body_chars)),
+            "the model must still be told the body was cut"
+        );
+    }
+
     /// THE SEAL, end to end. The subject and body below both carry a six-digit
     /// code; nothing the lane writes may contain either, and the candidate has
     /// no field that could have carried them in the first place.
@@ -1642,6 +1807,78 @@ mod tests {
                 "the subject leaked into {text:?}"
             );
         }
+    }
+
+    /// A PERSON WHO SAID "THIS IS NOT A LOGIN CODE" OUTRANKS THE DETECTOR, on
+    /// the sealed path too. `detect_sealed` biases to recall on purpose, so it
+    /// over-seals; `correct_triage` is how that is undone. But `candidate` is
+    /// PURE and reads the FRESH heuristic triage, so the very next re-ingest
+    /// inside `freshness_window_secs` builds a `Candidate::Sealed` for the row
+    /// again and nothing in the gate can know better.
+    ///
+    /// Without the re-read in `run`'s sealed arm that is an Urgent,
+    /// importance-90 "Login code arrived" on a lock screen, routed to the Auth
+    /// list where the message is not, for mail the user has explicitly called
+    /// ordinary — the mirror of the model path's guard, which docs/SECURITY.md
+    /// §4 states only in the normal-to-sealed direction.
+    #[tokio::test]
+    async fn a_row_a_person_un_sealed_never_pings_as_a_login_code() {
+        let (store, acct) = store();
+        let now = Utc::now();
+        let eml = format!(
+            "From: Newsletter <news@auth-vendor.example>\r\n\
+             To: me@example.com\r\n\
+             Subject: Your verification code is 483920\r\n\
+             Date: {}\r\n\
+             \r\n\
+             Your one-time passcode is 483920. Enter this code to continue.\r\n",
+            now.to_rfc2822()
+        );
+        let on = NotifyConfig {
+            sealed_enabled: true,
+            ..cfg()
+        };
+        let (mid, c) = ingest(&store, acct, "g-otp", &eml, now, &on);
+        assert!(matches!(c, Some(Candidate::Sealed { .. })));
+
+        // THE USER SAYS IT IS ORDINARY MAIL.
+        store
+            .correct_triage(
+                acct,
+                mid,
+                crate::types::TriageAxis::Sensitivity,
+                "normal",
+                None,
+                now,
+            )
+            .unwrap();
+
+        // THE ROUTINE RE-WALK: same gmail id, same seed detector, same verdict.
+        let (mid2, c2) = ingest(&store, acct, "g-otp", &eml, now, &on);
+        assert_eq!(mid2, mid);
+        assert!(
+            store.sealed_messages(acct).unwrap().is_empty(),
+            "the re-ingest must not re-seal what a person un-sealed: only a \
+             PERSON outranks a person, in both directions"
+        );
+        assert!(
+            matches!(c2, Some(Candidate::Sealed { .. })),
+            "the sharp edge: the gate is pure and the detector has not changed \
+             its mind, so the candidate is built anyway"
+        );
+
+        lane(&store, acct, None, on).run(c2.unwrap()).await;
+
+        assert!(
+            store.events_after(acct, 0, 10).unwrap().is_empty(),
+            "no auth ping for mail the user has declared ordinary"
+        );
+        let row = ledger(&store, acct, mid).expect("recorded, not dropped");
+        assert_eq!(
+            row.decision,
+            NotifyDecision::Suppressed,
+            "and the row is what stops the NEXT re-walk asking again"
+        );
     }
 
     #[tokio::test]
@@ -1726,6 +1963,78 @@ mod tests {
         let c = candidate(&triaged, mid, &rules, &cfg(), |_| false);
         assert!(c.is_none());
         assert!(ledger(&store, acct, mid).is_none());
+    }
+
+    /// THE STORED STAMP IS THE ONE THAT DECIDES, which is this module's second
+    /// departure from docs/NOTIFY.md §11.5 (no variant carries an
+    /// `eligible_at`) and the only guard behind it.
+    ///
+    /// The divergence is not hypothetical. A backfill walk stamps NULL — silent
+    /// forever, deliberately, or a first sync of a year's archive is a year of
+    /// buzzing. Then a `catch_up()` re-walks the same window on the INCREMENTAL
+    /// path, and for anything whose `Date:` is still inside
+    /// `freshness_window_secs` `notify_eligible_stamp` computes a fresh `Some`
+    /// that `ingest_message` refuses to store. `candidate` gates on the
+    /// COMPUTED one and so hands back a full `Candidate::Model`; only `run`'s
+    /// re-read of the STORED stamp stops it.
+    ///
+    /// Put `eligible_at` back on the variants and every other test in this file
+    /// still passes while this one goes red — which is why it is here.
+    #[tokio::test]
+    async fn a_backfilled_row_re_walked_incrementally_still_never_buzzes() {
+        let (store, acct) = store();
+        let now = Utc::now();
+        let (url, seen) = mock(200, verdict(90), false).await;
+
+        // FIRST SIGHT IS THE BACKFILL: stored stamp NULL.
+        let f = RawFetched {
+            account_id: acct,
+            gmail_msg_id: "g-back".to_string(),
+            gmail_thread_id: None,
+            raw: note_eml(now).into_bytes(),
+            internal_date: Some(now),
+            is_sent: false,
+            is_spam: false,
+            account_addr: "me@example.com".to_string(),
+        };
+        let rules = store.list_sender_rules(acct).unwrap();
+        let mut triaged = ingest_with_rules(&f, &Stage1Config::default(), now, &rules, |_| false);
+        triaged.notify_eligible_at = super::super::notify_eligible_stamp(
+            &triaged,
+            super::super::IngestOrigin::Backfill,
+            &cfg(),
+            now,
+        );
+        assert_eq!(triaged.notify_eligible_at, None);
+        let mid = store.ingest_message(&triaged).unwrap();
+
+        // THEN THE CATCH-UP, on the incremental path, inside the freshness
+        // window: the stamp RECOMPUTES to `Some` and the store keeps its NULL.
+        let (mid2, c) = ingest(&store, acct, "g-back", &note_eml(now), now, &cfg());
+        assert_eq!(mid2, mid, "a re-walk is the same row");
+        assert!(
+            matches!(c, Some(Candidate::Model { .. })),
+            "the gate cannot tell: it sees only the stamp ingest just computed"
+        );
+        assert_eq!(
+            store.notify_eligible_at(acct, mid).unwrap(),
+            None,
+            "and the store never accepted it"
+        );
+
+        lane(&store, acct, Some(&url), cfg()).run(c.unwrap()).await;
+
+        assert_eq!(
+            seen.lock().unwrap().len(),
+            0,
+            "a month of archived mail must not buy a fresh rescue window by \
+             being re-walked"
+        );
+        assert!(store.events_after(acct, 0, 10).unwrap().is_empty());
+        assert!(
+            ledger(&store, acct, mid).is_none(),
+            "and no ledger row either: the table records only stamped messages"
+        );
     }
 
     /// A CONFIG FAILURE IS ABOUT THE DEPLOYMENT, NOT THE MESSAGE: park the lane,

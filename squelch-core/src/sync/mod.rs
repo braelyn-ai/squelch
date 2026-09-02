@@ -609,10 +609,20 @@ enum CapKind {
     Revisit,
     /// The notify fast lane's daily cap ([`NOTIFY_FAST_BUDGET_KEY`]). Its own
     /// kind, not Revisit's, or a capped fast lane would go unmentioned on any
-    /// day a revisit notice had already been logged. It carries the lane's
-    /// config-failure notice too (see [`notify_lane`]), which is the other thing
-    /// worth saying once a day rather than once a message.
+    /// day a revisit notice had already been logged.
     NotifyFast,
+    /// The notify fast lane's CONFIG-FAILURE park (see [`notify_lane`]).
+    ///
+    /// A SEPARATE SLOT FROM `NotifyFast`, though both are about the same lane
+    /// and both are worth saying once a day rather than once a message. They
+    /// are the only two diagnoses for "the fast lane stopped notifying", they
+    /// are unrelated faults, and sharing one slot means whichever fires first
+    /// on a UTC day silences the other for the rest of it: a mailbox that
+    /// exhausts the cap at 09:00 would swallow the 14:00 line naming a broken
+    /// allow-list, on the day somebody is reading the log precisely because
+    /// notifications stopped. The [[fleet LLM outage]] was a config-level 400
+    /// that read as normal for four days.
+    NotifyFastConfig,
 }
 
 /// The preamble every LLM pass shares: resolved credentials, runtime cap
@@ -649,6 +659,7 @@ struct WarnDays {
     stage1_global: Option<String>,
     revisit: Option<String>,
     notify_fast: Option<String>,
+    notify_fast_config: Option<String>,
 }
 
 /// The account's daily-budget ledger plus the warn-once state that goes with it:
@@ -687,6 +698,7 @@ impl<S: Store + ?Sized> BudgetLedger<'_, S> {
             CapKind::Stage1Global => &mut guard.stage1_global,
             CapKind::Revisit => &mut guard.revisit,
             CapKind::NotifyFast => &mut guard.notify_fast,
+            CapKind::NotifyFastConfig => &mut guard.notify_fast_config,
         };
         if slot.as_deref() == Some(day) {
             false
@@ -821,7 +833,12 @@ pub struct SyncEngine<S: Store, C: CredentialStore + ?Sized> {
     /// count into an orphan registry in production and run the model path in the
     /// tests that exist to prove the no-model path. `OnceLock` makes the
     /// builders' order irrelevant instead of making every future builder
-    /// remember to rebuild it.
+    /// remember to rebuild it, and it is safe because both builders take
+    /// `mut self` and so can only run before the engine moves into `run()`.
+    ///
+    /// RECORDED as the fifth deliberate departure in docs/NOTIFY.md §11.9, so
+    /// a later reader diffing the code against the contract finds it named
+    /// rather than re-deriving whether it was on purpose.
     notify_lane: std::sync::OnceLock<Arc<notify_lane::NotifyLane<S>>>,
     /// Set while the INBOX unread fetch is failing, so a persistent failure
     /// (revoked scope, Gmail outage) says so ONCE instead of once per poll. The
@@ -6152,6 +6169,12 @@ mod tests {
     /// UTC day PER KIND: sharing a slot with `Revisit` would mean a capped fast
     /// lane went unmentioned on any day a revisit notice had already fired,
     /// which is precisely the day somebody would be looking.
+    ///
+    /// And the lane's two OWN notices do not share a slot with each other.
+    /// "Cap exhausted" and "config-level failure, lane parked ten minutes" are
+    /// the only two diagnoses for a fast lane that stopped notifying, they are
+    /// unrelated faults, and one slot means the first of the day swallows the
+    /// second.
     #[test]
     fn the_notify_fast_budget_shares_neither_a_key_nor_a_warn_slot() {
         let keys = [
@@ -6180,6 +6203,17 @@ mod tests {
         // And a revisit notice on the same day does not consume the fast lane's.
         assert!(engine.warn_once_per_day(CapKind::Revisit, "2026-09-02"));
         assert!(!engine.warn_once_per_day(CapKind::NotifyFast, "2026-09-02"));
+        // NOR DOES THE LANE'S OWN CONFIG-FAILURE NOTICE, in either order: the
+        // cap notice has already fired on both days above, and the park still
+        // gets its line — the one naming the failure kind, on the day the
+        // gateway's allow-list went wrong.
+        assert!(engine.warn_once_per_day(CapKind::NotifyFastConfig, "2026-09-01"));
+        assert!(engine.warn_once_per_day(CapKind::NotifyFastConfig, "2026-09-02"));
+        assert!(!engine.warn_once_per_day(CapKind::NotifyFastConfig, "2026-09-02"));
+        // And the other way round: a config park on a fresh day must not
+        // silence that day's exhausted-cap notice.
+        assert!(engine.warn_once_per_day(CapKind::NotifyFastConfig, "2026-09-03"));
+        assert!(engine.warn_once_per_day(CapKind::NotifyFast, "2026-09-03"));
     }
 
     /// The ledger category the fast lane books under is the SAME STRING both

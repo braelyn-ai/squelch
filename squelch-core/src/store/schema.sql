@@ -593,7 +593,11 @@ CREATE TABLE IF NOT EXISTS triage_feedback (
     account_id   INTEGER NOT NULL,
     message_id   INTEGER NOT NULL,
     corrected_at TEXT NOT NULL,
-    -- Which axis the human overrode: 'tier' | 'category'.
+    -- Which axis the human overrode: 'tier' | 'category' | 'sensitivity'.
+    -- READ BY THE INGEST UPSERT, not only by the eval queries: a
+    -- 'sensitivity' row here is what tells `ingest_message` that a PERSON
+    -- decided whether this message is auth mail, so a re-walk's heuristic seed
+    -- may not overwrite it in either direction (docs/SECURITY.md §4).
     dimension    TEXT NOT NULL,
     -- What triage had (NULL when the row never had a value for that axis).
     from_value   TEXT,

@@ -456,7 +456,7 @@ can filter". Keep the guards returning errors, the reveal audited-before-served 
 the audit log, and keep both seal paths scrubbing it — a draft outliving its parent's
 seal is a quotation of auth mail the user has already decided is auth.
 
-**Sealed notifications, and the five things that keep them safe.** Sealed mail
+**Sealed notifications, and the six things that keep them safe.** Sealed mail
 buzzes (docs/NOTIFY.md §6, §11.6). A ping is not a reveal — `PushRequest` is
 `{event_id, collapse_id}` and the relay is blind by construction — but the
 `events` row behind it is served to a client, so it is the surface with rules:
@@ -499,11 +499,33 @@ buzzes (docs/NOTIFY.md §6, §11.6). A ping is not a reveal — `PushRequest` is
   bookkeeping: with no row, the lane's re-entry probe stays false, and the next
   re-ingest inside `notify.freshness_window_secs` re-runs the whole lane over
   the sealed body. Which is also why `ingest_message`'s triage upsert preserves
-  a human-decided `sensitivity` (`triage.model_used = 'human'`) instead of
-  overwriting it with the heuristic seed a re-walk carries: a re-ingest that
-  reverts a person's seal is the same leak from the other end. The deliberate
-  lane has the same guard in `stage1_apply`/`stage2_apply` returning
-  `Ok(false)`.
+  a human-decided `sensitivity` instead of overwriting it with the heuristic
+  seed a re-walk carries: a re-ingest that reverts a person's seal is the same
+  leak from the other end. The deliberate lane has the same guard in
+  `stage1_apply`/`stage2_apply` returning `Ok(false)`.
+
+  **"Human-decided" is asked of the AXIS, not of the row.** The predicate is a
+  `triage_feedback` row with `dimension = 'sensitivity'`, written by
+  `correct_triage` in the same transaction as the correction. It is not
+  `triage.model_used = 'human'`, which that function stamps for a *tier* or a
+  *category* correction too: keyed on the column, a freeze would pin the
+  sensitivity of every human-corrected row forever, so an improved
+  `detect_sealed` could never newly seal a message whose tier somebody once
+  fixed — and detection biasing to recall is worth nothing if it cannot be
+  improved. Keyed on the axis it holds in BOTH directions, which is the second
+  half: `detect_sealed` over-seals by design, `correct_triage` is how that is
+  undone, and a re-walk that quietly re-sealed the row would be a correction
+  the user has to make again every poll.
+
+- **The sealed path re-reads too, in the opposite direction.**
+  `notify_lane::candidate` is pure and reads the FRESH heuristic triage, so a
+  message a person un-sealed is a `Candidate::Sealed` again on the next
+  re-walk: the seed detector has not changed its mind and nothing in the gate
+  can know better. `run`'s sealed arm therefore asks the store whether the row
+  is still sealed before it appends, and records `suppressed` when it is not.
+  Otherwise "this is not a login code" costs the user an Urgent,
+  importance-90 ping on a lock screen, routed to the Auth list where the
+  message is not, once per re-walk.
 - **The decline ledger carries no email-derived text.** `notify_decisions` holds
   ids, a lane, a decision word, a score, a model id and a latency. Not the
   `one_line`, not the subject, nothing. It cannot leak by construction, which is

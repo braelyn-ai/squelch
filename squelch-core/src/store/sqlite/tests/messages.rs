@@ -744,6 +744,54 @@ fn reingest_cannot_revert_a_human_seal_but_a_detector_seal_still_refreshes() {
         "sealed",
         "an improved detector must still be able to seal a row it missed"
     );
+
+    // --- Row C: a person corrected the TIER, which has nothing to say about
+    // whether this is auth mail. `correct_triage` stamps `model_used='human'`
+    // for EVERY axis, so a freeze keyed on that column would pin row C's
+    // sensitivity forever and quietly delete row B's behaviour for every
+    // human-corrected row in the mailbox. The freeze is keyed on the AXIS the
+    // person actually ruled on. ---
+    let c = triaged_row(acct, "g-c", "t-c", None, false, Sensitivity::Normal).ingest(&store);
+    store
+        .correct_triage(
+            acct,
+            c,
+            crate::types::TriageAxis::Tier,
+            "signal",
+            None,
+            Utc::now(),
+        )
+        .unwrap();
+    triaged_row(acct, "g-c", "t-c", None, false, Sensitivity::Sealed).ingest(&store);
+    assert_eq!(
+        sealed_now(c),
+        "sealed",
+        "a tier correction is not a ruling about auth mail, and must not stop \
+         a detector fix from sealing this row"
+    );
+
+    // --- Row D: the OTHER direction of a sensitivity ruling. The detector is
+    // recall-biased and over-seals; a person saying "this is ordinary mail"
+    // must outrank the same detector on the next re-walk, or the correction is
+    // one the user makes again every poll — and the fast lane pings it as a
+    // login code each time (docs/NOTIFY.md §11.6). ---
+    let d = triaged_row(acct, "g-d", "t-d", None, false, Sensitivity::Sealed).ingest(&store);
+    store
+        .correct_triage(
+            acct,
+            d,
+            crate::types::TriageAxis::Sensitivity,
+            "normal",
+            None,
+            Utc::now(),
+        )
+        .unwrap();
+    triaged_row(acct, "g-d", "t-d", None, false, Sensitivity::Sealed).ingest(&store);
+    assert_eq!(
+        sealed_now(d),
+        "normal",
+        "only a person outranks a person, in the un-seal direction too"
+    );
 }
 
 #[test]
