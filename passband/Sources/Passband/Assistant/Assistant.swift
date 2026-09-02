@@ -814,7 +814,14 @@ final class AssistantSession {
                 // tool_result blocks — the provider takes text after results —
                 // because anywhere else would either split the results from
                 // their tool_use or arrive as a second user turn in a row.
-                if let refinement = refinements.take() {
+                //
+                // NOT ON THE CUT-OFF PATH. That turn is about to `fail`, which
+                // rolls the wire history back past this very message: a
+                // refinement taken out of the slot there would be discarded
+                // with it, and the reader's newest words would simply never
+                // reach the model. Left pending, the run's own ending sends
+                // them as the next question instead.
+                if !cutOff, let refinement = refinements.take() {
                     append(.user, text: refinement.text)
                     results.append(
                         .text(
