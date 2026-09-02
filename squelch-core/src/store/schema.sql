@@ -51,6 +51,22 @@ CREATE TABLE IF NOT EXISTS messages (
     -- bypass rather than granting it. Nothing is backfilled: any re-sync refills
     -- the column through the message upsert.
     auth_pass   INTEGER,
+    -- THE PROVIDER'S SPAM VERDICT, not ours: 1 when this message was fetched
+    -- from Gmail's SPAM label, 0 otherwise. Gmail sorted it; nothing in squelch
+    -- did, and no LLM ever looks at it (the ingest branch stamps a neutral row
+    -- and the 'n/a' stage markers, exactly as it does for sent mail).
+    --
+    -- IT IS A STRUCTURAL EXCLUSION, NOT A TIER. Tier has no `spam` variant for
+    -- the same reason it has no `sealed` one: these rows must be absent from
+    -- every band, queue, count and search rather than ranked last within them,
+    -- so every listing pairs `is_spam = 0` with its `is_sent = 0`. The ONE
+    -- surface that passes 1 is the human door's spam page.
+    --
+    -- STICKY TO 0 on conflict (`MIN`), like `is_sent` and for the same reason: a
+    -- message ever seen outside the spam label can never be hidden by a later
+    -- spam sighting. Nothing moves a row the other way except the user's own
+    -- "not spam", which clears it here and in Gmail together.
+    is_spam     INTEGER NOT NULL DEFAULT 0,
     UNIQUE(account_id, gmail_msg_id)
 );
 

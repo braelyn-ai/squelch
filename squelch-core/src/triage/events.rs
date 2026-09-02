@@ -45,6 +45,8 @@ pub struct EventContext<'a> {
     pub sensitivity: Sensitivity,
     /// `true` for the user's own outbox.
     pub is_sent: bool,
+    /// `true` when the provider filed this under its spam label.
+    pub is_spam: bool,
     /// The disposition of the sender rule that decided this row, when one fired.
     pub rule: Option<Disposition>,
     pub tier: Tier,
@@ -109,6 +111,14 @@ pub fn worthy_kind(
     }
     // The user's own outbox never notifies the user.
     if ctx.is_sent {
+        return Err(Refusal::NotWorthy);
+    }
+    // Neither does mail the provider already sorted into spam. Waking someone up
+    // for something Gmail filed in the spam folder inverts the entire point of
+    // the folder, and the tier/importance tests below cannot catch it: a spam row
+    // is never triaged, so it carries the neutral seed and would fall through to
+    // `None` today by accident rather than by decision. This makes it a decision.
+    if ctx.is_spam {
         return Err(Refusal::NotWorthy);
     }
     // A squelch/filtered rule is a standing "not from this sender".
@@ -211,6 +221,7 @@ pub fn ingest_context<'a>(
         notify_eligible_at: triaged.notify_eligible_at,
         sensitivity: triaged.sensitivity,
         is_sent: triaged.message.is_sent,
+        is_spam: triaged.message.is_spam,
         rule,
         tier: triaged.tier,
         importance: triaged.importance,
@@ -251,8 +262,9 @@ pub fn seed_context<'a>(
         // the fresher read is the honest one to quote.
         notify_eligible_at: seed.notify_eligible_at,
         sensitivity: row.sensitivity,
-        // The Stage-1 queue selects `m.is_sent = 0`.
+        // The Stage-1 queue selects `m.is_sent = 0` and `m.is_spam = 0`.
         is_sent: false,
+        is_spam: false,
         rule,
         tier: seed.tier,
         importance: seed.importance,
@@ -297,6 +309,7 @@ mod tests {
             notify_eligible_at: Some(now),
             sensitivity: Sensitivity::Normal,
             is_sent: false,
+            is_spam: false,
             rule: None,
             tier: Tier::Signal,
             importance: 70,

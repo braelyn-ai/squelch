@@ -237,6 +237,7 @@ actor APIClient {
                 "cursor": params.cursor,
                 "peek": peek ? "true" : nil,
                 "reminders": params.remindersPending ? "pending" : nil,
+                "spam": params.spamOnly ? "only" : nil,
             ])
     }
 
@@ -580,6 +581,34 @@ actor APIClient {
     func actionArchive(_ messageId: Int) async throws -> StatusResult {
         try await post(
             "/client/actions/archive", body: ArchiveBody(message_id: messageId, confirm: true))
+    }
+
+    /// Rescue one message from the provider's spam folder: Gmail drops its SPAM
+    /// label and regains INBOX, and the daemon requeues the row for a real
+    /// triage verdict. The ONLY write the spam page makes — there is no
+    /// "mark as spam" going the other way, because Passband cannot show the
+    /// effects of training a filter it does not read.
+    /// Ask the daemon to go and fetch the provider's spam folder. FIRE AND
+    /// FORGET: the daemon does not track that folder, so this is a real Gmail
+    /// round trip measured in tens of seconds, and the answer arrives through
+    /// the ordinary updates poll rather than this response.
+    ///
+    /// `RefreshResult`, the same `{"triggered": bool}` `refreshMail` above
+    /// decodes, because it is the same kind of poke at the same sync loop. It
+    /// was briefly typed as `StatusResult`, which requires a `status` key this
+    /// route does not send: the POST reached the daemon and the fetch ran
+    /// perfectly, the DECODE of the acknowledgement threw, and the page reported
+    /// that it could not reach the provider. A wrong response type on a
+    /// fire-and-forget call fails at the only place it can still be seen.
+    @discardableResult
+    func refreshSpam() async throws -> RefreshResult {
+        try await post("/client/spam/refresh", body: EmptyBody())
+    }
+
+    @discardableResult
+    func actionNotSpam(_ messageId: Int) async throws -> StatusResult {
+        try await post(
+            "/client/actions/not_spam", body: NotSpamBody(message_id: messageId, confirm: true))
     }
 
     @discardableResult

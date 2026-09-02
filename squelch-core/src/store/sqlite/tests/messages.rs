@@ -28,6 +28,7 @@ fn ingest_message_persists_attachments_and_thread_view_carries_them() {
         raw: eml.as_bytes().to_vec(),
         internal_date: Some(Utc::now()),
         is_sent: false,
+        is_spam: false,
         account_addr: "me@example.com".into(),
     };
     let t = crate::sync::ingest::ingest(&fetched, &Stage1Config::default(), Utc::now(), |_| false);
@@ -94,6 +95,7 @@ fn cid_inline_part_carries_its_content_id_to_the_thread_view() {
         raw: eml.as_bytes().to_vec(),
         internal_date: Some(Utc::now()),
         is_sent: false,
+        is_spam: false,
         account_addr: "me@example.com".into(),
     };
     let t = crate::sync::ingest::ingest(&fetched, &Stage1Config::default(), Utc::now(), |_| false);
@@ -147,6 +149,7 @@ fn double_attached_identical_file_cannot_kill_ingest() {
         raw: eml.as_bytes().to_vec(),
         internal_date: Some(Utc::now()),
         is_sent: false,
+        is_spam: false,
         account_addr: "me@example.com".into(),
     };
     let t = crate::sync::ingest::ingest(&fetched, &Stage1Config::default(), Utc::now(), |_| false);
@@ -385,6 +388,7 @@ fn field_reasons_roundtrip_through_ingest_and_attention_updates() {
             None,
             None,
             false,
+            SpamScope::Exclude,
         )
         .unwrap();
     let u = ups.iter().find(|u| u.update.id == id).expect("row present");
@@ -444,6 +448,7 @@ fn predating_triage_row_reads_back_as_none() {
             None,
             None,
             false,
+            SpamScope::Exclude,
         )
         .unwrap();
     let u = ups.iter().find(|u| u.update.id == mid).unwrap();

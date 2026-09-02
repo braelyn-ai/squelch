@@ -96,6 +96,7 @@ fn client_router(state: ApiState) -> Router {
             post(handlers::set_update_reminder).delete(handlers::clear_update_reminder),
         )
         .route("/client/refresh", post(handlers::refresh_now))
+        .route("/client/spam/refresh", post(handlers::refresh_spam))
         .route("/client/thread/{thread_id}", get(handlers::get_thread))
         // "I opened this." Its own route rather than a side effect of the GET
         // above, because the client warms threads it has not shown and opens
@@ -240,6 +241,7 @@ fn client_router(state: ApiState) -> Router {
         // Actions: the only write capability. Require the opt-in write
         // credential; 403 without one.
         .route("/client/actions/archive", post(handlers::action_archive))
+        .route("/client/actions/not_spam", post(handlers::action_not_spam))
         .route("/client/actions/label", post(handlers::action_label))
         .route("/client/actions/send", post(handlers::action_send))
         // Bearer auth wraps EVERY route above.

@@ -1,7 +1,7 @@
 // One dense update row: importance meter · avatar · sender · one_line ·
 // relative time · matched-rule hint · deadline chip. Mouse click selects AND
 // opens the thread (gmail semantics); action affordances stay keyboard-first,
-// with the [r][e][d] verb hint only on the selected row.
+// with the verb hint (default [r][e][d]) only on the selected row.
 
 import SwiftUI
 
@@ -12,6 +12,13 @@ struct UpdateRow: View {
     var aging = false
     /// 0..1 escalation weight for the STILL OPEN visual ramp.
     var weight: Double = 0
+    /// The keyboard hint on the selected row. A PARAMETER because the spam page
+    /// has a different answer: `r` still replies there, but the verb somebody
+    /// opened that page to use is `i`, and `v`/`f`/`h` are inert on a row
+    /// nothing triaged. A hint that names keys the page ignores is worse than
+    /// no hint, and this is the only visible affordance the Mac gives the
+    /// rescue — the phone has the swipe rail, the Mac has this.
+    var verbHint: String = "[r][e][d]"
     let onHover: () -> Void
     let onOpen: () -> Void
 
@@ -222,7 +229,7 @@ struct UpdateRow: View {
                             .frame(width: 30, alignment: .trailing)
                     }
                     if selected {
-                        Text("[r][e][d]")
+                        Text(verbHint)
                             .font(Typo.mono(9))
                             .foregroundStyle(Palette.inkFaintest)
                     }

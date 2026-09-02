@@ -64,7 +64,7 @@ fn sender_history_conn(
          WHERE m.account_id = ?1
            AND m.from_addr = ?2 COLLATE NOCASE
            AND m.id != ?3
-           AND m.is_sent = 0
+           AND m.is_sent = 0 AND m.is_spam = 0
            AND t.sensitivity = 'normal'",
         params![account_id, from_addr, exclude_message_id],
         |r| Ok((r.get(0)?, r.get(1)?)),
@@ -228,7 +228,7 @@ impl SqliteStore {
                AND t.category IN ({placeholders})
                AND t.extractor_model_used IS NULL
                AND t.sensitivity = 'normal'
-               AND m.is_sent = 0
+               AND m.is_sent = 0 AND m.is_spam = 0
                AND NOT EXISTS(
                    SELECT 1 FROM receipts r
                    WHERE r.account_id = t.account_id AND r.message_id = t.message_id
@@ -289,7 +289,7 @@ impl SqliteStore {
              WHERE t.account_id = ?1
                AND t.ship_extract_model = 'pending'
                AND t.sensitivity = 'normal'
-               AND m.is_sent = 0
+               AND m.is_sent = 0 AND m.is_spam = 0
              ORDER BY t.retriage_at IS NULL, t.retriage_at DESC, m.received_at DESC
              LIMIT ?2",
         )?;
@@ -373,7 +373,7 @@ impl SqliteStore {
                AND COALESCE(stage1_model_used, '') NOT IN ('rule', 'n/a', 'human')
                AND message_id IN (
                    SELECT m.id FROM messages m
-                   WHERE m.account_id = ?1 AND m.is_sent = 0 AND {scope_sql}
+                   WHERE m.account_id = ?1 AND m.is_sent = 0 AND m.is_spam = 0 AND {scope_sql}
                )"
         );
         let n = conn.execute(
@@ -386,7 +386,7 @@ impl SqliteStore {
             "SELECT t.message_id FROM triage t
              JOIN messages m ON m.id = t.message_id
              WHERE t.account_id = ?1 AND t.stage1_model_used IS NULL
-               AND m.is_sent = 0 AND {scope_sql}"
+               AND m.is_sent = 0 AND m.is_spam = 0 AND {scope_sql}"
         );
         // Drop stale specialist rows; re-extraction recreates them, possibly
         // under a different category verdict. MARKETING is here for the same
@@ -469,7 +469,7 @@ impl SqliteStore {
              WHERE t.account_id = ?1
                AND t.retriage_at >= ?2
                AND t.sensitivity = 'normal'
-               AND m.is_sent = 0",
+               AND m.is_sent = 0 AND m.is_spam = 0",
             params![account_id, since],
             |r| {
                 Ok((
@@ -540,7 +540,7 @@ impl SqliteStore {
              WHERE t.account_id = ?1
                AND t.stage1_model_used IS NULL
                AND t.sensitivity = 'normal'
-               AND m.is_sent = 0
+               AND m.is_sent = 0 AND m.is_spam = 0
              ORDER BY t.retriage_at IS NULL, t.retriage_at DESC, m.received_at DESC
              LIMIT ?2",
         )?;
@@ -720,7 +720,7 @@ impl SqliteStore {
                AND t.sensitivity = 'normal'
                AND t.status != 'done'
                AND t.revisit_count < ?3
-               AND m.is_sent = 0
+               AND m.is_sent = 0 AND m.is_spam = 0
                AND NOT EXISTS(
                    SELECT 1 FROM triage_feedback f2
                    WHERE f2.account_id = v.account_id AND f2.message_id = v.message_id
@@ -827,7 +827,7 @@ impl SqliteStore {
                AND t.status != 'done'
                AND t.stage1_model_used IS NOT NULL
                AND t.revisit_count < ?3
-               AND m.is_sent = 0
+               AND m.is_sent = 0 AND m.is_spam = 0
                AND m.received_at <= ?2
                AND NOT EXISTS(
                    SELECT 1 FROM triage_revisits v
@@ -1067,7 +1067,7 @@ impl SqliteStore {
                AND t.needs_stage2 = 1
                AND t.model_used IS NULL
                AND t.sensitivity = 'normal'
-               AND m.is_sent = 0
+               AND m.is_sent = 0 AND m.is_spam = 0
              ORDER BY t.retriage_at IS NULL, t.retriage_at DESC, m.received_at DESC
              LIMIT ?2",
         )?;
@@ -1390,7 +1390,7 @@ impl SqliteStore {
         let conn = self.lock()?;
         let n: i64 = conn.query_row(
             "SELECT COUNT(*) FROM messages
-             WHERE account_id = ?1 AND is_sent = 0 AND received_at >= ?2",
+             WHERE account_id = ?1 AND is_sent = 0 AND is_spam = 0 AND received_at >= ?2",
             params![account_id, since.to_rfc3339()],
             |r| r.get(0),
         )?;

@@ -184,6 +184,7 @@ fn seeded() -> (Arc<SqliteStore>, i64, i64) {
             body: String::new(),
             body_html: None,
             is_sent: false,
+            is_spam: false,
             to_addrs: None,
             list_unsubscribe: None,
             list_unsub_one_click: false,

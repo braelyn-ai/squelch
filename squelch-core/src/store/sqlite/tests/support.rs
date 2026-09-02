@@ -69,6 +69,7 @@ pub(super) fn triaged(account_id: AccountId, gmail: &str, thread: &str) -> Triag
             body: "Hey, want to grab lunch tomorrow?".to_string(),
             body_html: None,
             is_sent: false,
+            is_spam: false,
             to_addrs: None,
             list_unsubscribe: None,
             list_unsub_one_click: false,
@@ -123,6 +124,11 @@ impl TriagedBuilder {
     }
     pub(super) fn is_sent(mut self, is_sent: bool) -> Self {
         self.msg.is_sent = is_sent;
+        self
+    }
+    /// Mail the provider filed as spam — what the SPAM label walk ingests.
+    pub(super) fn is_spam(mut self, is_spam: bool) -> Self {
+        self.msg.is_spam = is_spam;
         self
     }
     /// Sent mail's display recipients, as the ingest path renders them.

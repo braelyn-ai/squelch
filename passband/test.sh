@@ -166,6 +166,19 @@ run_suite gmail-health \
   Sources/Passband/Lib/AsyncMemo.swift \
   Tests/GmailHealthTests.swift
 
+# The spam page's wire contract, against verbatim daemon responses. It exists
+# because the seam it covers is checked by nobody else: these suites never build
+# APIClient, and the Rust tests know nothing of Swift's types. A response type
+# typed wrong there fails at the only place it can still be seen — the client
+# read a decode error on a fire-and-forget POST as a failed request and reported
+# that it could not reach a spam folder it had just synced perfectly.
+run_suite spam-wire \
+  Sources/Passband/Model/WireTypes.swift \
+  Sources/Passband/Model/SubjectText.swift \
+  Sources/Passband/Lib/Format.swift \
+  Sources/Passband/Lib/AsyncMemo.swift \
+  Tests/SpamWireTests.swift
+
 run_suite sender-identity \
   Sources/Passband/Model/SubjectText.swift \
   Sources/Passband/Model/WireTypes.swift \

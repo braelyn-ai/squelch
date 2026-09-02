@@ -81,6 +81,11 @@ pub(super) fn migrate(conn: &Connection) -> Result<()> {
     // IS NULL`); the backfill runs from the sync engine, over the network, so it
     // cannot live in this synchronous seam.
     add_column_if_missing(conn, "messages", "to_addrs", "TEXT")?;
+    // Gmail's own spam verdict. 0 on every pre-existing row, which is the honest
+    // reading: this daemon never fetched the SPAM label before, so nothing
+    // already stored came from it. The first sync after the upgrade backfills
+    // the label's window like any other.
+    add_column_if_missing(conn, "messages", "is_spam", "INTEGER NOT NULL DEFAULT 0")?;
     // The composer grew Cc and Bcc fields; a draft has to be able to hold what
     // the composer can show, or closing one silently drops recipients.
     add_column_if_missing(conn, "drafts", "cc_addr", "TEXT NOT NULL DEFAULT ''")?;
@@ -148,6 +153,23 @@ pub(super) fn migrate(conn: &Connection) -> Result<()> {
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_triage_remind_at
              ON triage(account_id, remind_at) WHERE remind_at IS NOT NULL",
+            [],
+        )?;
+    }
+
+    // THE SPAM PAGE'S INDEX, partial for the same reason and in the same place.
+    // Every other listing wants `is_spam = 0`, which is almost every row and so
+    // is better served by a scan the planner was going to do anyway; only the
+    // spam page asks for the handful with `is_spam = 1`, and it asks newest-first.
+    // BOTH columns in the guard, not just the migrated one. `has_columns` is
+    // there to keep an index off a table that has not grown its column yet, and
+    // an index names every column it covers: checking only `is_spam` left
+    // `received_at` assumed, which holds for any table `schema.sql` built and
+    // not for a partial one.
+    if has_columns(conn, "messages", &["is_spam", "received_at"])? {
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_messages_spam
+             ON messages(account_id, received_at) WHERE is_spam = 1",
             [],
         )?;
     }

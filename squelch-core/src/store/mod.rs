@@ -41,6 +41,58 @@ pub enum SitrepBand {
     Open,
 }
 
+/// `app_settings` key holding when the on-demand spam sync last COMPLETED
+/// (RFC3339 UTC), absent until one has.
+///
+/// It exists so the spam page can tell "we looked and the folder is empty" apart
+/// from "nobody has looked yet", which are the same empty list on the wire and
+/// opposite facts to a reader. The poll loop never walks the spam label at all,
+/// so without this stamp a page that has not synced yet would tell somebody
+/// their provider filtered nothing — a confident answer nobody has earned.
+///
+/// `pub` because the sync engine writes it and the store reads it into
+/// [`crate::types::StoreStats`], and a key spelled in two places is a key that
+/// eventually disagrees with itself.
+pub const SPAM_SYNCED_AT_KEY: &str = "spam_synced_at";
+
+/// WHICH SIDE of the provider's spam verdict a listing wants. A two-variant
+/// enum rather than a `bool` because the boolean has no honest name: `spam:
+/// true` reads as "include spam" at half the call sites and "only spam" at the
+/// other half, and the two differ by the entire inbox.
+///
+/// There is no `Both`. Spam and ordinary mail interleaved in one list is the
+/// state this feature exists to end, and offering it would make the default
+/// listing one mistaken argument away from it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SpamScope {
+    /// Everything the provider did NOT file as spam. The default, and what every
+    /// band, queue, count and search asks for.
+    #[default]
+    Exclude,
+    /// ONLY what the provider filed as spam — the human door's spam page, and
+    /// the only caller in the codebase that passes it.
+    Only,
+}
+
+impl SpamScope {
+    /// The SQL predicate over `messages` (aliased `m`) this scope stands for.
+    pub fn predicate(self) -> &'static str {
+        match self {
+            SpamScope::Exclude => "m.is_spam = 0",
+            SpamScope::Only => "m.is_spam = 1",
+        }
+    }
+
+    /// One accepted string, and `None` for anything else so the caller can 400
+    /// rather than silently serve the wrong side of the verdict.
+    pub fn parse(s: &str) -> Option<SpamScope> {
+        match s {
+            "only" => Some(SpamScope::Only),
+            _ => None,
+        }
+    }
+}
+
 /// One attachment's `(filename, mime, data)`; `data` is `None` when the bytes
 /// were not stored (the part was over the ingest cap).
 pub type AttachmentBytes = (String, String, Option<Vec<u8>>);
@@ -1246,6 +1298,16 @@ pub trait Store: Send + Sync {
         days: u32,
     ) -> Result<u64>;
 
+    /// THE LOCAL HALF OF "NOT SPAM": clear `messages.is_spam` on one message and
+    /// hand the row back to triage as newly-arrived mail — LLM markers reset, a
+    /// `retriage_at` force stamp so its age cannot stale-skip it, and the
+    /// attention lifecycle back to `new`. Sealed rows are refused. `false` when
+    /// nothing changed (unknown id, sealed, or not spam to begin with).
+    ///
+    /// The Gmail half is the caller's and runs first; see the `not_spam`
+    /// handler for why that order and not the other one.
+    fn clear_spam(&self, account_id: AccountId, message_id: i64) -> Result<bool>;
+
     /// Mark an extract-queued row PROCESSED without writing a specialist row —
     /// stamp `extractor_model_used` only. Used on the skip / refusal / permanent-
     /// error paths so the row does not loop. Guarded by `sensitivity='normal'`.
@@ -1370,6 +1432,7 @@ pub trait Store: Send + Sync {
     /// them soonest-first, which is a SCHEDULE rather than a band: every such row
     /// is `done` by construction (see [`Store::set_reminder`]), so a caller
     /// asking for it must not also be filtering done away.
+    #[allow(clippy::too_many_arguments)] // the filters of one listing, one per axis
     fn attention_updates(
         &self,
         account_id: AccountId,
@@ -1378,6 +1441,7 @@ pub trait Store: Send + Sync {
         status: Option<AttentionStatus>,
         band: Option<SitrepBand>,
         pending_reminders: bool,
+        spam: SpamScope,
     ) -> Result<Vec<AttentionUpdate>>;
 
     /// SEEN-LEDGER stamp, in ONE transaction: for each non-sealed message id set

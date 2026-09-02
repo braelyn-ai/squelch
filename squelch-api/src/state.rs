@@ -67,6 +67,10 @@ pub struct ApiState {
     /// `POST /client/refresh`. `None` when no sync loop is wired in, which the
     /// endpoint reports as `triggered: false` rather than faking a poke.
     pub(crate) refresh: Option<Arc<tokio::sync::Notify>>,
+    /// On-demand spam-fetch signal shared with the Gmail sync loop, fired by
+    /// `POST /client/spam/refresh`. `None` when no sync loop is wired in, which
+    /// the endpoint reports as `triggered: false` rather than pretending.
+    pub(crate) spam_refresh: Option<Arc<tokio::sync::Notify>>,
     /// Wake channel for `GET /client/events`, the SAME sender attached to the
     /// store. THE PAYLOAD IS ONLY A HINT — the `events` table is the truth and
     /// every connection re-reads past its own cursor — so a missed or lagged
@@ -340,6 +344,7 @@ impl ApiState {
                 .price_out_per_mtok,
             stage1_global_daily_cap: squelch_core::config::Stage1Config::default().global_daily_cap,
             refresh: None,
+            spam_refresh: None,
             event_notifier: None,
             shutdown: None,
             tracking_base_url: None,
@@ -378,6 +383,22 @@ impl ApiState {
     /// [`SyncEngine::with_refresh`]: squelch_core::sync::SyncEngine::with_refresh
     pub fn with_refresh(mut self, refresh: Arc<tokio::sync::Notify>) -> Self {
         self.refresh = Some(refresh);
+        self
+    }
+
+    /// Share the sync loop's ON-DEMAND SPAM signal. Wire the SAME handle you
+    /// pass to [`SyncEngine::with_spam_refresh`]; without it
+    /// `POST /client/spam/refresh` is a no-op (`triggered: false`) and the spam
+    /// page shows whatever was last fetched, which on a fresh install is
+    /// nothing.
+    ///
+    /// SEPARATE FROM `with_refresh` on purpose. The spam folder is the one thing
+    /// the poll loop deliberately does not track, and folding the two signals
+    /// together would put its fetch back on every ordinary manual refresh.
+    ///
+    /// [`SyncEngine::with_spam_refresh`]: squelch_core::sync::SyncEngine::with_spam_refresh
+    pub fn with_spam_refresh(mut self, spam_refresh: Arc<tokio::sync::Notify>) -> Self {
+        self.spam_refresh = Some(spam_refresh);
         self
     }
 

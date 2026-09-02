@@ -1932,6 +1932,13 @@ fn cmd_serve(
     // wakes early.
     let refresh = Arc::new(tokio::sync::Notify::new());
 
+    // On-demand spam signal: `POST /client/spam/refresh` fires it and the poll
+    // loop runs ONE spam-window fetch. Its own handle rather than a second use
+    // of `refresh`, because the SPAM label is the one thing the loop
+    // deliberately does not track and folding the two together would put that
+    // fetch back on every ordinary refresh.
+    let spam_refresh = Arc::new(tokio::sync::Notify::new());
+
     // Wake channel: the store pokes it on every real `append_event`, and each
     // open `GET /client/events` stream re-reads the table past its own cursor.
     let event_tx = squelch_api::attach_event_channel(&store)?;
@@ -2026,6 +2033,7 @@ fn cmd_serve(
     let api_state = squelch_api::ApiState::from_config(store.clone(), &email, &config, cap_sources)
         .map_err(|e| other_err(format!("{e}")))?
         .with_refresh(refresh.clone())
+        .with_spam_refresh(spam_refresh.clone())
         // THE SAME registry the sync engine writes, so `/client/stats` answers
         // "is this mailbox still connected" from live state rather than from a
         // copy taken at boot.
@@ -2131,6 +2139,7 @@ fn cmd_serve(
                 let _sync_running = sync_running;
                 SyncEngine::new(store, creds, account_id, email, config)
                     .with_refresh(refresh)
+                    .with_spam_refresh(spam_refresh)
                     .with_metrics(sync_metrics)
                     .with_embedder_gate(embedder_gate)
                     .run(shutdown_rx)
