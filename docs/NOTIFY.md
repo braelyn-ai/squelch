@@ -804,19 +804,91 @@ label, one `AtomicU64` per combination, every series rendered even at zero,
 
 ### 11.11 Rollout, in order
 
-1. Merge. The author's self-hosted daemon runs it first.
-2. After a few days: `SELECT lane, decision, count(*) FROM notify_decisions
-   GROUP BY 1,2` and the rescued/overturned joins from §11.4. That number,
-   not an argument, decides whether the threshold or the model moves.
-3. Hosted: verify on the LIVE gateway (not the docs) that the provider key's
-   `models` and every tenant VK's `allowed_models` carry
-   `anthropic/claude-haiku-4-5`. `squelch-control`'s `DEFAULT_LLM_MODELS`
-   already lists it in both spellings, so this is `llm sync` plus a per-tenant
-   `llm mint` only where a VK predates that list. Then the daemon roll.
-4. The fast lane costs roughly a thousandth of a dollar per message on Haiku
-   against Stage-1's few cents on Opus: it is inside the noise of the tenant
-   VK budget (live `SQUELCH_CONTROL_LLM_BUDGET_USD=75`/month on 2026-09-01,
-   not the code default of 5), but it does draw from the same pool. The
-   live `SQUELCH_CONTROL_LLM_MODELS` already lists Haiku in both spellings;
-   what `llm sync` has to confirm is that the provider key and each VK
-   actually reflect it.
+Merging is deploying for every Railway service, but nothing in this PR runs
+there: the daemon ships as a tagged image and the client as a tagged app, so
+the merge itself changes nothing a user sees. The steps below are what does,
+and only the first is automatic.
+
+1. **Migration: automatic, and silent in the right direction.** The two new
+   columns and the ledger table land on the daemon's next open (schema.sql
+   + `migrate.rs`), no operator step. Every pre-existing row has
+   `notify_eligible_at = NULL`, so mail already queued at upgrade time never
+   notifies and never enters the ledger; new mail earns its stamp from the
+   first poll. Nobody should file that as a bug.
+
+2. **Self-host first (the author's daemon).** No config needed: the fast lane
+   is on by default, sealed events are off. After a few days:
+   `SELECT lane, decision, count(*) FROM notify_decisions GROUP BY 1,2` and
+   the rescued/overturned/confirmed joins from §11.4. That number, not an
+   argument, decides whether `notify.min_importance` or the model moves.
+   `fast/unavailable` at 100% means the lane is parked on a config failure
+   and `stderr` has the one line naming it.
+
+3. **Hosted gateway allow-list, BEFORE the daemon roll.** A third model now
+   has to be on the gateway: `anthropic/claude-haiku-4-5` beside the two
+   Opus pins. Verify on the LIVE gateway, not the docs: `squelch-control llm
+   sync` (provider key) and `llm mint <label>` for any tenant whose VK was
+   minted from an older list (`llm sync` reports, it never rewrites VKs).
+   The live `SQUELCH_CONTROL_LLM_MODELS` already carries Haiku in both
+   spellings, so this is a confirmation, not a config change. If it is
+   missing, every fast-lane call 400s, the lane parks itself for ten minutes
+   at a time, every row reads `unavailable`, and the deliberate lane rescues:
+   degraded to today's behaviour, not dark, but it is exactly the drift the
+   2026-08-19 outage was. The lockstep comment in
+   `deploy/hosted/15-warden-config.yaml` names the notify model now.
+
+4. **Daemon roll: tag, pin, apply.** Tag `daemon-X.Y.Z` (GHCR builds the
+   image), bump the pin in the four deploy files (`15-warden-config.yaml`,
+   `20-warden.yaml`, `60-models.yaml`, `90-warden-roller.yaml`, one commit
+   like 6509cec), and the carrier-side `kubectl apply` + roller run that the
+   operator does by hand. The warden's tenant env contract is CLOSED and
+   carries no `SQUELCH_NOTIFY_*` variable, so hosted daemons run the CODE
+   DEFAULTS for every knob in §11.5: model, timeout, cap, and the two
+   switches. Moving any of them fleet-wide is either a default change plus a
+   roll, or a warden change adding the passthrough (its env-contract tests
+   enumerate the closed set and will need the new name).
+
+5. **Bifrost budget: watch, no action.** The lane costs about a thousandth
+   of a dollar per message on Haiku against Stage-1's few cents on Opus,
+   inside the noise of the tenant VK budget (live
+   `SQUELCH_CONTROL_LLM_BUDGET_USD=75`/month, not the code default of 5),
+   but it draws from the same pool. `/client/usage` and
+   `squelchd_llm_cost_usd_total` price the `notify` category at its own
+   rates, so the ledger will say what it costs.
+
+6. **Monitoring: panels only, no scrape change.** Two new families,
+   `squelchd_notify_decisions_total{lane,decision}` (12 series) and
+   `squelchd_notify_fast_seconds` (11), fit the squelchd job's
+   `sample_limit: 2800` with its headroom intact (the comment's own sum is
+   ~40 scalars + a 2600 histogram cap; this adds 23 scalars), and the job
+   has no metric keep-list, so they arrive on the first scrape. What does
+   not exist yet: a panel for `expired` (the number this whole issue is
+   about), one for `fast/unavailable` (the lane is parked), the rescued vs
+   overturned pair, and the fast-lane latency histogram. The dashboard is
+   baked into the Grafana image, so that is an edit to
+   `deploy/monitoring/grafana/dashboards/passband-health.json`, merged, and
+   verified on the pod rather than on the deploy status. An alert on
+   `fast/unavailable` approaching the fast lane's total for 15m is the one
+   worth paging on: it is the allow-list drift alarm the fleet did not have.
+
+7. **Blackbox canary (optional).** `BLACKBOX_CANARY_MODEL` probes the
+   gateway with the Stage-1 model only. A second probe on the notify model
+   would catch step 3's drift before a tenant's ledger does.
+
+8. **App release, then flip the sealed switch.** The client half (2d2811b)
+   rides the next Mac and iOS releases after 0.0.6: `ReleaseNotes.swift`
+   is the only authored changelog, bump `passband/VERSION` + `project.yml`
+   + `xcodegen` for the Mac tag, `MARKETING_VERSION` + `xcodegen` for the
+   iOS tag (the two version lines are deliberately separate). Once those
+   are out (Sparkle carries the Mac update within a day; iOS waits on
+   TestFlight/App Store), flip `notify.sealed_enabled`: self-host by
+   `[notify] sealed_enabled = true` or `SQUELCH_NOTIFY_SEALED_ENABLED=true`,
+   hosted by changing the code default to `true` in the same commit as the
+   NEXT daemon tag (step 4 again), because of the closed env contract. Flip
+   it before the app ships and an un-updated Mac shows two banners with a
+   dead tap on the second.
+
+9. **Docs that go stale on this PR:** `deploy/hosted/SETUP.md` §6b's model
+   list (already stale; add Haiku), `PRODUCTION.md`'s gateway table
+   (Haiku is the third allow-listed model), and `docs/CHANGELOG.md` /
+   the daemon release body for the new knobs and the ledger.
