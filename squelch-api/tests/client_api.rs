@@ -8596,8 +8596,9 @@ async fn spam_refresh_answers_the_triggered_shape() {
 async fn senders_autocomplete_ranks_prefix_then_volume_and_hides_spam_and_sent() {
     // WIRE CONTRACT: GET /client/senders?q= returns a flat array of
     // {addr, display_name, msg_count, last_received_at}, ranked prefix-match
-    // first, then by volume; an empty fragment is [], the limit is capped, and
-    // the response is no-store. Sent mail and spam register nobody.
+    // first, then by volume; an empty fragment lists the senders with the most
+    // mail (the reader has just typed `from:`), the limit is capped, and the
+    // response is no-store. Sent mail and spam register nobody.
     let Harness { app, .. } = harness(|store, acct| {
         let seed = |gmail: &str, from: &str, name: Option<&str>| {
             let mut m = msg(acct, gmail, gmail, "hello", "body");
@@ -8676,13 +8677,25 @@ async fn senders_autocomplete_ranks_prefix_then_volume_and_hides_spam_and_sent()
         );
     }
 
-    // An empty fragment is an empty list, and the limit is honoured and capped.
+    // An empty fragment is the volume listing, spam and sent still absent; and
+    // the limit is honoured and capped.
     let resp = app
         .clone()
         .oneshot(authed("GET", "/client/senders?q=%20%20"))
         .await
         .unwrap();
-    assert_eq!(body_json(resp).await, Value::Array(vec![]));
+    let items = body_json(resp).await;
+    let addrs: Vec<&str> = items
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| i["addr"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        addrs,
+        vec!["dan@example.com", "ann@example.com", "joanne@example.com"],
+        "volume first, then recency, then address"
+    );
     let resp = app
         .clone()
         .oneshot(authed("GET", "/client/senders?q=example&limit=1"))

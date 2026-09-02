@@ -67,6 +67,13 @@ impl SqliteStore {
     /// sorts above a substring match, then by how much mail the sender has
     /// sent and how recently, then by address so the order is stable.
     ///
+    /// AN EMPTY FRAGMENT IS NOT AN EMPTY ANSWER, unlike contacts: it lists the
+    /// senders with the most mail. The reader has just typed `from:` and has
+    /// not said who yet, and the people who write to you most are the likeliest
+    /// answer; a menu that stays blank until the second keystroke reads as a
+    /// menu that did not open. The cap on `limit` at the door keeps this from
+    /// being a directory dump.
+    ///
     /// A sender is offered only while at least one of their messages is
     /// something search could return: inbound, not spam, not sealed. The
     /// directory cannot know sealed at write time (see [`bump_sender_conn`]), so
@@ -93,10 +100,11 @@ impl SqliteStore {
         limit: u32,
     ) -> Result<Vec<SenderEntry>> {
         let q = q.trim();
-        if q.is_empty() {
-            return Ok(Vec::new());
-        }
-        // LIKE metacharacters in the fragment are literal text to the user.
+        // LIKE metacharacters in the fragment are literal text to the user. An
+        // empty fragment escapes to an empty string, so both patterns below
+        // become `%`, which every row matches: the prefix tier is then a tie
+        // for all and volume decides, which is exactly the empty-fragment
+        // listing described above.
         let escaped = q
             .replace('\\', "\\\\")
             .replace('%', "\\%")

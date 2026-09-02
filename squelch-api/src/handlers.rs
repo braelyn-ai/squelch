@@ -1498,19 +1498,18 @@ pub struct SenderView {
 /// `get_contacts` over the other direction of mail; contacts are the people the
 /// user writes TO and cannot answer `from:`.
 ///
-/// HUMAN DOOR ONLY, like contacts. An empty fragment is an empty list without a
-/// store round-trip, and the response is `no-store`: this is a list of the
-/// user's correspondents.
+/// HUMAN DOOR ONLY, like contacts. UNLIKE contacts, an empty fragment answers:
+/// it lists the senders with the most mail, because the reader has just typed
+/// `from:` and a menu that stays blank until the next keystroke reads as one
+/// that did not open. The response is `no-store`: this is a list of the user's
+/// correspondents.
 pub async fn get_senders(
     State(state): State<ApiState>,
     Query(params): Query<SendersQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
     let q = params.q.trim().to_string();
-    if q.is_empty() {
-        return Ok((no_store(), Json(Vec::<SenderView>::new())));
-    }
     // Menu-sized by default; capped so no caller turns this into a directory
-    // dump endpoint.
+    // dump endpoint, which the empty-fragment listing would otherwise be.
     let limit = params.limit.unwrap_or(8).min(25);
     let hits = store_call(&state, move |store, account_id| {
         store.search_senders(account_id, &q, limit)

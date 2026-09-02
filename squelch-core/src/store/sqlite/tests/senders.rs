@@ -155,7 +155,28 @@ fn like_metacharacters_in_the_fragment_are_literal() {
     assert!(store.search_senders(acct, "%", 8).unwrap().is_empty());
     assert!(store.search_senders(acct, "_", 8).unwrap().is_empty());
     assert!(store.search_senders(acct, "d_n", 8).unwrap().is_empty());
-    assert!(store.search_senders(acct, "  ", 8).unwrap().is_empty());
+}
+
+#[test]
+fn an_empty_fragment_lists_the_senders_with_the_most_mail() {
+    let (store, acct) = store();
+    for gmail in ["g1", "g2", "g3"] {
+        triaged(acct, gmail, "t")
+            .from("busy@example.com")
+            .upsert(&store);
+    }
+    triaged(acct, "g4", "t")
+        .from("quiet@example.com")
+        .upsert(&store);
+    for q in ["", "   "] {
+        let hits = store.search_senders(acct, q, 8).unwrap();
+        assert_eq!(
+            hits.iter().map(|h| h.addr.as_str()).collect::<Vec<_>>(),
+            vec!["busy@example.com", "quiet@example.com"],
+            "{q:?}"
+        );
+    }
+    assert_eq!(store.search_senders(acct, "", 1).unwrap().len(), 1);
 }
 
 #[test]
