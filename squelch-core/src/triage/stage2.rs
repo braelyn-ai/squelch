@@ -922,6 +922,9 @@ mod tests {
             thread: Vec::new(),
             sensitivity: Sensitivity::Normal,
             retriage_at: None,
+            // The apply math never reads the notify stamp; emission lives in
+            // `triage::events` and the sync engine, and is tested there.
+            notify_eligible_at: None,
         }
     }
 

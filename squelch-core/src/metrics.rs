@@ -165,6 +165,90 @@ pub enum RevisitVerdict {
     Fallback,
 }
 
+/// WHICH LANE decided a notification. The two answer different questions and
+/// want opposite error profiles: the fast lane is recall-biased and runs at
+/// ingest, the deliberate lane is the triage verdict that comes behind it and
+/// can only ADD a buzz the fast lane declined (docs/NOTIFY.md §3).
+///
+/// A closed enum, like every other label axis in this file: a label is a series,
+/// and a series is forever.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NotifyLane {
+    /// At ingest, on the notify model. Not wired up until Wave 2; its series
+    /// exist from this wave so a dashboard reads correctly from the first
+    /// scrape after they start moving.
+    Fast,
+    /// The triage passes' own emission sites (Stage-1 apply, the seed fallback,
+    /// Stage-2 apply).
+    Deliberate,
+}
+
+impl NotifyLane {
+    /// Exposition order.
+    const ALL: [Self; 2] = [Self::Fast, Self::Deliberate];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Fast => "fast",
+            Self::Deliberate => "deliberate",
+        }
+    }
+}
+
+/// What one lane decided about one message. ONE closed set for both lanes, so
+/// the cross-lane questions (rescued, overturned, confirmed) are joins over the
+/// same vocabulary rather than two vocabularies that have to be reconciled.
+///
+/// `Suppressed` IS NOT `DeclinedByModel`, and the split is load-bearing: a
+/// structural gate (a Squelch/Filtered rule, the user's own sent copy) is "never
+/// a candidate", not "the model said no". Folding them together would make the
+/// notify model's false-negative rate read catastrophic for no reason, and would
+/// let a rescue path that asks only "was this declined?" fire on a row it must
+/// never touch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NotifyDecision {
+    /// This lane appended the `events` row.
+    Sent,
+    /// Buzz-worthy, but an event already existed (the other lane got there
+    /// first). `UNIQUE(message_id)` means a sent buzz is never rewritten.
+    WouldSend,
+    /// A model scored it and it fell below the line. RESCUABLE.
+    DeclinedByModel,
+    /// No model answer at all: no key, timeout, budget, transport, config
+    /// failure. RESCUABLE.
+    Unavailable,
+    /// A structural gate silenced an ELIGIBLE message (Squelch/Filtered rule).
+    Suppressed,
+    /// Eligible and worthy, but past `notify.rescue_window_secs` by the time
+    /// this lane reached it. THE DROP THAT USED TO BE SILENT: 24.7% of
+    /// notify-worthy mail produced no event ever, with no counter and no log
+    /// line to say so (docs/NOTIFY.md §2a).
+    Expired,
+}
+
+impl NotifyDecision {
+    /// Exposition order; the index into a lane's decision row.
+    const ALL: [Self; 6] = [
+        Self::Sent,
+        Self::WouldSend,
+        Self::DeclinedByModel,
+        Self::Unavailable,
+        Self::Suppressed,
+        Self::Expired,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Sent => "sent",
+            Self::WouldSend => "would_send",
+            Self::DeclinedByModel => "declined_by_model",
+            Self::Unavailable => "unavailable",
+            Self::Suppressed => "suppressed",
+            Self::Expired => "expired",
+        }
+    }
+}
+
 /// What one row's trip through the Stage-2 escalation pass produced.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Stage2Verdict {
@@ -237,6 +321,12 @@ pub struct SyncMetrics {
     stage2_failed: AtomicU64,
     stage2_retryable: AtomicU64,
     stage2_stale_skipped: AtomicU64,
+
+    /// Notification decisions as `[lane][decision]`, both axes closed enums —
+    /// 12 series, fixed forever. A MESSAGE IS NEVER A LABEL: nothing here
+    /// carries a sender, a subject or an id, which is what lets an
+    /// unauthenticated scrape have it at all.
+    notify_decisions: [[AtomicU64; NotifyDecision::ALL.len()]; NotifyLane::ALL.len()],
 
     /// Config-level LLM failures (a 4xx shared by every row: bad key,
     /// disallowed model, spent gateway budget — see
@@ -312,9 +402,15 @@ impl SyncMetrics {
     }
 
     /// Move the freshness stamp to now WITHOUT touching the run counters. The
-    /// poll loop calls this per successful tick: a healthy daemon stays inside
+    /// POLL LANE calls this per successful tick: a healthy daemon stays inside
     /// one `run_once` for weeks, so the run-level stamp alone would look like a
     /// mailbox that stopped syncing at boot.
+    ///
+    /// The poll lane and not the refine lane, deliberately (docs/NOTIFY.md
+    /// §11.2). Sync freshness answers "are we still hearing from Gmail", which
+    /// is what the staleness alert was always meant to mean; a daemon grinding
+    /// through a long queue of model calls is busy, not stale, and stamping this
+    /// from the refine lane would let a wedged poll hide behind it.
     pub fn stamp_sync_success(&self) {
         self.sync_last_success_unix
             .store(Utc::now().timestamp(), Ordering::Relaxed);
@@ -428,6 +524,13 @@ impl SyncMetrics {
         if verdict == Stage2Verdict::Ok {
             self.stamp_llm_ok();
         }
+    }
+
+    /// One lane's decision about one message. NOT gated on the decision being
+    /// interesting: a lane that declines is as much a fact as one that buzzes,
+    /// and the pair is the only way the threshold ever moves from real data.
+    pub fn record_notify(&self, lane: NotifyLane, decision: NotifyDecision) {
+        self.notify_decisions[lane as usize][decision as usize].fetch_add(1, Ordering::Relaxed);
     }
 
     /// One config-level LLM failure (see [`crate::triage::llm::is_config_failure`]):
@@ -1032,6 +1135,28 @@ pub fn render(metrics: &SyncMetrics, db: Option<&StoreSnapshot>) -> String {
         );
     }
 
+    // ALL TWELVE SERIES, zeros included, and for the usual reason plus one of
+    // its own: the fast lane does not exist yet, so every `lane="fast"` series
+    // is 0 until Wave 2 wires it up — and a dashboard built now must keep
+    // reading correctly the day they start moving, rather than gaining panels
+    // that were silently empty because the series were absent.
+    e.family(
+        "squelchd_notify_decisions_total",
+        MetricKind::Counter,
+        "Notification decisions by lane and decision. `expired` is the one that used to be \
+         silent: an eligible, notify-worthy message the pass reached past \
+         notify.rescue_window_secs, which is a notification the user wanted and did not get.",
+    );
+    for lane in NotifyLane::ALL {
+        for decision in NotifyDecision::ALL {
+            e.sample(
+                "squelchd_notify_decisions_total",
+                &[("lane", lane.label()), ("decision", decision.label())],
+                metrics.get(&metrics.notify_decisions[lane as usize][decision as usize]),
+            );
+        }
+    }
+
     e.scalar(
         "squelchd_llm_config_failures_total",
         MetricKind::Counter,
@@ -1285,6 +1410,77 @@ mod tests {
         assert!(text.contains(
             "squelchd_triage_verdicts_total{stage=\"stage2\",outcome=\"retryable\"} 1\n"
         ));
+    }
+
+    /// THE DROP THAT USED TO BE SILENT gets a sample line, from this wave on.
+    /// Both axes are closed, so all twelve series are exported at zero and a
+    /// dashboard built before the fast lane exists keeps reading correctly the
+    /// day it starts moving.
+    #[test]
+    fn notify_decisions_export_every_lane_and_decision_pair() {
+        // A FRESH REGISTRY EXPORTS ALL TWELVE, AT ZERO. An absent series and a
+        // zero one are the same picture on a graph and opposite facts in a
+        // query: `rate()` over a series that only appears once it moves has no
+        // baseline to rise from, and an alert on it cannot fire for a daemon
+        // that has been quiet.
+        let fresh = render(&SyncMetrics::new(), None);
+        for lane in NotifyLane::ALL {
+            for decision in NotifyDecision::ALL {
+                let line = format!(
+                    "squelchd_notify_decisions_total{{lane=\"{}\",decision=\"{}\"}} 0\n",
+                    lane.label(),
+                    decision.label()
+                );
+                assert!(fresh.contains(&line), "missing at zero: {line}");
+            }
+        }
+
+        // ONE record, one sample line, exactly.
+        let m = SyncMetrics::new();
+        m.record_notify(NotifyLane::Deliberate, NotifyDecision::Expired);
+        assert!(
+            render(&m, None).contains(
+                "squelchd_notify_decisions_total{lane=\"deliberate\",decision=\"expired\"} 1\n"
+            ),
+            "the expired series is the point of the family"
+        );
+
+        m.record_notify(NotifyLane::Deliberate, NotifyDecision::Expired);
+        m.record_notify(NotifyLane::Fast, NotifyDecision::DeclinedByModel);
+
+        let text = render(&m, None);
+        assert!(
+            text.contains(
+                "squelchd_notify_decisions_total{lane=\"deliberate\",decision=\"expired\"} 2\n"
+            ),
+            "the expired series is the point of the family"
+        );
+        assert!(text.contains(
+            "squelchd_notify_decisions_total{lane=\"fast\",decision=\"declined_by_model\"} 1\n"
+        ));
+        // A lane nobody has wired up yet still exports its whole decision row.
+        assert!(
+            text.contains("squelchd_notify_decisions_total{lane=\"fast\",decision=\"sent\"} 0\n")
+        );
+        assert!(text.contains(
+            "squelchd_notify_decisions_total{lane=\"deliberate\",decision=\"suppressed\"} 0\n"
+        ));
+        // Twelve series, in ONE contiguous family block: the `# TYPE` line
+        // appears once and nothing else is interleaved between the samples.
+        let body = text
+            .split("# TYPE squelchd_notify_decisions_total counter\n")
+            .nth(1)
+            .expect("the family is declared exactly once");
+        let block: Vec<&str> = body
+            .lines()
+            .take_while(|l| l.starts_with("squelchd_notify_decisions_total{"))
+            .collect();
+        assert_eq!(block.len(), 12, "2 lanes x 6 decisions, always: {block:?}");
+        assert_eq!(
+            text.matches("# TYPE squelchd_notify_decisions_total")
+                .count(),
+            1
+        );
     }
 
     /// The LLM-health pair the 2026-08-19 outage went two days without: the

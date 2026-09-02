@@ -73,6 +73,22 @@ impl SqliteStore {
         Ok(Some(inserted))
     }
 
+    pub(super) fn message_has_event(&self, account_id: AccountId, message_id: i64) -> Result<bool> {
+        let conn = self.lock()?;
+        // Rides the `UNIQUE(message_id)` index, so this is a point lookup rather
+        // than a scan; `account_id` is a scoping filter on the one row it finds.
+        // SELECT 1, not the row: the caller wants existence and nothing else,
+        // and an event row carries a `one_line` this caller must never read.
+        let found: Option<i64> = conn
+            .query_row(
+                "SELECT 1 FROM events WHERE account_id = ?1 AND message_id = ?2",
+                params![account_id, message_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(found.is_some())
+    }
+
     pub(super) fn events_after(
         &self,
         account_id: AccountId,

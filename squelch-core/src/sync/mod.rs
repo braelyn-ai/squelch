@@ -22,8 +22,11 @@ use serde::Deserialize;
 use crate::config::{Config, ResolvedLlm, Stage2Provider};
 use crate::credentials::CredentialStore;
 use crate::error::{CoreError, Result};
-use crate::metrics::{GmailErrorKind, RevisitVerdict, Stage1Verdict, Stage2Verdict, SyncMetrics};
-use crate::store::{ContactEntry, Stage2CapOverrides, Store, SyncState};
+use crate::metrics::{
+    GmailErrorKind, NotifyDecision, NotifyLane, RevisitVerdict, Stage1Verdict, Stage2Verdict,
+    SyncMetrics,
+};
+use crate::store::{ContactEntry, Stage2CapOverrides, Store, SyncState, TriagedMessage};
 use crate::sync::ingest::{
     RawFetched, collect_mailboxes, format_recipients, ingest_with_rules, is_robot_address,
 };
@@ -85,15 +88,111 @@ const REVISIT_USAGE_CATEGORY: &str = "revisit";
 /// Which sync path an ingest batch is on. Decides ONE thing: whether a
 /// notification-worthy verdict may append an `events` row. Backfill never
 /// notifies (a fresh install must not fire a hundred pushes for a month of
-/// already-read mail); every incremental path may, kept safe by the freshness
-/// window plus the one-event-per-message key even when `catch_up()` re-scans
-/// the whole backfill window.
+/// already-read mail); every incremental path may, kept safe by the first-sight
+/// test plus the one-event-per-message key even when `catch_up()` re-scans the
+/// whole backfill window.
+///
+/// It is answered ONCE, here at ingest, and stamped on the row as
+/// `triage.notify_eligible_at` (see [`notify_eligible_stamp`]) — this is the one
+/// site that knows which path it is on, and the emission sites downstream cannot
+/// re-derive it from anything the row carries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum IngestOrigin {
     /// First-run backfill. Structurally silent.
     Backfill,
     /// A history walk or a catch-up re-scan: mail that may be genuinely new.
     Incremental,
+}
+
+/// What one call to [`SyncEngine::emit_event`] did. Returned rather than
+/// swallowed because the emission sites are where the notify ledger's
+/// `deliberate` rows get written (docs/NOTIFY.md §11.7), and a site cannot
+/// record what it was not told: the three "no event" outcomes are three
+/// different facts about the mail, and folding them into `()` is precisely how
+/// 24.7% of notify-worthy mail disappeared without a trace.
+///
+/// Wave 1 reads only `Expired`, and reads it inside `emit_event` itself. The
+/// per-site ledger writes land in Wave 2b, against this same enum.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Emitted {
+    /// An `events` row was appended, with this id.
+    New(i64),
+    /// Worthy, but this message already had an event: `UNIQUE(message_id)`
+    /// means a buzz is never rewritten, so the other site got there first.
+    AlreadyNotified,
+    /// No event, and correctly so: sealed, sent, squelched, never eligible, or
+    /// simply below the line. Silent by design.
+    NotWorthy,
+    /// Worthy and eligible, but past `notify.rescue_window_secs` since we first
+    /// saw the message. THE DROP THAT USED TO BE SILENT; counted, and logged.
+    Expired,
+}
+
+/// Whether an `Expired` refusal at this emission site is a MISSED NOTIFICATION
+/// (and so belongs in `squelchd_notify_decisions_total{decision="expired"}`) or
+/// merely a re-reading of old mail.
+///
+/// The distinction exists because of `retriage_reset`, which nulls the model
+/// stamps and sets `triage.retriage_at` while deliberately LEAVING
+/// `notify_eligible_at` alone, and because `retriage_forced` then exempts those
+/// rows from every pass's stale cutoff. So `retriage_reset(acct, None, 90)` hands
+/// the Stage-1 apply site thousands of rows carrying stamps weeks old. The ones
+/// that already notified are caught by the `message_has_event` read; the ones
+/// that were below the line before and are above it now — which is the usual
+/// REASON to run a re-triage, e.g. after lowering `notify.min_importance` — have
+/// no event, refuse with `Expired`, and would each add a count. That is one
+/// operator action inflating, by thousands, the single number §11.11 says decides
+/// whether the window or the model moves.
+///
+/// The refusal itself is unchanged either way: mail the user read a fortnight ago
+/// must not buzz. Only the bookkeeping differs, and for the same reason the code
+/// already keeps `Expired` behind the worthiness question — a re-evaluation of old
+/// mail is not a notification anybody missed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExpiryCount {
+    /// This site is seeing the row on its ordinary path: an expiry here is a
+    /// real miss.
+    Miss,
+    /// A human forced this row back through triage. Refuse, but do not book it.
+    Rereading,
+}
+
+impl ExpiryCount {
+    /// From a queue row's `triage.retriage_at`, which is the one field that
+    /// distinguishes the two.
+    fn from_retriage(retriage_at: Option<DateTime<Utc>>, now: DateTime<Utc>) -> Self {
+        if retriage_forced(retriage_at, now) {
+            Self::Rereading
+        } else {
+            Self::Miss
+        }
+    }
+}
+
+/// MAY THIS MESSAGE EVER NOTIFY, and from when — the whole of docs/NOTIFY.md
+/// §11.3, in one pure function so the engine and its tests cannot drift.
+///
+/// `Some(now)` only for mail we are seeing for the first time on an incremental
+/// path, that is not the user's own sent copy, and whose sender-claimed `Date:`
+/// was still inside `notify.freshness_window_secs` when we laid eyes on it.
+/// Everything else is `None`, the silent direction.
+///
+/// [`events::is_fresh`] is asked HERE and nowhere else. That is the fix for the
+/// bug this whole change exists for: asked at every emission site it measured
+/// the sender's clock against the wall clock, so mail that WAS fresh when it
+/// arrived and simply waited behind a queue of model calls aged out and was
+/// dropped, silently, 24.7% of the time (docs/NOTIFY.md §2a). Asked once, it
+/// answers the question it was always meant to ask.
+fn notify_eligible_stamp(
+    triaged: &TriagedMessage,
+    origin: IngestOrigin,
+    cfg: &crate::config::NotifyConfig,
+    now: DateTime<Utc>,
+) -> Option<DateTime<Utc>> {
+    let eligible = origin == IngestOrigin::Incremental
+        && !triaged.message.is_sent
+        && events::is_fresh(triaged.message.received_at, cfg, now);
+    eligible.then_some(now)
 }
 
 /// The SHIPMENTS extractor's own stale cutoff, from `carriers.max_age_days`.
@@ -484,13 +583,78 @@ pub struct SyncEngine<S: Store, C: CredentialStore + ?Sized> {
     /// Coalescing is intentional — several pokes during one in-flight poll
     /// collapse into a single extra tick.
     refresh: Arc<tokio::sync::Notify>,
+    /// POLL LANE -> REFINE LANE: poked once per poll tick that actually ingested
+    /// something, so new mail starts through Stage-1 the moment it lands instead
+    /// of waiting out whatever the refine lane is in the middle of.
+    ///
+    /// Not `Arc` and not shared outside the engine, because unlike `refresh`
+    /// nothing outside the engine may poke it: it means "I just ingested rows",
+    /// which is a statement of fact about this engine's own tick. Coalescing is
+    /// what makes a busy tick cheap — `Notify` holds one permit, so twenty
+    /// pokes during one grind are one extra pass.
+    ///
+    /// Poked by [`SyncEngine::fetch_raw_and_ingest`] and awaited by
+    /// [`SyncEngine::refine_lane`]; see [`SyncEngine::run_lanes`] for why the
+    /// two are separate futures at all.
+    refine_wake: tokio::sync::Notify,
     /// Per-cap-kind last-warned UTC day. In-memory only; a restart re-arms them,
     /// and one fresh notice on restart is acceptable.
     warn_days: std::sync::Mutex<WarnDays>,
+    /// Message ids already counted as `deliberate/expired`, so ONE missed
+    /// notification is ONE count.
+    ///
+    /// A single message is offered to [`SyncEngine::emit_event`] repeatedly: the
+    /// Stage-1 apply site, then the Stage-2 apply site behind it, then again
+    /// after any re-triage (`retriage_reset` nulls the stage markers and leaves
+    /// the eligibility stamp alone, on purpose). Once it is past the rescue
+    /// window every one of those offers refuses with the same
+    /// [`events::Refusal::Expired`], and billing each of them would inflate the
+    /// one number docs/NOTIFY.md §11.11 says decides whether the window or the
+    /// model moves — by up to 2x on every escalated row, and by a whole
+    /// mailbox's worth on one `retriage`.
+    ///
+    /// THE WAVE-1 STAND-IN for §11.4's `UNIQUE(message_id, lane)`, which is the
+    /// durable version of exactly this rule and lands with the ledger table in
+    /// Wave 2b. In-memory only, like `warn_days`: a restart re-arms it, so the
+    /// worst case is one re-count per missed notification per daemon lifetime,
+    /// against every-site-every-time without it.
+    expired_counted: std::sync::Mutex<std::collections::HashSet<i64>>,
     /// Set while the INBOX unread fetch is failing, so a persistent failure
     /// (revoked scope, Gmail outage) says so ONCE instead of once per poll. The
     /// next success re-arms it.
     unread_warned: AtomicBool,
+    /// HAS A POLL EVER SUCCEEDED IN THIS PROCESS, and has one succeeded since the
+    /// last one failed. Set by [`SyncEngine::poll_lane`] the moment `poll_once`
+    /// returns `Ok`; cleared by [`SyncEngine::run`] when a lifecycle bubbles an
+    /// `Err`. Read by [`SyncEngine::refine_lane`], which spends no model call
+    /// while it is false.
+    ///
+    /// THIS EXISTS BECAUSE A CANCELLED MODEL CALL IS STILL BILLED. The lane split
+    /// made the refine lane a sibling of the poll lane under one `select!`, so a
+    /// Gmail `Err` now drops a refine future that may be mid-classify, and
+    /// [`SyncEngine::gate_budget`] charges BEFORE the call (that is what makes the
+    /// cap a cap) while nothing refunds a cancellation. `run()`'s backoff is
+    /// initialised outside its loop and caps at [`BACKOFF_CAP`], so a credential
+    /// that has gone `invalid_grant` retries every five minutes forever: without
+    /// this gate, each cycle re-entered `run_lanes`, the refine lane ran
+    /// synchronously through `gate_budget` and issued a POST before `poll_lane`
+    /// reached its first real await, and the whole thing was cancelled one Gmail
+    /// round trip later. `stage2.global_daily_cap` defaults to 120 and the budget
+    /// key is the UTC DAY, so ten hours of Gmail downtime drained the entire day's
+    /// Stage-2 budget on verdicts that never landed, and nothing escalated again
+    /// until midnight even after the credential was fixed.
+    ///
+    /// FALSE AT STARTUP, deliberately, so not even the first cycle can spend on a
+    /// dead credential: the cost is that the refine lane waits out one poll
+    /// interval on a healthy daemon before its first steady-state round, which
+    /// `run_once` has already covered on a first run (it runs the passes inline)
+    /// and which is `sync.poll_secs` — 5 seconds by default — on every other.
+    ///
+    /// It restores exactly what the serial loop gave for free: `poll_once().await?`
+    /// returned before any pass started, so a Gmail outage cost zero model calls.
+    /// `Relaxed` throughout: this is a hint that costs at most one pass either way,
+    /// never a lock.
+    poll_healthy: AtomicBool,
     /// Scrape-facing counters. Its own registry unless the daemon shares one
     /// via [`SyncEngine::with_metrics`], so an engine built anywhere (tests, the
     /// contacts harvest, `run`) still records rather than branching on absence.
@@ -544,8 +708,12 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
             embedder: None,
             embedder_gate: None,
             refresh: Arc::new(tokio::sync::Notify::new()),
+            refine_wake: tokio::sync::Notify::new(),
             warn_days: std::sync::Mutex::new(WarnDays::default()),
+            expired_counted: std::sync::Mutex::new(std::collections::HashSet::new()),
             unread_warned: AtomicBool::new(false),
+            // Nothing has polled yet, so nothing may spend yet.
+            poll_healthy: AtomicBool::new(false),
             metrics: SyncMetrics::new(),
             api_base: GMAIL_API_BASE.to_string(),
         }
@@ -565,6 +733,19 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
     #[cfg(test)]
     fn with_api_base(mut self, base: String) -> Self {
         self.api_base = base;
+        self
+    }
+
+    /// Force the no-model path. Test-only, and NOT the same thing as building
+    /// with an empty config: [`Stage2Config::resolve_llm`] reads
+    /// `SQUELCH_STAGE2_API_KEY` / `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` from the
+    /// PROCESS ENVIRONMENT, so a developer with a key exported would otherwise
+    /// silently run the tests that are about the heuristics-are-authoritative
+    /// path down the model path instead, and they would fail (or worse, pass for
+    /// the wrong reason) on their machine and not in CI.
+    #[cfg(test)]
+    fn without_stage2_llm(mut self) -> Self {
+        self.stage2_llm = None;
         self
     }
 
@@ -760,7 +941,14 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
     }
 
     /// One full lifecycle: backfill if needed (establishing the historyId), then
-    /// poll until an error bubbles up (caller retries with backoff) or shutdown.
+    /// run the two steady-state lanes ([`Self::run_lanes`]) until an error
+    /// bubbles up (caller retries with backoff) or shutdown.
+    ///
+    /// The first-run sequence below is deliberately still SERIAL: on a brand-new
+    /// mailbox there is nothing to poll for concurrently, the backfill has to
+    /// finish before the history cursor exists at all, and running the passes
+    /// inline is what makes the first thing the user ever sees a triaged inbox
+    /// rather than an untriaged one.
     async fn run_once(&self, shutdown: &mut tokio::sync::watch::Receiver<bool>) -> Result<()> {
         eprintln!("squelch: gmail REST sync starting for <redacted account>");
 
@@ -785,7 +973,7 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
 
         self.backfill_missing_vectors().await;
 
-        self.poll_loop(shutdown).await
+        self.run_lanes(shutdown).await
     }
 
     /// First-run backfill: INBOX bodies over the window, then SENT headers to
@@ -831,9 +1019,65 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
         Ok(())
     }
 
+    /// THE STEADY STATE: two lanes, not one (docs/NOTIFY.md §11.2).
+    ///
+    /// This used to be a single serial conga line — poll, then Stage-1, then
+    /// Stage-2, then the extractors, then the revisits, then sleep — and that
+    /// shape is what made mail arrive LATE rather than SLOWLY. A refine pass
+    /// spends one reasoning-model call per row and a batch can be minutes wide;
+    /// for every one of those minutes the daemon was not asking Gmail whether
+    /// anything new had landed, because the fetch was queued behind the
+    /// thinking. New mail sat unfetched behind the classification of OLD mail,
+    /// which is the exact inversion of what the user wants, and it is also how
+    /// a notification aged past its freshness window before anybody had ever
+    /// looked at the message (docs/NOTIFY.md §2a).
+    ///
+    /// So: fetching and refining are separate futures, polled concurrently by
+    /// one `tokio::select!` over `&self`. NO `tokio::spawn`, no `'static`, no
+    /// new `Arc`s — both lanes borrow the engine, which is what keeps this a
+    /// restructuring of one function rather than a new ownership story.
+    ///
+    /// - The poll lane's `Err` (Gmail auth/quota) ends the `select!` and bubbles
+    ///   to [`Self::run`]'s backoff exactly as it did when this was one loop.
+    ///   The refine lane is then cancelled at its next await, which leaves the
+    ///   in-flight row queued (`stage1_model_used` NULL) — the same state a
+    ///   crash leaves it in, and the same state the next lifecycle picks up.
+    ///   ONE THING THAT IS NEW, and it costs money rather than correctness: the
+    ///   cancelled await can now be a model call, which the old serial loop
+    ///   could not be (`poll_once().await?` returned before any pass started).
+    ///   [`Self::gate_budget`] charges BEFORE the call so a retry storm cannot
+    ///   exceed the cap, and nothing refunds a cancellation, so the cancelled
+    ///   verdict is paid for out of a DAY-scoped budget and never lands.
+    ///   The charge-before-call rule stays (a refund path would be a second way
+    ///   to move the counter, and charging first is what makes the cap a cap);
+    ///   what bounds the damage is the `poll_healthy` gate, which stops the
+    ///   refine lane re-entering a pass on the next backoff cycle while the
+    ///   credential is still broken. So a multi-hour Gmail outage costs at most
+    ///   the one round that was in flight when it started, not one per cycle.
+    /// - The refine lane never returns an `Err` at all: every failure inside the
+    ///   passes is handled and logged internally, so a model outage must not be
+    ///   able to bounce the Gmail lifecycle.
+    /// - The two shutdown receivers are the SAME channel. The second is a clone
+    ///   because `changed()` needs `&mut`, and a clone starts out having seen
+    ///   the current value, which is why each lane still checks `borrow()` at
+    ///   the top of its own loop rather than trusting the wakeup.
+    async fn run_lanes(&self, shutdown: &mut tokio::sync::watch::Receiver<bool>) -> Result<()> {
+        let mut refine_shutdown = shutdown.clone();
+        tokio::select! {
+            polled = self.poll_lane(shutdown) => polled,
+            // Only ever completes on shutdown; it has no error to report.
+            () = self.refine_lane(&mut refine_shutdown) => Ok(()),
+        }
+    }
+
     /// Poll `history.list` every `poll_secs`, ingesting `messageAdded` INBOX
     /// messages and advancing the cursor. A poll batch IS the coalesced batch.
-    async fn poll_loop(&self, shutdown: &mut tokio::sync::watch::Receiver<bool>) -> Result<()> {
+    ///
+    /// This lane touches Gmail and the store and nothing else: no model call
+    /// runs here, so nothing that thinks can delay the next fetch. The refine
+    /// work it used to do inline is [`Self::refine_lane`], woken by
+    /// `refine_wake` the moment this lane ingests anything.
+    async fn poll_lane(&self, shutdown: &mut tokio::sync::watch::Receiver<bool>) -> Result<()> {
         let interval = Duration::from_secs(self.config.sync.poll_secs);
         loop {
             if *shutdown.borrow() {
@@ -849,25 +1093,24 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
             // outage starve it for as long as the outage lasts.
             self.reminder_pass();
             self.poll_once().await?;
+            // GMAIL ANSWERED, so the refine lane may spend again. Set AFTER the
+            // walk and before anything else, because this is the only proof in
+            // the process that the credential works; `fetch_raw_and_ingest` has
+            // already poked `refine_wake` from inside that call if it ingested
+            // anything, and `Notify` holds the permit, so the lane wakes on the
+            // poke and reads a flag that is true by the time it does. See the
+            // field's own doc for what this is protecting.
+            self.poll_healthy.store(true, Ordering::Relaxed);
             // THE freshness stamp for a healthy daemon: `run()` only records one
             // on its way out, and a mailbox that polls happily for a month never
             // goes there — staleness alerts would fire on the boot timestamp.
+            //
+            // IT STAYS IN THIS LANE, deliberately. Sync freshness measures
+            // POLLING, not refinement: that is what the staleness alert was
+            // always meant to mean, and stamping it from the refine lane would
+            // let a wedged Gmail credential keep looking healthy for as long as
+            // there were queued rows left to classify.
             self.metrics.stamp_sync_success();
-            // Both stages refine within the same cycle; neither can crash the
-            // loop (all failures are handled internally).
-            self.stage1_pass().await;
-            self.stage2_pass().await;
-            // AFTER both stages, so it sees each row's FINAL category (Stage-2
-            // may have overwritten Stage-1's).
-            self.extract_pass().await;
-            // LAST, and over OLD rows rather than the ones just ingested: a
-            // re-evaluation competes with nothing this cycle, and a row it
-            // re-escalates is picked up by the next cycle's Stage-2.
-            self.revisit_pass().await;
-
-            // Per-tick, so an embedder attached after startup catches up on rows
-            // ingested before it was ready, no restart needed.
-            self.backfill_missing_vectors().await;
 
             // A refresh poke that arrives mid-poll is not lost: `Notify` stores
             // one permit, so the next `notified()` returns at once and the loop
@@ -879,6 +1122,68 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
                 }
                 _ = shutdown.changed() => {
                     if *shutdown.borrow() { return Ok(()); }
+                }
+            }
+        }
+    }
+
+    /// The thinking half: Stage-1, Stage-2, the specialist extractors and the
+    /// scheduled re-evaluations, over whatever is queued RIGHT NOW.
+    ///
+    /// Runs one full round and then parks until [`Self::fetch_raw_and_ingest`]
+    /// pokes `refine_wake` (new mail is queued, start on it immediately) or
+    /// `poll_secs` elapses (the floor, so a queue that filled up some other way
+    /// — a re-triage, a revisit falling due, a row an earlier round left behind
+    /// — still drains without new mail having to arrive to trigger it).
+    ///
+    /// No `Result`: every failure inside these passes is already handled and
+    /// logged where it happens, and a lane that could `Err` would be a lane that
+    /// could bounce the Gmail lifecycle over a model outage.
+    ///
+    /// IT SPENDS NOTHING UNTIL A POLL HAS SUCCEEDED. See `poll_healthy` for the
+    /// whole argument; the short version is that this lane is cancelled whenever
+    /// the poll lane errors, a cancelled classify is charged and never refunded,
+    /// and `run()` retries the pair every five minutes for as long as the
+    /// credential stays broken.
+    async fn refine_lane(&self, shutdown: &mut tokio::sync::watch::Receiver<bool>) {
+        let interval = Duration::from_secs(self.config.sync.poll_secs);
+        loop {
+            if *shutdown.borrow() {
+                return;
+            }
+            if self.poll_healthy.load(Ordering::Relaxed) {
+                // Both stages refine within the same round; neither can crash the
+                // lane (all failures are handled internally).
+                self.stage1_pass().await;
+                self.stage2_pass().await;
+                // AFTER both stages, so it sees each row's FINAL category (Stage-2
+                // may have overwritten Stage-1's).
+                self.extract_pass().await;
+                // LAST, and over OLD rows rather than the ones just ingested: a
+                // re-evaluation competes with nothing this round, and a row it
+                // re-escalates is picked up by the next one.
+                self.revisit_pass().await;
+
+                // Per-round, so an embedder attached after startup catches up on
+                // rows ingested before it was ready, no restart needed.
+                //
+                // INSIDE THE GATE with the rest, even though it costs no model
+                // call: a round that skipped Stage-1 has nothing new to embed,
+                // and the next healthy round picks up whatever is missing. One
+                // shape for the whole round is easier to reason about than a
+                // half-round.
+                self.backfill_missing_vectors().await;
+            }
+
+            // A poke that arrives mid-round is not lost, for the same reason a
+            // mid-poll `refresh` is not: `Notify` holds one permit, so the next
+            // `notified()` returns at once. It also COALESCES — twenty pokes
+            // during one long round are one extra round, not twenty.
+            tokio::select! {
+                _ = self.refine_wake.notified() => {}
+                _ = tokio::time::sleep(interval) => {}
+                _ = shutdown.changed() => {
+                    if *shutdown.borrow() { return; }
                 }
             }
         }
@@ -957,9 +1262,12 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
         let sent_only = subtract_ids(sent_ids, &inbox_ids);
         if !sent_only.is_empty() {
             // `Incremental`, like the INBOX half: the silence guarantee for the
-            // user's own mail is NOT the origin but `events::worthy_kind`, which
-            // returns `None` for an `is_sent` row, and the 'n/a' stage markers
-            // ingest stamps, which keep it out of both LLM queues.
+            // user's own mail is NOT the origin. It is, in order,
+            // `notify_eligible_stamp` refusing to stamp an `is_sent` row at all
+            // (docs/NOTIFY.md §11.3), so there is nothing for any site to emit
+            // from; `events::worthy_kind` refusing one with
+            // `Err(Refusal::NotWorthy)` as defense in depth; and the 'n/a' stage
+            // markers ingest stamps, which keep it out of both LLM queues.
             match self
                 .fetch_raw_and_ingest(&sent_only, true, IngestOrigin::Incremental)
                 .await
@@ -1069,15 +1377,41 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
         // still a job rather than after it is a result. This is the line that
         // turns "silent for 30 minutes" into "re-fetching 4,500 messages".
         eprintln!(
+            // "triage runs alongside it", not "triage waits for this to
+            // finish": since the lane split (docs/NOTIFY.md §11.2) the refine
+            // lane is a sibling future under the same `select!` and grinds the
+            // rows this catch-up commits as it commits them. An operator who
+            // read the old wording concluded that no model spend was happening
+            // for the next half hour and that queued rows were frozen, and both
+            // are now false.
             "squelch: catch-up re-fetching {} INBOX message(s) from the last {} days; \
-             triage waits for this to finish",
+             triage runs alongside it",
             ids.len(),
             self.config.sync.backfill_days
         );
         self.metrics.catchup_begin(ids.len() as u64);
         // A catch-up may carry genuinely new mail, so it is allowed to notify.
-        // What keeps the whole-window re-scan from storming is the freshness
-        // window in `triage::events` plus the one-event-per-message key.
+        // What keeps the whole-window re-scan from storming is the FIRST-SIGHT
+        // STAMP (`triage.notify_eligible_at`, see [`notify_eligible_stamp`])
+        // plus the one-event-per-message key, and the two halves of the window
+        // are bounded by DIFFERENT parts of that rule:
+        //
+        // - Mail this re-scan has seen before ALREADY EXISTS, so
+        //   `ingest_message` preserves whatever stamp it was given the first
+        //   time — NULL for the backfill's rows, an hour-old timestamp for
+        //   anything the last catch-up already saw — and the rescue ceiling or
+        //   the NULL refuses it at every emission site.
+        // - Mail that arrived while the historyId was dead has never been seen
+        //   here and does NOT already exist, so preservation cannot be what
+        //   bounds it. `events::is_fresh`, asked ONCE at first sight, is: a
+        //   catch-up after a week-long outage stamps only the mail whose `Date:`
+        //   is still inside `notify.freshness_window_secs` when we finally lay
+        //   eyes on it, and everything older is stamped NULL and silent forever.
+        //
+        // It is no longer the freshness window doing the first job, which is
+        // exactly the fix: asked at emission time it measured the SENDER's clock
+        // against the wall clock, so a row that waited behind a queue of model
+        // calls aged out and went silent.
         let n = self
             .fetch_raw_and_ingest(&ids, false, IngestOrigin::Incremental)
             .await?;
@@ -1357,7 +1691,6 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
             return Ok(0);
         }
         let rules = self.store.list_sender_rules(self.account_id)?;
-        let now = Utc::now();
         let mut count = 0usize;
 
         for id in ids {
@@ -1400,10 +1733,52 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
                 is_sent,
                 account_addr: self.account_email.clone(),
             };
+            // THE CLOCK IS READ PER MESSAGE AND AFTER ITS FETCH, not once for the
+            // batch, and that is load bearing rather than tidy. This value is what
+            // `notify_eligible_stamp` records as "the moment we first saw the
+            // message" (docs/NOTIFY.md §11.3) and what the rescue ceiling is
+            // measured from, and this loop is SEQUENTIAL over one `format=raw` GET
+            // per id: `catch_up` runs it over the whole backfill window, which
+            // [`Self::catch_up_inner`]'s own comment records taking half an hour
+            // for a real tenant. Frozen at the top of the function, both
+            // directions are wrong:
+            //
+            // - a genuinely new message fetched 30 minutes in would enter the
+            //   Stage-1 queue with 30 minutes of its rescue window already spent,
+            //   and expire before the refine lane ever reached it: a notification
+            //   dropped AND booked as `deliberate/expired`, which would have the
+            //   one counter this wave exists to make believable reporting a miss
+            //   that the stamp itself invented;
+            // - past `MAX_FUTURE_SKEW_SECS` of batch runtime every remaining
+            //   message would read as dated in the future, fail `is_fresh`, and be
+            //   stamped NULL: permanently unnotifiable, at every site, forever.
+            //   That is exactly §2a's silent drop, reintroduced on the
+            //   post-outage path where notifications matter most.
+            //
+            // AFTER the GET rather than before it, so a slow fetch is charged to
+            // the fetch and not to the message's rescue window. It costs one
+            // `clock_gettime` per network round trip. `ingest_with_rules` reads
+            // the same value; it is a pure function of the message and the clock,
+            // so per-message is simply the more truthful "now" for it too.
+            let now = Utc::now();
             if let Some((id, text)) = self.ingest_one(&fetched, &rules, now, origin)? {
                 self.embed_and_store(id, text).await;
             }
             count += 1;
+        }
+        // POLL LANE -> REFINE LANE. Poked from here rather than from the poll
+        // loop because this is the one place that knows BOTH facts the poke
+        // needs: how many rows actually landed, and which sync path they landed
+        // on. `Notify` stores a permit when nobody is waiting, so a poke that
+        // arrives while the refine lane is mid-round wakes it as soon as it
+        // finishes, and several pokes in one round collapse into one.
+        //
+        // BACKFILL DOES NOT POKE. The first backfill's refinement is run inline
+        // by `run_once` before either lane starts, so a poke would only queue a
+        // redundant round; and the poke means "mail that may be genuinely new is
+        // waiting", which a backfill's month of already-read mail is not.
+        if count > 0 && origin == IngestOrigin::Incremental {
+            self.refine_wake.notify_one();
         }
         Ok(count)
     }
@@ -1420,11 +1795,18 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
         now: DateTime<Utc>,
         origin: IngestOrigin,
     ) -> Result<Option<(i64, String)>> {
-        let triaged = ingest_with_rules(fetched, &self.config.stage1, now, rules, |addr| {
+        let mut triaged = ingest_with_rules(fetched, &self.config.stage1, now, rules, |addr| {
             self.store
                 .is_known_contact(self.account_id, addr)
                 .unwrap_or(false)
         });
+        // THE ELIGIBILITY STAMP, computed BEFORE the store call because
+        // `ingest_message` writes it on the triage row's FIRST INSERT only and
+        // preserves it verbatim on conflict. `ingest_with_rules` deliberately
+        // leaves it `None`: the pure pipeline does not know which sync path it
+        // is on, and that fact is the whole decision.
+        triaged.notify_eligible_at =
+            notify_eligible_stamp(&triaged, origin, &self.config.notify, now);
         // A SEALED OUTBOUND COPY IS NOT COMMITTED — the same rule
         // [`ingest::ingest_sent`] holds the api's send echo to, and now that the
         // sent walk delivers outbound mail on every poll it has to hold here too.
@@ -1445,13 +1827,44 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
         // notification is the loudest thing this product does; a pattern match is
         // the weakest evidence it has.
         //
-        // The wait costs one classify call, because the Stage-1 pass runs later in
-        // this same cycle and emits from its own apply site. With NO API key the
-        // heuristics are all there is and are authoritative, so they notify: that
-        // is the "unless we have no model access" case, and the only one.
+        // The wait costs one classify call, and the row does not wait long for
+        // it: the Stage-1 pass runs in the REFINE LANE, which `fetch_raw_and_ingest`
+        // pokes through `refine_wake` the moment this batch lands, and it emits
+        // from its own apply site (docs/NOTIFY.md §11.2 — the two are no longer
+        // one serial cycle). With NO API key the heuristics are all there is and
+        // are authoritative, so they notify: that is the "unless we have no model
+        // access" case, and the only one.
+        //
+        // The `origin` test below is now redundant with the stamp — a backfill
+        // row carries none, so `worthy_kind` refuses it anyway — and it stays as
+        // defense in depth, the same way the seal check is repeated inside
+        // `worthy_kind`.
         let llm_available = self.stage2_llm.is_some();
         if origin == IngestOrigin::Incremental && triaged.confident && !llm_available {
-            self.emit_event(&events::ingest_context(&triaged, id, rules), now);
+            let mut ctx = events::ingest_context(&triaged, id, rules);
+            // THE STAMP AS THE STORE KEPT IT, not the one we just computed. The
+            // two differ on exactly one path and it is a real one: `catch_up()`
+            // re-ingests a row that already exists, `ingest_message` preserves
+            // the stored `notify_eligible_at` on conflict, and a backfilled row
+            // whose `Date:` happens to be inside the freshness window at
+            // catch-up time would otherwise emit here off an in-memory `Some`
+            // the database never accepted. NULL is forever and NULL is silent at
+            // every emission site, INCLUDING this one — the `emit_seed_event`
+            // re-read is the same move for the same reason.
+            //
+            // A store error (or a row read back as sealed) reads as `None` and
+            // so as silence, which is the safe direction: the only cost is a
+            // notification a no-LLM daemon would have sent, and the only
+            // alternative is manufacturing one from a value the store rejected.
+            ctx.notify_eligible_at = self
+                .store
+                .triage_seed_verdict(self.account_id, id)
+                .ok()
+                .flatten()
+                .and_then(|seed| seed.notify_eligible_at);
+            // First sight, by construction: nobody can have re-triaged a row
+            // this call is committing for the first time.
+            self.emit_event(&ctx, now, ExpiryCount::Miss);
         }
         // STRUCTURAL EXCLUSION: sealed mail is never embedded.
         if triaged.sensitivity != Sensitivity::Normal {
@@ -1484,28 +1897,136 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
 
     /// The single emission point for all three verdict sites (ingest heuristic,
     /// Stage-1 apply, Stage-2 apply); the decision itself lives in
-    /// [`events::event_for`], which owns the seal invariant and the freshness
-    /// storm guard. BEST-EFFORT: a store error is logged (ids only) and
-    /// swallowed — a notification is never worth failing triage over. Store-side
+    /// [`events::event_for`], which owns the seal invariant and the rescue
+    /// ceiling. BEST-EFFORT: a store error is logged (ids only) and swallowed —
+    /// a notification is never worth failing triage over. Store-side
     /// `UNIQUE(message_id)` makes a repeat call a silent no-op, which is what
     /// makes the refine passes and `catch_up()`'s re-scan safe to hook.
-    fn emit_event(&self, ctx: &events::EventContext<'_>, now: DateTime<Utc>) {
-        let Some(ev) = events::event_for(ctx, &self.config.notify, now) else {
-            return;
+    ///
+    /// Returns what happened so the caller can record it. THIS WAVE RECORDS ONLY
+    /// `deliberate/expired` (docs/NOTIFY.md §11.9), and only here rather than
+    /// at each call site, because it is the one outcome that was previously
+    /// invisible: an eligible, notify-worthy message the pass reached too late is
+    /// a notification the user wanted and did not get, and until now nothing
+    /// counted it (docs/NOTIFY.md §2a). The deliberate lane's full ledger writes
+    /// are Wave 2b.
+    ///
+    /// ALREADY-NOTIFIED IS SETTLED BEFORE EXPIRED, and the order is the whole
+    /// correctness of the counter. `worthy_kind` refuses on the rescue ceiling
+    /// without ever touching the store, so it cannot know that the phone already
+    /// buzzed — and the commonest shape of an expiry offer is exactly that: a
+    /// message Stage-1 notified at 09:01 is offered again by Stage-2 at 11:00 and
+    /// again by every later re-triage, each time with the same 09:00 stamp and so
+    /// each time "expired". Counting those would fill the missed-notification
+    /// series with DELIVERED notifications. [`ExpiryCount`] is the second guard
+    /// on the same series, for the rows a human deliberately dragged back.
+    fn emit_event(
+        &self,
+        ctx: &events::EventContext<'_>,
+        now: DateTime<Utc>,
+        counting: ExpiryCount,
+    ) -> Emitted {
+        let ev = match events::event_for(ctx, &self.config.notify, now) {
+            Ok(ev) => ev,
+            Err(events::Refusal::NotWorthy) => return Emitted::NotWorthy,
+            Err(events::Refusal::Expired) => {
+                // The store read the refusal path skipped. A store error reads as
+                // "no event": counting a drop we are unsure about is the honest
+                // direction for a series whose whole job is to be believed when
+                // it says a notification went missing.
+                if self
+                    .store
+                    .message_has_event(self.account_id, ctx.message_id)
+                    .unwrap_or(false)
+                {
+                    return Emitted::AlreadyNotified;
+                }
+                // ONE MISS, ONE COUNT, however many sites offer the row — and
+                // nothing at all when a human asked for this row to be read
+                // again (see [`ExpiryCount`]).
+                if counting == ExpiryCount::Miss && self.count_expiry_once(ctx.message_id) {
+                    self.metrics
+                        .record_notify(NotifyLane::Deliberate, NotifyDecision::Expired);
+                    // REDACTED: the message id and nothing else. No sender, no
+                    // subject, no one_line — this line exists to prove the drop
+                    // happened and to point at the row, not to describe the mail.
+                    eprintln!(
+                        "squelch: notification expired for message {} (worthy, but past \
+                         notify.rescue_window_secs since we first saw it)",
+                        ctx.message_id
+                    );
+                }
+                return Emitted::Expired;
+            }
         };
         match self.store.append_event(&ev) {
-            Ok(Some(id)) => eprintln!(
-                "squelch: notification event {id} ({}) for message {}",
-                ev.kind.as_str(),
-                ev.message_id
-            ),
+            Ok(Some(id)) => {
+                eprintln!(
+                    "squelch: notification event {id} ({}) for message {}",
+                    ev.kind.as_str(),
+                    ev.message_id
+                );
+                Emitted::New(id)
+            }
             // Already notified once; one event per message, ever.
-            Ok(None) => {}
-            Err(e) => eprintln!(
-                "squelch: append_event failed ({e}); no notification for message {}",
-                ev.message_id
-            ),
+            Ok(None) => Emitted::AlreadyNotified,
+            Err(e) => {
+                eprintln!(
+                    "squelch: append_event failed ({e}); no notification for message {}",
+                    ev.message_id
+                );
+                // A LOST NOTIFICATION, AND IT GETS THE LOG LINE ABOVE AND
+                // NOTHING ELSE. The mail was worthy, eligible and in-window; the
+                // store broke (SQLITE_BUSY under the two lanes' contention, a
+                // full disk, a locked WAL) and the user was not told.
+                //
+                // NOT counted as `deliberate/unavailable`, though it is tempting.
+                // Two reasons, and the second is the one that decides it:
+                //
+                // - §11.4's closed vocabulary defines `unavailable` as "no model
+                //   answer: no key, timeout, budget, transport, config failure",
+                //   and marks it RESCUABLE, meaning a later lane may retry it.
+                //   A store write that failed is neither. On the §11.11 rollout
+                //   query a full disk would read as a model-availability problem.
+                // - §11.9 locks THIS wave to recording `deliberate/expired` and
+                //   nothing else, and §11.7 has each refine site write its ledger
+                //   row from the returned `Emitted`. A metric series with no
+                //   ledger row behind it is a number that will not reconcile with
+                //   the table the rollout decision is read off.
+                //
+                // Wave 2b is where this belongs: the ledger lands there, and with
+                // it the fault-injecting `Store` that can actually exercise this
+                // branch (`SqliteStore` is the only implementor today, so nothing
+                // here is reachable from a test). If it earns a series then, it
+                // earns a fifth `Emitted` arm and a row of its own, together.
+                Emitted::NotWorthy
+            }
         }
+    }
+
+    /// Claim the right to count ONE `deliberate/expired` for `message_id`:
+    /// `true` the first time this process is asked, `false` forever after. See
+    /// [`SyncEngine::expired_counted`] for why one missed notification is
+    /// offered to [`SyncEngine::emit_event`] many times.
+    ///
+    /// A poisoned mutex reads as "count it" rather than panicking: this is a
+    /// metric, and no notification is worth taking triage down over.
+    fn count_expiry_once(&self, message_id: i64) -> bool {
+        /// Ceiling on the remembered set, so a daemon whose refine lane is hours
+        /// behind for a week cannot grow it without bound. Clearing (rather than
+        /// refusing to insert) is the self-healing direction: the worst case is
+        /// re-counting some already-counted misses, where refusing would silence
+        /// every NEW one from here on.
+        const MAX_REMEMBERED: usize = 10_000;
+
+        let mut seen = match self.expired_counted.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if seen.len() >= MAX_REMEMBERED {
+            seen.clear();
+        }
+        seen.insert(message_id)
     }
 
     /// Emit for a Stage-1 row whose model call did NOT produce a verdict, from
@@ -1513,9 +2034,9 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
     /// [`events::seed_context`]; this reads the seed and does the emitting.
     ///
     /// Only the fallback path calls this. The stale-skip path has no
-    /// notification to lose: a row older than `stage2.max_age_days` is days
-    /// outside `notify.freshness_window_secs`, so the storm guard would drop the
-    /// event whichever site offered it.
+    /// notification to lose: a row older than `stage2.max_age_days` is days past
+    /// `notify.rescue_window_secs` from whenever we first saw it, so the ceiling
+    /// would refuse the event whichever site offered it.
     fn emit_seed_event(&self, row: &crate::store::Stage1Queued) {
         let seed = match self
             .store
@@ -1547,7 +2068,8 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
             deadline.as_ref(),
             self.current_rule(&row.from_addr),
         ) {
-            self.emit_event(&ctx, Utc::now());
+            let now = Utc::now();
+            self.emit_event(&ctx, now, ExpiryCount::from_retriage(row.retriage_at, now));
         }
     }
 
@@ -1635,8 +2157,10 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
             if n < batch {
                 break;
             }
-            // Throttle between batches so a large backfill doesn't peg the CPU or
-            // starve the poll loop.
+            // Throttle between batches so a large backfill doesn't peg the CPU
+            // or starve the poll lane, which shares this task: the two lanes are
+            // futures under one `select!`, not two runtimes, so a tight loop
+            // here still delays the next `history.list`.
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
 
@@ -1829,9 +2353,16 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
     /// loop runs this AHEAD of `poll_once` rather than after it: nothing here
     /// talks to Gmail, so a mailbox stuck retrying an `invalid_grant` — or a
     /// weekend of Gmail being down — must not be what swallows Saturday's
-    /// reminder. It still lands before `revisit_pass`, so a mail that comes back
-    /// this tick is already `open` when the re-evaluation sweep reads the
-    /// standing band.
+    /// reminder.
+    ///
+    /// IT NO LONGER LANDS BEFORE `revisit_pass`, and that used to be stated here
+    /// as a guarantee. The lane split (docs/NOTIFY.md §11.2) put this in the
+    /// poll lane and `revisit_pass` in the refine lane, on independent clocks
+    /// with independent wake sources, so the sweep can now read the standing
+    /// band before this tick's reminders have fired and miss a mail that came
+    /// back a moment ago. It is a race, not a lost reminder: both lanes cycle at
+    /// `poll_secs`, the row stays `open` once it fires, and the next sweep sees
+    /// it. One round of latency on a re-evaluation, self-correcting.
     ///
     /// Synchronous and infallible from the loop's point of view: one indexed
     /// UPDATE, and an error is logged and dropped. A store hiccup must not bounce
@@ -2188,8 +2719,20 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
                                 Utc::now(),
                             );
                             // The refined verdict is final, so it emits whatever
-                            // the seed thought; the freshness window is what stops
-                            // this pass storming a fresh install's backlog.
+                            // the seed thought; the ingest-time eligibility stamp
+                            // is what stops this pass storming a fresh install's
+                            // backlog, and what lets a SLOW verdict on genuinely
+                            // new mail still land — this site is where the old
+                            // `Date:`-based window ate notifications.
+                            //
+                            // A FORCED RE-TRIAGE DOES NOT BOOK AN EXPIRY HERE.
+                            // `retriage_forced` rows bypass this pass's stale
+                            // gate by design, so a `retriage_reset` over a wide
+                            // window walks weeks-old rows past this site; the
+                            // ones it newly rates worthy are exactly the point of
+                            // running it, and every one of them is refused as
+                            // expired. See [`ExpiryCount`].
+                            let emit_now = Utc::now();
                             self.emit_event(
                                 &events::EventContext {
                                     account_id: self.account_id,
@@ -2197,7 +2740,7 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
                                     thread_id: &row.thread_id,
                                     sender: &row.from_addr,
                                     one_line: &applied.one_line,
-                                    received_at: row.received_at,
+                                    notify_eligible_at: row.notify_eligible_at,
                                     sensitivity: row.sensitivity,
                                     // The Stage-1 queue selects `m.is_sent = 0`.
                                     is_sent: false,
@@ -2209,7 +2752,8 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
                                     importance: applied.importance,
                                     deadline: applied.deadline.as_ref(),
                                 },
-                                Utc::now(),
+                                emit_now,
+                                ExpiryCount::from_retriage(row.retriage_at, emit_now),
                             );
                         }
                     }
@@ -2846,6 +3390,10 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
                                 applied.deadline.as_ref(),
                                 Utc::now(),
                             );
+                            // Same re-triage exemption as the Stage-1 site above:
+                            // a row a human dragged back is being READ AGAIN, not
+                            // missed. See [`ExpiryCount`].
+                            let emit_now = Utc::now();
                             self.emit_event(
                                 &events::EventContext {
                                     account_id: self.account_id,
@@ -2853,7 +3401,7 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
                                     thread_id: &row.thread_id,
                                     sender: &row.from_addr,
                                     one_line: &applied.one_line,
-                                    received_at: row.received_at,
+                                    notify_eligible_at: row.notify_eligible_at,
                                     sensitivity: row.sensitivity,
                                     // The Stage-2 queue selects `m.is_sent = 0`.
                                     is_sent: false,
@@ -2866,7 +3414,8 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
                                     importance: applied.importance,
                                     deadline: applied.deadline.as_ref(),
                                 },
-                                Utc::now(),
+                                emit_now,
+                                ExpiryCount::from_retriage(row.retriage_at, emit_now),
                             );
                         }
                     }
@@ -3036,6 +3585,14 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
                 }
                 Err(e) => {
                     self.metrics.record_sync_error();
+                    // GMAIL IS THE THING THAT FAILED — only the poll lane can
+                    // return an `Err` at all — so the refine lane must not spend
+                    // on the next cycle until a poll has proved otherwise. Without
+                    // this, every backoff cycle re-entered `run_lanes` and burned
+                    // a Stage-1 and a Stage-2 unit of a DAY-scoped cap on classify
+                    // calls that were cancelled one Gmail round trip later. See
+                    // the `poll_healthy` field.
+                    self.poll_healthy.store(false, Ordering::Relaxed);
                     if *shutdown.borrow() {
                         return Ok(());
                     }
@@ -3233,8 +3790,13 @@ mod tests {
     // above it is out of reach, which is why the helper repeats the engine's two
     // lines of gating instead of calling `ingest_one` directly.
 
-    /// Mirror of the engine's ingest emission site. Returns
+    /// Mirror of the engine's ingest path with NO LLM configured, so the
+    /// confident seed is authoritative and emits here. Returns
     /// `(message_id, emitted_event_id)`.
+    ///
+    /// The eligibility stamp is computed by the engine's own
+    /// [`notify_eligible_stamp`], not re-derived, so a change to the §11.3 rule
+    /// cannot pass these tests while breaking the daemon.
     fn ingest_and_notify(
         store: &SqliteStore,
         account_id: AccountId,
@@ -3243,19 +3805,82 @@ mod tests {
         origin: IngestOrigin,
     ) -> (i64, Option<i64>) {
         let cfg = crate::config::NotifyConfig::default();
-        let rules = store.list_sender_rules(account_id).unwrap();
-        let triaged = ingest_with_rules(f, &Stage1Config::default(), now, &rules, |addr| {
-            store.is_known_contact(account_id, addr).unwrap_or(false)
-        });
-        let id = store.ingest_message(&triaged).unwrap();
+        let (id, triaged, rules) = ingest_stamped(store, account_id, f, now, origin, &cfg);
         let mut emitted = None;
         if origin == IngestOrigin::Incremental && triaged.confident {
-            let ctx = events::ingest_context(&triaged, id, &rules);
-            if let Some(ev) = events::event_for(&ctx, &cfg, now) {
+            let mut ctx = events::ingest_context(&triaged, id, &rules);
+            // The STORED stamp, exactly as the engine reads it: on a re-ingest
+            // the value just computed and the value the row kept disagree, and
+            // the row is the one that counts.
+            ctx.notify_eligible_at = store
+                .triage_seed_verdict(account_id, id)
+                .ok()
+                .flatten()
+                .and_then(|seed| seed.notify_eligible_at);
+            if let Ok(ev) = events::event_for(&ctx, &cfg, now) {
                 emitted = store.append_event(&ev).unwrap();
             }
         }
         (id, emitted)
+    }
+
+    /// The engine's ingest path with an LLM configured: the row is committed
+    /// carrying its eligibility stamp and NOTHING is emitted, because the
+    /// promise is that a model verdict is coming and the refine site will emit.
+    /// That is the state every refine-site test needs to start from.
+    ///
+    /// Returns the row's stamp so a test can assert on it directly — the whole
+    /// point of §11.3 is that this one value, not the sender's `Date:`, decides
+    /// what the refine sites are allowed to do.
+    fn ingest_deferring_to_refine(
+        store: &SqliteStore,
+        account_id: AccountId,
+        f: &RawFetched,
+        now: DateTime<Utc>,
+        origin: IngestOrigin,
+    ) -> (i64, Option<DateTime<Utc>>) {
+        let cfg = crate::config::NotifyConfig::default();
+        let (id, triaged, _) = ingest_stamped(store, account_id, f, now, origin, &cfg);
+        (id, triaged.notify_eligible_at)
+    }
+
+    /// Shared spine of the two helpers above: triage, stamp, commit.
+    fn ingest_stamped(
+        store: &SqliteStore,
+        account_id: AccountId,
+        f: &RawFetched,
+        now: DateTime<Utc>,
+        origin: IngestOrigin,
+        cfg: &crate::config::NotifyConfig,
+    ) -> (i64, TriagedMessage, Vec<crate::types::SenderRule>) {
+        let rules = store.list_sender_rules(account_id).unwrap();
+        let mut triaged = ingest_with_rules(f, &Stage1Config::default(), now, &rules, |addr| {
+            store.is_known_contact(account_id, addr).unwrap_or(false)
+        });
+        triaged.notify_eligible_at = notify_eligible_stamp(&triaged, origin, cfg, now);
+        let id = store.ingest_message(&triaged).unwrap();
+        (id, triaged, rules)
+    }
+
+    /// The eligibility stamp as the DATABASE holds it, read back through a
+    /// store method rather than off the `TriagedMessage` the test just built.
+    /// That round trip is the assertion: a stamp that never reached SQLite, or
+    /// one the `DO UPDATE SET` quietly rewrote, would pass every in-memory check
+    /// and still leave the emission sites reading the wrong clock.
+    ///
+    /// `triage_seed_verdict` because it is the one read that carries the column
+    /// for ANY normal row, sent copies included — the queue SELECTs filter
+    /// `m.is_sent = 0`, so they cannot see half of what these tests assert on.
+    fn stamp_of(
+        store: &SqliteStore,
+        account_id: AccountId,
+        message_id: i64,
+    ) -> Option<DateTime<Utc>> {
+        store
+            .triage_seed_verdict(account_id, message_id)
+            .unwrap()
+            .expect("a triage row for this message")
+            .notify_eligible_at
     }
 
     /// An ops-alert EML dated `at`: automated sender + alert language, so it
@@ -3290,6 +3915,15 @@ mod tests {
         assert_eq!(ev.sender, "alerts@monitoring.example");
         assert_eq!(store.latest_event_id(acct).unwrap(), ev_id);
 
+        // AND THE ROW CARRIES ITS STAMP, read back out of SQLite. The event
+        // above proves the decision; this proves the FACT the decision was made
+        // from survived the write, which is what every later refine site reads.
+        assert_eq!(
+            stamp_of(&store, acct, mid),
+            Some(now),
+            "the stamp is the moment we first saw the message, to the nanosecond"
+        );
+
         // RE-INGEST (history overlap / catch-up re-scan) must stay silent.
         let (mid2, again) = ingest_and_notify(&store, acct, &f, now, IngestOrigin::Incremental);
         assert_eq!(mid2, mid, "same message row");
@@ -3306,17 +3940,24 @@ mod tests {
         let eml = alert_eml(now);
         let f = fixture(acct, "g-alert", &eml, false);
 
-        let (_, ev) = ingest_and_notify(&store, acct, &f, now, IngestOrigin::Backfill);
+        let (mid, ev) = ingest_and_notify(&store, acct, &f, now, IngestOrigin::Backfill);
         assert_eq!(ev, None, "backfill is structurally silent");
         assert!(store.events_after(acct, 0, 100).unwrap().is_empty());
         assert_eq!(store.latest_event_id(acct).unwrap(), 0);
+
+        // NULL, not "old": the mail itself is minutes fresh and the verdict is
+        // above the line. The origin alone decided it, and the NULL is what
+        // makes the silence hold at every later emission site too, not just at
+        // this one.
+        assert_eq!(stamp_of(&store, acct, mid), None);
     }
 
     #[test]
     fn stale_mail_is_silent_even_at_the_top_tier() {
-        // THE STORM GUARD: a past-due bill from a KNOWN biller is the loudest
-        // verdict the pipeline can produce, and old mail is silent anyway. This
-        // is what makes `catch_up()`'s whole-window re-scan safe.
+        // THE FIRST-SIGHT TEST: a past-due bill from a KNOWN biller is the
+        // loudest verdict the pipeline can produce, and mail that was already
+        // three days old when we first saw it earns no stamp, so it is silent
+        // anyway. This is what makes `catch_up()`'s whole-window re-scan safe.
         let store = SqliteStore::open_in_memory().unwrap();
         let acct = store.ensure_account("me@example.com").unwrap();
         let now = Utc::now();
@@ -3351,6 +3992,12 @@ mod tests {
             "old mail is silent no matter what the verdict says"
         );
         assert!(store.events_after(acct, 0, 100).unwrap().is_empty());
+        assert_eq!(
+            stamp_of(&store, acct, mid),
+            None,
+            "mail already stale at first sight earns no stamp, so it is silent \
+             at every emission site and not just this one"
+        );
 
         // Sanity: the guard stopped it, not a mis-triage.
         let updates = store
@@ -3386,6 +4033,92 @@ mod tests {
             store.sealed_messages(acct).unwrap().len(),
             1,
             "it WAS sealed"
+        );
+    }
+
+    #[test]
+    fn the_users_own_sent_copy_is_never_stamped() {
+        // The user's own outbox is on the INCREMENTAL path and is as fresh as
+        // mail gets, so neither of the other two arms of the stamp rule stops
+        // it. `is_sent` is its own arm for exactly that reason: buzzing someone
+        // about the mail they just sent is the most obviously wrong
+        // notification the system could produce.
+        let store = SqliteStore::open_in_memory().unwrap();
+        let acct = store.ensure_account("me@example.com").unwrap();
+        let now = Utc::now();
+
+        let eml = format!(
+            "From: me@example.com\r\n\
+             To: Utility <billing@utilityco.example>\r\n\
+             Subject: PAST DUE: Your electric bill\r\n\
+             Date: {}\r\n\
+             \r\n\
+             Paying this now, sorry for the delay.\r\n",
+            now.to_rfc2822()
+        );
+        let f = fixture(acct, "g-mine", &eml, /* is_sent */ true);
+        let (mid, ev) = ingest_and_notify(&store, acct, &f, now, IngestOrigin::Incremental);
+
+        assert_eq!(
+            stamp_of(&store, acct, mid),
+            None,
+            "a sent copy is unstamped"
+        );
+        assert_eq!(ev, None);
+        assert!(store.events_after(acct, 0, 100).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_re_ingest_keeps_the_first_sight_stamp_and_a_null_stays_null() {
+        // WRITTEN ONCE, ON FIRST INSERT. Both halves matter and they fail in
+        // opposite directions: a stamp that got REFRESHED on every re-ingest
+        // would hand a row an unbounded rescue window, so a catch-up touching a
+        // day-old message could buzz for it; a NULL that got FILLED IN on
+        // re-ingest would let the first catch-up after a backfill push the
+        // month of archived mail the backfill deliberately silenced.
+        //
+        // Both are live paths, not hypotheticals: the history walk overlaps and
+        // `catch_up` re-fetches the whole window, so almost every row in a
+        // long-lived database is ingested more than once.
+        let store = SqliteStore::open_in_memory().unwrap();
+        let acct = store.ensure_account("me@example.com").unwrap();
+        let first = Utc::now();
+        // Inside the freshness window, so a naive recompute would produce a
+        // NEW stamp rather than nothing. That is what makes this discriminate.
+        let again = first + ChronoDuration::minutes(5);
+
+        let eml = alert_eml(first);
+        let f = fixture(acct, "g-alert", &eml, false);
+        let (mid, _) =
+            ingest_deferring_to_refine(&store, acct, &f, first, IngestOrigin::Incremental);
+        assert_eq!(stamp_of(&store, acct, mid), Some(first));
+
+        let (mid2, _) =
+            ingest_deferring_to_refine(&store, acct, &f, again, IngestOrigin::Incremental);
+        assert_eq!(mid2, mid, "same message row");
+        assert_eq!(
+            stamp_of(&store, acct, mid),
+            Some(first),
+            "the ORIGINAL stamp, not the fresher one: the rescue window is \
+             measured from when we first saw the mail, and a re-scan is not a \
+             new sighting"
+        );
+
+        // The other direction: a backfilled row re-ingested as fresh
+        // incremental mail stays NULL.
+        let back = alert_eml(first).replace("alerts@monitoring.example", "alerts@second.example");
+        let bf = fixture(acct, "g-back", &back, false);
+        let (bmid, _) =
+            ingest_deferring_to_refine(&store, acct, &bf, first, IngestOrigin::Backfill);
+        assert_eq!(stamp_of(&store, acct, bmid), None);
+        let (bmid2, _) =
+            ingest_deferring_to_refine(&store, acct, &bf, again, IngestOrigin::Incremental);
+        assert_eq!(bmid2, bmid);
+        assert_eq!(
+            stamp_of(&store, acct, bmid),
+            None,
+            "a NULL stays NULL: the backfill's silence is permanent, and a \
+             later catch-up cannot talk it out of it"
         );
     }
 
@@ -3459,21 +4192,41 @@ mod tests {
             return None;
         }
         let rules = store.list_sender_rules(account_id).unwrap();
-        let ctx = events::EventContext {
+        let rule = events::current_rule(&row.from_addr, &rules);
+        let ctx = stage1_ctx(account_id, row, rule, tier, importance);
+        events::event_for(&ctx, &cfg, now)
+            .ok()
+            .and_then(|ev| store.append_event(&ev).unwrap())
+    }
+
+    /// The `EventContext` the engine's Stage-1 apply site builds, in one place
+    /// so the two mirrors above and below cannot drift from each other. The
+    /// `one_line` is a fixed string because no test here is about the wording.
+    ///
+    /// `notify_eligible_at` comes OFF THE QUEUED ROW, exactly as the engine
+    /// reads it: `received_at` (the sender's `Date:`) is no longer part of the
+    /// emission decision at all.
+    fn stage1_ctx<'a>(
+        account_id: AccountId,
+        row: &'a crate::store::Stage1Queued,
+        rule: Option<Disposition>,
+        tier: Tier,
+        importance: u8,
+    ) -> events::EventContext<'a> {
+        events::EventContext {
             account_id,
             message_id: row.message_id,
             thread_id: &row.thread_id,
             sender: &row.from_addr,
             one_line: "refined one-liner",
-            received_at: row.received_at,
+            notify_eligible_at: row.notify_eligible_at,
             sensitivity: row.sensitivity,
             is_sent: false,
-            rule: events::current_rule(&row.from_addr, &rules),
+            rule,
             tier,
             importance,
             deadline: None,
-        };
-        events::event_for(&ctx, &cfg, now).and_then(|ev| store.append_event(&ev).unwrap())
+        }
     }
 
     /// [`refine_row_and_notify`] when nothing is racing the queue read: fetch
@@ -3505,7 +4258,12 @@ mod tests {
         let now = Utc::now();
 
         let f = fixture(acct, "g-alert", &alert_eml(now), false);
-        let (mid, _) = ingest_and_notify(&store, acct, &f, now, IngestOrigin::Backfill);
+        // ELIGIBLE, deliberately: the silence below has to come from the TOCTOU
+        // gate and nothing else. Ingesting this as backfill would leave the row
+        // unstamped and it would be silent for a reason the test is not about.
+        let (mid, stamp) =
+            ingest_deferring_to_refine(&store, acct, &f, now, IngestOrigin::Incremental);
+        assert!(stamp.is_some(), "fresh incremental mail is notify-eligible");
 
         // The pass is already holding the queued row...
         let row = store
@@ -3534,14 +4292,24 @@ mod tests {
         // Gmail's internalDate. The refine passes grind the backlog
         // `received_at DESC` — future-dated rows FIRST — so without an upper
         // edge on the freshness window a fresh install storms on mail dated 2030.
+        //
+        // The forgery is now caught EARLIER: `is_fresh` is asked once, at ingest,
+        // and mail dated four years out never earns a stamp, so the refine sites
+        // have nothing to be fooled by. This ingests on the INCREMENTAL path on
+        // purpose — the path that is allowed to stamp — so the silence is the
+        // future-date ceiling and not the origin.
         let store = SqliteStore::open_in_memory().unwrap();
         let acct = store.ensure_account("me@example.com").unwrap();
         let now = Utc::now();
 
         let eml = alert_eml(now + ChronoDuration::days(365 * 4));
         let f = fixture(acct, "g-liar", &eml, false);
-        let (mid, ev) = ingest_and_notify(&store, acct, &f, now, IngestOrigin::Backfill);
-        assert_eq!(ev, None, "backfill is silent by origin");
+        let (mid, stamp) =
+            ingest_deferring_to_refine(&store, acct, &f, now, IngestOrigin::Incremental);
+        assert_eq!(
+            stamp, None,
+            "a sender-controlled Date: cannot buy notify eligibility"
+        );
 
         // Sanity: the lying header really is what the row carries.
         let row = store
@@ -3554,13 +4322,508 @@ mod tests {
             row.received_at > now + ChronoDuration::days(1000),
             "the Date: header won"
         );
+        assert_eq!(row.notify_eligible_at, None, "and the row carries no stamp");
 
         assert_eq!(
             refine_and_notify(&store, acct, mid, Tier::PastDue, 100, now),
             None,
-            "future-dated mail is outside the freshness window, loud verdict or not"
+            "an unstamped row can never notify, loud verdict or not"
         );
         assert!(store.events_after(acct, 0, 100).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_late_verdict_inside_the_hour_buzzes_and_past_it_is_counted() {
+        // THE WHOLE POINT OF WAVE 1, at the site that decides it. Both rows are
+        // notify-eligible and both carry the loudest verdict there is; the only
+        // difference is how long the refine pass took to reach them. Inside the
+        // rescue window the buzz lands (this is the 24.7% the old `Date:`-based
+        // window ate); past it the drop is COUNTED, where it used to be silent.
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let acct = store.ensure_account("me@example.com").unwrap();
+        let now = Utc::now();
+        let eng = engine(store.clone(), acct, "http://127.0.0.1:1");
+        let window = eng.config.notify.rescue_window_secs as i64;
+
+        let late = events::EventContext {
+            account_id: acct,
+            message_id: 101,
+            thread_id: "t-late",
+            sender: "alerts@monitoring.example",
+            one_line: "incident opened",
+            notify_eligible_at: Some(now - ChronoDuration::seconds(window - 1)),
+            sensitivity: Sensitivity::Normal,
+            is_sent: false,
+            rule: None,
+            tier: Tier::Signal,
+            importance: 90,
+            deadline: None,
+        };
+        assert!(
+            matches!(
+                eng.emit_event(&late, now, ExpiryCount::Miss),
+                Emitted::New(_)
+            ),
+            "an hour-late verdict on fresh mail still buzzes"
+        );
+
+        let expired = events::EventContext {
+            message_id: 102,
+            thread_id: "t-expired",
+            notify_eligible_at: Some(now - ChronoDuration::seconds(window + 1)),
+            ..late
+        };
+        assert_eq!(
+            eng.emit_event(&expired, now, ExpiryCount::Miss),
+            Emitted::Expired
+        );
+        assert_eq!(
+            store.events_after(acct, 0, 100).unwrap().len(),
+            1,
+            "the expired one appended nothing"
+        );
+
+        // AND IT IS ON /metrics, which is the difference between this drop and
+        // the one that ran at 24.7% for fourteen days with nobody able to see it.
+        let text = crate::metrics::render(&eng.metrics, None);
+        assert!(
+            text.contains(
+                "squelchd_notify_decisions_total{lane=\"deliberate\",decision=\"expired\"} 1\n"
+            ),
+            "the expiry must be counted"
+        );
+        // A buzz that LANDED is not a `deliberate/sent` row yet: this wave counts
+        // only the drop, and Wave 2b adds the rest of the ledger.
+        assert!(text.contains(
+            "squelchd_notify_decisions_total{lane=\"deliberate\",decision=\"sent\"} 0\n"
+        ));
+    }
+
+    #[test]
+    fn a_stage1_verdict_half_an_hour_late_buzzes_and_two_hours_late_expires() {
+        // THE RESCUE WINDOW, end to end through the store rather than off a
+        // hand-built context. Both rows are real: ingested on the incremental
+        // path when they were fresh, stamped, written to SQLite, and read back
+        // out through the Stage-1 queue SELECT the pass actually uses. The only
+        // difference between them is how long the refine lane took to arrive.
+        //
+        // Under the OLD `Date:`-based window BOTH of these were silent, and
+        // silently so: half an hour is twice the freshness window, so the very
+        // notification this whole issue is about (a deadline the model took a
+        // busy afternoon to reach) was deleted rather than delayed.
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let acct = store.ensure_account("me@example.com").unwrap();
+        let now = Utc::now();
+        let eng = engine(store.clone(), acct, "http://127.0.0.1:1");
+
+        // Ingested WHEN THEY WERE FRESH, which is the only way to get an
+        // honest stamp: the engine's own `notify_eligible_stamp` runs, so
+        // neither row is handed a timestamp the daemon could not have produced.
+        let half_hour_ago = now - ChronoDuration::minutes(30);
+        let two_hours_ago = now - ChronoDuration::hours(2);
+        let late = fixture(acct, "g-late", &alert_eml(half_hour_ago), false);
+        let (late_mid, late_stamp) = ingest_deferring_to_refine(
+            &store,
+            acct,
+            &late,
+            half_hour_ago,
+            IngestOrigin::Incremental,
+        );
+        assert_eq!(late_stamp, Some(half_hour_ago));
+        let stale = alert_eml(two_hours_ago).replace("checkout api", "billing api");
+        let stale = fixture(acct, "g-stale", &stale, false);
+        let (stale_mid, stale_stamp) = ingest_deferring_to_refine(
+            &store,
+            acct,
+            &stale,
+            two_hours_ago,
+            IngestOrigin::Incremental,
+        );
+        assert_eq!(stale_stamp, Some(two_hours_ago));
+
+        let queued = store.stage1_queue(acct, 100).unwrap();
+        let row_for = |mid: i64| {
+            queued
+                .iter()
+                .find(|r| r.message_id == mid)
+                .expect("queued for the stage-1 refine pass")
+        };
+
+        // Thirty minutes late, inside the hour: it still buzzes.
+        let row = row_for(late_mid);
+        assert_eq!(
+            row.notify_eligible_at,
+            Some(half_hour_ago),
+            "the stamp survived the write and the queue SELECT"
+        );
+        let emitted = eng.emit_event(
+            &stage1_ctx(acct, row, None, Tier::Deadline, 90),
+            now,
+            ExpiryCount::Miss,
+        );
+        assert!(
+            matches!(emitted, Emitted::New(_)),
+            "a verdict half an hour late is a rescue, not a miss: {emitted:?}"
+        );
+
+        // Two hours late, past the ceiling: no event, and COUNTED.
+        let row = row_for(stale_mid);
+        assert_eq!(
+            eng.emit_event(
+                &stage1_ctx(acct, row, None, Tier::Deadline, 90),
+                now,
+                ExpiryCount::Miss
+            ),
+            Emitted::Expired
+        );
+        assert_eq!(
+            store.events_after(acct, 0, 100).unwrap().len(),
+            1,
+            "only the rescued one appended"
+        );
+
+        // EXACTLY ONCE, AND PROVEN BY OFFERING IT AGAIN. A row that escalates is
+        // offered at the Stage-1 apply site and then AGAIN at the Stage-2 apply
+        // site behind it, minutes to hours later, with the same stamp and so the
+        // same refusal both times. Counting each would overstate the very number
+        // §11.11 says decides whether the window moves — by 2x on every escalated
+        // row, and by a whole mailbox on one `retriage`.
+        assert_eq!(
+            eng.emit_event(
+                &stage1_ctx(acct, row, None, Tier::Deadline, 90),
+                now + ChronoDuration::minutes(30),
+                ExpiryCount::Miss
+            ),
+            Emitted::Expired,
+            "still expired, still refused"
+        );
+        let text = crate::metrics::render(&eng.metrics, None);
+        assert!(
+            text.contains(
+                "squelchd_notify_decisions_total{lane=\"deliberate\",decision=\"expired\"} 1\n"
+            ),
+            "one MISS, one count, however many sites offer it: {text}"
+        );
+    }
+
+    #[test]
+    fn a_message_already_notified_is_never_counted_as_a_miss() {
+        // THE COUNTER'S HONESTY, and the failure mode that would have ruined it:
+        // `worthy_kind` refuses on the rescue ceiling WITHOUT touching the store,
+        // so it cannot know the phone already buzzed. The commonest expiry offer
+        // in a real mailbox is exactly that shape — Stage-1 notifies at 09:01,
+        // the row carries `needs_stage2`, the Stage-2 queue is ninety minutes
+        // deep, and the second offer arrives past the hour with the same 09:00
+        // stamp. Booking that as a missed notification would fill the one series
+        // this wave exists to produce with notifications that were DELIVERED.
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let acct = store.ensure_account("me@example.com").unwrap();
+        let now = Utc::now();
+        let eng = engine(store.clone(), acct, "http://127.0.0.1:1");
+
+        let stamped = events::EventContext {
+            account_id: acct,
+            message_id: 301,
+            thread_id: "t-escalated",
+            sender: "alerts@monitoring.example",
+            one_line: "incident opened",
+            notify_eligible_at: Some(now),
+            sensitivity: Sensitivity::Normal,
+            is_sent: false,
+            rule: None,
+            tier: Tier::Signal,
+            importance: 90,
+            deadline: None,
+        };
+
+        // Stage-1, ten minutes in: the buzz lands.
+        let first = eng.emit_event(
+            &stamped,
+            now + ChronoDuration::minutes(10),
+            ExpiryCount::Miss,
+        );
+        assert!(matches!(first, Emitted::New(_)), "{first:?}");
+
+        // Stage-2, ninety minutes in: past the ceiling, but the user HAS been
+        // told. `AlreadyNotified` is the honest answer, and §11.4 already
+        // reserves `would_send` for it — nothing missed, nothing to count.
+        assert_eq!(
+            eng.emit_event(
+                &stamped,
+                now + ChronoDuration::minutes(90),
+                ExpiryCount::Miss
+            ),
+            Emitted::AlreadyNotified,
+            "a delivered notification is not a miss, however late the second look"
+        );
+        // And a re-triage hours later says the same thing, as many times as the
+        // user runs one: `retriage_reset` nulls the stage markers and leaves the
+        // eligibility stamp alone, so every worthy row in its window comes back
+        // through here looking exactly like this.
+        assert_eq!(
+            eng.emit_event(&stamped, now + ChronoDuration::hours(9), ExpiryCount::Miss),
+            Emitted::AlreadyNotified
+        );
+
+        let text = crate::metrics::render(&eng.metrics, None);
+        assert!(
+            text.contains(
+                "squelchd_notify_decisions_total{lane=\"deliberate\",decision=\"expired\"} 0\n"
+            ),
+            "no miss to count: {text}"
+        );
+        assert_eq!(
+            store.events_after(acct, 0, 100).unwrap().len(),
+            1,
+            "and one buzz is never rewritten"
+        );
+    }
+
+    #[test]
+    fn a_catch_up_rescan_cannot_manufacture_a_stamp_at_the_ingest_site() {
+        // NULL IS FOREVER, AND NULL IS SILENT AT EVERY EMISSION SITE — including
+        // this one, which is the site that emits from a value it computed itself
+        // rather than one it read back.
+        //
+        // The path is real on a no-LLM daemon: the first run backfills 30 days
+        // (every row NULL), the historyId later expires, and `catch_up` re-fetches
+        // the whole window on the INCREMENTAL path. A backfilled row whose `Date:`
+        // happens to be inside the freshness window at catch-up time computes a
+        // fresh `Some(now)` in memory; `ingest_message` correctly keeps the stored
+        // NULL, and without a re-read this site would emit off the discarded value
+        // for a row the database says may never notify.
+        //
+        // Driven through the ENGINE's own `ingest_one`, not a mirror of it: the
+        // whole finding was that the two lines diverged.
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let acct = store.ensure_account("me@example.com").unwrap();
+        let now = Utc::now();
+        // The no-model path is the subject: with no model to wait for, the
+        // heuristics are authoritative and THIS site is the one that emits.
+        // Forced rather than inferred from an empty config, because
+        // `resolve_llm` reads the process environment.
+        let eng = engine(store.clone(), acct, "http://127.0.0.1:1").without_stage2_llm();
+        let rules = store.list_sender_rules(acct).unwrap();
+
+        // First sight is a BACKFILL, so no stamp and no event, however loud.
+        let f = fixture(acct, "g-backfilled", &alert_eml(now), false);
+        let (mid, _) = eng
+            .ingest_one(&f, &rules, now, IngestOrigin::Backfill)
+            .unwrap()
+            .expect("a normal message is committed");
+        assert_eq!(stamp_of(&store, acct, mid), None, "backfill never stamps");
+        assert!(store.events_after(acct, 0, 100).unwrap().is_empty());
+
+        // The catch-up re-scan, on the incremental path, seconds later: the same
+        // Gmail id, still inside the freshness window, so the in-memory stamp
+        // this time is `Some`.
+        let again = now + ChronoDuration::seconds(30);
+        let (mid_again, _) = eng
+            .ingest_one(&f, &rules, again, IngestOrigin::Incremental)
+            .unwrap()
+            .expect("the same row, re-ingested");
+        assert_eq!(
+            mid_again, mid,
+            "UNIQUE(account_id, gmail_msg_id) collapsed it"
+        );
+        assert_eq!(
+            stamp_of(&store, acct, mid),
+            None,
+            "the DO UPDATE SET preserved the stored NULL"
+        );
+        assert!(
+            store.events_after(acct, 0, 100).unwrap().is_empty(),
+            "and the ingest site emitted from the stamp the STORE kept, not the \
+             one it just computed"
+        );
+
+        // Control: the same message seen for the FIRST time on the incremental
+        // path does stamp and does notify, so the silence above is the re-scan
+        // rule and not a dead code path.
+        let fresh = fixture(acct, "g-first-sight", &alert_eml(now), false);
+        let (fresh_mid, _) = eng
+            .ingest_one(&fresh, &rules, now, IngestOrigin::Incremental)
+            .unwrap()
+            .expect("committed");
+        assert!(stamp_of(&store, acct, fresh_mid).is_some());
+        assert_eq!(
+            store.events_after(acct, 0, 100).unwrap().len(),
+            1,
+            "first sight on an incremental path is exactly what MAY notify"
+        );
+    }
+
+    #[test]
+    fn a_re_triaged_row_expires_without_being_booked_as_a_miss() {
+        // THE COUNTER'S SECOND HONESTY PROBLEM, after already-notified.
+        // `retriage_reset` nulls the model stamps, sets `retriage_at`, and
+        // deliberately leaves `notify_eligible_at` alone; `retriage_forced` then
+        // exempts those rows from every pass's stale gate. So
+        // `retriage_reset(acct, None, 90)` walks weeks-old rows straight to the
+        // apply sites, and the ones that were below the line before and are above
+        // it now — the usual REASON to run one, e.g. after lowering
+        // `notify.min_importance` — have no event, refuse as expired, and would
+        // each add a count. Thousands of them, from one operator action, to the
+        // one number docs/NOTIFY.md §11.11 says decides whether the window moves.
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let acct = store.ensure_account("me@example.com").unwrap();
+        let now = Utc::now();
+        let eng = engine(store.clone(), acct, "http://127.0.0.1:1");
+        let window = eng.config.notify.rescue_window_secs as i64;
+
+        let old = events::EventContext {
+            account_id: acct,
+            message_id: 401,
+            thread_id: "t-retriaged",
+            sender: "alerts@monitoring.example",
+            one_line: "incident opened",
+            notify_eligible_at: Some(now - ChronoDuration::seconds(window * 24)),
+            sensitivity: Sensitivity::Normal,
+            is_sent: false,
+            rule: None,
+            tier: Tier::Signal,
+            importance: 90,
+            deadline: None,
+        };
+
+        // THE REFUSAL IS UNCHANGED. Mail the user read a fortnight ago must not
+        // buzz, whoever asked for it to be looked at again.
+        assert_eq!(
+            eng.emit_event(&old, now, ExpiryCount::Rereading),
+            Emitted::Expired,
+            "a re-triage rescues nothing past the ceiling"
+        );
+        assert!(store.events_after(acct, 0, 100).unwrap().is_empty());
+
+        // ...and it is not booked. Only the bookkeeping differs.
+        let text = crate::metrics::render(&eng.metrics, None);
+        assert!(
+            text.contains(
+                "squelchd_notify_decisions_total{lane=\"deliberate\",decision=\"expired\"} 0\n"
+            ),
+            "a re-reading of old mail is not a notification anybody missed: {text}"
+        );
+
+        // Control: the SAME row on its ordinary path is a miss, so the silence
+        // above is the flag and not a dead counter. A different message id
+        // because `count_expiry_once` is per message.
+        let missed = events::EventContext {
+            message_id: 402,
+            ..old
+        };
+        assert_eq!(
+            eng.emit_event(&missed, now, ExpiryCount::Miss),
+            Emitted::Expired
+        );
+        let text = crate::metrics::render(&eng.metrics, None);
+        assert!(
+            text.contains(
+                "squelchd_notify_decisions_total{lane=\"deliberate\",decision=\"expired\"} 1\n"
+            ),
+            "{text}"
+        );
+
+        // And the flag is derived from the row, not chosen by hand at the call
+        // site: this is the one field that separates the two.
+        assert_eq!(
+            ExpiryCount::from_retriage(Some(now), now),
+            ExpiryCount::Rereading
+        );
+        assert_eq!(ExpiryCount::from_retriage(None, now), ExpiryCount::Miss);
+    }
+
+    #[test]
+    fn the_stage2_queue_carries_the_stamp_to_its_apply_site() {
+        // THE THIRD CARRIER (docs/NOTIFY.md §11.3 names `Stage1Queued`,
+        // `Stage2Queued` and `SeedVerdict`), and the one whose SELECT nothing
+        // else reads the stamp through. A column-index slip in that projection
+        // would surface only as a queue read error, which `read_queue` logs and
+        // turns into an EMPTY QUEUE: Stage-2 would quietly stop notifying and
+        // every existing stage2_queue test would still pass, because they assert
+        // that rows come back rather than what is on them.
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let acct = store.ensure_account("me@example.com").unwrap();
+        let now = Utc::now();
+        let eng = engine(store.clone(), acct, "http://127.0.0.1:1");
+        let window = eng.config.notify.rescue_window_secs as i64;
+
+        // Ingested fresh on the incremental path, so the stamp is one the daemon
+        // could actually have produced rather than one the test invented.
+        let half_hour_ago = now - ChronoDuration::minutes(30);
+        let f = fixture(acct, "g-escalated", &alert_eml(half_hour_ago), false);
+        let (mid, stamp) =
+            ingest_deferring_to_refine(&store, acct, &f, half_hour_ago, IngestOrigin::Incremental);
+        assert_eq!(stamp, Some(half_hour_ago));
+
+        // The Stage-1 apply that escalates it, through the real store method:
+        // the row only reaches the Stage-2 queue by that hop, and the stamp has
+        // to survive it.
+        let escalate = crate::store::Stage1Applied {
+            message_id: mid,
+            account_id: acct,
+            importance: 60,
+            tier: Tier::Signal,
+            one_line: "refined one-liner".into(),
+            reason: "stage-1".into(),
+            field_reasons: crate::types::FieldReasons::default(),
+            stage1_model_used: "claude-haiku-4-5".into(),
+            needs_stage2: true,
+            escalation_reason: None,
+            deadline: None,
+            category: None,
+        };
+        assert!(store.stage1_apply(&escalate).unwrap());
+
+        let queued = store.stage2_queue(acct, 10).unwrap();
+        assert_eq!(queued.len(), 1, "the row reached the Stage-2 queue");
+        let row = &queued[0];
+        assert_eq!(
+            row.notify_eligible_at,
+            Some(half_hour_ago),
+            "the stamp survived the write, the escalation and the Stage-2 SELECT"
+        );
+        // The neighbours in the projection, so an index slip cannot pass by
+        // landing the stamp in the right variable and everything else one over.
+        assert!(row.is_known_contact.eq(&false));
+        assert_eq!(row.escalation_reason, None);
+        assert_eq!(row.retriage_at, None);
+
+        // And it decides at the apply site, in both directions.
+        fn ctx<'a>(acct: AccountId, r: &'a crate::store::Stage2Queued) -> events::EventContext<'a> {
+            events::EventContext {
+                account_id: acct,
+                message_id: r.message_id,
+                thread_id: &r.thread_id,
+                sender: &r.from_addr,
+                one_line: "refined one-liner",
+                notify_eligible_at: r.notify_eligible_at,
+                sensitivity: r.sensitivity,
+                is_sent: false,
+                rule: None,
+                tier: Tier::Signal,
+                importance: 90,
+                deadline: None,
+            }
+        }
+        assert!(
+            matches!(
+                eng.emit_event(&ctx(acct, row), now, ExpiryCount::Miss),
+                Emitted::New(_)
+            ),
+            "half an hour late is inside the rescue window"
+        );
+
+        // The same row read back the same way, offered past the ceiling: refused,
+        // and `AlreadyNotified` rather than a second miss, because the phone
+        // already buzzed at the site above.
+        assert_eq!(
+            eng.emit_event(
+                &ctx(acct, row),
+                half_hour_ago + ChronoDuration::seconds(window + 1),
+                ExpiryCount::Miss
+            ),
+            Emitted::AlreadyNotified
+        );
     }
 
     #[test]
@@ -3573,8 +4836,11 @@ mod tests {
         let acct = store.ensure_account("me@example.com").unwrap();
         let now = Utc::now();
 
+        // Incremental and fresh, so the row IS notify-eligible and the refine
+        // site would push it; with an LLM configured, ingest defers to that site
+        // rather than emitting itself.
         let f = fixture(acct, "g-alert", &alert_eml(now), false);
-        let (mid, _) = ingest_and_notify(&store, acct, &f, now, IngestOrigin::Backfill);
+        let (mid, _) = ingest_deferring_to_refine(&store, acct, &f, now, IngestOrigin::Incremental);
 
         store
             .set_sender_rule(
@@ -3594,7 +4860,8 @@ mod tests {
         // silence above is the rule and not the harness.
         let free = alert_eml(now).replace("alerts@monitoring.example", "alerts@other.example");
         let ff = fixture(acct, "g-other", &free, false);
-        let (mid2, _) = ingest_and_notify(&store, acct, &ff, now, IngestOrigin::Backfill);
+        let (mid2, _) =
+            ingest_deferring_to_refine(&store, acct, &ff, now, IngestOrigin::Incremental);
         assert!(
             refine_and_notify(&store, acct, mid2, Tier::PastDue, 100, now).is_some(),
             "unruled sender, same verdict: notifies"
@@ -4077,7 +5344,7 @@ mod tests {
     use axum::extract::{Path as AxumPath, Query, State};
     use axum::http::StatusCode;
     use axum::response::{IntoResponse, Response};
-    use axum::routing::get;
+    use axum::routing::{get, post};
     use axum::{Json, Router};
     use serde_json::{Value, json};
     use std::collections::HashMap;
@@ -4136,6 +5403,12 @@ mod tests {
         labels: HashMap<String, Option<Value>>,
         /// `users.getProfile`'s historyId.
         profile_history_id: u64,
+        /// gmail message id -> how long `messages.get` stalls before answering.
+        /// A FIXTURE, never an assertion: it exists so a test can make one batch
+        /// take measurable wall-clock time between two ids and then assert on the
+        /// two timestamps the engine wrote, which is the only deterministic way
+        /// to tell a per-message clock from a per-batch one.
+        slow: HashMap<String, Duration>,
         /// Every call this mock served, in order, as `verb:key`.
         seen: Vec<String>,
     }
@@ -4157,6 +5430,11 @@ mod tests {
         }
         fn body(&self, id: &str, eml: String) -> &Self {
             self.0.lock().unwrap().bodies.insert(id.to_string(), eml);
+            self
+        }
+        /// Make `messages.get` for `id` take `d` before it answers.
+        fn slow_body(&self, id: &str, d: Duration) -> &Self {
+            self.0.lock().unwrap().slow.insert(id.to_string(), d);
             self
         }
         /// Script `labels.get` for one label: `Some(counts)` answers a
@@ -4251,6 +5529,12 @@ mod tests {
         State(g): State<MockGmail>,
         AxumPath(id): AxumPath<String>,
     ) -> Response {
+        // Taken and DROPPED before the await: a std guard held across an await
+        // point would deadlock the single-threaded test runtime.
+        let stall = g.0.lock().unwrap().slow.get(&id).copied();
+        if let Some(d) = stall {
+            tokio::time::sleep(d).await;
+        }
         let mut st = g.0.lock().unwrap();
         st.seen.push(format!("get:{id}"));
         match st.bodies.get(&id) {
@@ -4330,12 +5614,23 @@ mod tests {
         acct: AccountId,
         base: &str,
     ) -> SyncEngine<SqliteStore, FixedToken> {
+        engine_with_config(store, acct, base, Config::default())
+    }
+
+    /// [`engine`] with the config spelled out, for the tests whose whole subject
+    /// is a config field (an LLM key, a poll interval).
+    fn engine_with_config(
+        store: Arc<SqliteStore>,
+        acct: AccountId,
+        base: &str,
+        config: Config,
+    ) -> SyncEngine<SqliteStore, FixedToken> {
         SyncEngine::new(
             store,
             Arc::new(FixedToken),
             acct,
             "me@example.com".to_string(),
-            Config::default(),
+            config,
         )
         .with_api_base(base.to_string())
     }
@@ -4366,8 +5661,10 @@ mod tests {
             .map(|s| s.last_uid)
     }
 
-    /// Mail the user WROTE, dated `at` so it is inside the freshness window —
-    /// the storm guard must not be what makes these tests quiet.
+    /// Mail the user WROTE, dated `at` so it passes the first-sight freshness
+    /// test — an old `Date:` must not be what makes these tests quiet. (Sent
+    /// mail earns no eligibility stamp anyway; that is the point being tested,
+    /// so it has to be the ONLY reason it is silent.)
     fn sent_eml(at: DateTime<Utc>, to: &str, subject: &str) -> String {
         format!(
             "From: me@example.com\r\n\
@@ -5186,7 +6483,7 @@ mod tests {
         let (_tx, mut shutdown) = tokio::sync::watch::channel(false);
         assert!(
             engine(store.clone(), acct, &base)
-                .poll_loop(&mut shutdown)
+                .poll_lane(&mut shutdown)
                 .await
                 .is_err(),
             "the poll itself failed, which is the whole premise"
@@ -5207,5 +6504,422 @@ mod tests {
         assert_eq!(rows[0].status, crate::types::AttentionStatus::Open);
         assert!(rows[0].remind_at.is_none(), "the pending stamp MOVED");
         assert!(rows[0].reminded_at.is_some(), "it came back on time");
+    }
+
+    // ---- the two lanes, on the wire ----------------------------------------
+    //
+    // Nothing else in this file drives a refine pass against a mock LLM through
+    // the engine; the emission sites are tested by hand-written mirrors. This
+    // one property is worth the harness because it is the property the whole
+    // change is about (docs/NOTIFY.md §11.2, §11.10).
+
+    /// THE STAMP IS READ PER MESSAGE, NOT PER BATCH. One
+    /// `fetch_raw_and_ingest` call over two ids, with the second one's fetch
+    /// made to take real time, and the two stamps the engine wrote must differ
+    /// by roughly that much.
+    ///
+    /// A batch-wide `let now = Utc::now()` passes every other test in this file:
+    /// the engine's own emission tests call `ingest_one` with an injected clock,
+    /// so only this path can tell. What it costs in production is the whole
+    /// point of docs/NOTIFY.md §11.3. `catch_up` runs this loop over the entire
+    /// backfill window, one sequential `format=raw` GET per id, and
+    /// `catch_up_inner`'s own comment records a tenant spending half an hour in
+    /// there. Frozen at the top:
+    ///
+    /// - a genuinely new message fetched 30 minutes in enters the Stage-1 queue
+    ///   with half its rescue window already spent, and expires before the refine
+    ///   lane reaches it: a notification dropped AND booked as `deliberate/expired`
+    ///   by the counter this wave exists to make believable;
+    /// - past an hour of batch runtime every remaining message reads as dated in
+    ///   the future, fails `is_fresh`, and is stamped NULL — unnotifiable at every
+    ///   site, forever. That is §2a's silent drop, reintroduced on the
+    ///   post-outage path where notifications matter most.
+    ///
+    /// The stall is a FIXTURE, not an assertion: the test asserts on two
+    /// timestamps the engine wrote to SQLite, and a slow machine only widens the
+    /// gap it is checking for.
+    #[tokio::test]
+    async fn the_eligibility_stamp_is_taken_per_message_not_per_batch() {
+        const STALL: Duration = Duration::from_millis(400);
+
+        let (store, acct) = store_at_cursor(Some(100));
+        let now = Utc::now();
+
+        // BOTH IDS IN ONE BATCH: one history record, so `history_walk` makes a
+        // single `fetch_raw_and_ingest` call over both.
+        let g = MockGmail::default();
+        g.history(
+            LABEL_INBOX,
+            LabelHistory::added(141, &[(140, "g-early"), (141, "g-late")]),
+        );
+        g.history(LABEL_SENT, LabelHistory::quiet(100));
+        g.body("g-early", alert_eml(now));
+        g.body(
+            "g-late",
+            alert_eml(now).replace("checkout api", "billing api"),
+        );
+        g.slow_body("g-late", STALL);
+        let base = serve_mock(g.clone()).await;
+
+        engine(store.clone(), acct, &base)
+            .poll_once()
+            .await
+            .unwrap();
+
+        let id_of = |thread: &str| store.thread_view(acct, thread).unwrap().messages[0].id;
+        let early = stamp_of(&store, acct, id_of("g-early")).expect("stamped at first sight");
+        let late = stamp_of(&store, acct, id_of("g-late")).expect("stamped at first sight");
+
+        let gap = late - early;
+        assert!(
+            gap >= ChronoDuration::milliseconds(STALL.as_millis() as i64 / 2),
+            "the second message was fetched {STALL:?} after the first and must be \
+             stamped accordingly; the stamps are {gap:?} apart, which is a clock \
+             read once for the whole batch"
+        );
+    }
+
+    /// THE POKE, on its own. Deleting `refine_wake.notify_one()` from
+    /// `fetch_raw_and_ingest` used to leave the whole suite green, because
+    /// `poll_secs` defaults to 5 and that is also the refine lane's sleep floor:
+    /// the lane woke on the timer and every test still passed, with the contract's
+    /// "start on new mail immediately" (docs/NOTIFY.md §11.2) quietly downgraded
+    /// to "up to poll_secs late".
+    ///
+    /// Asserted on the `Notify` PERMIT rather than on the lane's timing, which is
+    /// what makes it deterministic and free of sleeps in both directions:
+    /// `tokio::time::timeout` polls its inner future before its timer, and
+    /// `notified()` is immediately ready exactly when a permit is stored. So a
+    /// ZERO budget is a synchronous "is there a permit", not a wait.
+    #[tokio::test]
+    async fn ingesting_new_mail_pokes_the_refine_lane_and_a_backfill_does_not() {
+        let (store, acct) = store_at_cursor(Some(100));
+        let now = Utc::now();
+        let g = MockGmail::default();
+        g.history(LABEL_INBOX, LabelHistory::added(140, &[(140, "g-new")]));
+        g.history(LABEL_SENT, LabelHistory::quiet(100));
+        g.listing(LABEL_INBOX, &["g-old"]);
+        g.listing(LABEL_SENT, &[]);
+        g.body("g-new", alert_eml(now));
+        g.body(
+            "g-old",
+            alert_eml(now).replace("checkout api", "billing api"),
+        );
+        let base = serve_mock(g.clone()).await;
+        let eng = engine(store.clone(), acct, &base);
+
+        let poked = || tokio::time::timeout(Duration::ZERO, eng.refine_wake.notified());
+
+        // A BACKFILL DOES NOT POKE, even though it ingests: `run_once` refines
+        // the first backfill inline before either lane exists, and the poke means
+        // "mail that may be genuinely new is waiting", which a month of already
+        // read mail is not.
+        let n = eng
+            .fetch_raw_and_ingest(&["g-old".to_string()], false, IngestOrigin::Backfill)
+            .await
+            .unwrap();
+        assert_eq!(n, 1, "the backfill really did ingest a row");
+        assert!(
+            poked().await.is_err(),
+            "a backfill must leave the refine lane parked"
+        );
+
+        // An incremental tick that ingests DOES poke, and the permit is stored
+        // before `poll_once` even returns, so a lane that is mid-round when it
+        // lands still wakes as soon as it finishes.
+        eng.poll_once().await.unwrap();
+        assert!(
+            poked().await.is_ok(),
+            "new mail must start through Stage-1 immediately, not at the next \
+             poll_secs tick"
+        );
+
+        // ...and the permit COALESCES rather than accumulating: one round is
+        // queued, not one per message.
+        assert!(
+            poked().await.is_err(),
+            "the permit was consumed by the wait above; Notify holds exactly one"
+        );
+    }
+
+    /// The Stage-1 verdict the held mock eventually answers with. Its content
+    /// does not matter to this test — only that the call BLOCKS until we say so
+    /// and then completes cleanly, so the lane is parked rather than erroring.
+    const HELD_STAGE1_VERDICT: &str = r#"{"importance":72,"tier":"signal","has_deadline":false,
+        "deadline_iso":null,"deadline_kind":null,"one_line":"a real person",
+        "reason":"personal","importance_reason":"known","deadline_reason":null,
+        "confident":true}"#;
+
+    /// An Anthropic-shaped `/v1/messages` that HOLDS the first request open on a
+    /// oneshot the test owns. This is the stand-in for the real thing the refine
+    /// lane parks in: a reasoning-model call that legitimately thinks for
+    /// minutes on a hard row.
+    #[derive(Clone)]
+    struct HeldLlm {
+        /// Requests the mock has RECEIVED (not answered), so the test can wait
+        /// for the lane to actually be inside the call rather than sleeping and
+        /// hoping.
+        seen: Arc<std::sync::atomic::AtomicUsize>,
+        /// Taken by the first request and awaited; every later request is
+        /// answered at once, so releasing the hold does not wedge the tail of
+        /// the test.
+        release: Arc<Mutex<Option<tokio::sync::oneshot::Receiver<()>>>>,
+    }
+
+    async fn held_llm_messages(State(s): State<HeldLlm>) -> Json<Value> {
+        s.seen.fetch_add(1, Ordering::SeqCst);
+        // The std guard is dropped at the end of this statement, BEFORE the
+        // await below: holding a std::sync lock across an await point would
+        // deadlock the single-threaded test runtime.
+        let held = s.release.lock().unwrap().take();
+        if let Some(rx) = held {
+            let _ = rx.await;
+        }
+        Json(json!({
+            "content": [{ "type": "text", "text": HELD_STAGE1_VERDICT }],
+            "stop_reason": "end_turn",
+            "usage": { "input_tokens": 10, "output_tokens": 5 },
+        }))
+    }
+
+    /// Bind the held LLM on its own ephemeral loopback port. Its OWN server, not
+    /// a route bolted onto [`serve_mock`]: a request that hangs forever is the
+    /// entire point of this mock, and axum serves connections concurrently but
+    /// there is no reason to make the Gmail routes share a fate with it.
+    ///
+    /// Plain http is deliberate and allowed: `base_url_transport_ok` permits it
+    /// for loopback exactly so a test can do this.
+    async fn serve_held_llm(s: HeldLlm) -> String {
+        let app = Router::new()
+            .route("/v1/messages", post(held_llm_messages))
+            .with_state(s);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        format!("http://{addr}")
+    }
+
+    /// Poll `ready` until it holds or `budget` runs out. The sleep is the POLL
+    /// INTERVAL, never the assertion: the caller asserts on the returned bool,
+    /// so a slow machine costs a few more iterations and a broken lane split
+    /// costs the budget and then fails.
+    async fn holds_within(budget: Duration, mut ready: impl FnMut() -> bool) -> bool {
+        let deadline = tokio::time::Instant::now() + budget;
+        loop {
+            if ready() {
+                return true;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// A GMAIL OUTAGE COSTS NO MODEL CALLS, which is what the serial loop gave
+    /// for free and the lane split gave away.
+    ///
+    /// The shape that was found: a credential goes `invalid_grant` with rows in
+    /// the queues. `run()` -> `run_once` -> `run_lanes`; `select!` polls both
+    /// lanes, the refine lane runs synchronously from its first poll through
+    /// `gate_budget` (which charges BEFORE the call, deliberately) and issues a
+    /// classify POST before `poll_lane` reaches a real await; `poll_once` then
+    /// `Err`s, `run_lanes` returns, and the refine future is dropped mid-call.
+    /// No verdict lands, the row stays queued, nothing refunds. `run()`'s backoff
+    /// is initialised outside its loop and caps at five minutes, so the outage
+    /// re-enters `run_lanes` up to 288 times a day and re-picks the same
+    /// head-of-queue row every time. `stage2.global_daily_cap` defaults to 120
+    /// against a UTC-DAY budget key, so ten hours of downtime drained the whole
+    /// day's escalation budget on calls nobody ever read, and nothing escalated
+    /// again until midnight even once the credential was fixed.
+    #[tokio::test]
+    async fn a_gmail_outage_spends_nothing_on_the_model() {
+        let (store, acct) = store_at_cursor(Some(100));
+        let now = Utc::now();
+
+        // A row Stage-1 would classify the moment it got the chance.
+        let f = fixture(acct, "g-queued", &alert_eml(now), false);
+        ingest_deferring_to_refine(&store, acct, &f, now, IngestOrigin::Incremental);
+        assert_eq!(store.stage1_queue(acct, 10).unwrap().len(), 1);
+
+        // GMAIL IS DOWN: `history.list` 500s, so `poll_once` Errs on every tick.
+        let g = MockGmail::default();
+        g.history(LABEL_INBOX, LabelHistory::broken());
+        g.history(LABEL_SENT, LabelHistory::broken());
+        let gmail_base = serve_mock(g.clone()).await;
+
+        // A model that answers IMMEDIATELY: nothing here is about a slow call, so
+        // the hold is empty and any request the lane makes is a request it
+        // completes. That makes a nonzero count unambiguous.
+        let llm = HeldLlm {
+            seen: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            release: Arc::new(Mutex::new(None)),
+        };
+        let llm_base = serve_held_llm(llm.clone()).await;
+        let mut config = Config::default();
+        config.stage2.anthropic_api_key = Some("sk-ant-test".to_string());
+        config.stage2.anthropic_base_url = Some(llm_base);
+        config.stage2.stage2_provider = Some(Stage2Provider::Anthropic);
+        let eng = engine_with_config(store.clone(), acct, &gmail_base, config);
+
+        // Three backoff cycles, exactly as `run()` drives them: `run_lanes`,
+        // `Err`, clear the health flag, round again.
+        let (_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+        for cycle in 0..3 {
+            let out = eng.run_lanes(&mut shutdown_rx).await;
+            assert!(out.is_err(), "cycle {cycle}: the poll lane must bubble");
+            eng.poll_healthy.store(false, Ordering::Relaxed);
+        }
+        assert_eq!(
+            llm.seen.load(Ordering::SeqCst),
+            0,
+            "a broken credential must not keep charging a DAY-scoped budget for \
+             verdicts that are cancelled one Gmail round trip later"
+        );
+        assert_eq!(
+            store.stage1_queue(acct, 10).unwrap().len(),
+            1,
+            "and the row is still queued, waiting for a lane that can finish"
+        );
+
+        // CONTROL, and it is the whole test: the row, the queue, the key and the
+        // mock are all live, so the silence above is the gate and not a harness
+        // that could never have spent anything.
+        eng.stage1_pass().await;
+        assert_eq!(
+            llm.seen.load(Ordering::SeqCst),
+            1,
+            "the same engine spends the moment a pass actually runs"
+        );
+    }
+
+    /// THE KEYSTONE. Mail that arrives while the refine lane is inside a model
+    /// call is still fetched, ingested and stored.
+    ///
+    /// This is the whole point of the wave. Before the split there was ONE loop:
+    /// poll, then Stage-1, then Stage-2, then the extractors, then the revisits,
+    /// then sleep. `stage1_pass` awaits one classify call per queued row, so
+    /// while the model thought about message A the loop was not at the Gmail
+    /// call at all — message B did not arrive late, it did not arrive. On a
+    /// reasoning model at high effort that window is minutes wide, and a manual
+    /// refresh from the app could not shorten it either: the poke only wakes a
+    /// loop that is asleep, and this one was busy.
+    ///
+    /// ON THE OLD SERIAL LOOP THIS TEST HANGS AND FAILS: the mock never answers
+    /// until the test releases it, the test never releases it until B lands, and
+    /// B cannot land because the fetch is queued behind the model call. That
+    /// deadlock is the bug, reproduced.
+    ///
+    /// It is also why the drop in docs/NOTIFY.md §2a was silent: A's own
+    /// notification aged out of the freshness window while the lane sat here.
+    #[tokio::test]
+    async fn mail_arriving_during_a_model_call_is_still_ingested() {
+        let (store, acct) = store_at_cursor(Some(100));
+        let now = Utc::now();
+        let eml = |subject: &str| {
+            format!(
+                "From: Alice <alice@friends.com>\r\n\
+                 To: me@example.com\r\n\
+                 Subject: {subject}\r\n\
+                 Date: {}\r\n\
+                 \r\n\
+                 a body worth classifying\r\n",
+                now.to_rfc2822()
+            )
+        };
+
+        // A is on the wire from the first tick; B is added later, by hand, once
+        // the refine lane is provably stuck.
+        let g = MockGmail::default();
+        g.history(LABEL_INBOX, LabelHistory::added(140, &[(140, "g-a")]));
+        g.history(LABEL_SENT, LabelHistory::quiet(100));
+        g.body("g-a", eml("the lease"));
+        let gmail_base = serve_mock(g.clone()).await;
+
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let llm = HeldLlm {
+            seen: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            release: Arc::new(Mutex::new(Some(release_rx))),
+        };
+        let llm_base = serve_held_llm(llm.clone()).await;
+
+        let mut config = Config::default();
+        config.stage2.anthropic_api_key = Some("sk-ant-test".to_string());
+        config.stage2.anthropic_base_url = Some(llm_base);
+        // FORCED, not inferred: `resolve_llm` reads the ambient environment
+        // first, and a developer with only `OPENAI_API_KEY` exported would
+        // otherwise resolve an OpenAI provider whose URL is the real
+        // api.openai.com rather than the loopback mock.
+        config.stage2.stage2_provider = Some(Stage2Provider::Anthropic);
+
+        let refresh = Arc::new(tokio::sync::Notify::new());
+        let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+        let eng = engine_with_config(store.clone(), acct, &gmail_base, config)
+            .with_refresh(refresh.clone());
+
+        // `join!` rather than `spawn`: both halves run on this one task, so the
+        // engine only makes progress at its own await points and this test is
+        // driving the real `run_once`, cursor and all.
+        let driver = eng.run_once(&mut shutdown_rx);
+        let checker = async {
+            // 1. The refine lane is INSIDE the model call. Asserted on the
+            //    mock's own counter, not on elapsed time.
+            let called = holds_within(Duration::from_secs(20), || {
+                llm.seen.load(Ordering::SeqCst) > 0
+            })
+            .await;
+            assert!(
+                called,
+                "the refine lane never reached the model; nothing is being blocked, \
+                 so the rest of this test would prove nothing"
+            );
+
+            // 2. New mail lands in the mailbox and the app pokes refresh, which
+            //    is the exact sequence a user watching for a reply performs.
+            g.history(LABEL_INBOX, LabelHistory::added(180, &[(180, "g-b")]));
+            g.body("g-b", eml("the countersigned copy"));
+            refresh.notify_one();
+
+            // 3. THE ASSERTION. B is stored while the model call for A is still
+            //    outstanding.
+            let landed = holds_within(Duration::from_secs(10), || {
+                store
+                    .thread_view(acct, "g-b")
+                    .map(|v| !v.messages.is_empty())
+                    .unwrap_or(false)
+            })
+            .await;
+            assert!(
+                landed,
+                "message B never landed: the poll lane is still queued behind the \
+                 refine lane's model call"
+            );
+
+            // ...and the hold really was still on, so B did not simply arrive
+            // after a serial loop finished with A. A's row is still queued with
+            // no Stage-1 stamp, which is where a row sits mid-classify.
+            assert_eq!(
+                llm.seen.load(Ordering::SeqCst),
+                1,
+                "the mock answered nothing: exactly one call, still held"
+            );
+            let a_id = store.thread_view(acct, "g-a").unwrap().messages[0].id;
+            assert!(
+                store
+                    .triage_debug(acct, a_id)
+                    .unwrap()
+                    .expect("A has a triage row")
+                    .stage1_model_used
+                    .is_none(),
+                "A is still mid-classify, which is what B overtook"
+            );
+
+            // 4. Release, then shut down, so the driver returns rather than
+            //    leaving the mock's connection open at the end of the test.
+            release_tx.send(()).unwrap();
+            shutdown_tx.send(true).unwrap();
+        };
+        let (ran, ()) = tokio::join!(driver, checker);
+        ran.expect("the lifecycle ends on shutdown, not on an error");
     }
 }

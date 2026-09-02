@@ -420,6 +420,12 @@ pub fn apply_revisit_result(
         // has no stale skip to be forced past: `None` regardless of whether the
         // row was ever re-triaged by hand.
         retriage_at: None,
+        // This shim exists ONLY to reuse the apply path's field math; the
+        // revisit pass has no emission site, so nothing ever reads this. `None`
+        // is the safe direction anyway: eligibility is written once at ingest
+        // and lives on the row, and a value invented here would be a second
+        // answer to a question that already has one.
+        notify_eligible_at: None,
     };
     let mut applied = apply_result_with_rule(
         &as_stage1,
@@ -679,6 +685,10 @@ mod tests {
             sender_corrected: false,
             sensitivity: Sensitivity::Normal,
             retriage_at: None,
+            // These tests are about the APPLY math (floors, routing, reasons),
+            // which never reads the notify stamp; emission is the sync engine's
+            // and `triage::events`' business, and both are tested there.
+            notify_eligible_at: None,
         }
     }
 

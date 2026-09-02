@@ -237,6 +237,10 @@ impl TriagedBuilder {
             calendar: self.calendar.clone(),
             attachments: vec![],
             confident: self.confident,
+            // The store fixtures are about storage, not about which sync path
+            // an ingest was on; the engine's own tests own that decision. NULL
+            // is also the shape every pre-existing row has after the migration.
+            notify_eligible_at: None,
         }
     }
 

@@ -1064,6 +1064,10 @@ mod tests {
             thread: Vec::new(),
             sensitivity,
             retriage_at: None,
+            // The seal guards and the stale router never read the notify stamp:
+            // eligibility is decided at ingest and consumed at the emission
+            // sites, neither of which is what these rows are here to exercise.
+            notify_eligible_at: None,
         }
     }
 
@@ -1093,6 +1097,8 @@ mod tests {
             sender_corrected: false,
             sensitivity,
             retriage_at: None,
+            // See `queued_row`: not a notify test.
+            notify_eligible_at: None,
         }
     }
 

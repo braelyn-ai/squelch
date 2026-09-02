@@ -822,6 +822,49 @@ fn migrate_adds_reminder_columns_and_the_due_index_to_preexisting_triage() {
 }
 
 #[test]
+fn migrate_adds_notify_eligible_at_null_to_a_preexisting_triage_table() {
+    // A `triage` table predating the notify-eligibility stamp. The column has
+    // to land through the migration seam rather than schema.sql, because
+    // schema.sql's `CREATE TABLE IF NOT EXISTS` is a no-op against a table that
+    // already exists — and `ingest_message` NAMES the column in both halves of
+    // its upsert, so a missing one is a hard "no such column" on the very first
+    // message rather than a quietly dark feature.
+    let conn = Connection::open_in_memory().unwrap();
+    conn.execute_batch(
+        "CREATE TABLE triage(
+             message_id INTEGER PRIMARY KEY, account_id INTEGER NOT NULL,
+             model_used TEXT, status TEXT NOT NULL DEFAULT 'new');
+         INSERT INTO triage(message_id, account_id) VALUES (1, 1);",
+    )
+    .unwrap();
+    migrate(&conn).unwrap();
+    migrate(&conn).unwrap(); // idempotent
+    let mut stmt = conn.prepare("PRAGMA table_info(triage)").unwrap();
+    let cols: Vec<String> = stmt
+        .query_map([], |r| r.get::<_, String>(1))
+        .unwrap()
+        .collect::<std::result::Result<_, _>>()
+        .unwrap();
+    assert!(
+        cols.iter().any(|c| c == "notify_eligible_at"),
+        "notify_eligible_at added"
+    );
+
+    // NOT BACKFILLED, and the NULL is the whole safety property. A stamp
+    // invented for mail already in the database would make the first tick after
+    // an upgrade eligible to push a month of archived mail at a phone; historical
+    // rows simply never notify, which is exactly what they do today.
+    let stamp: Option<String> = conn
+        .query_row(
+            "SELECT notify_eligible_at FROM triage WHERE message_id=1",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(stamp, None, "every pre-existing row rests at NULL");
+}
+
+#[test]
 fn migrate_adds_content_id_null_to_a_preexisting_attachments_table() {
     // An install predating the cid column. The migration adds it, and every
     // already-synced attachment rests at NULL: the Content-ID only exists in the

@@ -941,6 +941,10 @@ impl Store for SqliteStore {
         self.append_event(ev)
     }
 
+    fn message_has_event(&self, account_id: AccountId, message_id: i64) -> Result<bool> {
+        self.message_has_event(account_id, message_id)
+    }
+
     fn events_after(
         &self,
         account_id: AccountId,

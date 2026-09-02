@@ -223,6 +223,24 @@ CREATE TABLE IF NOT EXISTS triage (
     -- product. Every consumer has to know that; see `Store::share_open_rate`,
     -- which is the only one, and which says so.
     opened_at       TEXT,
+    -- MAY THIS MESSAGE EVER NOTIFY, and from when (RFC3339 UTC). NULL means
+    -- never: a backfill row, the user's own sent copy, or mail that was already
+    -- older than `notify.freshness_window_secs` the first time we saw it.
+    --
+    -- Written by the SYNC ENGINE on the row's FIRST INSERT only and preserved
+    -- verbatim on conflict, because only the engine knows which sync path an
+    -- ingest is on — and that, not the sender's `Date:` header, is the honest
+    -- answer to "is this new mail or are we re-reading the archive". The stamp
+    -- replaces a per-emission freshness check that measured `messages.received_at`,
+    -- which could not tell old mail we are backfilling from new mail we were
+    -- slow to reach and so ate 24.7% of notify-worthy mail outright
+    -- (docs/NOTIFY.md §2a). Emission now measures `now - notify_eligible_at`
+    -- against `notify.rescue_window_secs`, so a verdict that came back late
+    -- still buzzes and only a genuinely stale one is dropped.
+    --
+    -- NOT BACKFILLED: every row that predates the column is NULL, which is the
+    -- silent direction.
+    notify_eligible_at TEXT,
     status          TEXT NOT NULL DEFAULT 'new',
     surfaced_at     TEXT,
     resolved_at     TEXT,
@@ -776,7 +794,9 @@ CREATE INDEX IF NOT EXISTS idx_audit_account_ts ON audit_log(account_id, ts);
 --
 -- ONE EVENT PER MESSAGE, EVER: UNIQUE(message_id) plus INSERT OR IGNORE at the
 -- writer, which is what makes re-ingest and the refine passes idempotent. The
--- storm guard proper is the freshness window in `triage::events`.
+-- storm guard proper is `triage.notify_eligible_at`, stamped once at ingest:
+-- a backfill row is structurally unable to reach this table, and a re-scan
+-- re-ingests rows that already carry their stamp, so it cannot manufacture one.
 --
 -- SECURITY: sealed mail is never represented here — the emission decision
 -- requires sensitivity='normal', and sealed rows carry no Stage-1 pass. An OTP

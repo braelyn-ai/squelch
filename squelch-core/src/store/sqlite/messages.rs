@@ -625,8 +625,9 @@ impl SqliteStore {
             "INSERT INTO triage(message_id, account_id, importance, tier, sensitivity,
                  sealed_kind, one_line, reason, deadline, matched_rule_id,
                  stage1_model_used, needs_stage2, model_used,
-                 status, resolved_at, created_at, field_reasons, ship_extract_model)
-             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,NULL,?13,?14,?15,?16,?17)
+                 status, resolved_at, created_at, field_reasons, ship_extract_model,
+                 notify_eligible_at)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,NULL,?13,?14,?15,?16,?17,?18)
              ON CONFLICT(message_id) DO UPDATE SET
                  importance=CASE WHEN {PROCESSED} THEN triage.importance ELSE excluded.importance END,
                  tier=CASE WHEN {PROCESSED} THEN triage.tier ELSE excluded.tier END,
@@ -646,7 +647,17 @@ impl SqliteStore {
                      THEN triage.ship_extract_model ELSE excluded.ship_extract_model END,
                  status=CASE WHEN excluded.status='done' THEN 'done' ELSE triage.status END,
                  resolved_at=CASE WHEN excluded.status='done'
-                     THEN excluded.resolved_at ELSE triage.resolved_at END"
+                     THEN excluded.resolved_at ELSE triage.resolved_at END,
+                 -- WRITTEN ONCE, ON FIRST INSERT, AND NEVER AGAIN — not even to
+                 -- a fresher stamp, and not conditioned on `PROCESSED` like the
+                 -- verdict columns. Notify eligibility is a fact about when we
+                 -- FIRST saw a message, so a re-ingest (history overlap, a
+                 -- catch-up re-scan, a sealed row being rewritten) must not be
+                 -- able to move it forward: that would hand the whole re-scanned
+                 -- window a fresh hour of notify eligibility, which is the storm
+                 -- the guard exists to prevent. A NULL stays NULL for the same
+                 -- reason, from the other direction.
+                 notify_eligible_at = triage.notify_eligible_at"
         );
         tx.execute(
             &triage_upsert,
@@ -668,6 +679,7 @@ impl SqliteStore {
                 now_s,
                 field_reasons_json,
                 ship_extract_model,
+                triaged.notify_eligible_at.map(|t| t.to_rfc3339()),
             ],
         )?;
 

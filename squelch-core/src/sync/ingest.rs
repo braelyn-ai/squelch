@@ -1147,6 +1147,10 @@ pub fn ingest(
             calendar: None,
             attachments,
             confident: true,
+            // NEVER set here: only the sync engine knows which sync path this
+            // ingest is on, and that is the whole eligibility decision. See
+            // `TriagedMessage::notify_eligible_at`.
+            notify_eligible_at: None,
         };
     }
 
@@ -1176,6 +1180,10 @@ pub fn ingest(
             calendar: None,
             attachments,
             confident: true,
+            // NEVER set here: only the sync engine knows which sync path this
+            // ingest is on, and that is the whole eligibility decision. See
+            // `TriagedMessage::notify_eligible_at`.
+            notify_eligible_at: None,
         };
     }
 
@@ -1242,6 +1250,8 @@ pub fn ingest(
         calendar,
         attachments,
         confident: result.confident,
+        // See the sealed arm above: the engine, not ingest, stamps this.
+        notify_eligible_at: None,
     }
 }
 

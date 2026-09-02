@@ -150,6 +150,21 @@ pub struct TriagedMessage {
     /// `false` when Stage-1 was not confident: the row keeps `model_used IS NULL`
     /// so the Stage-2 queue predicate picks it up.
     pub confident: bool,
+    /// MAY THIS MESSAGE EVER NOTIFY, and from when. `Some(now)` for mail we are
+    /// seeing for the first time on an incremental path that was still fresh
+    /// when we saw it; `None` — the silent direction — for a backfill row, the
+    /// user's own sent copy, and mail already stale at first sight.
+    ///
+    /// Set by [`crate::sync::SyncEngine`], NOT by ingest: the pure ingest
+    /// pipeline does not know which sync path it is on, and that fact is the
+    /// whole decision (docs/NOTIFY.md §11.3). `ingest_with_rules` therefore
+    /// leaves it `None` and the engine fills it in before the store call.
+    ///
+    /// Written by [`Store::ingest_message`] on the triage row's FIRST INSERT
+    /// ONLY and preserved verbatim on conflict, which is what makes a catch-up
+    /// re-scan structurally unable to storm: a row it re-ingests already exists
+    /// and keeps whatever it was stamped with, NULL included.
+    pub notify_eligible_at: Option<DateTime<Utc>>,
 }
 
 /// The full body of one sealed message. HUMAN-DOOR-ONLY: returned solely by
@@ -476,6 +491,11 @@ pub struct Stage2Queued {
     /// When a human last asked for this row to be re-triaged; see
     /// [`Stage1Queued::retriage_at`]. Overrides the SKIP-STALE check above.
     pub retriage_at: Option<DateTime<Utc>>,
+    /// `triage.notify_eligible_at`; see [`TriagedMessage::notify_eligible_at`].
+    /// Carried on the queue row so the Stage-2 apply site can emit without a
+    /// second read, and so the emission decision measures the age of OUR sight
+    /// of the message rather than the sender's `Date:` header.
+    pub notify_eligible_at: Option<DateTime<Utc>>,
 }
 
 /// How the account owner has treated this sender before. Aggregates, not
@@ -565,6 +585,10 @@ pub struct Stage1Queued {
     /// [`crate::triage::retriage_forced`], which is what lets an explicit
     /// re-triage of old mail bypass the pass's stale skip.
     pub retriage_at: Option<DateTime<Utc>>,
+    /// `triage.notify_eligible_at`; see [`TriagedMessage::notify_eligible_at`].
+    /// Carried on the queue row so the Stage-1 apply site can emit without a
+    /// second read.
+    pub notify_eligible_at: Option<DateTime<Utc>>,
 }
 
 /// A triage row's HEURISTIC SEED verdict, read back when the Stage-1 model call
@@ -582,6 +606,11 @@ pub struct SeedVerdict {
     /// this one.
     pub needs_stage2: bool,
     pub deadline: Option<DateTime<Utc>>,
+    /// `triage.notify_eligible_at`; see [`TriagedMessage::notify_eligible_at`].
+    /// Read back HERE rather than taken off the queued row because this whole
+    /// struct is the row as it stands at emission time, and the fallback site
+    /// has no other read of it.
+    pub notify_eligible_at: Option<DateTime<Utc>>,
 }
 
 /// One message whose scheduled re-evaluation has come due. Carries the PRIOR
@@ -1511,9 +1540,12 @@ pub trait Store: Send + Sync {
 
     // NOTIFICATION EVENTS: the durable, monotonic log the delivery adapters read.
     // WRITTEN ONLY BY THE SYNC ENGINE via `triage::events` — never from a store
-    // write method, because only the engine knows which sync path it is on and
-    // whether the mail is fresh. Every reader carries its OWN cursor; there is
-    // deliberately no global 'delivered' flag.
+    // write method, because only the engine knows which sync path an ingest is
+    // on, and that answer (not the sender's `Date:` header) is what decides
+    // whether a message may ever notify. The engine writes it down once, as
+    // `triage.notify_eligible_at`; see `TriagedMessage::notify_eligible_at`.
+    // Every reader carries its OWN cursor; there is deliberately no global
+    // 'delivered' flag.
 
     /// Append one event, at most once per message ever (INSERT OR IGNORE on
     /// `UNIQUE(message_id)`), which is what makes re-ingest and the refine passes
@@ -1523,6 +1555,21 @@ pub trait Store: Send + Sync {
     /// [`SqliteStore::attach_event_notifier`]) so an SSE reader wakes without
     /// polling; that send is best-effort, no receivers is normal.
     fn append_event(&self, ev: &NewEvent) -> Result<Option<i64>>;
+
+    /// Whether this message already has an `events` row: "has the user already
+    /// been notified about this one".
+    ///
+    /// EXISTS FOR THE EXPIRY COUNTER. `UNIQUE(message_id)` means a site that
+    /// APPENDS can already tell a new buzz from a repeat one by the `Option` it
+    /// gets back — but a site that REFUSES to append never reaches the store, so
+    /// it cannot, and the one refusal we count (past the rescue window) is
+    /// exactly the one that keeps coming back: a message notified from Stage-1
+    /// is offered again by Stage-2 and again by every re-triage, hours later
+    /// each time. Without this read, every one of those books a DELIVERED
+    /// notification as a missed one, in the single number docs/NOTIFY.md §11.11
+    /// says decides whether the window moves. See
+    /// [`crate::sync::SyncEngine::emit_event`].
+    fn message_has_event(&self, account_id: AccountId, message_id: i64) -> Result<bool>;
 
     /// Events with `id > after_id`, oldest first, capped at `limit`. The replay
     /// query behind `GET /client/events?after=<cursor>`.

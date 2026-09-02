@@ -208,8 +208,8 @@ impl Default for SyncConfig {
     }
 }
 
-/// Notification-event tunables: these two numbers are the whole non-structural
-/// policy for what earns a row in the `events` table.
+/// Notification-event tunables: these three numbers are the whole
+/// non-structural policy for what earns a row in the `events` table.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct NotifyConfig {
@@ -218,13 +218,30 @@ pub struct NotifyConfig {
     /// same number as the TUI's starting squelch line, so "notified" and "above
     /// the line" mean the same thing. Env: `SQUELCH_NOTIFY_MIN_IMPORTANCE`.
     pub min_importance: u8,
-    /// THE STORM GUARD: mail received longer ago than this can never produce an
-    /// event, whatever its verdict — that is what makes "never on initial
-    /// backfill" hold across restarts and re-syncs, instead of trusting a code
-    /// path to know which pass it is on. Mail dated in the FUTURE is out of the
-    /// window too, so a sender-controlled `Date:` cannot buy freshness (see
-    /// [`crate::triage::events::is_fresh`]). Default 900.
+    /// THE FIRST-SIGHT TEST: mail whose `Date:` header is older than this when
+    /// we FIRST see it never becomes notifiable, whatever its verdict. Mail
+    /// dated in the FUTURE is out of the window too, so a sender-controlled
+    /// `Date:` cannot buy freshness (see [`crate::triage::events::is_fresh`]).
+    ///
+    /// It is applied ONCE, at ingest, and the answer is stamped on the row as
+    /// `triage.notify_eligible_at` — it is no longer re-asked at every emission
+    /// site. That is what stopped it eating notifications for mail that WAS
+    /// fresh when it arrived and simply waited behind a queue: past this window
+    /// the old check did not delay a notification, it deleted one. Default 900.
+    /// Env: `SQUELCH_NOTIFY_FRESHNESS_WINDOW_SECS`.
     pub freshness_window_secs: u64,
+    /// THE RESCUE CEILING: how long after we first saw a message a verdict may
+    /// still buzz for it. Measured from `triage.notify_eligible_at` — the
+    /// moment WE saw it — never from the sender's `Date:`, so a slow model call
+    /// or a queue behind a backlog still lands. Past it the drop is COUNTED
+    /// (`squelchd_notify_decisions_total{decision="expired"}`) instead of
+    /// silent.
+    ///
+    /// One hour is the horizon past which "you probably have not seen this yet"
+    /// stops being true, and it is also what keeps a multi-hour gateway outage
+    /// from turning into a notification storm the moment it clears. Default
+    /// 3600. Env: `SQUELCH_NOTIFY_RESCUE_WINDOW_SECS`.
+    pub rescue_window_secs: u64,
 }
 
 impl Default for NotifyConfig {
@@ -232,6 +249,7 @@ impl Default for NotifyConfig {
         Self {
             min_importance: 50,
             freshness_window_secs: 900,
+            rescue_window_secs: 3600,
         }
     }
 }
@@ -1454,7 +1472,9 @@ pub struct Config {
     pub sync: SyncConfig,
     /// On-box semantic-recall (v1) tunables (embedding model, dims, cache dir).
     pub embed: EmbedConfig,
-    /// Notification-event emission policy (threshold + the freshness storm guard).
+    /// Notification-event emission policy: the importance threshold, the
+    /// first-sight freshness test, and the rescue ceiling a late verdict has to
+    /// beat.
     pub notify: NotifyConfig,
     /// Scheduled re-evaluation: how often triage looks at its own past verdicts.
     pub revisit: RevisitPassConfig,
@@ -1588,6 +1608,19 @@ impl Config {
         env_override(
             "SQUELCH_NOTIFY_MIN_IMPORTANCE",
             &mut self.notify.min_importance,
+        );
+        // The two notify WINDOWS, both reachable without editing a config file
+        // inside a container image. The freshness one never had an override at
+        // all, which made the one knob that decides whether a tenant's mail can
+        // notify AT ALL unreachable on hosted; the rescue one ships with its own
+        // from the day it exists.
+        env_override(
+            "SQUELCH_NOTIFY_FRESHNESS_WINDOW_SECS",
+            &mut self.notify.freshness_window_secs,
+        );
+        env_override(
+            "SQUELCH_NOTIFY_RESCUE_WINDOW_SECS",
+            &mut self.notify.rescue_window_secs,
         );
         // Which embedding weights this daemon loads. An env var so a fleet-wide
         // pin can be moved without cutting a new image, and validated where
@@ -3139,6 +3172,9 @@ backfill_days = 90
         let c = Config::default();
         assert_eq!(c.notify.min_importance, 50);
         assert_eq!(c.notify.freshness_window_secs, 900);
+        // The rescue ceiling: an hour from FIRST SIGHT, not from the sender's
+        // `Date:`.
+        assert_eq!(c.notify.rescue_window_secs, 3600);
 
         // SAFETY: guarded by ENV_LOCK.
         unsafe { std::env::set_var("SQUELCH_NOTIFY_MIN_IMPORTANCE", "85") }
@@ -3149,6 +3185,36 @@ backfill_days = 90
         // not the notify threshold; they must not alias.
         assert_eq!(c.default_min_importance, 0);
         unsafe { std::env::remove_var("SQUELCH_NOTIFY_MIN_IMPORTANCE") }
+    }
+
+    /// Both notify WINDOWS take an env override, and they are separate knobs:
+    /// one decides whether a message ever becomes notifiable, the other how
+    /// long a late verdict may still buzz for it. Aliasing them would make the
+    /// rescue window silently un-tunable on hosted, which is the deployment
+    /// that cannot edit a config file.
+    #[test]
+    fn both_notify_windows_take_an_env_override_and_do_not_alias() {
+        let _g = ENV_LOCK.lock().unwrap();
+        // SAFETY: guarded by ENV_LOCK.
+        unsafe {
+            std::env::set_var("SQUELCH_NOTIFY_FRESHNESS_WINDOW_SECS", "120");
+            std::env::set_var("SQUELCH_NOTIFY_RESCUE_WINDOW_SECS", "7200");
+        }
+        let mut c: Config =
+            toml::from_str("[notify]\nfreshness_window_secs = 60\nrescue_window_secs = 60\n")
+                .unwrap();
+        assert_eq!(c.notify.freshness_window_secs, 60, "the file, before env");
+        c.apply_env_overrides();
+        assert_eq!(c.notify.freshness_window_secs, 120, "env beats the file");
+        assert_eq!(c.notify.rescue_window_secs, 7200);
+
+        // Each var moves only its own field.
+        unsafe { std::env::remove_var("SQUELCH_NOTIFY_RESCUE_WINDOW_SECS") }
+        let mut c = Config::default();
+        c.apply_env_overrides();
+        assert_eq!(c.notify.freshness_window_secs, 120);
+        assert_eq!(c.notify.rescue_window_secs, 3600, "untouched default");
+        unsafe { std::env::remove_var("SQUELCH_NOTIFY_FRESHNESS_WINDOW_SECS") }
     }
 
     /// The pusher is OFF unless an operator names a relay. `relay_url` is the
@@ -3204,6 +3270,7 @@ backfill_days = 90
         // A config that predates the feature has no [notify] table at all.
         let cfg: Config = toml::from_str("squelch_level = 1\n").unwrap();
         assert_eq!(cfg.notify.min_importance, 50);
+        assert_eq!(cfg.notify.rescue_window_secs, 3600);
     }
 
     #[test]

@@ -114,6 +114,14 @@ pub(super) fn migrate(conn: &Connection) -> Result<()> {
     // tick — the exact opposite of what the age-based stale skip is for.
     add_column_if_missing(conn, "triage", "retriage_at", "TEXT")?;
 
+    // MAY THIS MESSAGE EVER NOTIFY, and from when. NULL on every pre-existing
+    // row and NOT backfilled, and the NULL is the whole safety property: a
+    // stamp invented for mail already in the database would make the first tick
+    // after an upgrade eligible to push a month of archived mail at a phone.
+    // New mail earns its stamp at ingest like everything else; old mail simply
+    // never notifies, which is exactly what it does today.
+    add_column_if_missing(conn, "triage", "notify_eligible_at", "TEXT")?;
+
     // "REMIND ME LATER": the pending stamp and the fired one. NULL on every
     // pre-existing row and NOT backfilled — nobody has asked to be reminded of
     // anything, and a backfilled `reminded_at` would drag the whole mailbox into
