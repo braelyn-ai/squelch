@@ -897,6 +897,25 @@ pub struct Stage2UsageDay {
     pub cache_read_tokens: u64,
 }
 
+/// One UTC day of the mailbox's own traffic, for the human door's activity
+/// report. `received` is everything that arrived that day, sealed mail
+/// included and spam never; the four tier counts partition the NON-SEALED part
+/// of it, so `received >= sealed + past_due + deadline + signal + noise` always
+/// holds, the slack being mail the triage pipeline has not reached yet.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MailActivityDay {
+    /// UTC date key, `YYYY-MM-DD` — the usage ledger's key, so the two series
+    /// line up day for day.
+    pub day: String,
+    pub received: u64,
+    pub sent: u64,
+    pub sealed: u64,
+    pub past_due: u64,
+    pub deadline: u64,
+    pub signal: u64,
+    pub noise: u64,
+}
+
 /// One call's token counts, as the ledger records them: `input` is the UNCACHED
 /// prompt remainder, with prompt-cache writes and reads in their own fields
 /// because they price differently. A struct rather than four positional u64s so
@@ -1936,6 +1955,18 @@ pub trait Store: Send + Sync {
     /// band counts are windowed to `bands_since` so they agree with the list
     /// queries they head; the inventory counts are all-time.
     fn stats(&self, account_id: AccountId, bands_since: DateTime<Utc>) -> Result<StoreStats>;
+
+    /// The mailbox's own traffic per UTC day over `[since, until)` on
+    /// `received_at`: mail in, mail out, and how the incoming split by tier.
+    /// Ascending and SPARSE — a day with no mail has no row. Spam is never
+    /// counted: it is fetched on demand, so a day's spam total would report how
+    /// recently the spam page was opened rather than what arrived.
+    fn mail_activity(
+        &self,
+        account_id: AccountId,
+        since: DateTime<Utc>,
+        until: DateTime<Utc>,
+    ) -> Result<Vec<MailActivityDay>>;
 
     // STAGE-2 additions, supporting the LLM triage pass in the sync loop. The
     // queue predicate is `model_used IS NULL AND sensitivity='normal'`, so sealed

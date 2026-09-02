@@ -43,6 +43,7 @@ SWIFT_FLAGS=(
   -strict-concurrency=minimal
   -framework AppKit
   -framework SwiftUI
+  -framework Charts
   -framework WebKit
   -framework Security
   -framework UniformTypeIdentifiers

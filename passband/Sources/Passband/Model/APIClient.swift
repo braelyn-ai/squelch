@@ -356,6 +356,10 @@ actor APIClient {
         try await get("/client/usage", query: ["days": days.map(String.init)])
     }
 
+    func getMailActivity(days: Int? = nil) async throws -> MailActivityResponse {
+        try await get("/client/mail-activity", query: ["days": days.map(String.init)])
+    }
+
     func getTriageConfig() async throws -> TriageConfig { try await get("/client/triage-config") }
 
     func setTriageConfig(_ patch: TriageConfigPatch) async throws -> TriageConfig {

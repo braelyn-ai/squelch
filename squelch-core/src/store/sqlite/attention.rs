@@ -816,6 +816,66 @@ impl SqliteStore {
             last_surfaced_at,
         })
     }
+
+    /// See [`Store::mail_activity`]. One pass over the window's messages,
+    /// bucketed in SQL: `received_at` is stored as RFC3339 UTC, so its first
+    /// ten characters ARE the ledger's day key, and the bounds compare as text
+    /// against the same `to_rfc3339` shape the writes use.
+    ///
+    /// LEFT JOIN, not JOIN: a message the triage pipeline has not reached yet
+    /// is still mail that arrived, so it counts as received and in no tier.
+    /// Sent mail carries a neutral triage row (see `ingest`: "the user's own
+    /// outbox must never pollute the ranked inbox"), which is why every tier
+    /// bucket re-checks `is_sent = 0` rather than trusting the row's tier.
+    pub(super) fn mail_activity(
+        &self,
+        account_id: AccountId,
+        since: DateTime<Utc>,
+        until: DateTime<Utc>,
+    ) -> Result<Vec<MailActivityDay>> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT substr(m.received_at, 1, 10) AS day,
+                    COALESCE(SUM(m.is_sent = 0), 0),
+                    COALESCE(SUM(m.is_sent = 1), 0),
+                    COALESCE(SUM(m.is_sent = 0 AND t.sensitivity = 'sealed'), 0),
+                    COALESCE(SUM(m.is_sent = 0 AND t.sensitivity != 'sealed'
+                                 AND t.tier = 'past_due'), 0),
+                    COALESCE(SUM(m.is_sent = 0 AND t.sensitivity != 'sealed'
+                                 AND t.tier = 'deadline'), 0),
+                    COALESCE(SUM(m.is_sent = 0 AND t.sensitivity != 'sealed'
+                                 AND t.tier = 'signal'), 0),
+                    COALESCE(SUM(m.is_sent = 0 AND t.sensitivity != 'sealed'
+                                 AND t.tier = 'noise'), 0)
+             FROM messages m
+             LEFT JOIN triage t ON t.message_id = m.id
+             WHERE m.account_id = ?1 AND m.is_spam = 0
+               AND m.received_at >= ?2 AND m.received_at < ?3
+             GROUP BY day
+             ORDER BY day",
+        )?;
+        let count = |r: &rusqlite::Row<'_>, i: usize| -> rusqlite::Result<u64> {
+            Ok(r.get::<_, i64>(i)?.max(0) as u64)
+        };
+        let rows = stmt
+            .query_map(
+                params![account_id, since.to_rfc3339(), until.to_rfc3339()],
+                |r| {
+                    Ok(MailActivityDay {
+                        day: r.get(0)?,
+                        received: count(r, 1)?,
+                        sent: count(r, 2)?,
+                        sealed: count(r, 3)?,
+                        past_due: count(r, 4)?,
+                        deadline: count(r, 5)?,
+                        signal: count(r, 6)?,
+                        noise: count(r, 7)?,
+                    })
+                },
+            )?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
 }
 
 /// The moment an account's open ledger started running.

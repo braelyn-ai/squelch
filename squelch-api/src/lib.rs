@@ -191,6 +191,7 @@ fn client_router(state: ApiState) -> Router {
         .route("/client/invites", get(sharing::get_invites))
         .route("/client/invites", post(sharing::post_invites))
         .route("/client/usage", get(handlers::get_usage))
+        .route("/client/mail-activity", get(handlers::get_mail_activity))
         .route(
             "/client/triage-config",
             get(handlers::get_triage_config).post(handlers::set_triage_config),

@@ -83,6 +83,7 @@
 		4BF112500D334A129834AAEB /* MobileToastHost.swift in Sources */ = {isa = PBXBuildFile; fileRef = D0318A22219D3A1E36429C76 /* MobileToastHost.swift */; };
 		4C489FDA815D1AA53534BA7B /* Quotes.swift in Sources */ = {isa = PBXBuildFile; fileRef = 30CE0F7FB80B319544FD62FA /* Quotes.swift */; };
 		4C66C7F7C1AB185340BCC719 /* ThreadMinimap.swift in Sources */ = {isa = PBXBuildFile; fileRef = 06AB2FB92191FC4913C38FFF /* ThreadMinimap.swift */; };
+		4C8971E5C6FA76A0AE2380E6 /* UsageSeries.swift in Sources */ = {isa = PBXBuildFile; fileRef = 380A6F03DF41EB8ACAACDBFC /* UsageSeries.swift */; };
 		4D086E1491D67B05B2626B90 /* KeyDispatch.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4E2AB71004C775ABFABB73D9 /* KeyDispatch.swift */; };
 		4D1913697E7DE1A0B25EFDC4 /* Avatar.swift in Sources */ = {isa = PBXBuildFile; fileRef = BC0ADC18AA758296235E8F59 /* Avatar.swift */; };
 		4D885CFF844970680B6C93DA /* EmailWebViewiOS.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1DD489E941E602E585098D3F /* EmailWebViewiOS.swift */; };
@@ -207,6 +208,7 @@
 		B17EE2D75B244234D57E7679 /* Security.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 78527CBD27E00907F26B9E79 /* Security.framework */; };
 		B220A3270FA5DC1638A76085 /* Raster.swift in Sources */ = {isa = PBXBuildFile; fileRef = D4382469FC056D0CD54B22F3 /* Raster.swift */; };
 		B2DCDDC65C633129F7E17471 /* UpdateRow.swift in Sources */ = {isa = PBXBuildFile; fileRef = 92398A24BE2068AEBF3FA312 /* UpdateRow.swift */; };
+		B2E2414F9A0257E75BC3C7B0 /* UsageSeries.swift in Sources */ = {isa = PBXBuildFile; fileRef = 380A6F03DF41EB8ACAACDBFC /* UsageSeries.swift */; };
 		B2EE10EBD8C634AC7069FB8B /* ImageWarmer.swift in Sources */ = {isa = PBXBuildFile; fileRef = 582A0094F147273BA003C4B6 /* ImageWarmer.swift */; };
 		B36D0542B36A1421D26CA968 /* Platform.swift in Sources */ = {isa = PBXBuildFile; fileRef = 37AEAA24984488DA00EBD6C4 /* Platform.swift */; };
 		B3BD3AFC1DED8C5544D23602 /* PassbandiOSApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = F714235A8E6F4742ABF772B3 /* PassbandiOSApp.swift */; };
@@ -383,6 +385,7 @@
 		361AB4D81F3740E2B072C5BA /* QuickLookPanel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = QuickLookPanel.swift; sourceTree = "<group>"; };
 		37716282CFABFF5910677BBC /* APIError.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = APIError.swift; sourceTree = "<group>"; };
 		37AEAA24984488DA00EBD6C4 /* Platform.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Platform.swift; sourceTree = "<group>"; };
+		380A6F03DF41EB8ACAACDBFC /* UsageSeries.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = UsageSeries.swift; sourceTree = "<group>"; };
 		389673F8FDDB51FC4830D9D2 /* PassbandApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PassbandApp.swift; sourceTree = "<group>"; };
 		39D5C019641DC37B55D7D922 /* ImageProxy.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ImageProxy.swift; sourceTree = "<group>"; };
 		3BE1E84810E523707C4E2CC5 /* SettingsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SettingsView.swift; sourceTree = "<group>"; };
@@ -642,6 +645,7 @@
 				9C92A36DDD1B4FF9A1BD99B0 /* ThreadStyleLedger.swift */,
 				EEFA34554013DFB615774309 /* Trackers.swift */,
 				74A0D0F666787312F4991788 /* TriageTargets.swift */,
+				380A6F03DF41EB8ACAACDBFC /* UsageSeries.swift */,
 			);
 			path = Lib;
 			sourceTree = "<group>";
@@ -1117,6 +1121,7 @@
 				E10D08C181CF74A1540E37BB /* UpdateAlert.swift in Sources */,
 				FA53DECE01289F91363AC331 /* UpdateRow.swift in Sources */,
 				2AE0CB107FAB86784BE5C0F4 /* Updater.swift in Sources */,
+				B2E2414F9A0257E75BC3C7B0 /* UsageSeries.swift in Sources */,
 				1D4DC0356DE1A699763FBFB0 /* UsageView.swift in Sources */,
 				454262AEF38CC6F59CEB4989 /* WhatsNew.swift in Sources */,
 				CF34A69E15DFE9980A622162 /* WhatsNewCard.swift in Sources */,
@@ -1261,6 +1266,7 @@
 				BF2AD4F3EB9857AB051753D0 /* Typography.swift in Sources */,
 				B2DCDDC65C633129F7E17471 /* UpdateRow.swift in Sources */,
 				4836A3C84F0310D8E5E60FCB /* UpdateVerbs.swift in Sources */,
+				4C8971E5C6FA76A0AE2380E6 /* UsageSeries.swift in Sources */,
 				0A10F1733FF17A416C100485 /* WhatsNew.swift in Sources */,
 				F7F2772B8DCFEA19D81F022E /* WhatsNewCard.swift in Sources */,
 				B91230E83D52E90A46495F77 /* WireTypes.swift in Sources */,

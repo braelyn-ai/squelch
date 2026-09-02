@@ -40,13 +40,13 @@ use crate::error::{CoreError, Result};
 use crate::metrics::{NotifyDecision, NotifyLane};
 use crate::store::{
     AttachmentBytes, BankingApplied, ContactEntry, Device, DeviceToken, Draft, DraftFields,
-    ExtractQueued, InboxUnread, IssuedDeviceToken, MarketingApplied, MarketingOffer, MessageOpen,
-    MessageUnsub, MintedPairingCode, MissingVector, NewAuditEntry, NewEvent, NewNotifyDecision,
-    NotifyDecisionRow, RevisitQueued, SPAM_SYNCED_AT_KEY, SealedBody, SealedMessage, SearchFilter,
-    SearchSort, SeedVerdict, SenderHistory, SentMessage, SentMissingRecipients, SitrepBand,
-    SpamScope, Stage1Applied, Stage1Queued, Stage2Applied, Stage2CapOverrides, Stage2Queued,
-    Stage2Usage, Stage2UsageDay, Store, SyncState, ThreadSibling, TrackedMessage, TriageDebug,
-    TriagedMessage, UsageTokens,
+    ExtractQueued, InboxUnread, IssuedDeviceToken, MailActivityDay, MarketingApplied,
+    MarketingOffer, MessageOpen, MessageUnsub, MintedPairingCode, MissingVector, NewAuditEntry,
+    NewEvent, NewNotifyDecision, NotifyDecisionRow, RevisitQueued, SPAM_SYNCED_AT_KEY, SealedBody,
+    SealedMessage, SearchFilter, SearchSort, SeedVerdict, SenderHistory, SentMessage,
+    SentMissingRecipients, SitrepBand, SpamScope, Stage1Applied, Stage1Queued, Stage2Applied,
+    Stage2CapOverrides, Stage2Queued, Stage2Usage, Stage2UsageDay, Store, SyncState, ThreadSibling,
+    TrackedMessage, TriageDebug, TriagedMessage, UsageTokens,
 };
 use crate::types::{
     AccountId, AttachmentInfo, AttentionStatus, AttentionUpdate, AuditEntry, BandCounts, Banking,
@@ -1108,6 +1108,15 @@ impl Store for SqliteStore {
 
     fn stats(&self, account_id: AccountId, bands_since: DateTime<Utc>) -> Result<StoreStats> {
         self.stats(account_id, bands_since)
+    }
+
+    fn mail_activity(
+        &self,
+        account_id: AccountId,
+        since: DateTime<Utc>,
+        until: DateTime<Utc>,
+    ) -> Result<Vec<MailActivityDay>> {
+        self.mail_activity(account_id, since, until)
     }
 
     fn stage1_queue(&self, account_id: AccountId, limit: usize) -> Result<Vec<Stage1Queued>> {

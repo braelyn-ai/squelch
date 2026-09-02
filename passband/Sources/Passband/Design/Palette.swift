@@ -58,6 +58,31 @@ enum Palette {
         return inkDim
     }
 
+    // MARK: - chart series
+
+    // The usage page's marks. Each pair or ramp was run through a colour-
+    // deficiency check against the pane it sits on, in both appearances, which
+    // is why the dark steps are their own values rather than the accent's: the
+    // accent's dark step is too light to sit inside a chart's lightness band.
+
+    /// Mail in / mail out — a cool/warm pair that stays apart under every
+    /// deficiency.
+    static let chartIn = Color(light: Color(hex: 0x2B7FD4), dark: Color(hex: 0x3D8EDC))
+    static let chartOut = Color(light: Color(hex: 0xC9682E), dark: Color(hex: 0xD6763C))
+    /// The signal fill of the signal-to-noise stack: the tier green, at a step
+    /// that clears a dark pane. Noise is the de-emphasis gray beside it.
+    static let chartSignal = Color(light: Color(hex: 0x1F7A4D), dark: Color(hex: 0x3BA873))
+    static let chartNoise = Color(
+        light: Color(hex: 0x94A2B2).opacity(0.5), dark: Color(hex: 0x62707F).opacity(0.6))
+    /// The pipeline's stages in pipeline order — stage 1, stage 2, the
+    /// extractors — as one blue, light to dark: an ordered set gets a ramp,
+    /// not three hues.
+    static let chartStages: [Color] = [
+        Color(light: Color(hex: 0x5E9EDC), dark: Color(hex: 0xA9CBF0)),
+        Color(light: Color(hex: 0x2B7FD4), dark: Color(hex: 0x4E9BEA)),
+        Color(light: Color(hex: 0x1C4E82), dark: Color(hex: 0x2C5F93)),
+    ]
+
     // MARK: - ink ladder
 
     static let ink = Color(light: Color(hex: 0x141C26), dark: Color(hex: 0xE9EEF5))
