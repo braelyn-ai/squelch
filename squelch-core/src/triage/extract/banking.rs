@@ -174,7 +174,7 @@ pub fn apply_result(q: &ExtractQueued, out: &BankingOutput, model: &str) -> Bank
         message_id: q.message_id,
         account_id: q.account_id,
         kind: kind_for_category(&q.category).to_string(),
-        institution: out.institution.as_deref().map(truncate_institution),
+        institution: sanitize_institution(out.institution.as_deref()),
         amount: out.amount,
         currency: out.currency.as_deref().map(truncate_currency),
         account_hint: sanitize_account_hint(out.account_hint.as_deref()),
@@ -184,12 +184,83 @@ pub fn apply_result(q: &ExtractQueued, out: &BankingOutput, model: &str) -> Bank
     }
 }
 
-/// Hard cap for the stored institution name. UNTRUSTED model text: bounded AND
-/// digit-run redacted, because a prompt-injected email could otherwise steer a
-/// full card number into the one text field that isn't `account_hint`.
-fn truncate_institution(name: &str) -> String {
-    const MAX: usize = 80;
-    truncate_chars(&redact_digit_runs(name.trim()), MAX)
+/// Hard cap for the stored institution name, in characters.
+const MAX_INSTITUTION_CHARS: usize = 80;
+
+/// The most words a real institution name runs to. The longest ones anybody
+/// banks with are four ("Bank of the West", "JPMorgan Chase Bank, N.A."), so
+/// five is already generous; past it the model is writing prose, not naming a
+/// bank.
+const MAX_INSTITUTION_WORDS: usize = 5;
+
+/// Reduce a model-emitted institution to a SAFE display name, or `None`.
+///
+/// A CAP IS NOT A CHECK, and for a while this was only a cap. Structured output
+/// constrains the SHAPE of the answer and says nothing about its contents, so a
+/// model that emits `"Venmo"` and then keeps generating hands back JSON that
+/// parses perfectly and carries a paragraph in a field the card renders on one
+/// line. Two rows reached a real inbox that way, each opening with a correct
+/// bank name and running on into this crate's own prompt scaffolding
+/// (`Venmo=== TRUSTED CONTEXT (from the account owner; authoritative) ===`).
+/// Truncation is what made it unreadable rather than what made it wrong.
+///
+/// So the value has to look like a NAME before it can be stored:
+///   * non-whitespace CONTROL characters and BIDI controls are removed — the
+///     same laundering [`super::shipments::sanitize_item_name`] does, and for
+///     the same reason: a U+202E would flip the card's row right-to-left;
+///   * a name is ONE LINE, so an interior newline is refused outright;
+///   * FENCE AND MARKUP punctuation (`=`, `<`, `>`, `{`, `}`, `|`, backtick,
+///     quote) is refused — no bank has it in its name, and every one of them
+///     appears in a prompt fence, a JSON fragment, or HTML;
+///   * more than [`MAX_INSTITUTION_WORDS`] words is prose, not a name;
+///   * something has to be a LETTER, so a pile of punctuation is not a bank;
+///   * long digit runs are redacted and the result is capped, unchanged from
+///     before: a prompt-injected email must not be able to steer a full card
+///     number into the one text field that isn't `account_hint`.
+///
+/// Refusing yields `None`, and `None` is a GOOD outcome: the client already
+/// falls back to the sender's display name, so a Venmo alert with no usable
+/// institution still reads "Venmo" on the card. A wrong name is worse than no
+/// name on a row about money.
+pub fn sanitize_institution(raw: Option<&str>) -> Option<String> {
+    let plain: String = raw?
+        .chars()
+        .filter(|c| !c.is_control() || c.is_whitespace())
+        .filter(|c| {
+            !matches!(
+                c,
+                '\u{200E}' | '\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}'
+            )
+        })
+        .collect();
+    let plain = plain.trim();
+    if plain.is_empty() {
+        return None;
+    }
+    // ONE LINE. Checked after the trim, so a merely trailing newline is
+    // innocent and an interior one is not.
+    if plain.contains('\n') || plain.contains('\r') {
+        return None;
+    }
+    if plain
+        .chars()
+        .any(|c| matches!(c, '=' | '<' | '>' | '{' | '}' | '|' | '`' | '"'))
+    {
+        return None;
+    }
+    if plain.split_whitespace().count() > MAX_INSTITUTION_WORDS {
+        return None;
+    }
+    if !plain.chars().any(char::is_alphabetic) {
+        return None;
+    }
+    let name = truncate_chars(&redact_digit_runs(plain), MAX_INSTITUTION_CHARS);
+    let name = name.trim();
+    if name.is_empty() {
+        None
+    } else {
+        Some(name.to_string())
+    }
 }
 
 /// Replace any run of more than 4 digits (counting digits across the common
@@ -317,6 +388,151 @@ mod tests {
         let alert = apply_result(&queued("transaction_alert"), &out(), "m");
         assert_eq!(alert.kind, "transaction_alert");
         assert!(alert.auto_resolve);
+    }
+
+    // ---- institution post-validation -------------------------------------
+
+    /// The two values that actually reached a production `banking` table, byte
+    /// for byte. Both begin with the RIGHT ANSWER and then keep going, which is
+    /// why a length cap could not save them: truncating the first at 80 chars is
+    /// precisely what produced the "Venmo=== TRUSTED" a card rendered on one
+    /// line. Neither email carried an injection — the model simply did not stop.
+    const PROMPT_ECHO: &str =
+        "Venmo=== TRUSTED CONTEXT (from the account owner; authoritative) ===\nowner refin";
+    const DEGENERATED: &str = "Visa=== END NOTE ===Continue extraction.ionation. Return JSON.999,";
+
+    #[test]
+    fn the_two_rows_that_shipped_are_refused() {
+        assert_eq!(sanitize_institution(Some(PROMPT_ECHO)), None);
+        assert_eq!(sanitize_institution(Some(DEGENERATED)), None);
+    }
+
+    #[test]
+    fn a_refusal_survives_the_whole_apply_path() {
+        // End to end, not just the helper: the field the client reads has to
+        // come back NULL, because NULL is what makes it fall back to the
+        // sender's display name and render "Venmo" instead of a paragraph.
+        let mut o = out();
+        o.institution = Some(PROMPT_ECHO.into());
+        let a = apply_result(&queued("transaction_alert"), &o, "m");
+        assert_eq!(a.institution, None);
+        // The rest of the row is still good and must survive the refusal.
+        assert_eq!(a.amount, Some(1234.56));
+        assert_eq!(a.account_hint.as_deref(), Some("…1234"));
+    }
+
+    #[test]
+    fn real_institution_names_pass_through() {
+        for name in [
+            "Chase",
+            "American Express",
+            "Bank of America",
+            "Hetzner Online GmbH",
+            "Venmo",
+            "Wells Fargo Bank, N.A.",
+            "AT&T",
+        ] {
+            assert_eq!(
+                sanitize_institution(Some(name)).as_deref(),
+                Some(name),
+                "{name:?} is a real institution and must survive"
+            );
+        }
+    }
+
+    #[test]
+    fn prose_is_not_a_name() {
+        // The single most discriminating signal that a model kept talking.
+        assert_eq!(
+            sanitize_institution(Some("Chase Bank which is the issuer of this card")),
+            None
+        );
+        // Five words is the line, and it is inclusive.
+        assert_eq!(
+            sanitize_institution(Some("one two three four five")).as_deref(),
+            Some("one two three four five")
+        );
+        assert_eq!(
+            sanitize_institution(Some("one two three four five six")),
+            None
+        );
+    }
+
+    #[test]
+    fn a_name_is_one_line() {
+        assert_eq!(sanitize_institution(Some("Chase\nand then some")), None);
+        assert_eq!(sanitize_institution(Some("Chase\r\nmore")), None);
+        // A merely TRAILING newline is innocent — trimmed, not refused.
+        assert_eq!(
+            sanitize_institution(Some("  Chase\n")).as_deref(),
+            Some("Chase")
+        );
+    }
+
+    #[test]
+    fn fence_and_markup_punctuation_is_refused() {
+        for raw in [
+            "Chase === TRUSTED",
+            "<b>Chase</b>",
+            "{\"institution\": \"Chase\"}",
+            "Chase | Visa",
+            "`Chase`",
+        ] {
+            assert_eq!(
+                sanitize_institution(Some(raw)),
+                None,
+                "{raw:?} carries fence/markup punctuation and must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn empty_and_letterless_answers_are_refused() {
+        assert_eq!(sanitize_institution(None), None);
+        assert_eq!(sanitize_institution(Some("   ")), None);
+        assert_eq!(sanitize_institution(Some("1234")), None);
+        assert_eq!(sanitize_institution(Some("--- ...")), None);
+    }
+
+    #[test]
+    fn bidi_and_control_characters_are_laundered_out() {
+        // A U+202E would render the card's whole row right-to-left.
+        assert_eq!(
+            sanitize_institution(Some("Cha\u{202E}se")).as_deref(),
+            Some("Chase")
+        );
+    }
+
+    #[test]
+    fn long_digit_runs_are_still_redacted() {
+        // The pre-existing guarantee, kept: a card number steered into this
+        // field must not survive it.
+        assert_eq!(
+            sanitize_institution(Some("Visa 4111111111111234")).as_deref(),
+            Some("Visa ####")
+        );
+        // Four digits or fewer is a plausible part of a name, not a card.
+        assert_eq!(
+            sanitize_institution(Some("Bank 1234")).as_deref(),
+            Some("Bank 1234")
+        );
+    }
+
+    #[test]
+    fn sanitizing_is_idempotent() {
+        // The one-shot backfill re-runs this over stored rows, so its output has
+        // to be a FIXED POINT or the pass would keep finding work to do.
+        for raw in [
+            "Chase",
+            "Visa 4111111111111234",
+            "  Chase\n",
+            PROMPT_ECHO,
+            DEGENERATED,
+        ] {
+            let once = sanitize_institution(Some(raw));
+            let twice = sanitize_institution(once.as_deref());
+            assert_eq!(once, twice, "not a fixed point: {raw:?}");
+        }
     }
 
     // ---- account_hint post-validation -----------------------------------

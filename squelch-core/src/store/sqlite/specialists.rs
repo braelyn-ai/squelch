@@ -37,6 +37,23 @@ fn delivered_ts(status: crate::triage::ShipmentStatus, ts: &str) -> Option<Strin
 /// "the deletions happened" are one fact.
 const SHIPMENTS_REDETECT_FLAG: &str = "shipments_redetect_v1";
 
+/// Do two optional money values agree TO THE CENT? Both `None` agrees; one
+/// `None` does not. Compared in integer cents rather than by `==`, because these
+/// are `f64` on both sides and a re-parse that produced the identical decimal
+/// must not read as a change worth writing.
+fn same_cents(a: Option<f64>, b: Option<f64>) -> bool {
+    match (a, b) {
+        (None, None) => true,
+        (Some(x), Some(y)) => (x * 100.0).round() == (y * 100.0).round(),
+        _ => false,
+    }
+}
+
+/// `app_settings` key recording that the one-shot receipt re-parse
+/// ([`SqliteStore::receipts_reparse_cleanup`]) has run for an account. Written
+/// inside the same transaction as the corrections, exactly as above.
+const RECEIPTS_REPARSE_FLAG: &str = "receipts_reparse_v1";
+
 /// The MERCHANT NAMESPACE an order reference lives in: the registrable domain of
 /// the sender that supplied it, lowercased, or `""` when the address yields none.
 ///
@@ -1022,6 +1039,98 @@ impl SqliteStore {
         )?;
         tx.commit()?;
         Ok(deleted)
+    }
+
+    /// One-shot repair: re-run the (fixed) total extraction over each receipt
+    /// row's own message and correct the stored amount where the two disagree.
+    /// Returns the number of rows corrected, and 0 once the pass has already run
+    /// for this account.
+    ///
+    /// WHY THERE IS A PASS AT ALL. The amount patterns admitted a two-digit
+    /// fraction and nothing longer, so a sender printing an unrounded binary
+    /// float — Amazon ships `67.28999999999999 USD` as an order total — matched
+    /// nothing at the start of the number and matched beautifully in the MIDDLE
+    /// of it. The stored total became the fractional tail: five figures on a real
+    /// mailbox, one of them a $29 trillion Amazon order sitting on the receipts
+    /// card. Reparsing is the only way back, because the wrong number carries no
+    /// trace of the right one.
+    ///
+    /// AND IT IS NOT ONLY COSMETIC: [`auto_close_bill_for_receipt_conn`] settles
+    /// an open bill by comparing a receipt's amount against it, so a mis-parsed
+    /// total is a wrong answer in a second place that nobody is looking at.
+    ///
+    /// ATOMIC WITH ITS OWN DONE-FLAG, for the same reason as
+    /// [`SqliteStore::shipments_redetect_cleanup`]: the corrections and the flag
+    /// commit together, so the pass can never complete unrecorded.
+    ///
+    /// A NULL amount is a legal receipt state and is filled in when the parser
+    /// now finds a total, since that is the same regex change being applied. The
+    /// reverse never happens: a re-parse that finds NOTHING leaves the stored
+    /// amount standing rather than clearing it, because absent evidence is not
+    /// evidence of absence. Rows whose message is gone are skipped for the same
+    /// reason — there is nothing left to re-read.
+    ///
+    /// SECURITY: the detector never runs on sealed mail, so the join skips any
+    /// message whose triage row is not `sensitivity='normal'`.
+    pub(super) fn receipts_reparse_cleanup(&self, account_id: AccountId) -> Result<u64> {
+        let mut conn = self.lock()?;
+        let done: Option<String> = conn
+            .query_row(
+                "SELECT value FROM app_settings WHERE account_id = ?1 AND key = ?2",
+                params![account_id, RECEIPTS_REPARSE_FLAG],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if done.as_deref() == Some("done") {
+            return Ok(0);
+        }
+
+        let tx = conn.transaction()?;
+        let rows: Vec<(i64, Option<f64>, String, String, String)> = {
+            let mut stmt = tx.prepare(
+                "SELECT r.id, r.amount, m.from_addr, m.subject, m.body
+                 FROM receipts r
+                 JOIN messages m
+                   ON m.id = r.message_id AND m.account_id = r.account_id
+                 LEFT JOIN triage t ON t.message_id = m.id AND t.account_id = m.account_id
+                 WHERE r.account_id = ?1
+                   AND COALESCE(t.sensitivity, 'normal') = 'normal'",
+            )?;
+            stmt.query_map(params![account_id], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?
+        };
+
+        let mut corrected = 0u64;
+        for (id, stored, from_addr, subject, body) in rows {
+            // NEVER CLEAR ON ABSENT EVIDENCE. A re-parse that finds no total is
+            // not testimony that the stored one is wrong — the body may have
+            // been re-ingested since, or hold a total this pass's patterns do
+            // not reach. Same rule the shipment re-detect follows for a row with
+            // no feeder message: a repair pass corrects what it can read and
+            // leaves alone what it cannot.
+            let Some(fresh) = crate::triage::recompute_total(&from_addr, &subject, &body) else {
+                continue;
+            };
+            if same_cents(stored, Some(fresh)) {
+                continue;
+            }
+            corrected += tx.execute(
+                "UPDATE receipts SET amount = ?3, currency = COALESCE(currency, 'USD')
+                 WHERE account_id = ?1 AND id = ?2",
+                params![account_id, id, fresh],
+            )? as u64;
+        }
+
+        tx.execute(
+            "INSERT INTO app_settings(account_id, key, value)
+             VALUES(?1, ?2, 'done')
+             ON CONFLICT(account_id, key) DO UPDATE SET value = excluded.value",
+            params![account_id, RECEIPTS_REPARSE_FLAG],
+        )?;
+        tx.commit()?;
+        Ok(corrected)
     }
 
     pub(super) fn list_pollable_shipments(

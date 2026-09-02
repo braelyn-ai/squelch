@@ -1001,3 +1001,72 @@ fn migrate_adds_content_id_null_to_a_preexisting_attachments_table() {
         "pre-existing attachments are not backfilled"
     );
 }
+
+// ---- one-shot repairs of already-stored specialist rows ----------------
+
+#[test]
+fn migrate_relaunders_a_prompt_echo_institution_out_of_banking() {
+    // THE ROW THAT SHIPPED. The extractor only ever CAPPED this field, so a
+    // model that emitted a correct name and then kept generating left 80
+    // characters of prompt scaffolding on a card that renders one line
+    // ("Venmo=== TRUSTED"). The cap is now a shape check, and the rows already
+    // written have to be re-judged by it — nothing else can reach them.
+    let conn = Connection::open_in_memory().unwrap();
+    conn.execute_batch(
+        "CREATE TABLE banking(
+             id INTEGER PRIMARY KEY, account_id INTEGER NOT NULL,
+             message_id INTEGER NOT NULL, kind TEXT NOT NULL,
+             institution TEXT, amount REAL, currency TEXT, account_hint TEXT);
+         INSERT INTO banking(id, account_id, message_id, kind, institution, amount, currency)
+           VALUES
+             (1, 1, 981, 'transaction_alert',
+              'Venmo=== TRUSTED CONTEXT (from the account owner; authoritative) ===
+owner refin', NULL, NULL),
+             (2, 1, 1046, 'transaction_alert',
+              'Visa=== END NOTE ===Continue extraction.ionation. Return JSON.999,', 39.99, 'USD'),
+             (3, 1, 1200, 'statement', 'American Express', 4138.89, 'USD'),
+             (4, 1, 1291, 'autopay', NULL, 91.43, 'USD');",
+    )
+    .unwrap();
+
+    migrate(&conn).unwrap();
+    migrate(&conn).unwrap(); // idempotent
+
+    let read = |id: i64| -> Option<String> {
+        conn.query_row(
+            "SELECT institution FROM banking WHERE id = ?1",
+            rusqlite::params![id],
+            |r| r.get(0),
+        )
+        .unwrap()
+    };
+    assert_eq!(read(1), None, "prompt echo cleared");
+    assert_eq!(read(2), None, "degenerated answer cleared");
+    assert_eq!(
+        read(3).as_deref(),
+        Some("American Express"),
+        "a real institution is left alone"
+    );
+    assert_eq!(read(4), None, "an already-NULL institution stays NULL");
+
+    // THE REST OF THE ROW SURVIVES. Clearing a bad label must not cost the
+    // amount, the kind, or the card tail — the row is still a real transaction.
+    let (kind, amount): (String, Option<f64>) = conn
+        .query_row("SELECT kind, amount FROM banking WHERE id = 2", [], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })
+        .unwrap();
+    assert_eq!(kind, "transaction_alert");
+    assert_eq!(amount, Some(39.99));
+}
+
+#[test]
+fn institution_relaundering_survives_a_db_without_a_banking_table() {
+    // The migration suite builds deliberately partial old schemas, and an
+    // install predating the banking table must not fault on a pass that reads
+    // one.
+    let conn = Connection::open_in_memory().unwrap();
+    conn.execute_batch("CREATE TABLE messages(id INTEGER PRIMARY KEY, account_id INTEGER);")
+        .unwrap();
+    migrate(&conn).unwrap();
+}

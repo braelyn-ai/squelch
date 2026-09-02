@@ -459,6 +459,24 @@ pub(super) fn migrate(conn: &Connection) -> Result<()> {
     // gate — a plain re-run is free.
     backfill_message_recipients(conn)?;
 
+    // Re-launder every stored institution through the extractor's OWN sanitizer,
+    // which grew a shape check after a model returned a valid-looking JSON object
+    // whose institution ran from a correct bank name straight into this crate's
+    // prompt scaffolding. The stored text was only ever CAPPED, so those rows are
+    // on screen right now reading "Venmo=== TRUSTED".
+    //
+    // In Rust and through the real function, never a hand-written SQL predicate:
+    // a second definition of "does this look like a bank name" would drift from
+    // the one the extractor enforces, and then stored data and new data would
+    // obey different rules.
+    //
+    // Self-triggering and idempotent, like the recipients backfill above: the
+    // candidate predicate is "the sanitizer disagrees with what is stored", and
+    // its output is a fixed point, so a completed pass matches nothing and a
+    // re-run is free. No done-flag needed for a pass this cheap - one short
+    // string per banking row, no bodies read.
+    resanitize_institutions(conn)?;
+
     // Guarded on table existence — migration unit tests build partial schemas.
     if !tables_exist(conn, &["triage", "deadlines", "messages"])? {
         return Ok(());
@@ -700,6 +718,39 @@ fn backfill_message_recipients(conn: &Connection) -> Result<()> {
                 params![account_id, message_id, addr],
             )?;
         }
+    }
+    Ok(())
+}
+
+/// Re-run [`banking::sanitize_institution`] over every stored institution,
+/// clearing or shortening the ones it now refuses. See the call site in
+/// [`migrate`] for why this exists and why it is written in Rust.
+///
+/// A refusal writes NULL rather than deleting the banking row: the amount, the
+/// kind and the card tail on that row are all still good, and the client falls
+/// back to the sender's display name for the label, so the card keeps reading
+/// "Venmo" without the paragraph after it.
+fn resanitize_institutions(conn: &Connection) -> Result<()> {
+    use crate::triage::extract::banking::sanitize_institution;
+
+    if !tables_exist(conn, &["banking"])? {
+        return Ok(());
+    }
+    let rows: Vec<(i64, String)> = {
+        let mut stmt =
+            conn.prepare("SELECT id, institution FROM banking WHERE institution IS NOT NULL")?;
+        stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<std::result::Result<Vec<_>, _>>()?
+    };
+    for (id, stored) in rows {
+        let clean = sanitize_institution(Some(&stored));
+        if clean.as_deref() == Some(stored.as_str()) {
+            continue;
+        }
+        conn.execute(
+            "UPDATE banking SET institution = ?2 WHERE id = ?1",
+            rusqlite::params![id, clean],
+        )?;
     }
     Ok(())
 }

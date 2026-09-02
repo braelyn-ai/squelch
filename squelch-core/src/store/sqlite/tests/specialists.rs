@@ -2983,3 +2983,104 @@ fn the_redetect_one_shot_records_itself_even_when_it_deletes_nothing() {
     assert_eq!(store.shipments_redetect_cleanup(acct).unwrap(), 0);
     assert_eq!(redetect_flag(&store, acct).as_deref(), Some("done"));
 }
+
+// ---- one-shot receipt re-parse ----------------------------------------
+
+/// Amazon's own unrounded total, verbatim, plus the "your order" boilerplate
+/// that classifies the mail. `$67.29` is the right answer.
+const AMAZON_FLOAT_BODY: &str = "* Gap Filler Syringe\n  Quantity: 1\n  7.97 USD\n\n\
+     * Goat Ram Horn Devil Mask\n  Quantity: 2\n  21.99 USD\n\n\
+     Total\n67.28999999999999 USD\n\n\
+     If your order contains one or more items from a third party.";
+
+#[test]
+fn reparse_corrects_a_float_tail_total_and_leaves_good_rows_alone() {
+    let (store, acct) = store();
+
+    // The row as the OLD parser wrote it: the fractional tail of the total,
+    // stored as the total. This is what a receipts card was rendering as
+    // $28,999,999,999,999.
+    let bad = triaged(acct, "g-amz", "t-amz")
+        .from("shipment-tracking@amazon.com")
+        .from_name(Some("Amazon.com"))
+        .subject("Shipped: 2 items")
+        .body(AMAZON_FLOAT_BODY)
+        .receipt(crate::triage::ReceiptInfo {
+            amount: Some(28_999_999_999_999.0),
+            currency: Some("USD".into()),
+        })
+        .ingest(&store);
+
+    // A receipt the old parser already got right.
+    let good = triaged(acct, "g-ok", "t-ok")
+        .from("receipts@shop.com")
+        .from_name(Some("Shop"))
+        .subject("Your receipt")
+        .body("Thank you for your order.\nOrder total: $12.34")
+        .receipt(crate::triage::ReceiptInfo {
+            amount: Some(12.34),
+            currency: Some("USD".into()),
+        })
+        .ingest(&store);
+    let _ = (bad, good);
+
+    assert_eq!(
+        store.receipts_reparse_cleanup(acct).unwrap(),
+        1,
+        "only the mis-parsed row is corrected"
+    );
+
+    let by_amount = |store: &SqliteStore| -> Vec<Option<f64>> {
+        let mut v: Vec<Option<f64>> = store
+            .list_receipts(acct, 30)
+            .unwrap()
+            .iter()
+            .map(|r| r.amount)
+            .collect();
+        v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        v
+    };
+    assert_eq!(
+        by_amount(&store),
+        vec![Some(12.34), Some(67.29)],
+        "the float tail becomes the real total; the good row is untouched"
+    );
+
+    // ONCE PER ACCOUNT: the flag commits with the corrections, so a second call
+    // judges nothing at all.
+    assert_eq!(store.receipts_reparse_cleanup(acct).unwrap(), 0);
+    assert_eq!(by_amount(&store), vec![Some(12.34), Some(67.29)]);
+}
+
+#[test]
+fn reparse_is_a_no_op_on_a_store_that_never_mis_parsed() {
+    // The pass must not invent work. The stored amount already agrees with what
+    // the parser says about this body, so nothing is written.
+    let (store, acct) = store();
+    receipt_triaged(acct, "g-r1", "t-r1", Some(3.49))
+        .body("Thank you for your ride. Total: $3.49")
+        .ingest(&store);
+    assert_eq!(store.receipts_reparse_cleanup(acct).unwrap(), 0);
+    assert_eq!(
+        store.list_receipts(acct, 30).unwrap()[0].amount,
+        Some(3.49),
+        "a correct amount is never rewritten"
+    );
+}
+
+#[test]
+fn reparse_never_clears_an_amount_it_cannot_reproduce() {
+    // ABSENT EVIDENCE IS NOT EVIDENCE OF ABSENCE. A body that yields no total
+    // today does not make yesterday's stored total wrong, and a repair pass that
+    // blanks money on silence is worse than the bug it was written to fix.
+    let (store, acct) = store();
+    receipt_triaged(acct, "g-r2", "t-r2", Some(3.49))
+        .body("Thanks for riding with us.")
+        .ingest(&store);
+    assert_eq!(store.receipts_reparse_cleanup(acct).unwrap(), 0);
+    assert_eq!(
+        store.list_receipts(acct, 30).unwrap()[0].amount,
+        Some(3.49),
+        "an unreproducible amount is left standing, not cleared"
+    );
+}

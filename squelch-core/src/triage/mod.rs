@@ -30,7 +30,7 @@ pub(crate) mod text;
 
 pub use calendar::{CalendarInfo, CalendarKind, detect_calendar};
 pub use deadline::DeadlineHit;
-pub use receipt::{ReceiptInfo, detect_receipt};
+pub use receipt::{ReceiptInfo, detect_receipt, recompute_total};
 pub use shipment::{
     CarrierTrack, ShipmentInfo, ShipmentStatus, detect_shipment, is_ambiguous_tracking_shape,
 };
@@ -463,6 +463,16 @@ pub fn stage1_sealed_guard(row: &Stage1Queued) -> crate::error::Result<()> {
 /// Historical rows stamped before the split stay ambiguous; nothing records when
 /// they were processed, so they cannot be re-attributed after the fact.
 pub const STALE_SKIP_MODEL: &str = "stale-skip";
+
+/// The `extractor_model_used` stamp for a row an extractor REFUSED because the
+/// message had no body to read (see
+/// [`extract::route_extract_row`](crate::triage::extract::route_extract_row)).
+///
+/// Its own value, not [`STALE_SKIP_MODEL`], for exactly the reason that constant
+/// exists: "too old to spend a call on" and "there was nothing in it to read"
+/// are different facts about a row, and collapsing them makes the pass
+/// unauditable at the moment somebody asks why a bank alert has no record.
+pub const NO_BODY_SKIP_MODEL: &str = "skip-no-body";
 
 /// How long a human's re-triage request FORCES a row through the LLM passes.
 ///
