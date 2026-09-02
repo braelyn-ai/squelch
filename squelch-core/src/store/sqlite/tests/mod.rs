@@ -9,6 +9,7 @@ mod feedback;
 mod groups;
 mod messages;
 mod migrate;
+mod notify;
 mod rules;
 mod search;
 mod spam;

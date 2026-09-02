@@ -205,6 +205,22 @@ run_suite thread-arrivals \
   Sources/Passband/Lib/ThreadArrivals.swift \
   Tests/ThreadArrivalsTests.swift
 
+# The fork the notify lane put in the event feed: which frames are mail with a
+# thread to open, and which are the fast word that a login code arrived. Both
+# the decode and the routing are pure, which is the point — the alternative to
+# asserting them here is discovering the answer on a lock screen. The auth
+# banner's copy comes along because it is the one place a subject could reach
+# a notification, and the fixture makes the subject a six-digit code.
+run_suite sealed-event \
+  Sources/Passband/Model/SubjectText.swift \
+  Sources/Passband/Model/WireTypes.swift \
+  Sources/Passband/Lib/Format.swift \
+  Sources/Passband/Lib/AsyncMemo.swift \
+  Sources/Passband/Lib/SenderIdentity.swift \
+  Sources/Passband/Lib/AuthLabels.swift \
+  Sources/Passband/Model/EventBanner.swift \
+  Tests/SealedEventTests.swift
+
 # The settings search. A ranking is the one kind of code where a green build
 # says nothing at all: the matcher compiles whatever weights it is given, and
 # only a fixture says whether "dark mode" lands on the theme switch. One file,

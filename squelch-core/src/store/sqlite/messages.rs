@@ -684,6 +684,31 @@ impl SqliteStore {
         const PROCESSED: &str = "(triage.model_used IS NOT NULL \
              OR (triage.stage1_model_used IS NOT NULL \
                  AND triage.stage1_model_used NOT IN ('rule', 'n/a')))";
+        // DID A PERSON RULE ON *SENSITIVITY* FOR THIS ROW? Not "did a person
+        // touch this row at all", which is what `triage.model_used = 'human'`
+        // asks: `correct_triage` stamps that column for a TIER or a CATEGORY
+        // correction too, so keying the seal freeze on it would pin the
+        // sensitivity of every human-corrected row forever and take the
+        // detector-fix direction below down with it — a better `detect_sealed`
+        // could never newly seal a message whose tier somebody once fixed.
+        //
+        // `triage_feedback` is the exact record instead: `correct_triage`
+        // writes one row per correction, naming the axis, in the SAME
+        // transaction as the UPDATE, so a `dimension = 'sensitivity'` row is
+        // "a person decided whether this is auth mail" and nothing else. It
+        // rides `idx_triage_feedback_msg`, so this is an index probe on a table
+        // that holds one row per human correction.
+        //
+        // BOTH DIRECTIONS, which is the point of asking about the axis rather
+        // than the value: a person's seal outranks the seed that would revert
+        // it (docs/SECURITY.md §4), and a person's un-seal outranks the same
+        // recall-biased detector that over-sealed in the first place. An
+        // un-seal a re-walk quietly undid would be a correction the user has to
+        // make again every poll.
+        const HUMAN_SENSITIVITY: &str = "EXISTS (SELECT 1 FROM triage_feedback f \
+             WHERE f.account_id = triage.account_id \
+               AND f.message_id = triage.message_id \
+               AND f.dimension = 'sensitivity')";
         // SHIPMENTS-EXTRACTOR TRIGGER. 'pending' queues the row for the shipments
         // specialist; NULL means no shipping signal at ingest. Sealed, sent and
         // spam mail never queue — the detector does not even run for them.
@@ -700,12 +725,39 @@ impl SqliteStore {
             "INSERT INTO triage(message_id, account_id, importance, tier, sensitivity,
                  sealed_kind, one_line, reason, deadline, matched_rule_id,
                  stage1_model_used, needs_stage2, model_used,
-                 status, resolved_at, created_at, field_reasons, ship_extract_model)
-             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,NULL,?13,?14,?15,?16,?17)
+                 status, resolved_at, created_at, field_reasons, ship_extract_model,
+                 notify_eligible_at)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,NULL,?13,?14,?15,?16,?17,?18)
              ON CONFLICT(message_id) DO UPDATE SET
                  importance=CASE WHEN {PROCESSED} THEN triage.importance ELSE excluded.importance END,
                  tier=CASE WHEN {PROCESSED} THEN triage.tier ELSE excluded.tier END,
-                 sensitivity=excluded.sensitivity, sealed_kind=excluded.sealed_kind,
+                 -- A HUMAN SEAL OUTRANKS A RE-INGEST, which every other verdict
+                 -- column has always said via the PROCESSED predicate above and
+                 -- this one did not.
+                 -- A re-ingest carries only heuristic SEED values, and the seed
+                 -- detector never saw whatever made a person call this mail
+                 -- auth, so `excluded.sensitivity` here reverts the seal — on a
+                 -- catch-up, or on the routine INBOX re-walk a held cursor
+                 -- causes. That is not a bookkeeping loss: an unsealed row is a
+                 -- row the fast lane will send to a model and turn into an
+                 -- events row, minted AFTER `correct_triage` ran its redaction
+                 -- and so with nothing left that can redact it (docs/SECURITY.md
+                 -- §4). HUMAN_SENSITIVITY rather than PROCESSED because only a
+                 -- PERSON outranks a person: an LLM-classified row refreshes
+                 -- from the fresh detection as before, which is what lets a
+                 -- detector fix newly seal an old message.
+                 sensitivity=CASE WHEN {HUMAN_SENSITIVITY}
+                     THEN triage.sensitivity ELSE excluded.sensitivity END,
+                 -- SEALED_KIND IS NOT FROZEN WITH IT, deliberately. It looks
+                 -- like it should move with the column above, and freezing it
+                 -- only loses: `correct_triage` never writes a kind, so a row
+                 -- a PERSON sealed carries NULL until a later detection
+                 -- supplies one, and that kind is what routes the tap to the
+                 -- reveal flow. Nothing reads it ungated either — every query
+                 -- that selects it (`sealed_messages`, `sealed_body`, the
+                 -- shred sweep) joins on `sensitivity = 'sealed'` — so a stale
+                 -- kind left on a row a person called normal is inert.
+                 sealed_kind=excluded.sealed_kind,
                  one_line=CASE WHEN {PROCESSED} THEN triage.one_line ELSE excluded.one_line END,
                  reason=CASE WHEN {PROCESSED} THEN triage.reason ELSE excluded.reason END,
                  field_reasons=CASE WHEN {PROCESSED} THEN triage.field_reasons ELSE excluded.field_reasons END,
@@ -721,7 +773,17 @@ impl SqliteStore {
                      THEN triage.ship_extract_model ELSE excluded.ship_extract_model END,
                  status=CASE WHEN excluded.status='done' THEN 'done' ELSE triage.status END,
                  resolved_at=CASE WHEN excluded.status='done'
-                     THEN excluded.resolved_at ELSE triage.resolved_at END"
+                     THEN excluded.resolved_at ELSE triage.resolved_at END,
+                 -- WRITTEN ONCE, ON FIRST INSERT, AND NEVER AGAIN — not even to
+                 -- a fresher stamp, and not conditioned on `PROCESSED` like the
+                 -- verdict columns. Notify eligibility is a fact about when we
+                 -- FIRST saw a message, so a re-ingest (history overlap, a
+                 -- catch-up re-scan, a sealed row being rewritten) must not be
+                 -- able to move it forward: that would hand the whole re-scanned
+                 -- window a fresh hour of notify eligibility, which is the storm
+                 -- the guard exists to prevent. A NULL stays NULL for the same
+                 -- reason, from the other direction.
+                 notify_eligible_at = triage.notify_eligible_at"
         );
         tx.execute(
             &triage_upsert,
@@ -743,6 +805,7 @@ impl SqliteStore {
                 now_s,
                 field_reasons_json,
                 ship_extract_model,
+                triaged.notify_eligible_at.map(|t| t.to_rfc3339()),
             ],
         )?;
 

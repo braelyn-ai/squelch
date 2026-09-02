@@ -7,6 +7,11 @@ use super::*;
 /// One `events` row, columns in SELECT order, into an [`Event`]. An unparseable
 /// `kind`/`tier` falls back to the least-alarming value rather than erroring:
 /// refusing to serve a stored row would stall a client's cursor at it forever.
+///
+/// `sealed_kind` follows the same rule for the same reason, and lands on the
+/// same side: an unrecognized kind reads as `None`, i.e. an ordinary event. That
+/// costs a tap the reveal route and never the other way round, which is the
+/// direction that cannot leak.
 fn map_event(r: &rusqlite::Row<'_>) -> rusqlite::Result<Event> {
     Ok(Event {
         id: r.get(0)?,
@@ -18,7 +23,10 @@ fn map_event(r: &rusqlite::Row<'_>) -> rusqlite::Result<Event> {
         sender: r.get(6)?,
         one_line: r.get(7)?,
         deadline: r.get(8)?,
-        created_at: dt(r, 9)?,
+        sealed_kind: r
+            .get::<_, Option<String>>(9)?
+            .and_then(|s| SealedKind::parse(&s)),
+        created_at: dt(r, 10)?,
     })
 }
 
@@ -45,8 +53,8 @@ impl SqliteStore {
             // so a re-ingest or a second refined verdict stays silent (0 rows).
             let n = conn.execute(
                 "INSERT OR IGNORE INTO events(account_id, message_id, thread_id, kind, tier,
-                     importance, sender, one_line, deadline, created_at)
-                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+                     importance, sender, one_line, deadline, sealed_kind, created_at)
+                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
                 params![
                     ev.account_id,
                     ev.message_id,
@@ -57,6 +65,7 @@ impl SqliteStore {
                     ev.sender,
                     ev.one_line,
                     ev.deadline,
+                    ev.sealed_kind.map(|k| k.as_str()),
                     Utc::now().to_rfc3339(),
                 ],
             )?;
@@ -73,6 +82,22 @@ impl SqliteStore {
         Ok(Some(inserted))
     }
 
+    pub(super) fn message_has_event(&self, account_id: AccountId, message_id: i64) -> Result<bool> {
+        let conn = self.lock()?;
+        // Rides the `UNIQUE(message_id)` index, so this is a point lookup rather
+        // than a scan; `account_id` is a scoping filter on the one row it finds.
+        // SELECT 1, not the row: the caller wants existence and nothing else,
+        // and an event row carries a `one_line` this caller must never read.
+        let found: Option<i64> = conn
+            .query_row(
+                "SELECT 1 FROM events WHERE account_id = ?1 AND message_id = ?2",
+                params![account_id, message_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(found.is_some())
+    }
+
     pub(super) fn events_after(
         &self,
         account_id: AccountId,
@@ -82,7 +107,7 @@ impl SqliteStore {
         let conn = self.lock()?;
         let mut stmt = conn.prepare(
             "SELECT id, message_id, thread_id, kind, tier, importance, sender, one_line,
-                    deadline, created_at
+                    deadline, sealed_kind, created_at
              FROM events
              WHERE account_id = ?1 AND id > ?2
              ORDER BY id ASC
@@ -99,7 +124,7 @@ impl SqliteStore {
         let row = conn
             .query_row(
                 "SELECT id, message_id, thread_id, kind, tier, importance, sender, one_line,
-                        deadline, created_at
+                        deadline, sealed_kind, created_at
                  FROM events
                  WHERE account_id = ?1 AND id = ?2",
                 params![account_id, id],

@@ -91,7 +91,13 @@ str_enum! {
 
 str_enum! {
     /// The kind of auth-related content that caused a message to be sealed.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    ///
+    /// Serde-visible because it rides on [`Event::sealed_kind`], which crosses
+    /// the human door: the KIND is metadata of exactly the class `/client/sealed`
+    /// already serves, and it is what lets a client route a tap to the reveal
+    /// flow. The sealed body is a different type entirely and does not.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "snake_case")]
     pub enum SealedKind {
         Otp => "otp",
         PasswordReset => "password_reset",
@@ -665,8 +671,9 @@ str_enum! {
 /// DENORMALIZED SNAPSHOT taken at emission time: a client must render the whole
 /// notification from this row alone (the iOS Notification Service Extension
 /// fetches one by id after an opaque push and has no second round-trip to
-/// spend). Sealed mail can never be represented here — emission requires
-/// `Sensitivity::Normal`; see docs/SECURITY.md.
+/// spend). Sealed mail is represented here only as a KIND and a fixed sentence
+/// derived from it (docs/NOTIFY.md §11.6): no subject, no body, no code ever
+/// reaches this shape. See docs/SECURITY.md §4.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Event {
     /// Monotonic id — also the per-channel cursor clients page with (`after`).
@@ -681,6 +688,16 @@ pub struct Event {
     /// Snapshotted deadline as stored RFC3339 text, passed through verbatim:
     /// display copy only, never something the delivery path computes with.
     pub deadline: Option<String>,
+    /// WHICH AUTH SHAPE this event is about, `None` for every ordinary event.
+    /// A client uses it to route the tap to the sealed reveal flow instead of a
+    /// thread fetch the human door 404s, and to pick an icon. NOT A GATE: no
+    /// query reads it to decide what to serve, and none may.
+    ///
+    /// `skip_serializing_if` is a WIRE-COMPATIBILITY promise, not a size saving:
+    /// every event that exists today omits the key entirely, so an old client
+    /// decoding a new daemon's replay sees exactly the bytes it has always seen.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sealed_kind: Option<SealedKind>,
     pub created_at: DateTime<Utc>,
 }
 

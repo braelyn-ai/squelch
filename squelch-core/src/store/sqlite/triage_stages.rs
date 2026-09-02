@@ -523,7 +523,7 @@ impl SqliteStore {
         // is not. Every other queue orders the same way, for the same reason.
         let mut stmt = conn.prepare(
             "SELECT m.id, m.thread_id, m.from_addr, m.subject, m.body, t.sensitivity,
-                    m.received_at, t.retriage_at,
+                    m.received_at, t.retriage_at, t.notify_eligible_at,
                     EXISTS(
                         SELECT 1 FROM contacts c
                         WHERE c.account_id = m.account_id
@@ -556,8 +556,9 @@ impl SqliteStore {
                     sensitivity: Sensitivity::parse(&r.get::<_, String>(5)?),
                     received_at: dt(r, 6)?,
                     retriage_at: dt_opt(r, 7)?,
-                    is_known_contact: r.get::<_, i64>(8)? != 0,
-                    sender_corrected: r.get::<_, i64>(9)? != 0,
+                    notify_eligible_at: dt_opt(r, 8)?,
+                    is_known_contact: r.get::<_, i64>(9)? != 0,
+                    sender_corrected: r.get::<_, i64>(10)? != 0,
                 })
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -929,7 +930,8 @@ impl SqliteStore {
         let conn = self.lock()?;
         let row = conn
             .query_row(
-                "SELECT tier, importance, one_line, needs_stage2, deadline
+                "SELECT tier, importance, one_line, needs_stage2, deadline,
+                        notify_eligible_at
                  FROM triage
                  WHERE message_id = ?1 AND account_id = ?2 AND sensitivity = 'normal'",
                 params![message_id, account_id],
@@ -943,11 +945,31 @@ impl SqliteStore {
                             .get::<_, Option<String>>(4)?
                             .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
                             .map(|d| d.with_timezone(&Utc)),
+                        notify_eligible_at: dt_opt(r, 5)?,
                     })
                 },
             )
             .optional()?;
         Ok(row)
+    }
+
+    pub(super) fn notify_eligible_at(
+        &self,
+        account_id: AccountId,
+        message_id: i64,
+    ) -> Result<Option<DateTime<Utc>>> {
+        let conn = self.lock()?;
+        // NO `sensitivity` PREDICATE. See the trait doc: a sealed row carries a
+        // stamp like any other and `triage_seed_verdict` cannot see it.
+        let at = conn
+            .query_row(
+                "SELECT notify_eligible_at FROM triage
+                 WHERE message_id = ?1 AND account_id = ?2",
+                params![message_id, account_id],
+                |r| dt_opt(r, 0),
+            )
+            .optional()?;
+        Ok(at.flatten())
     }
 
     pub(super) fn stage1_mark_processed(
@@ -1048,7 +1070,7 @@ impl SqliteStore {
         // Hand-requested rows sort first; see `stage1_queue`.
         let mut stmt = conn.prepare(
             "SELECT m.id, m.thread_id, m.from_addr, m.subject, m.body, t.sensitivity,
-                    sr.want_text, m.received_at, t.retriage_at,
+                    sr.want_text, m.received_at, t.retriage_at, t.notify_eligible_at,
                     EXISTS(
                         SELECT 1 FROM contacts c
                         WHERE c.account_id = m.account_id
@@ -1081,8 +1103,9 @@ impl SqliteStore {
                     rule_want_text: r.get::<_, Option<String>>(6)?.filter(|s| !s.is_empty()),
                     received_at: dt(r, 7)?,
                     retriage_at: dt_opt(r, 8)?,
-                    is_known_contact: r.get::<_, i64>(9)? != 0,
-                    escalation_reason: r.get::<_, Option<String>>(10)?,
+                    notify_eligible_at: dt_opt(r, 9)?,
+                    is_known_contact: r.get::<_, i64>(10)? != 0,
+                    escalation_reason: r.get::<_, Option<String>>(11)?,
                     // Filled per row below; both need the row's own identifiers,
                     // and the batch is `batch_per_cycle` rows, not a table scan.
                     sender_history: SenderHistory::default(),

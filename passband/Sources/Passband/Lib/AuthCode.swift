@@ -90,21 +90,11 @@ enum AuthCode {
 
 // MARK: - auth copy
 
-/// User-facing copy for auth mail. "Sealed" is internal jargon and must never
-/// reach the UI, so wire `sealed_kind` values map to auth-centric labels.
-enum AuthCopy {
-    static func label(_ kind: SealedKind?) -> String {
-        switch kind {
-        case .otp: "Login code"
-        case .passwordReset: "Password reset"
-        case .magicLink: "Sign-in link"
-        case .loginAlert: "Sign-in alert"
-        case .verification: "Verification"
-        // A kind we don't know stays generic — its raw string is never shown.
-        case .unknown, nil: "Auth message"
-        }
-    }
-
+/// The DRAWN half of `AuthCopy`. The words themselves live in
+/// Lib/AuthLabels.swift, which is Foundation-only so the iOS notification
+/// service extension can compile it; this file imports SwiftUI for the ledger
+/// below and so can never be on that extension's source list.
+extension AuthCopy {
     static func symbol(_ kind: SealedKind?) -> String {
         switch kind {
         case .otp: "key.fill"

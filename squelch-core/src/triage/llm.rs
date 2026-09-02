@@ -32,8 +32,11 @@ const GATEWAY_VK_HEADER: &str = "x-bf-vk";
 /// truncation is retried once at the doubled value.
 pub const MAX_TOKENS: u32 = 8_000;
 pub const MAX_TOKENS_RETRY: u32 = 16_000;
-/// Retry policy for retryable statuses (429 / 5xx / 529).
-const MAX_TRIES: u32 = 3;
+/// Retry policy for retryable statuses (429 / 5xx / 529): the value every
+/// BATCH pass uses, and [`LlmRequest::max_tries`]'s only sane default. Public
+/// because a caller that wants a different one has to be able to say "the usual
+/// number" without knowing what it is.
+pub const MAX_TRIES: u32 = 3;
 pub const BACKOFF_CAP: Duration = Duration::from_secs(60);
 
 /// The URL for a provider's production endpoint.
@@ -59,6 +62,17 @@ pub struct LlmRequest<'a> {
     /// hard over a fully contextualized one. `None` omits the field entirely,
     /// which is what a model without effort support requires.
     pub effort: Option<&'a str>,
+    /// How many attempts a RETRYABLE status (429 / 5xx / 529) gets before the
+    /// call gives up. [`MAX_TRIES`] for every batch pass; `1` means ONE
+    /// attempt, no backoff, and a 429 comes straight back as a failure.
+    ///
+    /// It is a per-request field rather than a constant because latency budget
+    /// is a property of the CALLER, not of the provider. A pass grinding a
+    /// queue can afford to sleep 60s and retry; the notify fast lane
+    /// (docs/NOTIFY.md §11.5) is a user waiting for their phone to buzz, and
+    /// the deliberate lane behind it IS its retry, so a second attempt there
+    /// buys nothing and costs the whole window.
+    pub max_tries: u32,
 }
 
 /// The outcome of a single LLM call, generic over the verdict `T`. Every stage
@@ -103,8 +117,10 @@ impl std::fmt::Display for ClassifyError {
 /// the IDENTICAL system prompt, fenced user message, and output schema.
 ///
 /// Retry policy: 429 (honors `retry-after`) and 529/5xx retry with exponential
-/// backoff (60s cap, 3 tries); 400/401 are permanent; a truncation retries once
-/// at a higher token budget.
+/// backoff (60s cap, [`LlmRequest::max_tries`] attempts, [`MAX_TRIES`] for every
+/// batch pass); 400/401 are permanent; a truncation retries once at a higher
+/// token budget REGARDLESS of `max_tries`, since that is one request the model
+/// has already answered rather than a retry of a failed one.
 pub async fn classify_llm(
     http: &reqwest::Client,
     url: &str,
@@ -387,7 +403,7 @@ async fn classify_anthropic(
             };
             req.json(&body)
         };
-        let parsed: MessagesResponse = match send_with_retry(build).await? {
+        let parsed: MessagesResponse = match send_with_retry(build, req.max_tries).await? {
             SendOk::Body(b) => b,
             SendOk::PermanentFailure(kind) => return Ok(LlmOutcome::Failed(kind)),
         };
@@ -457,7 +473,7 @@ async fn classify_openai(
                 .header("content-type", "application/json")
                 .json(&body)
         };
-        let parsed: OpenAiResponse = match send_with_retry(build).await? {
+        let parsed: OpenAiResponse = match send_with_retry(build, req.max_tries).await? {
             SendOk::Body(b) => b,
             SendOk::PermanentFailure(kind) => return Ok(LlmOutcome::Failed(kind)),
         };
@@ -519,11 +535,20 @@ struct ApiErrorInner {
 }
 
 /// POST the request, applying the retry policy for retryable statuses.
-async fn send_with_retry<T, F>(build: F) -> std::result::Result<SendOk<T>, ClassifyError>
+///
+/// `max_tries` is the caller's ([`LlmRequest::max_tries`]), not a constant: 1
+/// means one attempt and no sleep at all, which is what a latency-bounded
+/// caller needs. Clamped to at least one, since zero attempts would return a
+/// retry-exhaustion error for a request that was never sent.
+async fn send_with_retry<T, F>(
+    build: F,
+    max_tries: u32,
+) -> std::result::Result<SendOk<T>, ClassifyError>
 where
     T: serde::de::DeserializeOwned,
     F: Fn() -> reqwest::RequestBuilder,
 {
+    let max_tries = max_tries.max(1);
     let mut attempt: u32 = 0;
     loop {
         attempt += 1;
@@ -532,7 +557,7 @@ where
         let resp = match send {
             Ok(r) => r,
             Err(_) => {
-                if attempt >= MAX_TRIES {
+                if attempt >= max_tries {
                     return Err(ClassifyError {
                         kind: "transport".into(),
                         retryable: true,
@@ -555,7 +580,7 @@ where
         let code = status.as_u16();
         let retryable = code == 429 || code == 529 || (500..600).contains(&code);
         if retryable {
-            if attempt >= MAX_TRIES {
+            if attempt >= max_tries {
                 return Err(ClassifyError {
                     kind: format!("http_{code}"),
                     retryable: true,

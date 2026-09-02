@@ -2,12 +2,25 @@
 // NOT on screen, whose entire output is a banner saying which mailbox a login
 // code just landed in.
 //
-// It exists because sealed mail deliberately never rides the event feed — the
-// daemon keeps auth metadata off SSE — so an `EventStream` cannot say a word
-// about it. The live account learns of it through SitrepPoller → AuthArrival;
-// every other account would learn of it never, which for a client the human
-// added a second mailbox to is the one gap that matters: a code arrives, the
-// app is open, and nothing happens.
+// It exists because for a long time sealed mail did not ride the event feed at
+// all — the daemon kept auth metadata off SSE — so an `EventStream` could not
+// say a word about it. The live account learned of it through SitrepPoller →
+// AuthArrival; every other account would have learned of it never, which for a
+// client the human added a second mailbox to is the one gap that matters: a
+// code arrives, the app is open, and nothing happens.
+//
+// THAT IS NO LONGER THE WHOLE STORY. The notify lane emits a sealed event
+// (docs/NOTIFY.md §11.6), and `AccountManager.noteSealedEvent` rings `pollNow`
+// below the instant one lands on this account's feed. It is still a doorbell
+// and not the answer: the event carries no subject and its `created_at` is when
+// triage emitted the row, not when the mail arrived, so what the banner says
+// still comes from THIS request and `AuthSeenSet` is still the only dedup.
+//
+// So the 30s loop is now the FALLBACK rather than the only way — for a daemon
+// with the lane switched off, for a frame lost to a dropped connection, and for
+// the window between a reconnect and its first frame. It stays exactly as it
+// was: a poll that finds nothing costs one request against a mailbox nobody is
+// looking at.
 //
 // DELIBERATELY THE THIN VERSION of that flow. No ring, no auto-reveal, no code
 // in the notification. Revealing a body is audited server-side and belongs to
@@ -57,6 +70,14 @@ final class BackgroundAuthWatch {
 
     private let resident = ResidentTask()
 
+    /// The pull in flight, shared by the 30s loop and every doorbell ring, held
+    /// as the TASK rather than a flag so an overlapping caller JOINS it — the
+    /// same arrangement `SitrepPoller` uses, and here it is what preserves the
+    /// ONE REQUEST IN FLIGHT rule that used to fall out of having a single
+    /// caller. Two sealed events landing together must not become two requests
+    /// racing to write one seen-set.
+    private var inFlight: Task<Bool, Never>?
+
     /// The persisted seen-set, shared with `AuthArrival` (see AuthSeenSet).
     /// Read from disk HERE, at construction, so a watcher restarted by a switch
     /// picks up everything the live flow recorded while it was the live one.
@@ -93,14 +114,29 @@ final class BackgroundAuthWatch {
 
     func stop() {
         resident.stop()
+        inFlight?.cancel()
+        inFlight = nil
+    }
+
+    /// THE DOORBELL: a sealed event just named this account on its feed, so ask
+    /// the daemon what landed now rather than up to 30 seconds from now. Fire
+    /// and forget — the caller is an SSE frame handler with nothing to wait for
+    /// — and cheap to over-ring: it joins a pull already running, and the
+    /// seen-set decides exactly once whether the answer is worth a banner.
+    ///
+    /// The 30s loop keeps its own cadence underneath, untouched. This does not
+    /// reset the backoff and cannot: a doorbell ringing against a wedged daemon
+    /// would otherwise be a way to poll it faster than a working one.
+    func pollNow() {
+        Task { [weak self] in _ = await self?.pollShared() }
     }
 
     // MARK: - the loop
 
     /// Poll, sleep, repeat — and back off instead of sleeping when the daemon
-    /// did not answer. ONE REQUEST IN FLIGHT by construction: this loop is the
-    /// only caller of `poll()` and it awaits its own, so a slow daemon delays
-    /// the next request rather than stacking one on top of it.
+    /// did not answer. ONE REQUEST IN FLIGHT, now enforced by `pollShared`
+    /// rather than by this being the only caller, so a slow daemon delays the
+    /// next request rather than stacking one on top of it.
     private func run() async {
         // Ask for the notification grant here as well as on the feed's first
         // connect: an install whose only auth mail arrives in a background
@@ -109,7 +145,7 @@ final class BackgroundAuthWatch {
 
         var backoff = Backoff(base: Self.backoffBase, cap: Self.backoffCap)
         while !Task.isCancelled {
-            let answered = await poll()
+            let answered = await pollShared()
             if Task.isCancelled { return }
             if answered {
                 backoff.reset()
@@ -118,6 +154,17 @@ final class BackgroundAuthWatch {
                 await backoff.sleep()
             }
         }
+    }
+
+    /// One pull, or a join of the one already running. Every caller comes
+    /// through here; nothing calls `poll()` directly.
+    private func pollShared() async -> Bool {
+        if let inFlight { return await inFlight.value }
+        let task = Task { await self.poll() }
+        inFlight = task
+        let answered = await task.value
+        if inFlight == task { inFlight = nil }
+        return answered
     }
 
     /// One pull of the sealed metadata. Returns whether the daemon ANSWERED,

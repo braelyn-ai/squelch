@@ -303,6 +303,9 @@ impl OpensPoller {
             sender: tracked.from_addr,
             one_line: tracked.subject,
             deadline: None,
+            // An open receipt is about the user's OWN sent mail; nothing here is
+            // sealed and nothing routes to the reveal flow.
+            sealed_kind: None,
         };
         if let Err(e) = self.store.append_event(&ev) {
             eprintln!("squelch: opens poller could not append an opened event: {e}");

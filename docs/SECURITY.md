@@ -241,7 +241,11 @@ queryable as normal mail — not even for an instant.
 - **Human door only.** `squelch-api` (`/client/*`, bearer auth) carries sealed
   **metadata** at `/client/sealed` and exactly one body at
   `/client/sealed/{id}/reveal`, which appends the audit row **before** returning
-  and sets `Cache-Control: no-store`.
+  and sets `Cache-Control: no-store`. A **sealed notification** (`events` rows
+  carrying `sealed_kind`, docs/NOTIFY.md §11.6) is the same metadata class and
+  no wider: the sender address, the thread id, and a fixed phrase chosen by the
+  kind. It rides the SSE feed and `get_event`, both behind the same bearer; the
+  agent door has zero references to `events`.
 
 **Human-door credentials.** Two kinds, checked in this order by
 `squelch-api/src/auth.rs`:
@@ -451,6 +455,82 @@ can filter". Keep the guards returning errors, the reveal audited-before-served 
 `no-store`, and writes human-door only. Keep `drafts` off the agent door and out of
 the audit log, and keep both seal paths scrubbing it — a draft outliving its parent's
 seal is a quotation of auth mail the user has already decided is auth.
+
+**Sealed notifications, and the six things that keep them safe.** Sealed mail
+buzzes (docs/NOTIFY.md §6, §11.6). A ping is not a reveal — `PushRequest` is
+`{event_id, collapse_id}` and the relay is blind by construction — but the
+`events` row behind it is served to a client, so it is the surface with rules:
+
+- **A sealed event row carries `sealed_kind`-derived text only.** The `one_line`
+  is one of five constants picked by the kind ("Login code arrived", "Password
+  reset requested"). Never the subject, never a snippet, never the code, never
+  anything derived from any of them. `triage::events::sealed_event` takes no
+  `subject` and no `body` parameter, and none may be added: the signature is the
+  enforcement, and this is exactly the kind of thing a later change "improves"
+  by making the notification more useful.
+- **`events` is not gated on sensitivity, and must not need to be.** The table
+  has no `sensitivity` column and not one query reads one. That is safe only for
+  as long as the bullet above holds, which is why the two are one rule rather
+  than two.
+- **The fast lane runs after seal detection and cannot see a sealed body.**
+  `sync::notify_lane::Candidate::Sealed` has no `subject` and no `body` field,
+  so the sealed path is deterministic, model-free, and type-enforced. No model
+  is ever asked about sealed mail, in either lane.
+- **A seal that lands mid-call still wins, and it is asked TWICE.**
+  `correct_triage`'s redaction can only redact an `events` row that exists when
+  the human hits seal, and a notify model call takes seconds: a user sealing the
+  mail they can already see, while the fast lane is waiting on a verdict about
+  it, would otherwise get a row appended *afterwards* carrying a one_line
+  written from the body they just declared auth — served over SSE to every
+  cursor forever, with nothing left to redact it. So `notify_lane` re-reads the
+  row through `triage_seed_verdict` (which selects `sensitivity = 'normal'`) at
+  two points, because they protect different things across different windows:
+  - **After the semaphore permit, before the request is built**, which protects
+    THE PROMPT. `tokio::time::timeout` wraps the call but never the wait for a
+    permit, so at `fast_concurrency` 4 a burst queues the last task minutes
+    behind the message it is about, all of it after the mail is visible in the
+    client.
+  - **Immediately before the event is appended**, which protects the `events`
+    row against a seal that landed while the request was actually out.
+
+  Sealed or gone records a `suppressed` ledger row and emits nothing; a store
+  error emits nothing and records nothing (an error is a fact about the
+  database, not about the message). RECORDING IS PART OF THE GUARD, not
+  bookkeeping: with no row, the lane's re-entry probe stays false, and the next
+  re-ingest inside `notify.freshness_window_secs` re-runs the whole lane over
+  the sealed body. Which is also why `ingest_message`'s triage upsert preserves
+  a human-decided `sensitivity` instead of overwriting it with the heuristic
+  seed a re-walk carries: a re-ingest that reverts a person's seal is the same
+  leak from the other end. The deliberate lane has the same guard in
+  `stage1_apply`/`stage2_apply` returning `Ok(false)`.
+
+  **"Human-decided" is asked of the AXIS, not of the row.** The predicate is a
+  `triage_feedback` row with `dimension = 'sensitivity'`, written by
+  `correct_triage` in the same transaction as the correction. It is not
+  `triage.model_used = 'human'`, which that function stamps for a *tier* or a
+  *category* correction too: keyed on the column, a freeze would pin the
+  sensitivity of every human-corrected row forever, so an improved
+  `detect_sealed` could never newly seal a message whose tier somebody once
+  fixed — and detection biasing to recall is worth nothing if it cannot be
+  improved. Keyed on the axis it holds in BOTH directions, which is the second
+  half: `detect_sealed` over-seals by design, `correct_triage` is how that is
+  undone, and a re-walk that quietly re-sealed the row would be a correction
+  the user has to make again every poll.
+
+- **The sealed path re-reads too, in the opposite direction.**
+  `notify_lane::candidate` is pure and reads the FRESH heuristic triage, so a
+  message a person un-sealed is a `Candidate::Sealed` again on the next
+  re-walk: the seed detector has not changed its mind and nothing in the gate
+  can know better. `run`'s sealed arm therefore asks the store whether the row
+  is still sealed before it appends, and records `suppressed` when it is not.
+  Otherwise "this is not a login code" costs the user an Urgent,
+  importance-90 ping on a lock screen, routed to the Auth list where the
+  message is not, once per re-walk.
+- **The decline ledger carries no email-derived text.** `notify_decisions` holds
+  ids, a lane, a decision word, a score, a model id and a latency. Not the
+  `one_line`, not the subject, nothing. It cannot leak by construction, which is
+  why it needs no sensitivity gate either — and adding a text column would give
+  it one to need.
 
 **The recipient headers a send states.** `to`, `cc` and `bcc` come from the caller
 and go into the outgoing message's headers, so `gmail_write::build_reply_rfc822` and

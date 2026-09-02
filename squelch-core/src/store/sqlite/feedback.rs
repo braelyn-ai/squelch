@@ -242,6 +242,12 @@ impl SqliteStore {
             // next `append_event` REUSE that id, and every durable cursor already
             // past it would skip that event permanently. The row stays and only
             // its CONTENT goes; a replaying client renders its generic fallback.
+            //
+            // `sealed_kind` is deliberately NOT cleared: it carries no content
+            // at all (it is routing metadata, one of five constants) and its
+            // whole job is to point a tap at the reveal flow instead of a thread
+            // fetch the human door now 404s. NULLing it on the row a human just
+            // sealed would break exactly the case it exists for.
             tx.execute(
                 "UPDATE events SET sender = '', one_line = '', deadline = NULL
                  WHERE account_id = ?1 AND message_id = ?2",

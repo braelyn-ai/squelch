@@ -577,6 +577,8 @@ pub async fn classify_at(
         user: &user,
         schema: output_schema(),
         effort: cfg.effort.as_deref(),
+        // A BATCH pass: it is grinding a queue, so a 429 is worth sleeping on.
+        max_tries: llm::MAX_TRIES,
     };
     llm::classify_into(http, url, api_key, provider, &req, |out: Stage2Output| {
         check_importance(out.importance).map(|()| out)
@@ -922,6 +924,9 @@ mod tests {
             thread: Vec::new(),
             sensitivity: Sensitivity::Normal,
             retriage_at: None,
+            // The apply math never reads the notify stamp; emission lives in
+            // `triage::events` and the sync engine, and is tested there.
+            notify_eligible_at: None,
         }
     }
 

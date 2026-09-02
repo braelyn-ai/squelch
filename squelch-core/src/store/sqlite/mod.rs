@@ -18,6 +18,7 @@ mod feedback;
 pub mod groups;
 mod messages;
 mod migrate;
+mod notify;
 mod rules;
 mod search;
 mod specialists;
@@ -35,20 +36,23 @@ use chrono::{DateTime, Utc};
 use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::error::{CoreError, Result};
+// The ledger's stored lane/decision strings ARE the metric labels; see `notify`.
+use crate::metrics::{NotifyDecision, NotifyLane};
 use crate::store::{
     AttachmentBytes, BankingApplied, ContactEntry, Device, DeviceToken, Draft, DraftFields,
     ExtractQueued, InboxUnread, IssuedDeviceToken, MarketingApplied, MarketingOffer, MessageOpen,
-    MessageUnsub, MintedPairingCode, MissingVector, NewAuditEntry, NewEvent, RevisitQueued,
-    SPAM_SYNCED_AT_KEY, SealedBody, SealedMessage, SearchFilter, SearchSort, SeedVerdict,
-    SenderHistory, SentMessage, SentMissingRecipients, SitrepBand, SpamScope, Stage1Applied,
-    Stage1Queued, Stage2Applied, Stage2CapOverrides, Stage2Queued, Stage2Usage, Stage2UsageDay,
-    Store, SyncState, ThreadSibling, TrackedMessage, TriageDebug, TriagedMessage, UsageTokens,
+    MessageUnsub, MintedPairingCode, MissingVector, NewAuditEntry, NewEvent, NewNotifyDecision,
+    NotifyDecisionRow, RevisitQueued, SPAM_SYNCED_AT_KEY, SealedBody, SealedMessage, SearchFilter,
+    SearchSort, SeedVerdict, SenderHistory, SentMessage, SentMissingRecipients, SitrepBand,
+    SpamScope, Stage1Applied, Stage1Queued, Stage2Applied, Stage2CapOverrides, Stage2Queued,
+    Stage2Usage, Stage2UsageDay, Store, SyncState, ThreadSibling, TrackedMessage, TriageDebug,
+    TriagedMessage, UsageTokens,
 };
 use crate::types::{
     AccountId, AttachmentInfo, AttentionStatus, AttentionUpdate, AuditEntry, BandCounts, Banking,
     CalendarUpdate, ClientAttachment, ClientMessage, ClientThreadView, Deadline, Disposition,
     Event, EventKind, GroupHistoryEntry, GroupMember, GroupMode, NewMessage, OpenRate, Receipt,
-    RetriageProgress, SanitizedMessage, SearchHit, SendGroup, SenderRule, Sensitivity,
+    RetriageProgress, SanitizedMessage, SealedKind, SearchHit, SendGroup, SenderRule, Sensitivity,
     ShredCandidate, StoreStats, ThreadView, Tier, TriageAxis, TriageFeedback, UnsubscribeRecord,
     Update,
 };
@@ -947,6 +951,10 @@ impl Store for SqliteStore {
         self.append_event(ev)
     }
 
+    fn message_has_event(&self, account_id: AccountId, message_id: i64) -> Result<bool> {
+        self.message_has_event(account_id, message_id)
+    }
+
     fn events_after(
         &self,
         account_id: AccountId,
@@ -958,6 +966,28 @@ impl Store for SqliteStore {
 
     fn event_by_id(&self, account_id: AccountId, id: i64) -> Result<Option<Event>> {
         self.event_by_id(account_id, id)
+    }
+
+    fn record_notify_decision(&self, decision: &NewNotifyDecision) -> Result<bool> {
+        self.record_notify_decision(decision)
+    }
+
+    fn notify_decision_exists(
+        &self,
+        account_id: AccountId,
+        message_id: i64,
+        lane: NotifyLane,
+    ) -> Result<bool> {
+        self.notify_decision_exists(account_id, message_id, lane)
+    }
+
+    fn notify_decisions_since(
+        &self,
+        account_id: AccountId,
+        since: DateTime<Utc>,
+        limit: usize,
+    ) -> Result<Vec<NotifyDecisionRow>> {
+        self.notify_decisions_since(account_id, since, limit)
     }
 
     fn latest_event_id(&self, account_id: AccountId) -> Result<i64> {
@@ -1099,6 +1129,14 @@ impl Store for SqliteStore {
         message_id: i64,
     ) -> Result<Option<SeedVerdict>> {
         self.triage_seed_verdict(account_id, message_id)
+    }
+
+    fn notify_eligible_at(
+        &self,
+        account_id: AccountId,
+        message_id: i64,
+    ) -> Result<Option<DateTime<Utc>>> {
+        self.notify_eligible_at(account_id, message_id)
     }
 
     fn revisits_schedule(

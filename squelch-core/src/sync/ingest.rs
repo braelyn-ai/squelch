@@ -1154,6 +1154,10 @@ pub fn ingest(
             calendar: None,
             attachments,
             confident: true,
+            // NEVER set here: only the sync engine knows which sync path this
+            // ingest is on, and that is the whole eligibility decision. See
+            // `TriagedMessage::notify_eligible_at`.
+            notify_eligible_at: None,
         };
     }
 
@@ -1183,6 +1187,10 @@ pub fn ingest(
             calendar: None,
             attachments,
             confident: true,
+            // NEVER set here: only the sync engine knows which sync path this
+            // ingest is on, and that is the whole eligibility decision. See
+            // `TriagedMessage::notify_eligible_at`.
+            notify_eligible_at: None,
         };
     }
 
@@ -1215,6 +1223,9 @@ pub fn ingest(
             field_reasons: FieldReasons::default(),
             matched_rule: None,
             deadline: None,
+            // See the sealed arm above: the engine, not ingest, stamps this, and
+            // a spam row is refused at every emission site regardless.
+            notify_eligible_at: None,
             shipment: None,
             ship_extract: false,
             receipt: None,
@@ -1287,6 +1298,8 @@ pub fn ingest(
         calendar,
         attachments,
         confident: result.confident,
+        // See the sealed arm above: the engine, not ingest, stamps this.
+        notify_eligible_at: None,
     }
 }
 

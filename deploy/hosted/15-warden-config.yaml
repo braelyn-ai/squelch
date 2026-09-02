@@ -151,6 +151,20 @@ data:
   #
   # Revisit if the gateway is ever upgraded to a build that resolves bare ids:
   # dropping the prefix is then a one-knob revert (plus the canary's var).
+  #
+  # A THIRD MODEL THE GATEWAY MUST CARRY, WITH NO KNOB HERE: the daemon's
+  # notify fast lane (docs/NOTIFY.md §11.5) runs `claude-haiku-4-5` by its
+  # own code default and qualifies it to `anthropic/claude-haiku-4-5` itself
+  # whenever the base URL above is a gateway, the way the assistant relay
+  # does. The warden hands tenants no SQUELCH_NOTIFY_* variable, so nothing in
+  # this file names it, and that is exactly why it is easy to forget when the
+  # allow-list is edited: if the gateway drops it, every fast-lane call 400s,
+  # the lane parks itself and records `unavailable`, and Stage-1 quietly
+  # rescues. Degraded, not dark, and invisible until somebody reads
+  # squelchd_notify_decisions_total{lane="fast",decision="unavailable"}.
+  # `squelch-control llm sync` covers it (DEFAULT_LLM_MODELS lists Haiku in
+  # both spellings); moving the notify model is a daemon code-default change
+  # plus a roll until the warden grows the passthrough.
   SQUELCH_WARDEN_LLM_STAGE1_MODEL: "anthropic/claude-opus-5"
   SQUELCH_WARDEN_LLM_STAGE2_MODEL: "anthropic/claude-opus-5"
   # 3. EDIT ME. The control plane's origin, handed to every tenant daemon as

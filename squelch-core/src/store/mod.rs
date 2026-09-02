@@ -12,6 +12,9 @@ pub use search_query::{SearchFilter, SearchSort, parse_search_query};
 pub use sqlite::SqliteStore;
 
 use crate::error::Result;
+// ONE closed vocabulary for the metric label and the stored ledger string; see
+// the type comments in `metrics.rs` and docs/NOTIFY.md §11.4.
+use crate::metrics::{NotifyDecision, NotifyLane};
 use crate::triage::extract::shipments::ShipmentsApplied;
 use crate::triage::{CalendarInfo, CarrierTrack, DeadlineHit, ReceiptInfo, ShipmentInfo};
 use crate::types::{
@@ -202,6 +205,21 @@ pub struct TriagedMessage {
     /// `false` when Stage-1 was not confident: the row keeps `model_used IS NULL`
     /// so the Stage-2 queue predicate picks it up.
     pub confident: bool,
+    /// MAY THIS MESSAGE EVER NOTIFY, and from when. `Some(now)` for mail we are
+    /// seeing for the first time on an incremental path that was still fresh
+    /// when we saw it; `None` — the silent direction — for a backfill row, the
+    /// user's own sent copy, and mail already stale at first sight.
+    ///
+    /// Set by [`crate::sync::SyncEngine`], NOT by ingest: the pure ingest
+    /// pipeline does not know which sync path it is on, and that fact is the
+    /// whole decision (docs/NOTIFY.md §11.3). `ingest_with_rules` therefore
+    /// leaves it `None` and the engine fills it in before the store call.
+    ///
+    /// Written by [`Store::ingest_message`] on the triage row's FIRST INSERT
+    /// ONLY and preserved verbatim on conflict, which is what makes a catch-up
+    /// re-scan structurally unable to storm: a row it re-ingests already exists
+    /// and keeps whatever it was stamped with, NULL included.
+    pub notify_eligible_at: Option<DateTime<Utc>>,
 }
 
 /// The full body of one sealed message. HUMAN-DOOR-ONLY: returned solely by
@@ -302,7 +320,11 @@ pub struct NewAuditEntry {
 
 /// A notification-worthy event appended to the `events` log. Produced ONLY by
 /// [`crate::triage::events`]; every field besides the ids is a denormalized
-/// snapshot of the verdict at emission time. Sealed mail never produces one.
+/// snapshot of the verdict at emission time.
+///
+/// Sealed mail produces one only through the KIND-DERIVED path (docs/NOTIFY.md
+/// §11.6): a fixed sentence chosen by `sealed_kind`, the sender address, and
+/// nothing the mail said. `one_line` on such a row is a constant, not a summary.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NewEvent {
     pub account_id: AccountId,
@@ -315,6 +337,55 @@ pub struct NewEvent {
     pub one_line: String,
     /// RFC3339 deadline snapshot, or `None`.
     pub deadline: Option<String>,
+    /// Which auth shape this event is about; `None` for every ordinary event.
+    /// See [`crate::types::Event::sealed_kind`] — routing metadata, never a gate.
+    pub sealed_kind: Option<SealedKind>,
+}
+
+/// One row for the NOTIFY DECISION LEDGER (docs/NOTIFY.md §11.4): what one lane
+/// decided about notifying for one message, and nothing else.
+///
+/// CARRIES NO EMAIL-DERIVED TEXT — no one_line, no subject, no sender. Every
+/// field is an id, a closed-vocabulary string, a score or a duration, which is
+/// what lets a SEALED message be recorded here at all.
+///
+/// Written with INSERT OR IGNORE and never updated: see
+/// [`Store::record_notify_decision`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewNotifyDecision {
+    pub account_id: AccountId,
+    pub message_id: i64,
+    /// Which lane decided. The stored string is [`NotifyLane::as_str`].
+    pub lane: NotifyLane,
+    /// What it decided. The stored string is [`NotifyDecision::as_str`].
+    pub decision: NotifyDecision,
+    /// The notify model's 0-100 score, `None` when no model scored this row —
+    /// a suppressed, expired or unavailable decision has no score, and a 0
+    /// stood in for one would read as "the model said no".
+    pub notify_importance: Option<u8>,
+    /// Model id, `'sealed'`, `'heuristic'`, or `None`.
+    pub model_used: Option<String>,
+    /// First sight to this decision, in milliseconds. Fast lane only.
+    pub latency_ms: Option<u32>,
+}
+
+/// One stored ledger row, as the eval read hands it back. `created_at` and `id`
+/// are the store's, everything else is what the lane wrote.
+///
+/// The lane/decision strings are parsed back into the closed enums; a row whose
+/// vocabulary this build does not know (written by a newer daemon) is SKIPPED by
+/// the read rather than coerced into a neighbouring variant, because the whole
+/// point of the ledger is that each row means exactly one thing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NotifyDecisionRow {
+    pub id: i64,
+    pub message_id: i64,
+    pub lane: NotifyLane,
+    pub decision: NotifyDecision,
+    pub notify_importance: Option<u8>,
+    pub model_used: Option<String>,
+    pub latency_ms: Option<u32>,
+    pub created_at: DateTime<Utc>,
 }
 
 /// One registered APNs device.
@@ -528,6 +599,11 @@ pub struct Stage2Queued {
     /// When a human last asked for this row to be re-triaged; see
     /// [`Stage1Queued::retriage_at`]. Overrides the SKIP-STALE check above.
     pub retriage_at: Option<DateTime<Utc>>,
+    /// `triage.notify_eligible_at`; see [`TriagedMessage::notify_eligible_at`].
+    /// Carried on the queue row so the Stage-2 apply site can emit without a
+    /// second read, and so the emission decision measures the age of OUR sight
+    /// of the message rather than the sender's `Date:` header.
+    pub notify_eligible_at: Option<DateTime<Utc>>,
 }
 
 /// How the account owner has treated this sender before. Aggregates, not
@@ -617,6 +693,10 @@ pub struct Stage1Queued {
     /// [`crate::triage::retriage_forced`], which is what lets an explicit
     /// re-triage of old mail bypass the pass's stale skip.
     pub retriage_at: Option<DateTime<Utc>>,
+    /// `triage.notify_eligible_at`; see [`TriagedMessage::notify_eligible_at`].
+    /// Carried on the queue row so the Stage-1 apply site can emit without a
+    /// second read.
+    pub notify_eligible_at: Option<DateTime<Utc>>,
 }
 
 /// A triage row's HEURISTIC SEED verdict, read back when the Stage-1 model call
@@ -634,6 +714,11 @@ pub struct SeedVerdict {
     /// this one.
     pub needs_stage2: bool,
     pub deadline: Option<DateTime<Utc>>,
+    /// `triage.notify_eligible_at`; see [`TriagedMessage::notify_eligible_at`].
+    /// Read back HERE rather than taken off the queued row because this whole
+    /// struct is the row as it stands at emission time, and the fallback site
+    /// has no other read of it.
+    pub notify_eligible_at: Option<DateTime<Utc>>,
 }
 
 /// One message whose scheduled re-evaluation has come due. Carries the PRIOR
@@ -1575,9 +1660,12 @@ pub trait Store: Send + Sync {
 
     // NOTIFICATION EVENTS: the durable, monotonic log the delivery adapters read.
     // WRITTEN ONLY BY THE SYNC ENGINE via `triage::events` — never from a store
-    // write method, because only the engine knows which sync path it is on and
-    // whether the mail is fresh. Every reader carries its OWN cursor; there is
-    // deliberately no global 'delivered' flag.
+    // write method, because only the engine knows which sync path an ingest is
+    // on, and that answer (not the sender's `Date:` header) is what decides
+    // whether a message may ever notify. The engine writes it down once, as
+    // `triage.notify_eligible_at`; see `TriagedMessage::notify_eligible_at`.
+    // Every reader carries its OWN cursor; there is deliberately no global
+    // 'delivered' flag.
 
     /// Append one event, at most once per message ever (INSERT OR IGNORE on
     /// `UNIQUE(message_id)`), which is what makes re-ingest and the refine passes
@@ -1587,6 +1675,21 @@ pub trait Store: Send + Sync {
     /// [`SqliteStore::attach_event_notifier`]) so an SSE reader wakes without
     /// polling; that send is best-effort, no receivers is normal.
     fn append_event(&self, ev: &NewEvent) -> Result<Option<i64>>;
+
+    /// Whether this message already has an `events` row: "has the user already
+    /// been notified about this one".
+    ///
+    /// EXISTS FOR THE EXPIRY COUNTER. `UNIQUE(message_id)` means a site that
+    /// APPENDS can already tell a new buzz from a repeat one by the `Option` it
+    /// gets back — but a site that REFUSES to append never reaches the store, so
+    /// it cannot, and the one refusal we count (past the rescue window) is
+    /// exactly the one that keeps coming back: a message notified from Stage-1
+    /// is offered again by Stage-2 and again by every re-triage, hours later
+    /// each time. Without this read, every one of those books a DELIVERED
+    /// notification as a missed one, in the single number docs/NOTIFY.md §11.11
+    /// says decides whether the window moves. See
+    /// [`crate::sync::SyncEngine::emit_event`].
+    fn message_has_event(&self, account_id: AccountId, message_id: i64) -> Result<bool>;
 
     /// Events with `id > after_id`, oldest first, capped at `limit`. The replay
     /// query behind `GET /client/events?after=<cursor>`.
@@ -1601,6 +1704,64 @@ pub trait Store: Send + Sync {
     /// is what the iOS Notification Service Extension calls after an opaque
     /// push, so it must never be more informative than that.
     fn event_by_id(&self, account_id: AccountId, id: i64) -> Result<Option<Event>>;
+
+    // THE NOTIFY DECISION LEDGER (docs/NOTIFY.md §11.4): one row per (message,
+    // lane), APPEND-ONLY, carrying no email-derived text. It is the labeled
+    // corpus that decides whether the threshold or the model moves; a row that
+    // could be rewritten would be evidence of nothing.
+
+    /// Record one lane's decision about one message. `false` when a row for that
+    /// (message, lane) already existed and this call was IGNORED.
+    ///
+    /// INSERT OR IGNORE on `UNIQUE(message_id, lane)` is the append-only rule
+    /// made structural: a Stage-2 pass over a row Stage-1 already recorded, or a
+    /// human re-triage hours later, is a silent no-op rather than a rewrite of
+    /// what that lane decided the first time it reached the message. Callers
+    /// record only for messages carrying a `triage.notify_eligible_at` stamp, so
+    /// backfill and already-stale mail produce no rows at all.
+    fn record_notify_decision(&self, decision: &NewNotifyDecision) -> Result<bool>;
+
+    /// Whether `lane` has ALREADY recorded a decision about this message.
+    ///
+    /// THE FAST LANE'S RE-ENTRY GATE, and it exists because `INSERT OR IGNORE`
+    /// is not one. Re-ingest is routine (`catch_up` re-walks the whole window,
+    /// and a failed SENT half holds the cursor so the next tick re-walks the
+    /// same INBOX ids), and `notify_lane::candidate` re-fires on any re-ingested
+    /// row whose stamp is still inside the freshness window. Without this read
+    /// the second run makes a second PAID model call, charges a second
+    /// `__notify_fast__` unit, and — if it scores above the line where the first
+    /// run scored below it — appends the `events` row while the ignored ledger
+    /// insert leaves the table still saying `declined_by_model`. A decision
+    /// silently contradicted by the world is exactly what docs/NOTIFY.md
+    /// §11.11's rescued/overturned joins cannot survive.
+    ///
+    /// HALF A GUARD, NEVER THE WHOLE ONE. This is a TOCTOU read: the row it
+    /// looks for is written LAST, after the model call, so two runs that OVERLAP
+    /// both see `false` here. `NotifyLane` pairs it with an in-process in-flight
+    /// set that covers exactly that window; this read covers what the set cannot,
+    /// which is a re-ingest on the other side of a restart. Neither is
+    /// sufficient alone, and a change to one wants a look at the other.
+    fn notify_decision_exists(
+        &self,
+        account_id: AccountId,
+        message_id: i64,
+        lane: NotifyLane,
+    ) -> Result<bool>;
+
+    /// This account's ledger rows created at or after `since`, oldest first,
+    /// capped at `limit`. The eval read behind docs/NOTIFY.md §11.11.
+    ///
+    /// ORDER BY id, not `created_at`: two decisions inside the same clock tick
+    /// are common (the fast lane records at ingest while a refine pass is
+    /// recording another message), and the insert order is the only total one.
+    /// A row whose stored lane or decision this build does not recognize is
+    /// skipped rather than coerced.
+    fn notify_decisions_since(
+        &self,
+        account_id: AccountId,
+        since: DateTime<Utc>,
+        limit: usize,
+    ) -> Result<Vec<NotifyDecisionRow>>;
 
     /// The newest event id for the account, or `0` when there are none — the
     /// starting cursor for a client that has never connected.
@@ -1808,6 +1969,22 @@ pub trait Store: Send + Sync {
         account_id: AccountId,
         message_id: i64,
     ) -> Result<Option<SeedVerdict>>;
+
+    /// `triage.notify_eligible_at` as the STORE holds it, for one message.
+    /// `None` when the row is missing or was never stamped.
+    ///
+    /// NOT GATED ON `sensitivity`, which is the whole reason it is not
+    /// [`Store::triage_seed_verdict`]: a sealed row has no seed verdict to read
+    /// and still has a stamp, and the fast lane's sealed path needs the stored
+    /// stamp for exactly the reason its model path does. `ingest_message` writes
+    /// the column on FIRST INSERT ONLY and preserves it on conflict, so the
+    /// value ingest recomputed on a re-ingest is not the value that decides the
+    /// rescue window (docs/NOTIFY.md §11.3).
+    fn notify_eligible_at(
+        &self,
+        account_id: AccountId,
+        message_id: i64,
+    ) -> Result<Option<DateTime<Utc>>>;
 
     // ---- REVISITS (see `crate::triage::revisit`) --------------------------
 

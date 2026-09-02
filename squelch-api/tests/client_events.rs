@@ -59,6 +59,7 @@ fn event_for(account_id: i64, message_id: i64) -> NewEvent {
         sender: "alice@example.com".to_string(),
         one_line: format!("line {message_id}"),
         deadline: None,
+        sealed_kind: None,
     }
 }
 

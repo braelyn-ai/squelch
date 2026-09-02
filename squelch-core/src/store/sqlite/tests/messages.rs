@@ -690,6 +690,110 @@ fn reingest_preserves_llm_classification_but_refreshes_heuristic_rows() {
     assert_eq!(ub.one_line, "fresh seed");
 }
 
+/// A RE-INGEST MAY NOT UNDO A PERSON'S SEAL, and this is the one verdict column
+/// where that was not true. A re-ingest carries only heuristic SEED values, and
+/// the detector never saw whatever made the user call this mail auth, so the old
+/// unconditional `sensitivity=excluded.sensitivity` reverted the seal on any
+/// re-walk inside the freshness window — a catch-up, or the routine one a held
+/// cursor causes.
+///
+/// It is not a bookkeeping loss. An unsealed row is a row the fast lane will
+/// send to the notify model and turn into an `events` row minted AFTER
+/// `correct_triage` ran its redaction, so there is nothing left that can redact
+/// it, and it replays over SSE to every cursor forever (docs/SECURITY.md §4).
+#[test]
+fn reingest_cannot_revert_a_human_seal_but_a_detector_seal_still_refreshes() {
+    let (store, acct) = store();
+    let sealed_now = |mid: i64| -> String {
+        let conn = store.lock().unwrap();
+        conn.query_row(
+            "SELECT sensitivity FROM triage WHERE message_id=?1",
+            params![mid],
+            |r| r.get::<_, String>(0),
+        )
+        .unwrap()
+    };
+
+    // --- Row A: a person seals a message the detector called normal. ---
+    let a = triaged_row(acct, "g-a", "t-a", None, false, Sensitivity::Normal).ingest(&store);
+    store
+        .correct_triage(
+            acct,
+            a,
+            crate::types::TriageAxis::Sensitivity,
+            "sealed",
+            None,
+            Utc::now(),
+        )
+        .unwrap();
+    // The same gmail id walked again, carrying the seed's `normal` verdict.
+    triaged_row(acct, "g-a", "t-a", None, false, Sensitivity::Normal).ingest(&store);
+    assert_eq!(
+        sealed_now(a),
+        "sealed",
+        "only a person outranks a person: the seed cannot un-seal what a human sealed"
+    );
+
+    // --- Row B: no human ever touched it, so the fresh detection still wins,
+    // which is what lets a detector FIX newly seal an old message. ---
+    let b = triaged_row(acct, "g-b", "t-b", None, false, Sensitivity::Normal).ingest(&store);
+    assert_eq!(sealed_now(b), "normal");
+    triaged_row(acct, "g-b", "t-b", None, false, Sensitivity::Sealed).ingest(&store);
+    assert_eq!(
+        sealed_now(b),
+        "sealed",
+        "an improved detector must still be able to seal a row it missed"
+    );
+
+    // --- Row C: a person corrected the TIER, which has nothing to say about
+    // whether this is auth mail. `correct_triage` stamps `model_used='human'`
+    // for EVERY axis, so a freeze keyed on that column would pin row C's
+    // sensitivity forever and quietly delete row B's behaviour for every
+    // human-corrected row in the mailbox. The freeze is keyed on the AXIS the
+    // person actually ruled on. ---
+    let c = triaged_row(acct, "g-c", "t-c", None, false, Sensitivity::Normal).ingest(&store);
+    store
+        .correct_triage(
+            acct,
+            c,
+            crate::types::TriageAxis::Tier,
+            "signal",
+            None,
+            Utc::now(),
+        )
+        .unwrap();
+    triaged_row(acct, "g-c", "t-c", None, false, Sensitivity::Sealed).ingest(&store);
+    assert_eq!(
+        sealed_now(c),
+        "sealed",
+        "a tier correction is not a ruling about auth mail, and must not stop \
+         a detector fix from sealing this row"
+    );
+
+    // --- Row D: the OTHER direction of a sensitivity ruling. The detector is
+    // recall-biased and over-seals; a person saying "this is ordinary mail"
+    // must outrank the same detector on the next re-walk, or the correction is
+    // one the user makes again every poll — and the fast lane pings it as a
+    // login code each time (docs/NOTIFY.md §11.6). ---
+    let d = triaged_row(acct, "g-d", "t-d", None, false, Sensitivity::Sealed).ingest(&store);
+    store
+        .correct_triage(
+            acct,
+            d,
+            crate::types::TriageAxis::Sensitivity,
+            "normal",
+            None,
+            Utc::now(),
+        )
+        .unwrap();
+    triaged_row(acct, "g-d", "t-d", None, false, Sensitivity::Sealed).ingest(&store);
+    assert_eq!(
+        sealed_now(d),
+        "normal",
+        "only a person outranks a person, in the un-seal direction too"
+    );
+}
+
 #[test]
 fn reingest_preserves_a_processed_ship_marker_but_refreshes_pending() {
     let (store, acct) = store();

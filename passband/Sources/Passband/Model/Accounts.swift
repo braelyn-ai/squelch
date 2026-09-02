@@ -698,12 +698,18 @@ final class AccountManager {
     private var streams: [UUID: EventStream] = [:]
 
     /// The other ear, and the exact COMPLEMENT of the streams above: one
-    /// background auth watcher per account that is NOT live. Sealed mail never
-    /// rides the event feed, so a login code arriving in a mailbox nobody is
-    /// looking at is invisible to every stream in this process — the only way
-    /// to hear about it is to ask, which is what these do. The live account has
-    /// no entry: its auth mail comes through SitrepPoller → AuthArrival, which
-    /// runs the whole richer flow (ring, audited auto-reveal, code modal).
+    /// background auth watcher per account that is NOT live. A sealed event now
+    /// DOES ride the feed (docs/NOTIFY.md §11.6) but it carries no subject and
+    /// no received-at worth trusting, so it is a doorbell and not the answer —
+    /// the only way to learn what landed is still to ask, which is what these
+    /// do. The live account has no entry: its auth mail comes through
+    /// SitrepPoller → AuthArrival, which runs the whole richer flow (ring,
+    /// audited auto-reveal, code modal).
+    ///
+    /// So these are the fallback AND the fast path's second half. They keep
+    /// their 30s cadence for the mail no event ever mentions (a daemon with the
+    /// notify lane off, a frame lost to a dropped connection), and
+    /// `noteSealedEvent` below rings them the moment one does.
     private var watches: [UUID: BackgroundAuthWatch] = [:]
 
     /// The accounts whose feeds SHOULD be up. It differs from `streams` only
@@ -882,5 +888,36 @@ final class AccountManager {
     func stopWatch(_ id: UUID) {
         wantedWatches.remove(id)
         watches.removeValue(forKey: id)?.stop()
+    }
+
+    // MARK: - the sealed doorbell
+
+    /// A sealed event just arrived on ONE account's feed: go and ask that
+    /// account's daemon what landed, now, instead of at the next tick.
+    ///
+    /// THE ROUTING LIVES HERE because this is the only object that knows which
+    /// of the two ears is listening to a given mailbox — `EventStream` is
+    /// deliberately ignorant of which account is on screen, and asking it to
+    /// compare would give every stream in the process an opinion about that.
+    /// The two branches are the same complement as `streams` vs `watches`.
+    ///
+    /// FIRE AND FORGET, and idempotent by the layers underneath: the fetch it
+    /// pokes joins one already in flight rather than stacking a second, and
+    /// `AuthSeenSet` decides exactly once whether what comes back is worth a
+    /// noise. So an event that beats the poll, an event that loses to it, and
+    /// an event replayed across a reconnect all cost at most one extra request
+    /// and produce at most one banner.
+    func noteSealedEvent(for id: UUID) {
+        // Not an account this install still has: nothing to ask, nowhere to
+        // ask it. A stream for a removed account is already being torn down.
+        guard accounts.contains(where: { $0.id == id }) else { return }
+        if id == activeId {
+            // The live account's sealed list rides the sitrep read model, which
+            // is what `AuthArrival` watches. Pulling just that one leg is the
+            // whole poll's work minus four requests nothing here is waiting on.
+            Task { await SitrepPoller.shared.refreshSealed() }
+        } else {
+            watches[id]?.pollNow()
+        }
     }
 }

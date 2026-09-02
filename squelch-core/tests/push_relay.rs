@@ -147,6 +147,7 @@ impl Harness {
                 sender: SENDER.to_string(),
                 one_line: ONE_LINE.to_string(),
                 deadline: Some("2026-08-01T17:00:00Z".to_string()),
+                sealed_kind: None,
             })
             .unwrap()
             .unwrap()
@@ -664,6 +665,7 @@ async fn a_cold_start_joins_at_the_head() {
                     sender: SENDER.to_string(),
                     one_line: ONE_LINE.to_string(),
                     deadline: None,
+                    sealed_kind: None,
                 })
                 .unwrap()
                 .unwrap();
@@ -743,6 +745,7 @@ async fn the_relay_bearer_is_presented_when_configured() {
             sender: SENDER.to_string(),
             one_line: ONE_LINE.to_string(),
             deadline: None,
+            sealed_kind: None,
         })
         .unwrap()
         .unwrap();
