@@ -40,9 +40,30 @@ pub(crate) enum Untrusted {
 /// Line separators that can start a new visual line inside a fence: the ASCII
 /// pair plus the vertical/form feeds and the Unicode separators, since the
 /// decoded bytes of an RFC 2047 encoded-word are arbitrary.
-const LINE_SEPARATORS: [char; 7] = [
+pub const LINE_SEPARATORS: [char; 7] = [
     '\n', '\r', '\u{000B}', '\u{000C}', '\u{0085}', '\u{2028}', '\u{2029}',
 ];
+
+/// Characters that occupy no visual space: zero-width joiners/spaces, the soft
+/// hyphen, the word joiner and the BOM. `char::is_whitespace` does NOT include
+/// them, so `str::trim` leaves them behind and a string made only of these reads
+/// as non-empty to every ordinary blankness test while rendering as nothing.
+pub const ZERO_WIDTH: [char; 6] = [
+    '\u{200B}', '\u{200C}', '\u{200D}', '\u{00AD}', '\u{FEFF}', '\u{2060}',
+];
+
+/// Is `s` blank TO A READER — empty once whitespace, zero-width characters and
+/// control characters are discounted?
+///
+/// `str::trim` alone is not this test. It uses `White_Space`, which excludes
+/// every character in [`ZERO_WIDTH`], so a body holding one U+FEFF is "not
+/// empty" to `trim` and completely invisible to a human. Both places that decide
+/// "is there anything here to read" — the ingest body selection and the
+/// extractor's empty-body refusal — need the reader's answer, not the parser's.
+pub fn is_blank(s: &str) -> bool {
+    !s.chars()
+        .any(|c| !c.is_whitespace() && !c.is_control() && !ZERO_WIDTH.contains(&c))
+}
 
 /// THE neutralizer for untrusted email text. EVERY field that renders inside an
 /// UNTRUSTED EMAIL fence goes through this function — `from`, `from_name`,

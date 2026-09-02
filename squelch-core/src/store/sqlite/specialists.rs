@@ -1086,26 +1086,66 @@ impl SqliteStore {
         }
 
         let tx = conn.transaction()?;
-        let rows: Vec<(i64, Option<f64>, String, String, String)> = {
+        // IDS FIRST, BODIES ONE AT A TIME. Selecting the bodies alongside the
+        // ids materialized every receipt's full message text into a single Vec:
+        // measured at ~160 MB for 4,000 receipts, and bodies are stored
+        // uncapped. A hosted tenant pod requests 384Mi and this crate has been
+        // global-OOM-killed on that box before, so the repair must not scale its
+        // peak memory with the mailbox. An id list does; a body list does not.
+        let ids: Vec<i64> = {
             let mut stmt = tx.prepare(
-                "SELECT r.id, r.amount, m.from_addr, m.subject, m.body
+                "SELECT r.id
                  FROM receipts r
                  JOIN messages m
                    ON m.id = r.message_id AND m.account_id = r.account_id
                  LEFT JOIN triage t ON t.message_id = m.id AND t.account_id = m.account_id
                  WHERE r.account_id = ?1
-                   AND COALESCE(t.sensitivity, 'normal') = 'normal'",
+                   AND COALESCE(t.sensitivity, 'normal') = 'normal'
+                 ORDER BY r.id",
             )?;
-            stmt.query_map(params![account_id], |r| {
-                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
-            })?
-            .collect::<std::result::Result<Vec<_>, _>>()?
+            stmt.query_map(params![account_id], |r| r.get(0))?
+                .collect::<std::result::Result<Vec<_>, _>>()?
         };
 
         let mut corrected = 0u64;
-        for (id, stored, from_addr, subject, body) in rows {
+        for id in ids {
+            // The sensitivity guard is REPEATED here rather than trusted from
+            // the id query above, because this is the statement that actually
+            // reads a body: a detector must never run over sealed mail, and the
+            // check belongs where the read happens. (Unlike shipments, sealing
+            // does NOT delete a receipts row - see `feedback.rs` - so this
+            // clause is the whole guarantee, not a belt on braces.)
+            type Row = (Option<f64>, String, Option<String>, i64, String, String, String);
+            let row: Option<Row> = tx
+                .query_row(
+                    "SELECT r.amount, r.from_addr, r.from_name, r.message_id, r.received_at,
+                            m.subject, m.body
+                     FROM receipts r
+                     JOIN messages m
+                       ON m.id = r.message_id AND m.account_id = r.account_id
+                     LEFT JOIN triage t ON t.message_id = m.id AND t.account_id = m.account_id
+                     WHERE r.account_id = ?1 AND r.id = ?2
+                       AND COALESCE(t.sensitivity, 'normal') = 'normal'",
+                    params![account_id, id],
+                    |r| {
+                        Ok((
+                            r.get(0)?,
+                            r.get(1)?,
+                            r.get(2)?,
+                            r.get(3)?,
+                            r.get(4)?,
+                            r.get(5)?,
+                            r.get(6)?,
+                        ))
+                    },
+                )
+                .optional()?;
+            let Some((stored, from_addr, from_name, message_id, received_raw, subject, body)) = row
+            else {
+                continue;
+            };
             // NEVER CLEAR ON ABSENT EVIDENCE. A re-parse that finds no total is
-            // not testimony that the stored one is wrong — the body may have
+            // not testimony that the stored one is wrong - the body may have
             // been re-ingested since, or hold a total this pass's patterns do
             // not reach. Same rule the shipment re-detect follows for a row with
             // no feeder message: a repair pass corrects what it can read and
@@ -1121,6 +1161,30 @@ impl SqliteStore {
                  WHERE account_id = ?1 AND id = ?2",
                 params![account_id, id, fresh],
             )? as u64;
+
+            // THE SECOND PLACE. A receipt settles an open bill by comparing its
+            // amount, so a total mis-parsed into the trillions failed
+            // `amounts_permit_close` and left the matching bill standing. Fixing
+            // the number without re-asking the question would leave that bill
+            // open forever, which is the more expensive half of the bug: a card
+            // reading wrong is visible, a bill that never closes is not.
+            // A receipt row whose stamp will not parse is not worth failing the
+            // whole repair over; the amount is already corrected either way.
+            let Ok(received_at) = DateTime::parse_from_rfc3339(&received_raw) else {
+                continue;
+            };
+            let _ = auto_close_bill_for_receipt_conn(
+                &tx,
+                account_id,
+                message_id,
+                &from_addr,
+                from_name.as_deref(),
+                &crate::triage::ReceiptInfo {
+                    amount: Some(fresh),
+                    currency: Some("USD".to_string()),
+                },
+                received_at.with_timezone(&Utc),
+            )?;
         }
 
         tx.execute(
