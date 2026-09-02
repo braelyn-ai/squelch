@@ -394,7 +394,13 @@ struct SearchView: View {
     private func judge(_ term: String) {
         let verdict = SearchIntent.classify(query: term, diagnostics: store.search.diagnostics)
         store.search.lastVerdict = verdict
-        guard prefs.deeperSearch != .off else { return }
+        guard prefs.deeperSearch != .off else {
+            // Turned off with a conversation still open: the next settled query
+            // is where that takes effect, because "off" has to mean the lane is
+            // not running rather than merely not visible.
+            if store.search.laneStarted { store.resetSearchLane(keepingVerdict: true) }
+            return
+        }
         // ONCE STARTED, EVERY SETTLED QUERY IS A REFINEMENT — including one the
         // classifier would not have started a lane for. Somebody who typed a
         // question and then deleted a word has not stopped asking it, and a
