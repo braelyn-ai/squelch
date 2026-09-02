@@ -220,6 +220,87 @@ fn the_spam_page_lists_spam_and_only_spam() {
     assert!(!ids.contains(&good));
 }
 
+/// THE SPAM ROW'S OWN WORDS. Nothing triaged these rows, so `one_line` is empty
+/// on every one of them and the page would be a column of senders against a
+/// blank; the subject and the stored snippet are the fill, and they are served
+/// on THIS listing alone.
+///
+/// Both halves are asserted together on purpose. "The spam page carries a
+/// subject" would still pass if the bands had quietly grown one too, and the
+/// bands paying 200 characters a row on every poll for text nothing renders is
+/// the exact accident this gate exists to catch.
+#[test]
+fn the_spam_page_carries_the_mails_own_text_and_the_bands_do_not() {
+    let (store, acct) = store();
+    let good = triaged(acct, "g-good", "t-good")
+        .subject("Lunch tomorrow")
+        .snippet("Are you free at noon?")
+        .tier(Tier::Signal)
+        .seed(&store);
+    let spam = triaged(acct, "g-spam", "t-spam")
+        .from("winner@lottery.example")
+        .subject("You have won")
+        .snippet("Claim your prize now.")
+        .is_spam(true)
+        .seed(&store);
+    let since = Utc::now() - chrono::Duration::days(1);
+
+    let page = store
+        .attention_updates(acct, since, None, None, None, false, SpamScope::Only)
+        .unwrap();
+    let row = page
+        .iter()
+        .find(|u| u.update.id == spam)
+        .expect("the spam row is on its page");
+    assert_eq!(
+        row.update.one_line, "",
+        "nothing triaged it, by construction"
+    );
+    assert_eq!(row.update.subject.as_deref(), Some("You have won"));
+    assert_eq!(row.update.preview.as_deref(), Some("Claim your prize now."));
+
+    let inbox = store
+        .attention_updates(acct, since, None, None, None, false, SpamScope::Exclude)
+        .unwrap();
+    let row = inbox
+        .iter()
+        .find(|u| u.update.id == good)
+        .expect("the ordinary row is in the inbox");
+    assert!(
+        row.update.subject.is_none() && row.update.preview.is_none(),
+        "an ordinary row has a summary and pays for no fill"
+    );
+}
+
+/// A subject of nothing but whitespace is ABSENT, not a subject. It is what a
+/// mailer that "cleared" the field sends, and a row rendering it would be a row
+/// with nothing on it — which reads as a bug rather than as blank mail. The
+/// client says "(no subject)" instead, and it can only do that if the daemon
+/// declines to send a blank.
+#[test]
+fn a_blank_spam_subject_is_absent_rather_than_empty() {
+    let (store, acct) = store();
+    let spam = triaged(acct, "g-spam", "t-spam")
+        .subject("\u{00a0} ")
+        .snippet("   ")
+        .is_spam(true)
+        .seed(&store);
+    let rows = store
+        .attention_updates(
+            acct,
+            Utc::now() - chrono::Duration::days(1),
+            None,
+            None,
+            None,
+            false,
+            SpamScope::Only,
+        )
+        .unwrap();
+    let row = rows.iter().find(|u| u.update.id == spam).unwrap();
+    assert!(row.update.subject.is_none(), "blank subject must be absent");
+    assert!(row.update.preview.is_none(), "blank preview must be absent");
+}
+
 /// Sealed outranks spam. A login code Gmail misfiled is still a login code, and
 /// the spam page is a page someone reads.
 #[test]

@@ -469,6 +469,8 @@ mod tests {
             field_reasons: None,
             has_attachments: None,
             from_name: None,
+            subject: None,
+            preview: None,
         }
     }
 

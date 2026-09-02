@@ -161,6 +161,17 @@ struct AttentionUpdate: Codable, Sendable, Identifiable, Hashable {
     /// on the agent door, which is why every read goes through `senderString`
     /// rather than this directly.
     var from_name: String?
+    /// The mail's own `Subject` and the opening of its body. PRESENT ONLY ON
+    /// THE SPAM PAGE, and absent everywhere else by design rather than by
+    /// accident: a spam row was never triaged, so `one_line` is empty on every
+    /// one of them and these are what the row says instead. Every other page
+    /// has a summary and the daemon does not pay to send these beside it.
+    ///
+    /// UNTRUSTED, and more pointedly than `from_name`: this is text out of the
+    /// corpus written to talk readers into things. It renders as words on a
+    /// row, is never handed to a model, and never reaches the agent door.
+    var subject: String?
+    var preview: String?
     var status: AttentionStatus
     var surfaced_at: String?
     var resolved_at: String?
@@ -179,6 +190,35 @@ struct AttentionUpdate: Codable, Sendable, Identifiable, Hashable {
 
     /// Whether a reminder is waiting to fire on this row.
     var hasPendingReminder: Bool { !(remind_at ?? "").isEmpty }
+
+    /// WHAT THE MIDDLE OF THE ROW SAYS when nothing triaged the mail: the
+    /// subject, then as much of the body's opening as fits. nil whenever there
+    /// IS a summary, so a row falls back to the mail's own words only where
+    /// there is nothing better — which today is the spam page and only the spam
+    /// page.
+    ///
+    /// The subject is blank-aware because a cleared `Subject` header is real
+    /// mail with a real body, and "(no subject)" beside its opening line is a
+    /// readable row where an empty one looks like a rendering bug. The preview
+    /// gets no such filler: a body that opens with nothing simply says nothing.
+    ///
+    /// Both are flattened here rather than at ingest. A body's own newlines are
+    /// its formatting, and a snippet that keeps them turns a one-line row into
+    /// a paragraph shaped by whoever sent it.
+    ///
+    /// The caps are a GUARD, not a layout decision — deliberately past what any
+    /// row can show, so the visible cut is the one the row's own width makes.
+    /// A cap tight enough to bite would put an ellipsis in the middle of a row
+    /// with space left on it. What they are actually for is the subject with no
+    /// upper bound at all: the daemon caps the snippet at 200 characters and
+    /// caps a `Subject` header at nothing.
+    var mailText: (subject: String, preview: String)? {
+        guard one_line.isEmpty, subject != nil || preview != nil else { return nil }
+        return (
+            (subject ?? "").displaySubject.flattenedLine(cap: 300),
+            (preview ?? "").flattenedLine(cap: 300)
+        )
+    }
 }
 
 /// The wire calls the address `sender` here and `from_addr` everywhere else, so

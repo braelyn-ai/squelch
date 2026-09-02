@@ -1,7 +1,11 @@
-// One dense update row: importance meter · avatar · sender · one_line ·
+// One dense update row: importance meter · avatar · sender · summary ·
 // relative time · matched-rule hint · deadline chip. Mouse click selects AND
 // opens the thread (gmail semantics); action affordances stay keyboard-first,
 // with the verb hint (default [r][e][d]) only on the selected row.
+//
+// The summary is the triage one-liner on every page but one. The spam page's
+// rows were never triaged and have no one-liner at all, so there the row shows
+// the mail's own subject and the opening of its body instead — see `summary`.
 
 import SwiftUI
 
@@ -26,6 +30,44 @@ struct UpdateRow: View {
     /// row shows the plain relative time like any other band.
     private var showAgeBadge: Bool {
         aging && Fmt.isAging(update.surfaced_at ?? update.resolved_at)
+    }
+
+    /// THE MIDDLE OF THE ROW, which is a summary everywhere except where there
+    /// is none. On the spam page nothing was ever triaged, so `one_line` is
+    /// empty on every row and the column would be a blank the width of the
+    /// window; there the mail speaks for itself — its subject in full ink, then
+    /// the opening of its body faded behind it.
+    ///
+    /// ONE `Text`, both branches, and the two runs are composed into it rather
+    /// than laid out side by side. That is what makes the line truncate in a
+    /// single place, and it truncates in the right order for free: the tail is
+    /// eaten off the preview first and the subject is the last thing to go,
+    /// which is the priority a person scanning a spam folder actually has.
+    ///
+    /// `Text(verbatim:)` for the mail's own words, deliberately. The plain
+    /// literal-with-interpolation form builds a `LocalizedStringKey`, which
+    /// hands a stranger's subject to the string lookup as a key; verbatim says
+    /// what this text is, which is somebody else's, shown as typed.
+    private var summary: Text {
+        guard let mail = update.mailText else {
+            return
+                Text(update.one_line)
+                .font(Typo.rowSub)
+                // Escalation: text leans toward amber as weight climbs.
+                .foregroundStyle(
+                    showAgeBadge ? Palette.warn.opacity(0.45 + weight * 0.55) : Palette.inkDim
+                )
+        }
+        let subject = Text(mail.subject).font(Typo.rowSub).foregroundStyle(Palette.ink)
+        guard !mail.preview.isEmpty else { return subject }
+        // Two spaces, not a glyph. A separator between a stranger's subject and
+        // a stranger's opening line would be one more mark competing with the
+        // decoration they already put in both, and the drop to the faintest ink
+        // says the same thing more quietly.
+        let preview = Text(verbatim: "  \(mail.preview)")
+            .font(Typo.rowSub)
+            .foregroundStyle(Palette.inkFaintest)
+        return Text("\(subject)\(preview)")
     }
 
     /// Phone rows are taller: a tap target, and two lines instead of one, so the
@@ -81,9 +123,11 @@ struct UpdateRow: View {
     // MARK: - phone
 
     /// ONE ROW, TWO LINES. A 393pt screen cannot hold the Mac's six columns —
-    /// the one_line, which carries the whole meaning, is the first thing a
+    /// the summary, which carries the whole meaning, is the first thing a
     /// single-line layout truncates away — so the sender and the stamp take the
-    /// top line and the summary gets the width of the row to itself.
+    /// top line and the summary gets the width of the row to itself. It gets
+    /// two lines of it here, which is also what lets a spam row's subject and
+    /// its opening line both land instead of the second being cut away.
     #if !os(macOS)
         @ViewBuilder
         private func phoneGuts(chip: Fmt.DeadlineChip?) -> some View {
@@ -112,12 +156,7 @@ struct UpdateRow: View {
                             .foregroundStyle(Palette.inkFaintest)
                     }
 
-                    Text(update.one_line)
-                        .font(Typo.rowSub)
-                        .foregroundStyle(
-                            showAgeBadge
-                                ? Palette.warn.opacity(0.45 + weight * 0.55) : Palette.inkDim
-                        )
+                    summary
                         .lineLimit(2)
                         .multilineTextAlignment(.leading)
                         .fixedSize(horizontal: false, vertical: true)
@@ -186,13 +225,7 @@ struct UpdateRow: View {
                         .accessibilityLabel("has attachments")
                 }
 
-                Text(update.one_line)
-                    .font(Typo.rowSub)
-                    // Escalation: text leans toward amber as weight climbs.
-                    .foregroundStyle(
-                        showAgeBadge
-                            ? Palette.warn.opacity(0.45 + weight * 0.55) : Palette.inkDim
-                    )
+                summary
                     .lineLimit(1)
                     .truncationMode(.tail)
                     .frame(maxWidth: .infinity, alignment: .leading)
