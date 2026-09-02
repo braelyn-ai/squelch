@@ -201,6 +201,19 @@ run_suite usage-series \
   Sources/Passband/Lib/UsageSeries.swift \
   Tests/UsageSeriesTests.swift
 
+# The rules page's shape. The nesting, the labels that drop the `*@` and the
+# selection order are all only reachable from a mailbox with several rules on
+# one domain — the one this was built against has eleven rules on eleven
+# domains and exercises none of it. So the fixture lives here instead.
+run_suite rule-grouping \
+  Sources/Passband/Model/SubjectText.swift \
+  Sources/Passband/Model/WireTypes.swift \
+  Sources/Passband/Lib/Format.swift \
+  Sources/Passband/Lib/AsyncMemo.swift \
+  Sources/Passband/Lib/SenderIdentity.swift \
+  Sources/Passband/Lib/RuleGrouping.swift \
+  Tests/RuleGroupingTests.swift
+
 run_suite sender-identity \
   Sources/Passband/Model/SubjectText.swift \
   Sources/Passband/Model/WireTypes.swift \
