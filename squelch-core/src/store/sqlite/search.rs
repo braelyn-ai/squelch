@@ -561,6 +561,9 @@ impl SqliteStore {
         );
         let mut args = vec![Value::Integer(account_id), Value::Text(expr.to_string())];
         if let Some(exclude) = exclude {
+            // The subquery carries no sealed/spam guard and needs none: it only
+            // SUBTRACTS from a set the outer WHERE has already narrowed, so the
+            // worst it could do is hide a row, never reveal one.
             sql.push_str(
                 " AND f.rowid NOT IN (
                      SELECT rowid FROM messages_fts WHERE messages_fts MATCH ?)",
@@ -683,6 +686,9 @@ impl SqliteStore {
         );
         let mut args = vec![Value::Integer(account_id), Value::Text(expr.to_string())];
         if let Some(exclude) = exclude {
+            // The subquery carries no sealed/spam guard and needs none: it only
+            // SUBTRACTS from a set the outer WHERE has already narrowed, so the
+            // worst it could do is hide a row, never reveal one.
             sql.push_str(
                 " AND f.rowid NOT IN (
                      SELECT rowid FROM messages_fts WHERE messages_fts MATCH ?)",

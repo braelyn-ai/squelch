@@ -477,6 +477,10 @@ impl SquelchServer {
         let account_id = self.account_id;
         let query = query.to_string();
         let (hits, _window_full) = tokio::task::spawn_blocking(move || {
+            // `partial: false` — an agent sends settled words, so nothing is
+            // matched as a prefix. The as-you-type widening belongs to a human
+            // still typing (the panel's `partial=1`), and applying it here
+            // would rank `passwordless` beside a query for `password`.
             store.hybrid_search(account_id, &query, &Default::default(), sort, false, k)
         })
         .await
