@@ -80,6 +80,7 @@ struct UsageView: View {
                 if !page.isLoading, let error = page.error {
                     Text(error).font(Typo.micro).foregroundStyle(Palette.danger)
                 }
+                masthead
                 tiles(series)
                 mailCard(series)
                 signalCard(series)
@@ -100,6 +101,20 @@ struct UsageView: View {
         } else {
             SectionCard(label: "Usage") { EmptyNote("loading…") }
         }
+    }
+
+    /// The page's one line of voice. Nothing here is load-bearing, and the
+    /// masthead says so.
+    private var masthead: some View {
+        VStack(alignment: .leading, spacing: 3) {
+            Text("Fun charts")
+                .font(.system(size: 20, weight: .semibold))
+                .foregroundStyle(Palette.ink)
+            Text("We didn't need to build this but graphs are fun ¯\\_(ツ)_/¯")
+                .font(Typo.rowSub)
+                .foregroundStyle(Palette.inkFaint)
+        }
+        .padding(.bottom, 2)
     }
 
     // MARK: - tiles
@@ -148,7 +163,13 @@ struct UsageView: View {
     // MARK: - mail in and out
 
     private func mailCard(_ s: UsageSeries) -> some View {
-        ChartCard(
+        // ONE SCALE, cropped to what is there. Left to itself the axis pads the
+        // sent side out to a round number, and a mailbox that sends three a
+        // day spends half the plot on air under the baseline.
+        let maxIn = Double(s.mail.map(\.received).max() ?? 0)
+        let maxOut = Double(s.mail.map(\.sent).max() ?? 0)
+        let yDomain = (-max(maxOut, 1) * 1.15)...(max(maxIn, 1) * 1.05)
+        return ChartCard(
             title: "Mail in and out", note: "per day",
             legend: [
                 LegendKey(label: "received", color: Palette.chartIn),
@@ -159,7 +180,7 @@ struct UsageView: View {
                 ForEach(s.mail) { d in
                     BarMark(
                         x: .value("Day", d.date, unit: .day),
-                        y: .value("Received", d.received),
+                        y: .value("Received", Double(d.received)),
                         stacking: .unstacked
                     )
                     .foregroundStyle(Palette.chartIn)
@@ -167,7 +188,7 @@ struct UsageView: View {
                     // Sent hangs below the line: in up, out down, one scale.
                     BarMark(
                         x: .value("Day", d.date, unit: .day),
-                        y: .value("Sent", -d.sent),
+                        y: .value("Sent", -Double(d.sent)),
                         stacking: .unstacked
                     )
                     .foregroundStyle(Palette.chartOut)
@@ -187,12 +208,13 @@ struct UsageView: View {
                     }
                 }
             }
+            .chartYScale(domain: yDomain)
             .chartYAxis {
                 AxisMarks(position: .leading, values: .automatic(desiredCount: 4)) { value in
                     AxisGridLine().foregroundStyle(Palette.hairline)
                     AxisValueLabel {
-                        if let n = value.as(Int.self) {
-                            Text(UsageText.count(abs(n)))
+                        if let n = value.as(Double.self) {
+                            Text(UsageText.count(Int(abs(n).rounded())))
                         }
                     }
                     .font(Typo.micro)
@@ -340,7 +362,7 @@ struct UsageView: View {
                     AxisGridLine().foregroundStyle(Palette.hairline)
                     AxisValueLabel {
                         if let v = value.as(Double.self) {
-                            Text(Fmt.fmtCost(v))
+                            Text(v == 0 ? "$0" : Fmt.fmtCost(v))
                         }
                     }
                     .font(Typo.micro)
