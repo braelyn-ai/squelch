@@ -1360,7 +1360,46 @@ struct AssistantSection: View {
 
     var body: some View {
         @Bindable var prefs = prefs
-        SectionCard(label: "Assistant") {
+        VStack(alignment: .leading, spacing: 16) {
+            chatCard
+            // THE SEARCH LANE'S OWN CARD, beside the chat's because it is the
+            // same key and the same bill, and separate from it because it is a
+            // different spender: this one runs unasked, on a search that looked
+            // like a question (docs/SEARCH.md §6.5).
+            //
+            // Mac only. The phone's search field still counts spaces and hands
+            // the whole query to the agent (MobileSearchView), so there is no
+            // lane there to configure and a picker that changed nothing would
+            // be worse than no picker.
+            #if os(macOS)
+                SectionCard(label: "Deeper search") {
+                    InlineRow(key: "when") {
+                        GlassSegmented(
+                            options: DeeperSearchChoice.allCases.map { ($0, $0.label) },
+                            selection: $prefs.deeperSearch)
+                    }
+                    SettingsHint(prefs.deeperSearch.blurb)
+                    if prefs.deeperSearch != .off {
+                        InlineRow(key: "model") {
+                            GlassSegmented(
+                                options: AssistantModel.allCases.map { ($0, $0.shortLabel) },
+                                selection: $prefs.searchLaneModel)
+                        }
+                        SettingsHint(
+                            "Which model reads your mail when a search goes deeper. Separate "
+                                + "from the chat's, because this one runs on every "
+                                + "question-shaped search rather than when you ask.")
+                    }
+                }
+            #endif
+        }
+        .task { status = await AssistantKeyStore.statusAsync() }
+    }
+
+    /// The ⌘K chat's own settings, exactly as they were.
+    private var chatCard: some View {
+        @Bindable var prefs = prefs
+        return SectionCard(label: "Assistant") {
             if store.relayAvailable {
                 InlineRow(key: "chats via") {
                     GlassSegmented(
@@ -1386,7 +1425,6 @@ struct AssistantSection: View {
             }
             SettingsHint(prefs.assistantModel.label)
         }
-        .task { status = await AssistantKeyStore.statusAsync() }
     }
 
     /// The BYOK card as it has always been: the masked key field, its status

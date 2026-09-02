@@ -26,6 +26,7 @@
 		0FE1B2AACB4D13002E0F5381 /* GroupEditor.swift in Sources */ = {isa = PBXBuildFile; fileRef = F8FF235DC1DB2B57F7C06220 /* GroupEditor.swift */; };
 		120F38E19705221A8EAA5ECF /* SidePanel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 992EA99CCF93A2EA929D6E3B /* SidePanel.swift */; };
 		13068136E70BA1E4AD4A9709 /* PushRegistration.swift in Sources */ = {isa = PBXBuildFile; fileRef = 083E104C0BABF65C4BB44673 /* PushRegistration.swift */; };
+		15A787A3BDDFA9B878693BED /* AgentCards.swift in Sources */ = {isa = PBXBuildFile; fileRef = 09312A1F80127B91A8FDC394 /* AgentCards.swift */; };
 		1627BFF43F50B50F6F5C606A /* ThreadStyleLedger.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9C92A36DDD1B4FF9A1BD99B0 /* ThreadStyleLedger.swift */; };
 		16B0C0F30C085FB37AB94D2A /* APIError.swift in Sources */ = {isa = PBXBuildFile; fileRef = 37716282CFABFF5910677BBC /* APIError.swift */; };
 		16E483911006F01000C2CEC8 /* ConnectView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4D6D7D083F3A7242DB7EB186 /* ConnectView.swift */; };
@@ -65,12 +66,14 @@
 		396BF899A7D7540E0DBCBB5B /* Badge.swift in Sources */ = {isa = PBXBuildFile; fileRef = F3B428F6536347775B3EA5DC /* Badge.swift */; };
 		39808BC8E64BACBC8B8DCB4F /* ReadReceipt.swift in Sources */ = {isa = PBXBuildFile; fileRef = 759702EBD03C1CECFD041E57 /* ReadReceipt.swift */; };
 		39B48BCF60CA5737C7088687 /* RemindTimes.swift in Sources */ = {isa = PBXBuildFile; fileRef = CDDAB6C380027F87A19022BF /* RemindTimes.swift */; };
+		3D45D6FA3BBF96A82531286A /* DeeperSearchBand.swift in Sources */ = {isa = PBXBuildFile; fileRef = EE90BEFCBE860D7F852028C5 /* DeeperSearchBand.swift */; };
 		3D971F09C7234C3DDB9B4534 /* AttachmentFiles.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9369773169CED1C1EFD48EB0 /* AttachmentFiles.swift */; };
 		3D9FC5E3CCE051354CB6FF29 /* RefinementSlot.swift in Sources */ = {isa = PBXBuildFile; fileRef = 15B8541C2F7C988507905103 /* RefinementSlot.swift */; };
 		3DE29A8C29C7B5A426EB8122 /* AuthArrival.swift in Sources */ = {isa = PBXBuildFile; fileRef = FE241E317BA5B3B4D25B892E /* AuthArrival.swift */; };
 		3E13EF7C34DE299091467239 /* ImageFill.swift in Sources */ = {isa = PBXBuildFile; fileRef = CE514B2862480E62EB8936A3 /* ImageFill.swift */; };
 		3E86ED3B31C4CFD8E08695DF /* AttachmentThumbs.swift in Sources */ = {isa = PBXBuildFile; fileRef = BE85FBF58B14F2DC27FC16FB /* AttachmentThumbs.swift */; };
 		3F3CDF4B6911349A9481A225 /* InlineReply.swift in Sources */ = {isa = PBXBuildFile; fileRef = E5B001C6ABDDB051E2B57205 /* InlineReply.swift */; };
+		3FBFC0C93CC79B3FD2624085 /* DeeperSearchBand.swift in Sources */ = {isa = PBXBuildFile; fileRef = EE90BEFCBE860D7F852028C5 /* DeeperSearchBand.swift */; };
 		3FF1A5AFB7412C3BABDA8352 /* Sparkle.framework in Embed Frameworks */ = {isa = PBXBuildFile; fileRef = 82CD5D3AEF359995F968DB53 /* Sparkle.framework */; settings = {ATTRIBUTES = (CodeSignOnCopy, RemoveHeadersOnCopy, ); }; };
 		40E611424100EA3551AB3477 /* ThreadPrefetch.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5F62561CEB4911BA0E72FEDD /* ThreadPrefetch.swift */; };
 		41353103B9D24E161228B692 /* Assistant.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1EC7EBBF801C0364D402F94D /* Assistant.swift */; };
@@ -197,6 +200,7 @@
 		999288733123CB9385DBE681 /* GmailDisconnectedBanner.swift in Sources */ = {isa = PBXBuildFile; fileRef = C756C9A9A4570C1AFFE7003E /* GmailDisconnectedBanner.swift */; };
 		99CFBE791F3799FBEFB5D213 /* ComposePane.swift in Sources */ = {isa = PBXBuildFile; fileRef = B97BB8DF0B7CB3C4E9EC791B /* ComposePane.swift */; };
 		99E823237BD7F3F4EE5C26DF /* Newsletters.swift in Sources */ = {isa = PBXBuildFile; fileRef = 47779240FEC7579D6A0072CB /* Newsletters.swift */; };
+		9A9AA77AC829165E466C9597 /* AgentCards.swift in Sources */ = {isa = PBXBuildFile; fileRef = 09312A1F80127B91A8FDC394 /* AgentCards.swift */; };
 		9B3E18E0184901FAE39CB499 /* ThreadMinimap.swift in Sources */ = {isa = PBXBuildFile; fileRef = 06AB2FB92191FC4913C38FFF /* ThreadMinimap.swift */; };
 		9C92F8C76EDAC718182EE03C /* SpamNotice.swift in Sources */ = {isa = PBXBuildFile; fileRef = 848BEC54D1FCD1F0FC5BE1A5 /* SpamNotice.swift */; };
 		9EA7C093CFE335E233A6411C /* AuthCodeModal.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A47FA6986F50A4E81628452 /* AuthCodeModal.swift */; };
@@ -366,6 +370,7 @@
 		070286D5016F78C93DC49070 /* Opener.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Opener.swift; sourceTree = "<group>"; };
 		083E104C0BABF65C4BB44673 /* PushRegistration.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PushRegistration.swift; sourceTree = "<group>"; };
 		09298B50527CD0E9872F345B /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = Info.plist; sourceTree = "<group>"; };
+		09312A1F80127B91A8FDC394 /* AgentCards.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AgentCards.swift; sourceTree = "<group>"; };
 		0AFCAEC0D83E0E01D0074CE7 /* WhatsNewCard.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WhatsNewCard.swift; sourceTree = "<group>"; };
 		10544C7DF8CDBA851AF0D9D8 /* Actions.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Actions.swift; sourceTree = "<group>"; };
 		12468DFB107CC662204BCE84 /* MobileRootView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MobileRootView.swift; sourceTree = "<group>"; };
@@ -519,6 +524,7 @@
 		E8D7384FAFC16891C369CFA8 /* UsageView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = UsageView.swift; sourceTree = "<group>"; };
 		E949BF41848E8F43B63C7AB7 /* AnthropicStream.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AnthropicStream.swift; sourceTree = "<group>"; };
 		EA2D959F49735AD9EDD13910 /* SentRow.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SentRow.swift; sourceTree = "<group>"; };
+		EE90BEFCBE860D7F852028C5 /* DeeperSearchBand.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DeeperSearchBand.swift; sourceTree = "<group>"; };
 		EEFA34554013DFB615774309 /* Trackers.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Trackers.swift; sourceTree = "<group>"; };
 		EFF2F03B0D68F54C0DC28777 /* ImageRepeats.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ImageRepeats.swift; sourceTree = "<group>"; };
 		F1E7DFB379AF677D44E393FF /* AgentTools.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AgentTools.swift; sourceTree = "<group>"; };
@@ -575,6 +581,7 @@
 			isa = PBXGroup;
 			children = (
 				9B11AE47A064BB58DD81A6DB /* ActionLayer.swift */,
+				09312A1F80127B91A8FDC394 /* AgentCards.swift */,
 				4D74815E3375EAC96A4841CF /* AskBar.swift */,
 				15D14DE02E72E63FE53D5C8D /* AttachmentStrip.swift */,
 				E6D39F14D1F28EEB5D9E86FE /* AuditView.swift */,
@@ -584,6 +591,7 @@
 				B97BB8DF0B7CB3C4E9EC791B /* ComposePane.swift */,
 				5FCD987D800267801D7B4DFE /* ConnectionHealth.swift */,
 				4D6D7D083F3A7242DB7EB186 /* ConnectView.swift */,
+				EE90BEFCBE860D7F852028C5 /* DeeperSearchBand.swift */,
 				6D358053F47CDAD2D0B7EAB5 /* EmailsView.swift */,
 				3BFBFFBE499370A5F88E2540 /* EmailWebCore.swift */,
 				49697D28E02B833310EE2C12 /* EmailWebView.swift */,
@@ -1027,6 +1035,7 @@
 				E96078DC56E87F722CEBEDE8 /* Accounts.swift in Sources */,
 				022DB1DE5C307F7EFF36AFE5 /* ActionLayer.swift in Sources */,
 				E5DC83A762609363C2ED15CB /* Actions.swift in Sources */,
+				9A9AA77AC829165E466C9597 /* AgentCards.swift in Sources */,
 				8584D208439539843BAE4481 /* AgentTools.swift in Sources */,
 				ADCD91460923247021793032 /* Analytics.swift in Sources */,
 				88DA0B8D32AA1FE0E82DA026 /* AnthropicStream.swift in Sources */,
@@ -1055,6 +1064,7 @@
 				D83D2EEAF55EE8AC5B9EBEAE /* Concurrency.swift in Sources */,
 				41C4ED1EF887939603866DC0 /* ConnectView.swift in Sources */,
 				A4DAE234F5C7BDED52D12A55 /* ConnectionHealth.swift in Sources */,
+				3FBFC0C93CC79B3FD2624085 /* DeeperSearchBand.swift in Sources */,
 				2530ADC217749D5FEEFFA4D9 /* DraftSaver.swift in Sources */,
 				918EB3663E912FF4F36229C2 /* EmailWebCore.swift in Sources */,
 				D5D9F05E11B3B8383ED792EB /* EmailWebView.swift in Sources */,
@@ -1174,6 +1184,7 @@
 				542F16866D729BD1E30B6AA6 /* AccountPage.swift in Sources */,
 				57D260FC9FFF00F0F3DB336E /* Accounts.swift in Sources */,
 				778A9FBEDBA350092B770844 /* Actions.swift in Sources */,
+				15A787A3BDDFA9B878693BED /* AgentCards.swift in Sources */,
 				EA82308C99D5B6C590E73289 /* AgentTools.swift in Sources */,
 				C3DD204EC3377648F4153546 /* Analytics.swift in Sources */,
 				7D06A833C919C4053C84351D /* AnthropicStream.swift in Sources */,
@@ -1201,6 +1212,7 @@
 				37323F67BEB78A71E32524ED /* Concurrency.swift in Sources */,
 				16E483911006F01000C2CEC8 /* ConnectView.swift in Sources */,
 				4AC6AF18555B3DB2FE69CC91 /* ConnectionHealth.swift in Sources */,
+				3D45D6FA3BBF96A82531286A /* DeeperSearchBand.swift in Sources */,
 				2305ADF476A30E034D2EC27C /* DraftSaver.swift in Sources */,
 				903D181BC549637A0AEEB564 /* EmailWebCore.swift in Sources */,
 				4D885CFF844970680B6C93DA /* EmailWebViewiOS.swift in Sources */,

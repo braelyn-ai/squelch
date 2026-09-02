@@ -218,6 +218,35 @@ struct SearchSession: Sendable, Equatable {
     /// more (or nothing authoritative is on screen). Parked here with the rest
     /// so reopening resumes mid-scroll instead of dropping back to page one.
     var nextCursor: String?
+
+    // MARK: the deeper-search lane, as the PANEL sees it
+    //
+    // The conversation itself is `AppStore.searchLane`, an AssistantSession,
+    // and it cannot live in here: this is a struct with Equatable semantics
+    // that the store copies around, and a class with identity inside one would
+    // compare by pointer while behaving like shared state. So the session sits
+    // beside this and its bookkeeping sits in here, as plain values that the
+    // band renders and that reset with the search they describe.
+
+    /// The last verdict, for the panel session on screen. nil until a query has
+    /// settled and been judged; `.lookup` is a real answer, which is why this
+    /// is not merely "is there a trigger".
+    var lastVerdict: SearchIntent.Verdict?
+    /// Whether the lane has been started for THIS panel session. What makes a
+    /// second deeper query a refinement rather than a second conversation.
+    var laneStarted = false
+    /// Why it started, for the band's one line of small type. Held rather than
+    /// re-derived: the query has moved on by the time the band draws, and the
+    /// reason has to be the one that actually spent the money.
+    var laneTrigger: SearchIntent.Trigger?
+    /// The query the lane was started on, so the band's reason can count the
+    /// words that triggered it rather than whatever is in the field now.
+    var laneQuery = ""
+    /// How often it has been narrowed since. A MIRROR of the session's own
+    /// count (`AssistantSession.refinementCount`), which stays authoritative:
+    /// this copy is for the panel to read without reaching through the store
+    /// into a class it does not own.
+    var refinementCount = 0
 }
 
 // MARK: - connection
@@ -710,6 +739,16 @@ final class AppStore {
     /// mid-answer — every time the bar closed. Living in the store, the
     /// transcript survives until the user asks for a new chat.
     let assistant = AssistantSession()
+    /// THE SEARCH PANEL'S OWN AGENT, a second session in the search lane (see
+    /// `Lane`, docs/SEARCH.md §6.1). Held here for the reason the ⌘K session is
+    /// and one more: `SearchSession` is a struct the store copies, so the
+    /// conversation lives beside it and only its bookkeeping goes in it.
+    ///
+    /// Its own session rather than a mode on the chat's, because the two are
+    /// genuinely different conversations: the chat is a thread of questions
+    /// somebody typed, the lane is one search being narrowed, and merging them
+    /// would put a search the reader never spoke into the ⌘K transcript.
+    let searchLane = AssistantSession(lane: .search)
     var shortcutsOpen = false
     /// The first-run tour. Held here for the same reason the assistant is: it
     /// outlives every view it draws itself in, and the trigger that starts it
@@ -1266,6 +1305,11 @@ final class AppStore {
         remindersLoadedAt = nil
         remindersRefresh = nil
         reminderFilter = false
+        // The panel's state AND the conversation beside it. A lane left running
+        // here would finish a search of the old mailbox into the new one's
+        // panel, cards and all — it holds thread ids that mean something else
+        // under the account that just went away.
+        searchLane.clear()
         search = SearchSession()
         resolvedIds = []
         selectedId = nil
@@ -2204,7 +2248,16 @@ final class AppStore {
     }
 
     func openSide(_ view: SideView) { sideView = view }
-    func closeSide() { sideView = .none }
+
+    /// Close the panel, and HOLD the deeper-search lane rather than losing it
+    /// (docs/SEARCH.md §6.3). Nothing is torn down: the in-flight model turn
+    /// finishes, no tool runs after it, and the conversation sits with its
+    /// transcript and cards until the panel is opened again. A pause on an idle
+    /// session is a no-op, so this is safe to call unconditionally.
+    func closeSide() {
+        searchLane.pause()
+        sideView = .none
+    }
 
     /// Open search. By default it RESUMES the last one; `seed` forces a fresh
     /// term (`f` on a row or in the reader, seeding `from:<address>`).
@@ -2219,10 +2272,21 @@ final class AppStore {
             // Nil BOTH: the fetched term is what gates the refetch, and a cursor
             // from the old term would page a search that is no longer on screen.
             search.fetchedQuery = nil
+            search.diagnostics = nil
             search.nextCursor = nil
-        } else if let seed {
-            // Restore the field text in case the bar was edited since the fetch.
-            search.query = seed
+            // A SEED IS A DIFFERENT SEARCH, not a narrowing of the one being
+            // held: `f` on a row asks "what else is from this person", which
+            // has nothing to do with the question the lane was answering. So
+            // the conversation goes rather than resuming (docs/SEARCH.md §6.3).
+            resetSearchLane()
+        } else {
+            // Restore the field text in case the bar was edited since the fetch
+            // (a seed that matches what is already on screen is the same
+            // search, so it keeps everything, the lane included).
+            if let seed { search.query = seed }
+            // The same search, coming back: pick the lane up at the boundary it
+            // was holding at.
+            searchLane.resume()
         }
         // Always reopen as the strip: resuming the query is a convenience,
         // resuming a fullscreen takeover is a mode trap.
@@ -2232,6 +2296,61 @@ final class AppStore {
         // from "expand results" to "open that stale row".
         search.index = -1
         sideView = .search
+    }
+
+    /// START THE DEEPER SEARCH on the query the panel has just answered, with
+    /// the hits it answered with. Called by the classifier's automatic path and
+    /// by the band's own button, so the two cannot disagree about what starting
+    /// means (docs/SEARCH.md §6.1, §6.5).
+    ///
+    /// The event carries the trigger and the model tier and NOTHING ELSE: the
+    /// query is the reader's own words about their own mail, and no part of it,
+    /// nor of what the search found, goes near telemetry.
+    func startDeeperSearch(trigger: SearchIntent.Trigger) {
+        let query = search.fetchedQuery ?? search.query.trimmed
+        guard !query.isEmpty, !search.laneStarted else { return }
+        search.laneStarted = true
+        search.laneTrigger = trigger
+        search.laneQuery = query
+        search.refinementCount = 0
+        Analytics.capture(
+            "search_deeper_started",
+            [
+                "trigger": trigger.analyticsValue,
+                "model": Prefs.shared.searchLaneModel.shortLabel.lowercased(),
+            ])
+        searchLane.send(query, openEmail: nil, hits: search.hits)
+    }
+
+    /// EVERY SETTLED QUERY AFTER THE FIRST is the same need narrowed, whatever
+    /// the classifier makes of it on its own: somebody who typed a question and
+    /// then deleted a word has not stopped asking the question. So this is
+    /// called for every settled query once the lane is going, and the session
+    /// decides whether it lands at a boundary or as the next turn.
+    func refineDeeperSearch() {
+        guard search.laneStarted else { return }
+        let query = search.fetchedQuery ?? search.query.trimmed
+        guard !query.isEmpty else { return }
+        searchLane.refine(query, hits: search.hits)
+        // Mirror the session's own count, and notice a reset: past the twelfth
+        // narrowing the session starts fresh on these words, so they are what
+        // the band's reason should be counting from here on.
+        if searchLane.refinementCount == 0 { search.laneQuery = query }
+        search.refinementCount = searchLane.refinementCount
+    }
+
+    /// Tear the deeper-search conversation down and forget that one ever ran
+    /// for this panel session. The band's "new" control and a seeded search
+    /// both land here, and so does every account teardown: one door, because
+    /// the session and the four values that describe it must never disagree
+    /// about whether a lane is running.
+    func resetSearchLane() {
+        searchLane.clear()
+        search.laneStarted = false
+        search.laneTrigger = nil
+        search.laneQuery = ""
+        search.lastVerdict = nil
+        search.refinementCount = 0
     }
 
     func openCompose(_ state: ComposeState) {

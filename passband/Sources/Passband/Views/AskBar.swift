@@ -466,51 +466,13 @@ struct AskBar: View {
 
     // MARK: - shown emails
 
-    /// The show_emails cards: the agent's answer AS emails. Same click contract
-    /// as a citation — open the thread, close the bar — but rendered like list
-    /// rows, because they are the result rather than a footnote.
+    /// The show_emails cards, drawn by the shared list (Views/AgentCards.swift
+    /// — the search lane draws the same rows). Same click contract as a
+    /// citation here: open the thread, close the bar.
     private func emailCards(_ cards: [EmailCard]) -> some View {
-        VStack(alignment: .leading, spacing: 6) {
-            ForEach(cards) { card in
-                Button {
-                    store.openThread(card.threadId)
-                    onClose()
-                } label: {
-                    VStack(alignment: .leading, spacing: 3) {
-                        HStack(spacing: 7) {
-                            Avatar(sender: card.sender, size: 18)
-                            Text(card.sender)
-                                .font(.system(size: 12, weight: .semibold))
-                                .foregroundStyle(Palette.ink)
-                                .lineLimit(1)
-                            Spacer(minLength: 6)
-                            Text(Fmt.dateTime(card.date))
-                                .font(Typo.num(10))
-                                .foregroundStyle(Palette.inkFaintest)
-                        }
-                        Text(card.subject)
-                            .font(Typo.rowSub)
-                            .foregroundStyle(Palette.inkDim)
-                            .lineLimit(1)
-                        if !card.snippet.isEmpty {
-                            Text(card.snippet)
-                                .font(Typo.micro)
-                                .foregroundStyle(Palette.inkFaintest)
-                                .lineLimit(2)
-                                .multilineTextAlignment(.leading)
-                        }
-                    }
-                    .padding(10)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .contentShape(Rectangle())
-                }
-                .buttonStyle(.plain)
-                .background(
-                    RoundedRectangle(cornerRadius: 10, style: .continuous)
-                        .fill(Palette.hairline.opacity(0.35))
-                )
-                .help("Open this thread")
-            }
+        EmailCardList(cards: cards) { threadId in
+            store.openThread(threadId)
+            onClose()
         }
     }
 
@@ -624,35 +586,5 @@ private final class MarkdownCache {
     }
 }
 
-/// One tool-activity chip: what the agent is doing, in the smallest type the
-/// app has, with its outcome on the trailing edge.
-private struct ToolChipRow: View {
-    let tool: ToolActivity
-
-    var body: some View {
-        HStack(spacing: 6) {
-            Image(systemName: AgentTools.Tool(rawValue: tool.name)?.symbol ?? "wrench")
-                .font(.system(size: 10, weight: .semibold))
-                .foregroundStyle(Palette.inkFaint)
-                .frame(width: 12)
-            Text(tool.summary)
-                .font(Typo.micro)
-                .foregroundStyle(Palette.inkFaint)
-                .lineLimit(1)
-                .truncationMode(.tail)
-            Spacer(minLength: 4)
-            switch tool.state {
-            case .running:
-                ProgressView().controlSize(.mini)
-            case .ok:
-                Image(systemName: "checkmark")
-                    .font(.system(size: 9, weight: .bold))
-                    .foregroundStyle(Palette.positive.opacity(0.8))
-            case .failed:
-                Image(systemName: "xmark")
-                    .font(.system(size: 9, weight: .bold))
-                    .foregroundStyle(Palette.danger)
-            }
-        }
-    }
-}
+// ToolChipRow and the email cards moved to Views/AgentCards.swift when the
+// search panel grew a lane that draws the same two rows.

@@ -87,6 +87,7 @@ enum Analytics {
         "email_remind", "email_not_spam",
         "block_rule_created", "compose_opened", "compose_send",
         "thread_opened", "thread_live_arrival", "undo_fired", "assistant_asked",
+        "search_deeper_started",
         "triage_corrected", "triage_digest", "rule_created", "rule_deleted",
         "process_completed", "notification_opened", "sealed_revealed",
         "shipment_cleared",
@@ -151,8 +152,14 @@ enum Analytics {
             "marketing", "general", "sealed", "normal", "unset",
             // rule_created dispositions
             "surface", "squelch", "filtered",
-            // assistant_asked models
+            // assistant_asked models — and search_deeper_started's, which is
+            // the same closed set because it is the same picker's vocabulary.
             "haiku", "opus",
+            // search_deeper_started triggers: which signal started the deeper
+            // search lane (SearchIntent.Trigger). The query itself is the
+            // reader's mail and goes nowhere near this event; these two say
+            // only which RULE fired.
+            "question", "no_strict_hits",
             // assistant_asked transports
             "relay", "byok",
             // invite_sent sources — where the share sheet was raised from

@@ -160,46 +160,25 @@ struct SearchView: View {
             if let error = store.search.error { BandNote(error) }
             if answered && store.search.hits.isEmpty { BandNote("no matches.") }
 
-            ScrollViewReader { proxy in
-                ScrollView {
-                    LazyVStack(spacing: expanded ? 10 : 6) {
-                        ForEach(Array(store.search.hits.enumerated()), id: \.element.id) { i, hit in
-                            // One click opens: the reader sits beside this list,
-                            // so opening a hit costs the results nothing.
-                            HitRow(
-                                hit: hit, terms: terms, selected: i == store.search.index,
-                                expanded: expanded
-                            ) {
-                                store.search.index = i
-                                open()
-                            }
-                            .id(hit.id)
-                            // Reaching the last row IS the request for the next
-                            // page. On the row rather than a footer sentinel so
-                            // it fires in both the strip and fullscreen, where
-                            // the column widths (and so the row counts) differ.
-                            .onAppear {
-                                guard hit.id == store.search.hits.last?.id else { return }
-                                Task { await loadMore() }
-                            }
+            // THE STRIP IS TOO NARROW FOR TWO COLUMNS (460pt), so there the
+            // lane is a band ABOVE the hits; expanded, it becomes the right
+            // column beside them and the results keep their reading width. Same
+            // view either way — see DeeperSearchBand.
+            if expanded {
+                HStack(alignment: .top, spacing: 0) {
+                    results(expanded: true)
+                    if bandMounted {
+                        ScrollView {
+                            DeeperSearchBand(expanded: true)
+                                .padding(.horizontal, 16)
+                                .padding(.bottom, 14)
                         }
-                        // Rows just stopping is indistinguishable from the end
-                        // of the results, so the append announces itself.
-                        if loadingMore { BandNote("loading more…") }
-                    }
-                    // Fullscreen keeps a reading-width column: match text in
-                    // window-wide rows is a treadmill for the eyes.
-                    .frame(maxWidth: expanded ? 780 : .infinity)
-                    .frame(maxWidth: .infinity)
-                    .padding(.horizontal, expanded ? 24 : 14)
-                    .padding(.bottom, 14)
-                }
-                .onChange(of: store.search.index) { _, i in
-                    guard let hit = store.search.hits[safe: i] else { return }
-                    withAnimation(Motion.scrollFollow) {
-                        proxy.scrollTo(hit.id, anchor: .center)
+                        .frame(minWidth: 320, idealWidth: 380, maxWidth: 440)
                     }
                 }
+            } else {
+                if bandMounted { DeeperSearchBand(expanded: false) }
+                results(expanded: false)
             }
         }
         .keyBindings(.modal, bindings)
@@ -227,6 +206,61 @@ struct SearchView: View {
         // screen until the reader edits their query. An array because tuples do
         // not conform to Equatable and `task(id:)` needs one value.
         .task(id: [store.search.query, prefs.searchSort.rawValue]) { await runSearch() }
+    }
+
+    /// The hits themselves, extracted so the strip (band above) and the
+    /// expanded layout (band beside) can both draw them without a second copy.
+    private func results(expanded: Bool) -> some View {
+        ScrollViewReader { proxy in
+            ScrollView {
+                LazyVStack(spacing: expanded ? 10 : 6) {
+                    ForEach(Array(store.search.hits.enumerated()), id: \.element.id) { i, hit in
+                        // One click opens: the reader sits beside this list,
+                        // so opening a hit costs the results nothing.
+                        HitRow(
+                            hit: hit, terms: terms, selected: i == store.search.index,
+                            expanded: expanded
+                        ) {
+                            store.search.index = i
+                            open()
+                        }
+                        .id(hit.id)
+                        // Reaching the last row IS the request for the next
+                        // page. On the row rather than a footer sentinel so
+                        // it fires in both the strip and fullscreen, where
+                        // the column widths (and so the row counts) differ.
+                        .onAppear {
+                            guard hit.id == store.search.hits.last?.id else { return }
+                            Task { await loadMore() }
+                        }
+                    }
+                    // Rows just stopping is indistinguishable from the end
+                    // of the results, so the append announces itself.
+                    if loadingMore { BandNote("loading more…") }
+                }
+                // Fullscreen keeps a reading-width column: match text in
+                // window-wide rows is a treadmill for the eyes.
+                .frame(maxWidth: expanded ? 780 : .infinity)
+                .frame(maxWidth: .infinity)
+                .padding(.horizontal, expanded ? 24 : 14)
+                .padding(.bottom, 14)
+            }
+            .onChange(of: store.search.index) { _, i in
+                guard let hit = store.search.hits[safe: i] else { return }
+                withAnimation(Motion.scrollFollow) {
+                    proxy.scrollTo(hit.id, anchor: .center)
+                }
+            }
+        }
+    }
+
+    /// Whether the deeper-search band is on screen at all. It appears once THIS
+    /// panel session has judged a query deeper (or has already started a lane),
+    /// so a reader whose searches are all lookups never sees it; `off` mounts
+    /// nothing, ever.
+    private var bandMounted: Bool {
+        guard prefs.deeperSearch != .off else { return false }
+        return store.search.laneStarted || store.search.lastVerdict?.isDeeper == true
     }
 
     private var bindings: [KeyBinding] {
@@ -326,6 +360,11 @@ struct SearchView: View {
             for hit in page.items.prefix(5) {
                 ThreadPrefetch.shared.prefetch(hit.thread_id)
             }
+            // AFTER THE FETCH, NEVER MID-KEYSTROKE. The classifier is a
+            // decision to spend money, so it is made once per SETTLED query —
+            // past the 220ms debounce, with the daemon's own diagnostics for
+            // exactly these words in hand.
+            judge(term)
         } catch {
             // Cancellation surfaces here too (URLError.cancelled mid-request):
             // that is a superseded task, not a failure, and writing an error
@@ -346,6 +385,29 @@ struct SearchView: View {
             store.search.nextCursor = nil
         }
         loading = false
+    }
+
+    /// Keyword or question, for the query whose hits are now on screen
+    /// (docs/SEARCH.md §5). The verdict is recorded whatever the preference
+    /// says, because it is also what mounts the band on request; only STARTING
+    /// is the preference's business.
+    private func judge(_ term: String) {
+        let verdict = SearchIntent.classify(query: term, diagnostics: store.search.diagnostics)
+        store.search.lastVerdict = verdict
+        guard prefs.deeperSearch != .off else { return }
+        // ONCE STARTED, EVERY SETTLED QUERY IS A REFINEMENT — including one the
+        // classifier would not have started a lane for. Somebody who typed a
+        // question and then deleted a word has not stopped asking it, and a
+        // lane that only heard about the queries that re-triggered it would be
+        // answering the question before last.
+        if store.search.laneStarted {
+            store.refineDeeperSearch()
+            return
+        }
+        // On request, the band offers a button and nothing runs until it is
+        // pressed. Automatic is the only path that spends unasked.
+        guard prefs.deeperSearch == .automatic, let trigger = verdict.trigger else { return }
+        store.startDeeperSearch(trigger: trigger)
     }
 
     /// Append the page after the one on screen. Cursors are only meaningful
