@@ -483,6 +483,13 @@ final class AssistantSession {
             switched: switched,
             hits: hits)
         activeAskEmail = openEmail
+        // THE MODEL NOW HAS THESE WORDS, whether they came in as a first
+        // question or as the restart past the twelfth narrowing. Recorded so
+        // the next `refine` carrying the same text can see that it narrows
+        // nothing: the panel refetches for reasons that are not the reader
+        // typing (the sort flipping, a failed search retried), and each of
+        // those arrives here as a settled query with characters unchanged.
+        refinements.markDelivered(question)
         running = true
         let gen = generation
         runTask = Task { [weak self] in await self?.run(question, pin: pin, gen: gen) }
@@ -500,14 +507,26 @@ final class AssistantSession {
     ///
     /// Refinements COALESCE: only the newest pending one is delivered, so
     /// "abstract conf" then "abstract conference wifi" is one refinement, the
-    /// second. Past the twelfth the conversation is started fresh: somebody who
-    /// has narrowed a dozen times has changed the subject, and the history is
-    /// costing tokens to carry a search nobody is running any more.
+    /// second. Twelve narrowings is what one conversation absorbs; the
+    /// thirteenth starts it fresh, because somebody who has narrowed a dozen
+    /// times has changed the subject and the history is costing tokens to carry
+    /// a search nobody is running any more.
+    ///
+    /// AND THE SAME WORDS ARE NOT A NARROWING. The panel resettles for things
+    /// the reader did not type — flipping the sort re-ranks the identical
+    /// query, a failed search is retried under it — and each of those would
+    /// otherwise buy a turn, a request and one of the twelve to tell the model
+    /// that the reader refined the search to what it is already reading.
     func refine(_ text: String, hits: [SearchHit]) {
         let words = text.trimmed
         guard !words.isEmpty else { return }
         let refinement = Refinement(text: words, hits: Self.promptHits(hits))
-        switch refinements.offer(refinement) {
+        switch refinements.offer(refinement, key: words) {
+        case .duplicate:
+            // Nothing narrowed, so nothing is spent. The newer local hits are
+            // dropped with it on purpose: they are context for a question, and
+            // there is no new question to attach them to.
+            return
         case .restart:
             clear()
             start(words, openEmail: nil, hits: refinement.hits)

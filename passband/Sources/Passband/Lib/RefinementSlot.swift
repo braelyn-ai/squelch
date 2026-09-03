@@ -24,10 +24,23 @@ struct RefinementSlot<Value: Sendable>: Sendable {
 
     private var pending: Value?
 
+    /// The words last handed to the model, first question or narrowing. A
+    /// refinement that repeats them is not a narrowing at all: §6.2 defines one
+    /// as "each settled query after the first" being the reader NARROWING, and
+    /// the same words are the same need at the same width.
+    ///
+    /// This exists because the panel refetches for things that are not the
+    /// reader typing. Flipping the sort re-runs the search with the identical
+    /// words, and so does retrying a failed one; without this, each of those
+    /// spent a turn out of the eight, a request on the reader's key, and one of
+    /// the narrowings before the conversation is torn down, to tell the model
+    /// "the reader refined the search to" exactly what it was already reading.
+    private(set) var lastDelivered: String?
+
     /// How many narrowings one conversation absorbs before it is started
-    /// fresh. Twelve is a lot of typing about one need; past it, the reader has
-    /// changed the subject and the history is now costing tokens to carry a
-    /// conversation about something else.
+    /// fresh. Twelve is a lot of typing about one need; the thirteenth is a
+    /// reader who has changed the subject, and the history is by then costing
+    /// tokens to carry a conversation about something else.
     static var resetLimit: Int { 12 }
 
     var isPending: Bool { pending != nil }
@@ -36,21 +49,37 @@ struct RefinementSlot<Value: Sendable>: Sendable {
     enum Outcome: Equatable, Sendable {
         /// Held for the next boundary, replacing whatever was waiting.
         case queued
-        /// The limit: tear the conversation down and start it fresh on this
-        /// text. The slot is empty afterwards — a restart carries its own
+        /// The same words the model already has. Nothing is queued, nothing is
+        /// counted, and the caller does nothing at all.
+        case duplicate
+        /// Past the limit: tear the conversation down and start it fresh on
+        /// this text. The slot is empty afterwards — a restart carries its own
         /// words, so leaving a copy pending would deliver them twice.
         case restart
     }
 
-    mutating func offer(_ value: Value) -> Outcome {
+    /// Offer one narrowing, keyed by the text the model would be shown. The key
+    /// is separate from the value because the value carries the local hits too,
+    /// and those move under a query that has not changed a character.
+    mutating func offer(_ value: Value, key: String) -> Outcome {
+        guard key != lastDelivered else { return .duplicate }
         count += 1
-        if count >= Self.resetLimit {
+        lastDelivered = key
+        if count > Self.resetLimit {
             pending = nil
             count = 0
             return .restart
         }
         pending = value
         return .queued
+    }
+
+    /// Record words the caller has just handed to the model by some other door:
+    /// the FIRST question of a conversation, and the restart that follows the
+    /// twelfth narrowing. Both are text the model now has, so both have to move
+    /// `lastDelivered` or the very next repeat of them reads as a narrowing.
+    mutating func markDelivered(_ key: String) {
+        lastDelivered = key
     }
 
     /// Take the pending refinement, if there is one, and empty the slot.
@@ -65,5 +94,9 @@ struct RefinementSlot<Value: Sendable>: Sendable {
     mutating func reset() {
         pending = nil
         count = 0
+        // AND THE MEMORY OF WHAT WAS SAID. A fresh conversation has heard
+        // nothing, so the first question it is given must reach it even when it
+        // happens to be the words the last one ended on.
+        lastDelivered = nil
     }
 }

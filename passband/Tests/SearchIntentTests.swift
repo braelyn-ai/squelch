@@ -30,7 +30,8 @@ struct SearchIntentTests {
         reasonsReadLikeSentences()
         // the refinement slot
         theNewestRefinementWins()
-        theTwelfthRestarts()
+        theSameWordsAreNotANarrowing()
+        theThirteenthRestarts()
         aResetForgets()
         // the prompt
         promptHasNoForbiddenDashes()
@@ -177,9 +178,10 @@ struct SearchIntentTests {
     /// Three narrowings arrive while one turn runs. The lane hears the last.
     static func theNewestRefinementWins() {
         var slot = RefinementSlot<String>()
-        expect(slot.offer("abstract conf") == .queued, "the first is queued")
-        _ = slot.offer("abstract confer")
-        _ = slot.offer("abstract conference wifi")
+        expect(
+            slot.offer("abstract conf", key: "abstract conf") == .queued, "the first is queued")
+        _ = slot.offer("abstract confer", key: "abstract confer")
+        _ = slot.offer("abstract conference wifi", key: "abstract conference wifi")
         expect(slot.isPending, "something is waiting")
         expect(
             slot.take() == "abstract conference wifi",
@@ -188,14 +190,38 @@ struct SearchIntentTests {
         expect(!slot.isPending, "so a second boundary delivers nothing twice")
     }
 
-    /// Twelve narrowings in one conversation is a search that changed subject.
-    static func theTwelfthRestarts() {
+    /// The panel resettles for things nobody typed: the sort flipping, a failed
+    /// search retried. Those words are not a narrowing, and paying a turn and a
+    /// request to say they are is the whole reason this rule exists.
+    static func theSameWordsAreNotANarrowing() {
         var slot = RefinementSlot<String>()
-        for i in 1..<RefinementSlot<String>.resetLimit {
-            expect(slot.offer("q\(i)") == .queued, "narrowing \(i) is queued")
+        slot.markDelivered("abstract wifi")
+        expect(
+            slot.offer("abstract wifi", key: "abstract wifi") == .duplicate,
+            "the words the model already has narrow nothing")
+        expect(slot.count == 0, "and a duplicate is not counted against the twelve")
+        expect(!slot.isPending, "nor queued for a boundary")
+        expect(
+            slot.offer("abstract wifi password", key: "abstract wifi password") == .queued,
+            "a real narrowing still lands")
+        expect(
+            slot.offer("abstract wifi password", key: "abstract wifi password") == .duplicate,
+            "and repeating THAT is a duplicate in its turn")
+        expect(slot.count == 1, "one narrowing, counted once")
+        expect(
+            slot.take() == "abstract wifi password",
+            "with the words themselves still waiting exactly once")
+    }
+
+    /// Twelve narrowings is what one conversation absorbs (docs/SEARCH.md
+    /// §6.2); the thirteenth is a search that changed subject.
+    static func theThirteenthRestarts() {
+        var slot = RefinementSlot<String>()
+        for i in 1...RefinementSlot<String>.resetLimit {
+            expect(slot.offer("q\(i)", key: "q\(i)") == .queued, "narrowing \(i) is queued")
         }
-        expect(slot.count == RefinementSlot<String>.resetLimit - 1, "eleven counted")
-        expect(slot.offer("q12") == .restart, "the twelfth starts a fresh conversation")
+        expect(slot.count == RefinementSlot<String>.resetLimit, "twelve counted")
+        expect(slot.offer("q13", key: "q13") == .restart, "the next starts a fresh conversation")
         expect(slot.count == 0, "which is where the counter goes back to")
         expect(
             !slot.isPending,
@@ -204,10 +230,13 @@ struct SearchIntentTests {
 
     static func aResetForgets() {
         var slot = RefinementSlot<String>()
-        _ = slot.offer("one")
-        _ = slot.offer("two")
+        _ = slot.offer("one", key: "one")
+        _ = slot.offer("two", key: "two")
         slot.reset()
         expect(slot.count == 0 && !slot.isPending, "a new search starts from nothing")
+        expect(
+            slot.offer("two", key: "two") == .queued,
+            "and a fresh conversation has not heard the old one's last words")
     }
 
     // MARK: - the prompt
