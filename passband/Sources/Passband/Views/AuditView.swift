@@ -60,6 +60,19 @@ struct AuditSection: View {
     @State private var verbs: Set<String> = []
     @State private var reversibleOnly = false
 
+    /// EVERY ACTION THE LOG CONTAINS, and how many of each — read once, up
+    /// front, over the whole ledger rather than over the page in hand.
+    ///
+    /// It costs one extra pass over the log at open, and it is worth it: a
+    /// facet list assembled from the rows you happen to have scrolled to is a
+    /// list that GROWS while you read it, so the action you are hunting is
+    /// missing precisely when you go looking, and appears later as if it had
+    /// just happened. There is no facet route on the daemon to ask instead —
+    /// `/client/audit` returns rows — so the pass reads rows and keeps only the
+    /// tally. (A `GET /client/audit/actions` would make this a handful of bytes;
+    /// worth it if the log ever outgrows MAX_LIMIT.)
+    @State private var vocabulary: [String: Int] = [:]
+
     private static let inboxLabel = "INBOX"
     /// Rows per page. Sized so the first pull fills a settings pane and a bit
     /// over, which is what makes the second page arrive before the reader has
@@ -109,25 +122,37 @@ struct AuditSection: View {
         // ledger there: a control below the thing it controls is a control you
         // scroll past before you know it exists.
         #if os(macOS)
-            HStack(alignment: .top, spacing: 18) {
+            HStack(alignment: .top, spacing: 34) {
                 // The card takes everything the rail leaves it — SectionCard is
                 // already `maxWidth: .infinity`, and the pane above hands this
                 // section the window's full height, so the ledger runs from the
                 // sub-nav to the filters and from the header to the floor.
                 card
-                // STATIONARY. It is outside the ledger's scroller by
-                // construction, so picking a filter and reading the answer
-                // never costs a scroll back up to change your mind.
-                sidebar.frame(width: 200)
+                // STATIONARY, meaning it does not move when the ledger does:
+                // it is outside that scroller by construction, so picking a
+                // filter and reading the answer never costs a scroll back up to
+                // change your mind.
+                //
+                // It gets a scroller of its OWN, without a bar, because the
+                // action list is as long as the log is varied — a mailbox with
+                // twenty kinds of entry in it has twenty pills — and in a short
+                // window the tail of that list, `refresh` included, would
+                // otherwise be off the bottom of the screen with no way to
+                // reach it.
+                ScrollView { sidebar }
+                    .scrollIndicators(.hidden)
+                    .frame(width: 200)
             }
             .frame(maxHeight: .infinity, alignment: .top)
             .task { await load(Self.pageSize) }
+            .task { await loadVocabulary() }
         #else
             VStack(alignment: .leading, spacing: 14) {
                 sidebar
                 card
             }
             .task { await load(Self.pageSize) }
+            .task { await loadVocabulary() }
         #endif
     }
 
@@ -146,7 +171,13 @@ struct AuditSection: View {
                 // scroll, and a scroll view inside a scroll view on a touch
                 // screen is a fight over every drag.
                 #if os(macOS)
+                    // NO SCROLLER DRAWN. The card is a page of a ledger, and a
+                    // bar tracking a position nobody asked about is chrome the
+                    // rows have to make room for. The wheel still works, and
+                    // how far in you are is written on every line anyway: the
+                    // times run down the left.
                     ScrollView { ledger }
+                        .scrollIndicators(.hidden)
                         .frame(maxHeight: .infinity)
                 #else
                     ledger
@@ -391,15 +422,25 @@ struct AuditSection: View {
         }
     }
 
-    /// Distinct action verbs in the rows the OTHER filters left, commonest
-    /// first, ties broken alphabetically so the list does not reshuffle under
-    /// the pointer when two counts are equal.
+    /// The pills: every action in the log, commonest first, ties broken
+    /// alphabetically so the list never reshuffles under the pointer.
+    ///
+    /// The counts are the WHOLE LOG's, and they hold still while you narrow by
+    /// who or when. A count that moved with the other filters would be a number
+    /// you cannot decide anything with — you would be reading the answer to a
+    /// question you had not asked yet. This one answers "how much of this is in
+    /// here", which is what a person picking a filter wants to know.
+    ///
+    /// Falls back to the rows in hand only until that first pass lands, so the
+    /// rail is never empty beside a ledger that already has rows in it.
     private var verbCounts: [(verb: String, count: Int)] {
-        var counts: [String: Int] = [:]
-        for entry in preVerb { counts[Self.actionVerb(entry), default: 0] += 1 }
-        // A verb that is currently PICKED stays on the list even when this
-        // pass counts none of it, or turning a filter off would mean hunting
-        // for the pill that turned it on.
+        var counts = vocabulary
+        if counts.isEmpty {
+            for entry in rows { counts[Self.actionVerb(entry), default: 0] += 1 }
+        }
+        // A verb that is currently PICKED stays on the list even when nothing
+        // counts it, or turning a filter off would mean hunting for the pill
+        // that turned it on.
         for verb in verbs where counts[verb] == nil { counts[verb] = 0 }
         return counts.map { (verb: $0.key, count: $0.value) }
             .sorted { $0.count == $1.count ? $0.verb < $1.verb : $0.count > $1.count }
@@ -443,11 +484,26 @@ struct AuditSection: View {
         exhausted = (auditState.value?.count ?? 0) < limit || limit >= Self.ceiling
     }
 
+    /// The one pass over the whole log, for the filter rail's vocabulary. Rows
+    /// are counted and dropped: the ledger's own copy is the paged one, and two
+    /// arrays of the same rows would be two things to keep in step.
+    ///
+    /// A failure is silent on purpose. The rail falls back to the actions in
+    /// the rows already loaded, which is a smaller truth rather than a wrong
+    /// one, and the ledger has its own error line to say the daemon is unwell.
+    private func loadVocabulary() async {
+        guard let all = try? await APIClient.shared.getAudit(limit: Self.ceiling) else { return }
+        var counts: [String: Int] = [:]
+        for entry in all { counts[Self.actionVerb(entry), default: 0] += 1 }
+        vocabulary = counts
+    }
+
     /// Re-pull everything already on screen. Deliberately not a reset to one
     /// page: `refresh` means "is this still what happened", not "forget what I
     /// have read".
     private func reload() async {
         await load(wanted)
+        await loadVocabulary()
     }
 
     private func loadMore() {
