@@ -914,19 +914,14 @@ impl SqliteStore {
         }
         let conn = self.lock()?;
         let mut terms = Vec::with_capacity(fts.terms.len());
-        let last = fts.terms.len() - 1;
-        for (i, term) in fts.terms.iter().enumerate() {
-            // Each term is counted AS IT WAS RANKED, prefix included: with
-            // `partial` on, the tail term matched every word starting with it,
-            // and a df for the bare word would describe a search nobody ran.
-            let expr = if partial && i == last {
-                format!("\"{term}\"*")
-            } else {
-                format!("\"{term}\"")
-            };
+        for (term, expr) in fts.terms.iter().zip(fts.term_exprs.iter()) {
+            // Each term is counted BY THE EXPRESSION THAT RANKED IT, straight
+            // off the builder — with `partial` on, the tail matched a whole OR
+            // group, and a df for the bare word would describe a search nobody
+            // ran. Rebuilding the string here is what let the two drift.
             terms.push(TermDf {
                 text: term.clone(),
-                df: self.fts_count(&conn, account_id, &expr, include_sent)?,
+                df: self.fts_count(&conn, account_id, expr, include_sent)?,
             });
         }
         Ok(SearchDiagnostics {

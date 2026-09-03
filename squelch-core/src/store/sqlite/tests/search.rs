@@ -298,6 +298,64 @@ fn the_trailing_token_matches_as_a_prefix_only_when_asked() {
 }
 
 #[test]
+fn an_as_you_type_hit_never_blinks_out_on_the_next_keystroke() {
+    // THE PAIR THAT ONLY BREAKS TOGETHER. `messages_fts` is stemmed, so the
+    // index holds "ship" for a body that says "shipped"; a naive `"<tail>"*`
+    // is a stem-of-a-fragment matched against stems and is not monotone in the
+    // characters typed. Measured against this schema, `"ship"*` hits,
+    // `"shipp"*` and `"shippi"*` miss, and `"shipping"*` hits again — the
+    // reader's result blinks out at the fifth keystroke and returns at the
+    // ninth. Once a hit has appeared it must never disappear while the word is
+    // still being typed toward it.
+    let (store, acct) = store();
+    let id = triaged(acct, "g1", "t1")
+        .subject("parcel news")
+        .body("your parcel shipped this morning")
+        .seed(&store);
+    triaged(acct, "g2", "t2")
+        .subject("cats")
+        .body("a plain message about cats")
+        .seed(&store);
+
+    let mut appeared = false;
+    for typed in [
+        "s", "sh", "shi", "ship", "shipp", "shippi", "shippin", "shipping",
+    ] {
+        let hits = store
+            .search_filtered(
+                acct,
+                typed,
+                &SearchFilter::default(),
+                SearchSort::Recent,
+                true,
+                10,
+                0,
+            )
+            .unwrap();
+        let found = hits.iter().any(|h| h.id == id);
+        if found {
+            appeared = true;
+        }
+        assert!(
+            !appeared || found,
+            "{typed:?} lost a hit the shorter fragment already had"
+        );
+    }
+    assert!(appeared, "the mail has to be findable at all");
+
+    // The same pair poisons the diagnostics, which is worse than cosmetic:
+    // docs/SEARCH.md §5 starts the deeper-search LLM lane on `strict_hits == 0`,
+    // so a tail that counts zero mid-word spends money the reader did not ask
+    // for. The counts read the SAME expression the ranking used.
+    for typed in ["parcel shipp", "parcel shippi"] {
+        let diag = store.search_diagnostics(acct, typed, true, false).unwrap();
+        assert_eq!(diag.strict_hits, 1, "{typed:?} strict count");
+        assert_eq!(diag.terms.len(), 2);
+        assert_eq!(diag.terms[1].df, 1, "{typed:?} tail df");
+    }
+}
+
+#[test]
 fn a_term_in_the_subject_outranks_the_same_term_in_the_body() {
     // The subject is the sender saying what the mail is about, so bm25 weights
     // it four times the body. Everything else here is held equal: two-word

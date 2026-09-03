@@ -202,6 +202,14 @@ pub struct FtsQuery {
     /// The terms as they are ranked, in the order typed, stripped of syntax and
     /// unquoted. What the door reports as `diagnostics.terms`.
     pub terms: Vec<String>,
+    /// The FTS5 expression each term was actually matched by, parallel to
+    /// `terms`. Usually just the quoted word; the as-you-type tail is a whole
+    /// OR group (see [`partial_tail_expr`]).
+    ///
+    /// It exists so a per-term COUNT can be taken with the SAME expression the
+    /// ranking used. `search_diagnostics` used to rebuild `"{term}"*` by hand,
+    /// which is how a df could describe a search nobody ran.
+    pub term_exprs: Vec<String>,
 }
 
 /// FTS5 syntax characters. They SPLIT a token rather than being escaped or
@@ -240,9 +248,9 @@ impl FtsQuery {
     /// from a search box. The defensive empty-on-error handling downstream
     /// stays anyway: this is not the only caller SQLite has.
     ///
-    /// `partial` prefixes the LAST token only (`"wif"*`), which is the word
-    /// still being typed. The panel's debounced fetch asks for it; the agent
-    /// door never does, because an agent sends settled words.
+    /// `partial` widens the LAST token only, the word still being typed (see
+    /// [`partial_tail_expr`]). The panel's debounced fetch asks for it; the
+    /// agent door never does, because an agent sends settled words.
     pub fn build(text: &str, partial: bool) -> FtsQuery {
         let terms: Vec<String> = text
             .split(|c: char| c.is_whitespace() || FTS_SYNTAX.contains(&c))
@@ -259,24 +267,26 @@ impl FtsQuery {
                 strict: String::new(),
                 any: String::new(),
                 terms,
+                term_exprs: Vec::new(),
             };
         }
         let last = terms.len() - 1;
-        let quoted: Vec<String> = terms
+        let exprs: Vec<String> = terms
             .iter()
             .enumerate()
             .map(|(i, t)| {
                 if partial && i == last {
-                    format!("\"{t}\"*")
+                    partial_tail_expr(t)
                 } else {
                     format!("\"{t}\"")
                 }
             })
             .collect();
         FtsQuery {
-            strict: quoted.join(" AND "),
-            any: quoted.join(" OR "),
+            strict: exprs.join(" AND "),
+            any: exprs.join(" OR "),
             terms,
+            term_exprs: exprs,
         }
     }
 
@@ -285,6 +295,66 @@ impl FtsQuery {
     pub fn is_empty(&self) -> bool {
         self.terms.is_empty()
     }
+}
+
+/// The shortest truncation [`partial_tail_expr`] will look for as a whole word.
+/// Below three characters a truncation stops describing the word being typed
+/// and starts matching the alphabet: `"a"` is in half the mailbox and votes for
+/// nothing.
+const PARTIAL_MIN_TRUNCATION: usize = 3;
+
+/// THE WORD THE READER IS STILL TYPING, as an FTS5 expression that cannot
+/// vanish mid-word.
+///
+/// The obvious form is `"<tail>"*`, and on an unstemmed index it would be
+/// right. `messages_fts` is `porter unicode61`, so the index holds STEMS, and
+/// fts5 runs the tokenizer over the query token as well — including the prefix
+/// token. That makes the naive prefix a stem-of-a-fragment matched against
+/// stems, and it is NOT monotone in the number of characters typed. Measured
+/// against the shipped schema, on a body reading "your parcel shipped this
+/// morning":
+///
+/// ```text
+/// "ship"*  -> 1   "shipp"*  -> 0   "shippi"* -> 0   "shipping"* -> 1
+/// "confe"* -> 1   "conferen"* -> 0                  "conference"* -> 1
+/// ```
+///
+/// The reader watches their result blink out at the fifth keystroke and come
+/// back at the ninth, which is the exact behaviour `partial` exists to prevent.
+/// The cause is that a stem is SHORTER than the word it came from: once the
+/// fragment is longer than `stem(word)`, no prefix of the fragment can be the
+/// index term, because the index term is a prefix of the FRAGMENT instead.
+///
+/// So the tail matches two ways at once, ORed:
+///
+/// - `"<tail>"*` — any indexed word starting with what has been typed. This is
+///   the half that works while the fragment is still shorter than the stem.
+/// - `"<truncation>"` for every prefix of the tail down to
+///   [`PARTIAL_MIN_TRUNCATION`] — the stem itself, matched as a whole word,
+///   for when the fragment has grown past it. `shipp` therefore still finds
+///   `shipped` through the exact term `ship`.
+///
+/// Only ONE of these can be right for any given document, and both are cheap
+/// term lookups, so the OR costs a doclist merge and buys monotonicity. The
+/// widening applies to the tail alone: a settled word is never touched.
+fn partial_tail_expr(tail: &str) -> String {
+    let mut alts = vec![format!("\"{tail}\"*")];
+    // Longest truncation first, which is also most-specific first — it reads
+    // the way the expression is meant to be understood.
+    let chars: Vec<char> = tail.chars().collect();
+    for len in (PARTIAL_MIN_TRUNCATION..chars.len()).rev() {
+        let prefix: String = chars[..len].iter().collect();
+        alts.push(format!("\"{prefix}\""));
+    }
+    if alts.len() == 1 {
+        // A tail at or under the floor is just its prefix query; wrapping one
+        // alternative in parentheses would only make the expression harder to
+        // read in a log.
+        return alts.remove(0);
+    }
+    // Parenthesised because this whole group is ONE term's worth of the strict
+    // AND-join: without them the OR would swallow the terms beside it.
+    format!("({})", alts.join(" OR "))
 }
 
 /// What retrieval made of the reader's words, reported on the wire beside the
@@ -457,8 +527,8 @@ mod tests {
     }
 
     #[test]
-    fn partial_prefixes_only_the_last_token() {
-        // The word still being typed, and only that one: prefixing the earlier
+    fn partial_widens_only_the_last_token() {
+        // The word still being typed, and only that one: widening the earlier
         // terms would widen a settled word the reader has finished with.
         let q = FtsQuery::build("abstract wif", true);
         assert_eq!(q.strict, r#""abstract" AND "wif"*"#);
@@ -468,6 +538,47 @@ mod tests {
         let one = FtsQuery::build("wif", true);
         assert_eq!(one.strict, r#""wif"*"#);
         assert_eq!(one.any, r#""wif"*"#);
+    }
+
+    #[test]
+    fn a_tail_past_the_floor_carries_its_truncations_as_whole_words() {
+        // The index holds STEMS, so once the fragment is longer than the stem
+        // no prefix query can reach it. The truncations are the other half.
+        let q = FtsQuery::build("shipp", true);
+        assert_eq!(q.strict, r#"("shipp"* OR "ship" OR "shi")"#);
+        assert_eq!(q.any, q.strict, "one term: both joins are the same group");
+
+        // Grouped, so the OR cannot swallow the settled term beside it.
+        let two = FtsQuery::build("parcel shipp", true);
+        assert_eq!(two.strict, r#""parcel" AND ("shipp"* OR "ship" OR "shi")"#);
+        assert_eq!(two.any, r#""parcel" OR ("shipp"* OR "ship" OR "shi")"#);
+        assert_eq!(two.terms, vec!["parcel", "shipp"]);
+    }
+
+    #[test]
+    fn the_truncation_floor_keeps_one_and_two_letter_fragments_out() {
+        // `"a"` as a whole word is in half the mailbox and says nothing. Below
+        // the floor the tail is its prefix query and nothing else.
+        for tail in ["s", "sh", "shi"] {
+            let q = FtsQuery::build(tail, true);
+            assert_eq!(q.strict, format!("\"{tail}\"*"), "{tail:?}");
+            assert!(!q.strict.contains(" OR "), "{tail:?} needs no group");
+        }
+    }
+
+    #[test]
+    fn every_term_reports_the_expression_it_was_matched_by() {
+        // The counting path reads these rather than rebuilding the strings, so
+        // a df always describes the search that actually ran.
+        let q = FtsQuery::build("parcel shipp", true);
+        assert_eq!(
+            q.term_exprs,
+            vec![r#""parcel""#, r#"("shipp"* OR "ship" OR "shi")"#]
+        );
+        assert_eq!(q.terms.len(), q.term_exprs.len());
+
+        let settled = FtsQuery::build("parcel shipped", false);
+        assert_eq!(settled.term_exprs, vec![r#""parcel""#, r#""shipped""#]);
     }
 
     #[test]
@@ -482,6 +593,7 @@ mod tests {
             assert_eq!(q.strict, "");
             assert_eq!(q.any, "");
             assert!(q.terms.is_empty());
+            assert!(q.term_exprs.is_empty());
         }
         assert!(FtsQuery::build("   ", true).is_empty());
     }
