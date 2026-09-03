@@ -2,6 +2,7 @@
 
 use super::super::*;
 use super::support::*;
+use crate::store::sqlite::search::DIAGNOSTIC_COUNT_CAP;
 use crate::store::{SearchFilter, SearchSort, parse_search_query};
 use crate::types::{SealedKind, Tier};
 use chrono::Duration;
@@ -1612,4 +1613,48 @@ fn semantic_ranking_lifts_the_fresher_within_the_knn_window() {
              (nearest is {near_age_days}d old)"
         );
     }
+}
+
+#[test]
+fn a_diagnostic_count_stops_at_the_cap_and_stays_exact_below_it() {
+    // The counts run on every request, the panel's as-you-type ones included,
+    // and an uncapped COUNT(*) over a MATCH walks the whole doclist under the
+    // store mutex. Nothing reads an exact frequency, so the scan stops at the
+    // cap and reports it: "at least this many". Below the cap the number is
+    // still the truth, which is the half the classifier depends on.
+    let (store, acct) = store();
+    let common = DIAGNOSTIC_COUNT_CAP as usize + 5;
+    for i in 0..common {
+        triaged(acct, &format!("g{i}"), &format!("t{i}"))
+            .subject("newsletter")
+            .body("the weekly roundup")
+            .seed(&store);
+    }
+    triaged(acct, "g-rare", "t-rare")
+        .subject("venue details")
+        .body("the pangolin is on the badge")
+        .seed(&store);
+
+    let d = store
+        .search_diagnostics(acct, "newsletter", false, false)
+        .unwrap();
+    assert_eq!(
+        d.any_hits, DIAGNOSTIC_COUNT_CAP,
+        "a count past the cap reports the cap"
+    );
+    assert_eq!(d.terms[0].df, DIAGNOSTIC_COUNT_CAP);
+
+    let d = store
+        .search_diagnostics(acct, "pangolin", false, false)
+        .unwrap();
+    assert_eq!(d.any_hits, 1, "under the cap the count is exact");
+    assert_eq!(d.strict_hits, 1);
+
+    // And zero still means zero, which is the reading docs/SEARCH.md §5 starts
+    // the deeper-search lane on.
+    let d = store
+        .search_diagnostics(acct, "newsletter pangolin", false, false)
+        .unwrap();
+    assert_eq!(d.strict_hits, 0, "no message carries both");
+    assert!(d.any_hits >= 2);
 }

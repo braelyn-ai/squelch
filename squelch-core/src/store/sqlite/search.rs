@@ -37,6 +37,16 @@ const BM25: &str = "bm25(messages_fts, 4.0, 1.0)";
 /// The marker `BODY_SNIPPET` plants on each matched term.
 const SNIPPET_MARK: char = '\u{1}';
 
+/// HOW FAR A DIAGNOSTIC COUNT COUNTS before it answers "that many, at least".
+///
+/// A thousand is far past every threshold anything reads (see
+/// [`SqliteStore::fts_count`] for who reads them) and far short of a full scan
+/// of a real mailbox. A capped count is reported as the cap, so a client can
+/// tell "a thousand" from "more than we bothered to count" only by knowing this
+/// number, which is the trade: the alternative is walking every doclist for a
+/// term on every keystroke of an as-you-type search.
+pub const DIAGNOSTIC_COUNT_CAP: u32 = 1_000;
+
 /// A `BODY_SNIPPET` value is a real match window only if the marker is present
 /// — otherwise the terms hit the subject (or nothing) and the caller should
 /// keep the stored snippet.
@@ -894,6 +904,11 @@ impl SqliteStore {
     /// them would be worse than no counts, because they would look like a
     /// missing page rather than a different question.
     ///
+    /// EVERY COUNT STOPS AT [`DIAGNOSTIC_COUNT_CAP`]. This runs on every
+    /// request, the panel's as-you-type ones included, so an exact frequency is
+    /// not worth a full doclist walk under the store mutex; nothing that reads
+    /// these needs one.
+    ///
     /// SECURITY: account-scoped, sealed rows excluded, spam rows excluded —
     /// exactly the predicates the hit queries carry, and for a sharper reason
     /// here. A document frequency is a yes/no oracle over message text, so a
@@ -931,10 +946,18 @@ impl SqliteStore {
         })
     }
 
-    /// How many non-sealed, non-spam messages of this account match `expr`.
-    /// The counting half of [`search_diagnostics`](Self::search_diagnostics);
-    /// no operators, because a count of "what the index holds" is not a count
-    /// of one filtered page.
+    /// How many non-sealed, non-spam messages of this account match `expr`,
+    /// COUNTED NO FURTHER THAN [`DIAGNOSTIC_COUNT_CAP`]. The counting half of
+    /// [`search_diagnostics`](Self::search_diagnostics); no operators, because
+    /// a count of "what the index holds" is not a count of one filtered page.
+    ///
+    /// The cap is what makes this affordable on every keystroke. An uncapped
+    /// `COUNT(*)` over a MATCH walks the whole doclist, and this runs
+    /// `terms + 2` times per request while holding the store mutex that sync,
+    /// triage and notify also queue on — the shape of the p95 floor the
+    /// kill-p95 branch had to remove. Nothing reads an exact frequency: §5 of
+    /// docs/SEARCH.md asks "did anything match all of it", and the panel asks
+    /// "is this word rare". Zero, some and many is the whole vocabulary.
     fn fts_count(
         &self,
         conn: &Connection,
@@ -947,19 +970,29 @@ impl SqliteStore {
         } else {
             " AND m.is_sent = 0"
         };
+        // The LIMIT sits INSIDE the counted subquery, which is what stops the
+        // scan; a LIMIT on the COUNT itself would only limit the one row it
+        // returns, after the whole doclist had been walked.
         let sql = format!(
-            "SELECT COUNT(*)
-             FROM messages_fts f
-             JOIN messages m ON m.id = f.rowid
-             LEFT JOIN triage t ON t.message_id = m.id
-             WHERE m.account_id = ?1
-               AND COALESCE(t.sensitivity, 'normal') != 'sealed'
-               AND m.is_spam = 0{sent}
-               AND messages_fts MATCH ?2"
+            "SELECT COUNT(*) FROM (
+                 SELECT 1
+                 FROM messages_fts f
+                 JOIN messages m ON m.id = f.rowid
+                 LEFT JOIN triage t ON t.message_id = m.id
+                 WHERE m.account_id = ?1
+                   AND COALESCE(t.sensitivity, 'normal') != 'sealed'
+                   AND m.is_spam = 0{sent}
+                   AND messages_fts MATCH ?2
+                 LIMIT ?3
+             )"
         );
         // Same reading as every other MATCH on this leg.
         let n: i64 = conn
-            .query_row(&sql, params![account_id, expr], |r| r.get(0))
+            .query_row(
+                &sql,
+                params![account_id, expr, DIAGNOSTIC_COUNT_CAP as i64],
+                |r| r.get(0),
+            )
             .unwrap_or(0);
         Ok(n.max(0) as u32)
     }

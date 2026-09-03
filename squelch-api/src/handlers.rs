@@ -803,7 +803,9 @@ struct SearchPage<T> {
 ///
 /// Every count is account-scoped and blind to sealed and spam mail; see
 /// `SqliteStore::search_diagnostics` for why that is a security property and
-/// not tidiness.
+/// not tidiness. Every count also STOPS at `DIAGNOSTIC_COUNT_CAP`, so a count
+/// equal to it means "at least that many": these run on every keystroke of an
+/// as-you-type search, and nothing that reads them needs an exact frequency.
 #[derive(Debug, Serialize)]
 struct Diagnostics {
     /// Messages matching EVERY term.
@@ -955,10 +957,14 @@ pub async fn search(
     // sealed rows in SQL. The bool is the recall legs' WINDOW FULL signal (see
     // below); the keyword leg paginates exactly, so it never needs one.
     //
-    // The diagnostics are counted in the SAME store call, under the same lock,
-    // and told which leg ran: the keyword leg excludes the reader's own sent
-    // mail and the recall legs include it, so counts taken under the other rule
-    // would contradict the list they sit beside.
+    // The diagnostics are counted in the SAME store call, and told which leg
+    // ran: the keyword leg excludes the reader's own sent mail and the recall
+    // legs include it, so counts taken under the other rule would contradict
+    // the list they sit beside. NOT under the same LOCK, though: the counts
+    // take the store mutex and give it back before the search takes it again,
+    // so an ingest landing between the two leaves the counts describing a
+    // mailbox one message older than the page. Harmless, and written down
+    // because "the same store call" is easy to misread as "atomically".
     let (items, window_full, diagnostics) = store_call(&state, move |store, account_id| {
         let include_sent = effective != SearchMode::Keyword;
         let diagnostics = store.search_diagnostics(account_id, &term, partial, include_sent)?;
