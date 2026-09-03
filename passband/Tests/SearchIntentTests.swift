@@ -28,6 +28,8 @@ struct SearchIntentTests {
         noDiagnosticsMeansTheShapeAlone()
         strictHitsSettleAPlainPhrase()
         reasonsReadLikeSentences()
+        digitsAreNotFirstPerson()
+        punctuationAloneIsNotAQuestion()
         // the refinement slot
         theNewestRefinementWins()
         theSameWordsAreNotANarrowing()
@@ -171,6 +173,53 @@ struct SearchIntentTests {
             SearchIntent.Trigger.questionShaped.analyticsValue == "question"
                 && SearchIntent.Trigger.noStrictHits.analyticsValue == "no_strict_hits",
             "the analytics values are the two closed-vocabulary strings")
+    }
+
+    /// A digit inside a word is a form number, a tax form or a version, and
+    /// none of them is somebody talking about their own mailbox. "form i9" is
+    /// two words an ordinary mailbox lookup would use.
+    static func digitsAreNotFirstPerson() {
+        expect(
+            SearchIntent.classify(query: "form i9", diagnostics: diagnostics(strict: 2))
+                == .lookup,
+            "i9 is a form, not the word I")
+        expect(
+            SearchIntent.classify(query: "my2024 taxes", diagnostics: diagnostics(strict: 1))
+                == .lookup,
+            "my2024 is not my")
+        expect(
+            SearchIntent.classify(query: "w2 copy", diagnostics: diagnostics(strict: 1))
+                == .lookup,
+            "w2 is not the word w, and nothing here is first person")
+        expect(
+            SearchIntent.classify(query: "can8 upgrade", diagnostics: diagnostics(strict: 1))
+                == .lookup,
+            "can8 does not open a question the way can does")
+        expect(
+            SearchIntent.classify(query: "my taxes", diagnostics: diagnostics(strict: 4))
+                == .deeper(trigger: .questionShaped),
+            "and the plain word still is one")
+    }
+
+    /// A stray mark left behind after deleting a query is not a question, and
+    /// under `automatic` it would otherwise start a lane whose whole user turn
+    /// is one punctuation mark.
+    static func punctuationAloneIsNotAQuestion() {
+        expect(
+            SearchIntent.classify(query: "?", diagnostics: diagnostics(strict: 0, any: 0))
+                == .lookup,
+            "a lone question mark asks nothing")
+        expect(
+            SearchIntent.classify(query: "!?", diagnostics: nil) == .lookup,
+            "nor does punctuation with a question mark in it")
+        expect(
+            SearchIntent.classify(query: "- ... ?", diagnostics: diagnostics(strict: 0))
+                == .lookup,
+            "and three wordless tokens do not reach the co-occurrence rule either")
+        expect(
+            SearchIntent.classify(query: "wifi?", diagnostics: diagnostics(strict: 1))
+                == .deeper(trigger: .questionShaped),
+            "one real word with a question mark still is a question")
     }
 
     // MARK: - the refinement slot

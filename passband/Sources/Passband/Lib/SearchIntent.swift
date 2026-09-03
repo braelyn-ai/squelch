@@ -98,6 +98,14 @@ enum SearchIntent {
     static func classify(query: String, diagnostics: SearchDiagnostics?) -> Verdict {
         let words = terms(query)
         guard !words.isEmpty else { return .lookup }
+        // AND NOT-EMPTY IS NOT THE SAME AS HAVING WORDS IN IT. A lone "?" left
+        // behind by a deleted query is one token, is not an operator, and ends
+        // in a question mark: without this it reads as question-shaped and,
+        // under `automatic`, starts a paid conversation whose entire user turn
+        // is one punctuation mark. §5's "one or two plain words are never
+        // deeper" applies harder to none, so a query with no letters anywhere
+        // in it is a lookup whatever the counts say about it.
+        guard words.contains(where: { $0.contains(where: \.isLetter) }) else { return .lookup }
         // OPERATORS WIN, ALWAYS, before anything else is looked at.
         if words.contains(where: isOperator) { return .lookup }
         if isQuestionShaped(words: words, query: query) {
@@ -152,7 +160,15 @@ enum SearchIntent {
     /// "What?" is "what" and "where's" is "where", while "mycompany" stays
     /// itself — the cut is at the END of the word, so a marker can never match
     /// a longer word that merely begins with it.
+    ///
+    /// A TOKEN WITH A DIGIT IN IT IS NOT A WORD, and that is not a nicety: the
+    /// cut above stops at the first non-letter, so "i9" would reduce to "i",
+    /// "my2024" to "my" and "can8" to "can", and "form i9" — two words, an
+    /// entirely ordinary mailbox lookup — would read as somebody talking about
+    /// their own mail and start a model on their key. Nothing in either marker
+    /// set has a digit in it, so refusing the whole token costs nothing.
     private static func bare(_ token: String) -> String {
-        String(token.lowercased().drop { !$0.isLetter }.prefix { $0.isLetter })
+        guard !token.contains(where: \.isNumber) else { return "" }
+        return String(token.lowercased().drop { !$0.isLetter }.prefix { $0.isLetter })
     }
 }
