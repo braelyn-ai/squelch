@@ -1,6 +1,6 @@
 //! Migration + init upgrade-path tests.
 
-use super::super::migrate::migrate;
+use super::super::migrate::{migrate, rebuild_fts_if_stale};
 use super::super::*;
 use super::support::*;
 use crate::types::Sensitivity;
@@ -1312,6 +1312,7 @@ fn migrate_rebuilds_the_fts_index_with_the_porter_tokenizer() {
         )
         .unwrap();
     assert!(created.contains("porter"), "tokenizer replaced: {created}");
+    assert!(created.contains("prefix"), "prefix index added: {created}");
 
     assert_eq!(
         matches(&conn, "\"password\""),
@@ -1338,4 +1339,112 @@ fn migrate_rebuilds_the_fts_index_with_the_porter_tokenizer() {
         window.contains("passwords"),
         "snippet returns the sender's own word: {window:?}"
     );
+}
+
+#[test]
+fn migrate_rebuilds_an_index_that_stems_but_has_no_prefix_index() {
+    // The in-between state: a mailbox opened by a build that had the stemmer
+    // and not the prefix index. Checking only for "porter" would have called
+    // that current and left the as-you-type expansion walking the whole term
+    // list forever, which is the failure mode of a one-marker drift check.
+    let conn = Connection::open_in_memory().unwrap();
+    conn.execute_batch(
+        "CREATE TABLE messages(
+             id INTEGER PRIMARY KEY, account_id INTEGER NOT NULL,
+             gmail_msg_id TEXT NOT NULL, subject TEXT NOT NULL DEFAULT '',
+             body TEXT NOT NULL DEFAULT '');
+         CREATE VIRTUAL TABLE messages_fts USING fts5(
+             subject, body, tokenize = 'porter unicode61');
+         INSERT INTO messages(id, account_id, gmail_msg_id, subject, body)
+             VALUES (1, 1, 'g1', 'venue details', 'the wifi passwords are on the agenda page');
+         INSERT INTO messages_fts(rowid, subject, body)
+             SELECT id, subject, body FROM messages;",
+    )
+    .unwrap();
+
+    migrate(&conn).unwrap();
+    migrate(&conn).unwrap(); // idempotent: the second open rebuilds nothing
+
+    let created: String = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE name = 'messages_fts'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(created.contains("prefix"), "prefix index added: {created}");
+    assert!(created.contains("porter"), "stemmer kept: {created}");
+    let rows: i64 = conn
+        .query_row("SELECT COUNT(*) FROM messages_fts", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(rows, 1, "the message survived the rebuild");
+}
+
+#[test]
+fn a_rebuild_that_cannot_run_leaves_the_old_index_serving() {
+    // Two processes really do open one mailbox here (`squelchd token issue`
+    // runs while `serve` holds the file). A rebuild that loses that race must
+    // not take the whole open down with it: the old index still finds mail,
+    // just unstemmed, and the next open tries again. A second connection holds
+    // a write lock to stand in for the busy daemon.
+    //
+    // The rebuild is called directly rather than through `migrate`, because
+    // under an exclusive lock EVERY write in the chain fails and the assertion
+    // would stop being about this one.
+    let dir = std::env::temp_dir().join(format!("squelch-fts-busy-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("busy.db");
+    // A leftover file from a previous run would test the wrong thing.
+    let _ = std::fs::remove_file(&path);
+    let conn = Connection::open(&path).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE messages(
+             id INTEGER PRIMARY KEY, account_id INTEGER NOT NULL,
+             gmail_msg_id TEXT NOT NULL, subject TEXT NOT NULL DEFAULT '',
+             body TEXT NOT NULL DEFAULT '');
+         CREATE VIRTUAL TABLE messages_fts USING fts5(subject, body);
+         INSERT INTO messages(id, account_id, gmail_msg_id, subject, body)
+             VALUES (1, 1, 'g1', 'venue details', 'the wifi passwords are here');
+         INSERT INTO messages_fts(rowid, subject, body)
+             SELECT id, subject, body FROM messages;",
+    )
+    .unwrap();
+
+    let blocker = Connection::open(&path).unwrap();
+    blocker
+        .busy_timeout(std::time::Duration::from_millis(1))
+        .unwrap();
+    // RESERVED, not EXCLUSIVE: a writer is blocked and a reader is not, which
+    // is what one daemon mid-write actually looks like to a second handle.
+    blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+    conn.busy_timeout(std::time::Duration::from_millis(1))
+        .unwrap();
+
+    rebuild_fts_if_stale(&conn).expect("a busy sibling is not a failed migration");
+
+    // Still the old definition, still holding every row: nothing was dropped.
+    let created: String = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE name = 'messages_fts'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(!created.contains("porter"), "not rebuilt: {created}");
+    let rows: i64 = conn
+        .query_row("SELECT COUNT(*) FROM messages_fts", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(rows, 1, "the index the reader still searches is intact");
+
+    // And the next open, once the sibling has let go, does the work.
+    blocker.execute_batch("ROLLBACK").unwrap();
+    rebuild_fts_if_stale(&conn).unwrap();
+    let created: String = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE name = 'messages_fts'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(created.contains("porter"), "rebuilt on retry: {created}");
 }

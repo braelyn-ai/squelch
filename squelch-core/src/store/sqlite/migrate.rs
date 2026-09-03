@@ -459,55 +459,12 @@ pub(super) fn migrate(conn: &Connection) -> Result<()> {
     // gate — a plain re-run is free.
     backfill_message_recipients(conn)?;
 
-    // ---- THE FTS TOKENIZER GREW A STEMMER ---------------------------------
+    // ---- THE FTS INDEX'S OPTIONS CHANGED ----------------------------------
     //
-    // `messages_fts` was created with fts5's default tokenizer, so the index
-    // held whichever form of a word the sender happened to type: a reader
-    // searching "password" found nothing in the two messages that say
-    // "passwords". `schema.sql` now asks for `porter unicode61`, but its
-    // `CREATE VIRTUAL TABLE IF NOT EXISTS` is a no-op against a table that
-    // already exists — so the old definition would live forever on every
-    // mailbox that predates this line.
-    //
-    // A tokenizer is not alterable, so the fix is DROP + CREATE + refill, in
-    // ONE transaction: an interrupted rebuild must not leave a mailbox with an
-    // empty search index. Refilling from `messages(subject, body)` is exact,
-    // not approximate — the message upsert writes the FTS row from those same
-    // two columns, so this reproduces the index rather than reinterpreting it.
-    //
-    // The trigger is the CREATE text in `sqlite_master`, which is what SQLite
-    // itself stored when the table was made, so this is idempotent by
-    // construction: the next open reads a definition that says `porter` and
-    // does nothing. Guarded on both tables existing, because the migration unit
-    // tests build partial schemas.
-    if tables_exist(conn, &["messages_fts", "messages"])? {
-        let created: Option<String> = conn
-            .query_row(
-                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'messages_fts'",
-                [],
-                |r| r.get(0),
-            )
-            .optional()?;
-        // A NULL/absent definition reads as "already current": there is nothing
-        // to act on, and rebuilding an index we cannot describe is the riskier
-        // guess.
-        let stemmed = created
-            .as_deref()
-            .map(|sql| sql.to_ascii_lowercase().contains("porter"))
-            .unwrap_or(true);
-        if !stemmed {
-            conn.execute_batch(
-                "BEGIN;
-                 DROP TABLE messages_fts;
-                 CREATE VIRTUAL TABLE messages_fts USING fts5(
-                     subject, body, tokenize = 'porter unicode61'
-                 );
-                 INSERT INTO messages_fts(rowid, subject, body)
-                     SELECT id, subject, body FROM messages;
-                 COMMIT;",
-            )?;
-        }
-    }
+    // Stemming and a prefix index, neither of which fts5 can be altered into.
+    // Best-effort by design: see the function for why a busy sibling process
+    // must not turn this into a failed open.
+    rebuild_fts_if_stale(conn)?;
 
     // Re-launder every stored institution through the extractor's OWN sanitizer,
     // which grew a shape check after a model returned a valid-looking JSON object
@@ -614,6 +571,102 @@ pub(super) fn migrate(conn: &Connection) -> Result<()> {
         }
     }
 
+    Ok(())
+}
+
+/// The `messages_fts` definition `schema.sql` creates. The rebuild has to say
+/// it a second time (a `CREATE ... IF NOT EXISTS` is a no-op against a table
+/// that already exists), so the two live next to their own drift check:
+/// [`FTS_MARKERS`] is what a definition must contain to be current.
+const FTS_CREATE: &str = "CREATE VIRTUAL TABLE messages_fts USING fts5(
+     subject, body, tokenize = 'porter unicode61', prefix = '2 3'
+ )";
+
+/// What an up-to-date `messages_fts` definition says, lowercased. Every option
+/// this index depends on is listed: miss one and the rebuild silently stops
+/// noticing that option's absence, which is how a mailbox ends up serving
+/// search off an index nobody meant to ship.
+const FTS_MARKERS: &[&str] = &["porter", "prefix"];
+
+/// THE FTS INDEX'S OPTIONS ARE NOT ALTERABLE, so a change to them is a
+/// DROP + CREATE + refill.
+///
+/// `messages_fts` was created with fts5's default tokenizer and no prefix
+/// index, so the index held whichever form of a word the sender happened to
+/// type (a reader searching "password" found nothing in the two messages that
+/// say "passwords") and every as-you-type prefix walked the whole term list.
+/// `schema.sql` now asks for `porter unicode61` and `prefix = '2 3'`, but its
+/// `CREATE VIRTUAL TABLE IF NOT EXISTS` is a no-op against a table that already
+/// exists, so the old definition would live forever on every mailbox that
+/// predates those lines.
+///
+/// Refilling from `messages(subject, body)` is exact, not approximate: the
+/// message upsert writes the FTS row from those same two columns, so this
+/// reproduces the index rather than reinterpreting it.
+///
+/// The trigger is the CREATE text in `sqlite_master`, which is what SQLite
+/// itself stored when the table was made, so this is idempotent by
+/// construction: the next open reads a definition carrying every marker and
+/// does nothing. Guarded on both tables existing, because the migration unit
+/// tests build partial schemas.
+///
+/// TWO THINGS ABOUT THE TRANSACTION, both of them about the fact that this repo
+/// really does open one DB from two processes (`squelchd token issue` and
+/// friends run while `serve` holds the file):
+///
+/// - `BEGIN IMMEDIATE`, not a bare `BEGIN`. A deferred transaction takes its
+///   write lock at the `DROP`, mid-batch, so a busy daemon means the batch
+///   fails with the index already gone from this connection's view of the
+///   world. Immediate takes the lock up front and fails before anything is
+///   dropped.
+/// - A FAILED REBUILD IS NOT A FAILED MIGRATION. Returning the error here would
+///   propagate out of `init` and make a CLI command refuse to run because
+///   another process happened to be writing. The old index still works, just
+///   unstemmed, so the honest response is to say so and carry on; the next open
+///   tries again.
+///
+/// COST: the rebuild holds the write lock for one full-mailbox `INSERT..SELECT`
+/// (roughly half a second per 1,500 messages, so linear and measurable in
+/// minutes on a very large mailbox). The first open after this ships is the
+/// slow one and nothing else can write during it.
+pub(super) fn rebuild_fts_if_stale(conn: &Connection) -> Result<()> {
+    if !tables_exist(conn, &["messages_fts", "messages"])? {
+        return Ok(());
+    }
+    let created: Option<String> = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'messages_fts'",
+            [],
+            |r| r.get(0),
+        )
+        .optional()?;
+    // A NULL/absent definition reads as "already current": there is nothing to
+    // act on, and rebuilding an index we cannot describe is the riskier guess.
+    let current = match created.as_deref() {
+        Some(sql) => {
+            let sql = sql.to_ascii_lowercase();
+            FTS_MARKERS.iter().all(|m| sql.contains(m))
+        }
+        None => true,
+    };
+    if current {
+        return Ok(());
+    }
+    let batch = format!(
+        "BEGIN IMMEDIATE;
+         DROP TABLE messages_fts;
+         {FTS_CREATE};
+         INSERT INTO messages_fts(rowid, subject, body)
+             SELECT id, subject, body FROM messages;
+         COMMIT;"
+    );
+    if let Err(e) = conn.execute_batch(&batch) {
+        // The connection is dropped or rolled back by rusqlite, so the old
+        // index is still there and still serves. Say which mailbox and why, so
+        // the operator can tell this apart from search being broken.
+        eprintln!("squelch: could not rebuild the search index ({e}); keeping the old one");
+        let _ = conn.execute_batch("ROLLBACK");
+    }
     Ok(())
 }
 

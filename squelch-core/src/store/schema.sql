@@ -806,10 +806,18 @@ CREATE INDEX IF NOT EXISTS idx_attachments_message ON attachments(account_id, me
 -- used. Stemming is applied to the QUERY as well by fts5 itself, so both sides
 -- meet at the same stem, and `snippet()` still returns the ORIGINAL text.
 --
+-- `prefix = '2 3'`: two- and three-character prefixes get their own indexes.
+-- The as-you-type fetch (`partial=1`) asks for `"<tail>"*` on every keystroke
+-- and the FIRST keystrokes are the expensive ones: with no prefix index fts5
+-- expands `"a"*` by walking the whole term list, and the diagnostics counts
+-- ask for the same expansion again beside the page. Two lengths and no more —
+-- past three characters the expansion is already narrow, and each extra length
+-- is another index to write on every message.
+--
 -- Changing this line means an existing index has to be rebuilt: `migrate.rs`
--- detects the old definition in `sqlite_master` and does exactly that.
+-- detects an out-of-date definition in `sqlite_master` and does exactly that.
 CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
-    subject, body, tokenize = 'porter unicode61'
+    subject, body, tokenize = 'porter unicode61', prefix = '2 3'
 );
 
 -- ON-BOX SEMANTIC RECALL. A sqlite-vec `vec0` table holding one embedding per
