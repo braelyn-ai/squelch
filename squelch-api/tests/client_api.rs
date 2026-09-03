@@ -9085,3 +9085,105 @@ async fn hybrid_items_report_the_legs_that_found_them() {
     // follow whichever leg ran.
     assert_eq!(json["diagnostics"]["terms"][0]["text"], "acme");
 }
+
+/// PUNCTUATION IS NOT AN INVITATION TO LIST THE MAILBOX, and the guard has to
+/// hold in every mode.
+///
+/// `q=***` passes the door's emptiness checks (non-empty string, non-empty
+/// term, no operators) and the builder then makes no expression of it. The
+/// keyword leg has always read that as an empty result. The recall legs never
+/// consulted the builder: they embedded "***" and served a page of essentially
+/// arbitrary mail, while the diagnostics beside it reported that nothing had
+/// been looked up. A response cannot say both.
+#[tokio::test]
+async fn a_query_of_pure_punctuation_lists_nothing_in_any_mode() {
+    use squelch_core::embed::StubEmbedder;
+
+    let store = SqliteStore::open_in_memory()
+        .unwrap()
+        .with_embedder(Arc::new(StubEmbedder::new(384)))
+        .unwrap();
+    let acct = store.ensure_account("me@example.com").unwrap();
+    let store = Arc::new(store);
+
+    for (i, subject) in ["lunch on friday", "the quarterly numbers"]
+        .iter()
+        .enumerate()
+    {
+        let n = store
+            .upsert_message(&msg(
+                acct,
+                &format!("g{i}"),
+                &format!("t{i}"),
+                subject,
+                "a body with words in it",
+            ))
+            .unwrap();
+        store
+            .set_triage(
+                n,
+                acct,
+                50,
+                Tier::Signal,
+                Sensitivity::Normal,
+                None,
+                "",
+                "",
+                None,
+            )
+            .unwrap();
+        let v = store
+            .embedder()
+            .unwrap()
+            .embed(&format!("{subject} a body with words in it"))
+            .unwrap();
+        store.upsert_message_vector(acct, n, &v).unwrap();
+    }
+
+    let app = router(ApiState::new(store.clone(), acct, TOKEN));
+
+    // Default (hybrid, since an embedder is attached) and each mode by name.
+    for query in [
+        "q=***",
+        "q=***&mode=keyword",
+        "q=***&mode=semantic",
+        "q=***&mode=hybrid",
+        "q=%3A%3A%3A&mode=hybrid",
+        "q=***&mode=hybrid&partial=1",
+    ] {
+        let resp = app
+            .clone()
+            .oneshot(authed("GET", &format!("/client/search?{query}")))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "{query}");
+        let json = body_json(resp).await;
+        assert!(
+            json["items"].as_array().unwrap().is_empty(),
+            "{query} listed mail: {}",
+            json["items"]
+        );
+        assert!(json["next_cursor"].is_null(), "{query} offered a next page");
+        assert_eq!(json["diagnostics"]["any_hits"], 0, "{query}");
+        assert_eq!(
+            json["diagnostics"]["terms"],
+            serde_json::json!([]),
+            "{query}"
+        );
+    }
+
+    // An operator beside it is a real constraint and still selects.
+    let resp = app
+        .oneshot(authed(
+            "GET",
+            "/client/search?q=***%20from:alice%40example.com",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+    assert!(
+        !json["items"].as_array().unwrap().is_empty(),
+        "the from: half still lists that sender's mail"
+    );
+}

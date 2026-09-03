@@ -18,8 +18,8 @@ use serde_json::json;
 use squelch_core::CoreError;
 use squelch_core::config::{CACHE_READ_INPUT_MULT, CACHE_WRITE_INPUT_MULT};
 use squelch_core::store::{
-    ActionMessageRef, Draft, NewAuditEntry, SearchFilter, SearchSort, SitrepBand, SpamScope,
-    SqliteStore, Store,
+    ActionMessageRef, Draft, FtsQuery, NewAuditEntry, SearchDiagnostics, SearchFilter, SearchSort,
+    SitrepBand, SpamScope, SqliteStore, Store,
 };
 use squelch_core::sync::{LABEL_INBOX, LABEL_SPAM, decode_raw_b64url, parse_internal_date};
 use squelch_core::triage::llm::Usage;
@@ -820,8 +820,8 @@ struct TermStat {
     df: u32,
 }
 
-impl From<squelch_core::store::SearchDiagnostics> for Diagnostics {
-    fn from(d: squelch_core::store::SearchDiagnostics) -> Self {
+impl From<SearchDiagnostics> for Diagnostics {
+    fn from(d: SearchDiagnostics) -> Self {
         Diagnostics {
             strict_hits: d.strict_hits,
             any_hits: d.any_hits,
@@ -925,6 +925,30 @@ pub async fn search(
 
     let k = recall_k(limit, offset, &filter);
     let partial = parse_partial(query.partial.as_deref())?;
+
+    // PUNCTUATION IS NOT AN INVITATION TO LIST THE MAILBOX, in any mode.
+    //
+    // `q=***` survives every check above: it is non-empty, it parses to no
+    // operators, and it leaves a non-empty `term`. The builder then makes
+    // nothing of it, which the keyword leg reads as an honest empty result —
+    // but the recall legs do not consult the builder at all. They would embed
+    // "***" (BGE instruction and all), KNN it, and serve a page of essentially
+    // arbitrary mail beside a diagnostics object reporting that nothing was
+    // looked up. That self-contradiction is the bug; the empty page is the
+    // answer, and it belongs HERE, ahead of the mode dispatch, so all three
+    // legs give it.
+    //
+    // With a filter it is a different question ("*** from:alice" still means
+    // alice's mail), and that keeps falling through to the filter-only listing.
+    if filter.is_empty() && FtsQuery::build(&term, partial).is_empty() {
+        return Ok(Json(SearchPage::<SearchItem> {
+            items: Vec::new(),
+            match_kind: effective.as_str(),
+            sort: sort.as_str(),
+            diagnostics: SearchDiagnostics::default().into(),
+            next_cursor: None,
+        }));
+    }
 
     // Keyword paginates and filters in SQL; semantic/hybrid rank a top-k window,
     // filter the hydrated hits, and offset the fused slice. EVERY leg excludes
