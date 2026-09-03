@@ -138,9 +138,13 @@ struct DeeperSearchBand: View {
             }
             ForEach(cardRows) { row in
                 EmailCardList(cards: row.emails) { threadId in
-                    // The panel stays exactly as it is. The reader is still
-                    // searching, and the results beside the thread are the
-                    // whole reason the strip exists.
+                    // The panel is not CLOSED, unlike AskBar's cards: the
+                    // reader is still searching, and the results beside the
+                    // thread are the whole reason the strip exists. An EXPANDED
+                    // panel does fold back to that strip on the way in, because
+                    // `openThread` collapses it as every path into the reader
+                    // must. What survives the click is the search, not the
+                    // layout it was being read in.
                     store.openThread(threadId)
                 }
             }

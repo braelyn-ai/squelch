@@ -164,21 +164,29 @@ struct SearchView: View {
             // lane is a band ABOVE the hits; expanded, it becomes the right
             // column beside them and the results keep their reading width. Same
             // view either way — see DeeperSearchBand.
-            if expanded {
-                HStack(alignment: .top, spacing: 0) {
-                    results(expanded: true)
-                    if bandMounted {
-                        ScrollView {
-                            DeeperSearchBand(expanded: true)
-                                .padding(.horizontal, 16)
-                                .padding(.bottom, 14)
-                        }
-                        .frame(minWidth: 320, idealWidth: 380, maxWidth: 440)
+            //
+            // ONE `results` CALL, IN ONE PLACE IN THIS TREE, and that is
+            // structural rather than tidy: written as two branches of `if
+            // expanded`, the two calls are different slots, so SwiftUI gives
+            // them different identities and tears the whole ScrollView down and
+            // rebuilds it on every Enter. The scroll offset went back to the
+            // top, and a remount fires no `onChange(of: index)`, so a reader
+            // thirty rows down who expanded landed at row one with their
+            // selection off screen. Here only the band moves; the hits keep
+            // their place because they never leave theirs.
+            if bandMounted && !expanded {
+                strippedBand
+            }
+            HStack(alignment: .top, spacing: 0) {
+                results(expanded: expanded)
+                if bandMounted && expanded {
+                    ScrollView {
+                        DeeperSearchBand(expanded: true)
+                            .padding(.horizontal, 16)
+                            .padding(.bottom, 14)
                     }
+                    .frame(minWidth: 320, idealWidth: 380, maxWidth: 440)
                 }
-            } else {
-                if bandMounted { DeeperSearchBand(expanded: false) }
-                results(expanded: false)
             }
         }
         .keyBindings(.modal, bindings)
@@ -253,6 +261,29 @@ struct SearchView: View {
             }
         }
     }
+
+    /// The band as the STRIP draws it: above the hits, and never allowed to
+    /// take the whole panel.
+    ///
+    /// The ceiling is the point. `show_emails` shows up to eight cards a batch
+    /// and the band renders every batch the lane has shown, so one answer is
+    /// around 620pt and a refined one twice that — in a 460pt strip that pushed
+    /// the results list, the panel's whole reason for existing, down to zero
+    /// height, with the band's own overflow clipped rather than scrollable so
+    /// neither could be read. Scrolling inside a bounded frame gives the hits a
+    /// floor and the cards a way to be reached; `fixedSize` is what keeps a
+    /// two-line band two lines tall instead of always claiming the ceiling.
+    private var strippedBand: some View {
+        ScrollView {
+            DeeperSearchBand(expanded: false)
+        }
+        .frame(maxHeight: Self.stripBandCeiling)
+        .fixedSize(horizontal: false, vertical: true)
+    }
+
+    /// The most of a 460pt strip the lane may occupy. Roughly four cards, which
+    /// is enough to read an answer without the hits going away.
+    private static let stripBandCeiling: CGFloat = 320
 
     /// Whether the deeper-search band is on screen at all. It appears once THIS
     /// panel session has judged a query deeper (or has already started a lane),
@@ -345,6 +376,15 @@ struct SearchView: View {
             // instead of nothing. The agent's own searches never ask for it.
             let page = try await APIClient.shared.search(
                 term, limit: 50, sort: sort, partial: true)
+            // AND AGAIN AFTER THE AWAIT, which the iOS twin has always done
+            // (`MobileSearchView`). A response landing in the window between
+            // `task(id:)` cancelling this task and URLSession noticing resolves
+            // normally, so without this a superseded fetch stamps its hits over
+            // the live ones. That much was self-correcting; `judge` below is
+            // not. It would start a paid conversation about words the reader
+            // deleted 200ms ago, and the next fetch would then hand the live
+            // words to it as a "refinement".
+            guard !Task.isCancelled, term == store.search.query.trimmed else { return }
             store.search.hits = page.items
             store.search.diagnostics = page.diagnostics
             store.search.nextCursor = page.next_cursor
