@@ -294,6 +294,35 @@ pub const CATEGORIES: &[&str] = &[
 /// an exception, never the attention bands. See [`clamp_record_tier`].
 pub const RECORD_CATEGORIES: &[&str] = &["banking_statement", "transaction_alert", "autopay_bill"];
 
+/// WHAT THE KNOWN-CONTACT FLOOR DOES NOT LIFT. The guarantee is that mail from
+/// someone the user has written to never lands below signal — but it is a
+/// statement about PEOPLE, and a category is how a pass says the mail is not a
+/// person writing. Every pass that writes a verdict asks this, so the answer
+/// cannot drift between them: the floor lives in four places and, before this
+/// existed, two of them carried an exemption list and two did not.
+///
+/// A record is exempt because the Banking rail owns it. `marketing` is exempt
+/// for the same shape of reason — the Newsletters zone owns it — and because on
+/// a promotional blast the floor's premise is simply false. Having emailed a
+/// shop's `info@` once about an order is not correspondence with the list that
+/// address sends to, so lifting the blast to `known_contact_importance` does not
+/// keep a promise, it invents one. The evidence is what the floor DOES: of 8
+/// known-contact marketing rows on a live 1568-message mailbox, 4 sat at exactly
+/// 70 and averaged 39.9; of 459 from senders never written to, ONE reached 70
+/// and they averaged 12.8. The model rates promotional mail low and consistently.
+/// The floor was overruling it on exactly the senders whose promos the user is
+/// most likely to be signed up to.
+///
+/// WHAT THIS IS NOT. It is not a category the user can be talked into: the value
+/// is the pipeline's own classification, and a human correction (`TriageAxis::
+/// Category`) rewrites it and restores the floor on the next pass. And it never
+/// touches the user's OWN Surface rule, which reuses `known_contact_floor` as a
+/// lift value but is an explicit instruction about a sender rather than an
+/// inference about one — see the `Disposition::Surface` arm in `apply_stage1`.
+pub fn floor_exempt_category(category: &str) -> bool {
+    RECORD_CATEGORIES.contains(&category) || category == "marketing"
+}
+
 /// STRUCTURAL CONSISTENCY: category wins over tier — for a record category force
 /// the tier to Noise, drop any deadline, and say why; a contradictory verdict
 /// (banking_statement + deadline) must never sit in the attention bands.
@@ -564,11 +593,13 @@ pub fn apply_result_with_rule(
     // known contact higher, never below the floor — "casual reply, no action
     // needed" from a friend is still mail the user chose to surface. The floor
     // is Stage1Config::known_contact_importance, threaded by the caller.
-    // RECORD-shaped mail is exempt: a bank's transaction alert lives in the
-    // Banking rail regardless of who sends it, and the record clamp below only
-    // demotes Deadline tiers — a floored Signal would slip past it.
+    // Some categories are exempt — a bank's transaction alert lives in the
+    // Banking rail regardless of who sends it (and the record clamp below only
+    // demotes Deadline tiers, so a floored Signal would slip past it), and a
+    // promotional blast is not the person the guarantee is about. See
+    // [`floor_exempt_category`], which every pass that writes a verdict shares.
     let floored = queued.is_known_contact
-        && !RECORD_CATEGORIES.contains(&category.as_str())
+        && !floor_exempt_category(&category)
         && importance < known_contact_floor;
     let importance = if floored {
         known_contact_floor
@@ -887,6 +918,101 @@ mod tests {
             now(),
         );
         assert_eq!(lo.importance, 0);
+    }
+
+    /// THE SHOP YOU EMAILED ONCE. The floor is a promise about PEOPLE, and one
+    /// order question to an `info@` is not correspondence with the list that
+    /// address broadcasts to. Before the carve-out this lifted every promo from
+    /// such a sender to 70 and signal tier, which is above the surface threshold
+    /// (50) — so the guarantee was manufacturing attention for mailing lists.
+    #[test]
+    fn the_known_contact_floor_does_not_lift_a_promotional_blast() {
+        let mut promo = out(12, true);
+        promo.category = "marketing".into();
+        let a = apply_result(
+            &queued(true),
+            &promo,
+            "m",
+            70,
+            &RouterConfig::default(),
+            now(),
+        );
+        assert_eq!(
+            a.importance, 12,
+            "a blast from a known contact keeps the model's own score"
+        );
+        assert!(
+            !a.field_reasons
+                .importance
+                .as_deref()
+                .unwrap()
+                .contains("known-contact floor"),
+            "and the reason must not claim a floor that did not apply"
+        );
+
+        // THE EXEMPTION IS THE CATEGORY, NOT THE SENDER: ordinary mail from the
+        // same address still gets the guarantee. This is what separates the
+        // carve-out from simply dropping the sender's contact status.
+        let mut ordinary = out(12, true);
+        ordinary.category = "general".into();
+        let b = apply_result(
+            &queued(true),
+            &ordinary,
+            "m",
+            70,
+            &RouterConfig::default(),
+            now(),
+        );
+        assert_eq!(b.importance, 70, "the order confirmation still stands");
+    }
+
+    /// The pre-existing record exemption, pinned because it now runs through the
+    /// shared predicate rather than a local slice test: a rename or a reordered
+    /// `||` that dropped the records would otherwise pass every other test.
+    #[test]
+    fn the_known_contact_floor_does_not_lift_record_shaped_mail() {
+        for category in RECORD_CATEGORIES {
+            let mut o = out(12, true);
+            o.category = (*category).into();
+            let a = apply_result(&queued(true), &o, "m", 70, &RouterConfig::default(), now());
+            assert_eq!(a.importance, 12, "{category} was floored");
+        }
+    }
+
+    /// THE USER OUTRANKS THE CARVE-OUT. A Surface rule is an explicit standing
+    /// instruction about a sender, not an inference about one, so it lifts a
+    /// promo the floor deliberately left alone. The two share a value
+    /// (`known_contact_floor`) and must not share a gate.
+    #[test]
+    fn a_surface_rule_still_lifts_a_blast_the_floor_will_not() {
+        let mut promo = out(12, true);
+        promo.category = "marketing".into();
+        let a = apply_result_with_rule(
+            &queued(true),
+            &promo,
+            "m",
+            70,
+            Some(crate::types::Disposition::Surface),
+            &RouterConfig::default(),
+            now(),
+        );
+        assert_eq!(
+            a.importance, 70,
+            "the account owner asked for this sender by name"
+        );
+        assert_eq!(a.tier, Tier::Signal);
+    }
+
+    /// The predicate itself, so both floor sites are reading one answer.
+    #[test]
+    fn floor_exempt_names_the_records_and_marketing_and_nothing_else() {
+        assert!(floor_exempt_category("marketing"));
+        for c in RECORD_CATEGORIES {
+            assert!(floor_exempt_category(c), "{c}");
+        }
+        for c in ["general", "invoice", ""] {
+            assert!(!floor_exempt_category(c), "{c} must still be floored");
+        }
     }
 
     #[test]
