@@ -1658,3 +1658,88 @@ fn a_diagnostic_count_stops_at_the_cap_and_stays_exact_below_it() {
     assert_eq!(d.strict_hits, 0, "no message carries both");
     assert!(d.any_hits >= 2);
 }
+
+#[test]
+fn a_sender_cannot_forge_a_body_window_on_the_recall_legs() {
+    // The window probe on the keyword PAGE is a marker planted in the snippet,
+    // and `messages.body` is flattened sender-controlled text with no C0 strip
+    // at ingest — so a sender who writes U+0001 into their own body can make a
+    // subject-only hit look like a body match. The recall legs cannot afford
+    // even that guess, because they ask for a window on EVERY hit, so they
+    // scope the MATCH to the body column and let SQLite answer.
+    let (store, acct) = store();
+    let id = triaged(acct, "g1", "t1")
+        .subject("pangolin fundraiser")
+        .snippet("A curated stored snippet.")
+        .body("\u{1}nothing in this body is what was searched for\u{1}")
+        .seed(&store);
+
+    let hits = store
+        .hybrid_search(
+            acct,
+            "pangolin",
+            &SearchFilter::default(),
+            SearchSort::Recent,
+            false,
+            10,
+        )
+        .unwrap()
+        .0;
+    let hit = hits.iter().find(|h| h.id == id).expect("the subject hit");
+    assert_eq!(
+        hit.snippet, "A curated stored snippet.",
+        "a subject-only hit keeps the stored snippet whatever the body plants"
+    );
+}
+
+#[test]
+fn a_caller_that_drops_the_snippet_can_decline_the_window() {
+    // One extra FTS query per hydrated hit, up to `recall_k` of them. The agent
+    // door builds its result from the subject and never reads the snippet, so
+    // it says no and gets the stored head instead.
+    let (store, acct) = store();
+    triaged(acct, "g1", "t1")
+        .subject("weekly digest")
+        .snippet("Thanks for subscribing to the weekly digest.")
+        .body(DEEP_BODY)
+        .seed(&store);
+
+    let windowed = store
+        .hybrid_search_legs(
+            acct,
+            "pangolin",
+            &SearchFilter::default(),
+            SearchSort::Recent,
+            false,
+            true,
+            10,
+        )
+        .unwrap()
+        .0;
+    assert!(
+        windowed[0].hit.snippet.contains("pangolin"),
+        "asked for: {:?}",
+        windowed[0].hit.snippet
+    );
+
+    let bare = store
+        .hybrid_search_legs(
+            acct,
+            "pangolin",
+            &SearchFilter::default(),
+            SearchSort::Recent,
+            false,
+            false,
+            10,
+        )
+        .unwrap()
+        .0;
+    assert_eq!(
+        bare[0].hit.snippet, "Thanks for subscribing to the weekly digest.",
+        "declined: the stored head, and no per-hit window query"
+    );
+    assert_eq!(
+        bare[0].hit.id, windowed[0].hit.id,
+        "the same search either way"
+    );
+}

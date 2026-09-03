@@ -998,7 +998,7 @@ pub async fn search(
             }
             SearchMode::Hybrid => {
                 let (mut hits, window_full) =
-                    store.hybrid_search_legs(account_id, &term, &filter, sort, partial, k)?;
+                    store.hybrid_search_legs(account_id, &term, &filter, sort, partial, true, k)?;
                 let page: Vec<SearchItem> = hits
                     .drain(..)
                     .skip(offset as usize)

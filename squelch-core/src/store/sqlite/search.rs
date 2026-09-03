@@ -8,16 +8,33 @@ use rusqlite::types::Value;
 use std::collections::{HashMap, HashSet};
 use zerocopy::AsBytes;
 
-/// The FTS5 MATCH WINDOW over the body column (column 1): up to 24 tokens
-/// around the matched terms, `…` where the window jumps a gap.
-///
-/// The open marker is `char(1)` (U+0001) and exists ONLY as a did-the-body-
-/// match probe: `snippet()` on a column the terms did not hit returns the
-/// column's head — indistinguishable from a real window by content alone — so
-/// a subject-only hit would silently swap the curated stored snippet for raw
-/// body head. The marker is stripped before anything leaves the store; the
+/// THE FTS5 MATCH WINDOW over the body column (column 1): up to 24 tokens
+/// around the matched terms, `…` where the window jumps a gap. No markup: the
 /// client paints highlights itself rather than decoding markup we invented.
-const BODY_SNIPPET: &str = "snippet(messages_fts, 1, char(1), '', '…', 24)";
+///
+/// Used where the query has ALREADY established that the body matched, which
+/// on this leg means a body-scoped MATCH (`body : (...)`). Then a returned row
+/// is the proof and the window needs no probe.
+const BODY_WINDOW: &str = "snippet(messages_fts, 1, '', '', '…', 24)";
+
+/// [`BODY_WINDOW`] with a did-the-body-match PROBE in the open marker slot.
+///
+/// `snippet()` on a column the terms did not hit returns that column's head,
+/// which is indistinguishable from a real window by content alone, so a
+/// subject-only hit would silently swap the curated stored snippet for the raw
+/// head of the body. The marker says which happened, and is stripped before
+/// anything leaves the store.
+///
+/// IT IS A HEURISTIC, NOT A GUARANTEE. `messages.body` is flattened
+/// sender-controlled text and nothing strips C0 controls at ingest, so a sender
+/// who plants U+0001 in their own body makes a subject-only hit on their own
+/// mail report a window. The consequence is that the reader sees the head of
+/// that sender's body instead of the head of that sender's stored snippet, on
+/// their own authed door: cosmetic, and self-inflicted by the one party it
+/// affects. The path that could not tolerate even that ([`SqliteStore::fts_snippet`],
+/// which runs for hits the keyword leg never produced) asks the question in SQL
+/// instead; this one cannot, because its MATCH has to span subject OR body.
+const BODY_WINDOW_PROBED: &str = "snippet(messages_fts, 1, char(1), '', '…', 24)";
 
 /// THE RELEVANCE SCORE for every keyword-leg query: bm25 with the SUBJECT
 /// weighted four times the body.
@@ -34,7 +51,7 @@ const BODY_SNIPPET: &str = "snippet(messages_fts, 1, char(1), '', '…', 24)";
 /// is the relevance and every ORDER BY here reads biggest-first.
 const BM25: &str = "bm25(messages_fts, 4.0, 1.0)";
 
-/// The marker `BODY_SNIPPET` plants on each matched term.
+/// The marker `BODY_WINDOW_PROBED` plants on each matched term.
 const SNIPPET_MARK: char = '\u{1}';
 
 /// HOW FAR A DIAGNOSTIC COUNT COUNTS before it answers "that many, at least".
@@ -47,9 +64,9 @@ const SNIPPET_MARK: char = '\u{1}';
 /// term on every keystroke of an as-you-type search.
 pub const DIAGNOSTIC_COUNT_CAP: u32 = 1_000;
 
-/// A `BODY_SNIPPET` value is a real match window only if the marker is present
-/// — otherwise the terms hit the subject (or nothing) and the caller should
-/// keep the stored snippet.
+/// A `BODY_WINDOW_PROBED` value is a real match window only if the marker is
+/// present — otherwise the terms hit the subject (or nothing) and the caller
+/// should keep the stored snippet.
 fn body_window(raw: Option<String>) -> Option<String> {
     let raw = raw?;
     if raw.contains(SNIPPET_MARK) {
@@ -72,7 +89,7 @@ fn map_search_hit(r: &rusqlite::Row<'_>) -> rusqlite::Result<SearchHit> {
     })
 }
 
-/// [`map_search_hit`] plus a trailing `BODY_SNIPPET` column (7): the window
+/// [`map_search_hit`] plus a trailing `BODY_WINDOW_PROBED` column (7): the window
 /// replaces the stored snippet only when the body really matched.
 fn map_search_hit_with_window(r: &rusqlite::Row<'_>) -> rusqlite::Result<SearchHit> {
     let mut hit = map_search_hit(r)?;
@@ -333,8 +350,11 @@ impl SqliteStore {
         partial: bool,
         k: usize,
     ) -> Result<(Vec<SearchHit>, bool)> {
+        // Windows ON: this is the shape a reader's surface uses. A caller that
+        // throws the snippet away should say so and ask
+        // [`hybrid_search_legs`](Self::hybrid_search_legs) directly.
         let (hits, window_full) =
-            self.hybrid_search_legs(account_id, query_text, filter, sort, partial, k)?;
+            self.hybrid_search_legs(account_id, query_text, filter, sort, partial, true, k)?;
         Ok((hits.into_iter().map(|h| h.hit).collect(), window_full))
     }
 
@@ -345,6 +365,13 @@ impl SqliteStore {
     /// answers to how much to trust a result, and a client that cannot tell
     /// them apart cannot say so to the reader. The plain method above is the
     /// same search with the provenance dropped.
+    ///
+    /// `want_windows` BUYS ONE QUERY PER HIT, so a caller that drops the
+    /// snippet says no. The agent door does: `search_mail` builds its result
+    /// from the subject alone, and `k` there is `limit + offset` capped at 600,
+    /// so windowing a deep page would compile and run hundreds of statements
+    /// for a field nothing reads.
+    #[allow(clippy::too_many_arguments)] // the query, the operators, the order, the window
     pub fn hybrid_search_legs(
         &self,
         account_id: AccountId,
@@ -352,6 +379,7 @@ impl SqliteStore {
         filter: &SearchFilter,
         sort: SearchSort,
         partial: bool,
+        want_windows: bool,
         k: usize,
     ) -> Result<(Vec<LeggedHit>, bool)> {
         // ONE clock for both legs of one search.
@@ -384,9 +412,15 @@ impl SqliteStore {
         let from_fts: HashSet<i64> = fts_hits.iter().map(|c| c.id).collect();
         let from_vec: HashSet<i64> = vec_hits.iter().map(|c| c.id).collect();
 
+        // ONE LOCK FOR THE WHOLE HYDRATION. Both recall legs are done, so
+        // nothing below needs the connection back; taking and releasing the
+        // store mutex per hit (twice per hit, with the window) would hand the
+        // daemon's sync, triage and notify lanes hundreds of acquisitions to
+        // interleave with, to serve one page.
+        let conn = self.lock()?;
         let mut out = Vec::with_capacity(ranked.len());
         for c in ranked {
-            if let Some(mut hit) = self.search_hit_by_id(account_id, c.id)? {
+            if let Some(mut hit) = self.search_hit_by_id(&conn, account_id, c.id)? {
                 if !filter.matches(&hit) {
                     continue;
                 }
@@ -398,7 +432,9 @@ impl SqliteStore {
                 // the body holds no term at all. The ANY expression is what is
                 // asked, because a strict window would find nothing in exactly
                 // the mail this whole wave exists for.
-                if let Some(window) = self.fts_snippet(account_id, c.id, &fts.any)? {
+                if want_windows
+                    && let Some(window) = self.fts_snippet(&conn, account_id, c.id, &fts.any)?
+                {
                     hit.snippet = window;
                 }
                 out.push(LeggedHit {
@@ -415,8 +451,20 @@ impl SqliteStore {
     /// [`FtsQuery`] built, never raw reader text), or `None` when there is
     /// nothing better than the stored snippet to show: the row is not in the
     /// index, the terms hit the subject rather than the body, or the MATCH
-    /// expression is malformed. Every one of those keeps the caller's existing snippet, so a
-    /// bad query degrades the preview instead of failing the search.
+    /// expression is malformed. Every one of those keeps the caller's existing
+    /// snippet, so a bad query degrades the preview instead of failing the
+    /// search.
+    ///
+    /// THE MATCH IS SCOPED TO THE BODY COLUMN (`body : (...)`), which is what
+    /// makes "the terms hit the subject rather than the body" an answer SQLite
+    /// gives rather than one we infer. Its sibling on the keyword page has to
+    /// infer it from a marker planted in the snippet, because that query's
+    /// MATCH must span subject OR body; here there is one message and one
+    /// question, so the column filter can ask it outright and a sender cannot
+    /// forge the answer by planting the marker in their own body.
+    ///
+    /// `prepare_cached`, and the connection comes from the caller: this runs
+    /// once per hydrated hit, up to `recall_k` (600) of them for a deep page.
     ///
     /// SECURITY: `messages_fts` indexes bodies at INGEST, before triage seals
     /// anything, so the index does contain sealed text. The account and sealed
@@ -425,6 +473,7 @@ impl SqliteStore {
     /// sealed body.
     fn fts_snippet(
         &self,
+        conn: &Connection,
         account_id: AccountId,
         message_id: i64,
         match_expr: &str,
@@ -432,9 +481,8 @@ impl SqliteStore {
         if match_expr.is_empty() {
             return Ok(None);
         }
-        let conn = self.lock()?;
         let sql = format!(
-            "SELECT {BODY_SNIPPET}
+            "SELECT {BODY_WINDOW}
              FROM messages_fts f
              JOIN messages m ON m.id = f.rowid
              LEFT JOIN triage t ON t.message_id = m.id
@@ -444,20 +492,19 @@ impl SqliteStore {
                AND m.is_spam = 0
                AND messages_fts MATCH ?3"
         );
-        let mut stmt = match conn.prepare(&sql) {
+        let mut stmt = match conn.prepare_cached(&sql) {
             Ok(s) => s,
             Err(_) => return Ok(None),
         };
         // A syntactically-invalid MATCH errors at step time, not prepare time;
         // both collapse to "no window".
-        let raw = stmt
-            .query_row(params![message_id, account_id, match_expr], |r| {
-                r.get::<_, Option<String>>(0)
-            })
-            .optional()
-            .unwrap_or(None)
-            .flatten();
-        Ok(body_window(raw))
+        let scoped = format!("body : ({match_expr})");
+        stmt.query_row(params![message_id, account_id, scoped], |r| {
+            r.get::<_, Option<String>>(0)
+        })
+        .optional()
+        .map(|raw| raw.flatten().filter(|w| !w.is_empty()))
+        .or(Ok(None))
     }
 
     /// SEMANTIC-ONLY recall as hydrated [`SearchHit`]s for the human door's
@@ -496,12 +543,15 @@ impl SqliteStore {
         // more than the head of the message. Asked with the ANY expression, so
         // a single term landing anywhere in the body wins a window.
         let fts = FtsQuery::build(query_text, partial);
+        // ONE LOCK for the whole hydration; see the twin loop in
+        // [`hybrid_search_legs`](Self::hybrid_search_legs).
+        let conn = self.lock()?;
         let mut out = Vec::with_capacity(ranked.len());
         for c in ranked {
-            if let Some(mut hit) = self.search_hit_by_id(account_id, c.id)?
+            if let Some(mut hit) = self.search_hit_by_id(&conn, account_id, c.id)?
                 && filter.matches(&hit)
             {
-                if let Some(window) = self.fts_snippet(account_id, c.id, &fts.any)? {
+                if let Some(window) = self.fts_snippet(&conn, account_id, c.id, &fts.any)? {
                     hit.snippet = window;
                 }
                 out.push(hit);
@@ -612,10 +662,18 @@ impl SqliteStore {
 
     /// Hydrate a single non-sealed message id into a [`SearchHit`] (sealed rows
     /// return `None`, keeping them absent from hybrid results).
-    fn search_hit_by_id(&self, account_id: AccountId, id: i64) -> Result<Option<SearchHit>> {
-        let conn = self.lock()?;
+    ///
+    /// The connection comes from the caller and the statement is cached: this
+    /// runs once per candidate in a hydration loop, so a lock per call and a
+    /// fresh compile per call are both paid `recall_k` times over.
+    fn search_hit_by_id(
+        &self,
+        conn: &Connection,
+        account_id: AccountId,
+        id: i64,
+    ) -> Result<Option<SearchHit>> {
         let row = conn
-            .query_row(
+            .prepare_cached(
                 "SELECT m.id, m.thread_id, m.from_addr, m.from_name, m.subject,
                         m.received_at, m.snippet
                  FROM messages m
@@ -623,9 +681,8 @@ impl SqliteStore {
                  WHERE m.account_id = ?1 AND m.id = ?2
                    AND COALESCE(t.sensitivity, 'normal') != 'sealed'
                    AND m.is_spam = 0",
-                params![account_id, id],
-                map_search_hit,
-            )
+            )?
+            .query_row(params![account_id, id], map_search_hit)
             .optional()?;
         Ok(row)
     }
@@ -684,7 +741,7 @@ impl SqliteStore {
         // snippet.
         let mut sql = format!(
             "SELECT m.id, m.thread_id, m.from_addr, m.from_name, m.subject,
-                    m.received_at, m.snippet, {BODY_SNIPPET}
+                    m.received_at, m.snippet, {BODY_WINDOW_PROBED}
              FROM messages_fts f
              JOIN messages m ON m.id = f.rowid
              LEFT JOIN triage t ON t.message_id = m.id
