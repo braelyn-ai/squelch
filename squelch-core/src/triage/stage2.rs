@@ -627,11 +627,14 @@ pub fn apply_result(
     // KNOWN-CONTACT GUARANTEE, same as stage-1's: someone the user has written
     // to never lands below signal, whichever pass writes the verdict last. An
     // explicit "don't want this" rule verdict beats it (the user outranks the
-    // heuristic), and record-shaped mail is exempt (the Banking rail owns it).
+    // heuristic), and the exempt categories are exempt here too — SAME predicate
+    // as stage-1's, because this pass runs LAST and a divergence here would
+    // quietly re-inflate on the capable model exactly what stage-1 declined to
+    // lift on the cheap one.
     let category = crate::triage::stage1_llm::normalize_category(&out.category);
     let floored = queued.is_known_contact
         && !rule_says_no
-        && !crate::triage::stage1_llm::RECORD_CATEGORIES.contains(&category.as_str())
+        && !crate::triage::stage1_llm::floor_exempt_category(&category)
         && importance < known_contact_floor;
     if floored {
         importance = known_contact_floor;
@@ -1413,6 +1416,31 @@ mod tests {
         assert_eq!(hi.importance, 100);
         let lo = apply_result(&q, &out(-5), "m", 70, now());
         assert_eq!(lo.importance, 0);
+    }
+
+    /// STAGE-2 RUNS LAST, so the carve-out has to hold here or the capable model
+    /// silently re-inflates on escalation exactly what Stage-1 declined to lift.
+    /// That divergence is the bug this shares a predicate to prevent: the floor
+    /// lives in four places and two of them carried an exemption list.
+    #[test]
+    fn the_known_contact_floor_does_not_lift_a_blast_on_the_second_pass_either() {
+        let mut promo = out(12);
+        promo.category = "marketing".into();
+        let a = apply_result(&queued(true, None), &promo, "m", 70, now());
+        assert_eq!(a.importance, 12, "stage-2 re-floored a promotional blast");
+        assert!(
+            !a.field_reasons
+                .importance
+                .as_deref()
+                .unwrap()
+                .contains("known-contact floor")
+        );
+
+        // Same sender, ordinary mail: the guarantee is untouched.
+        let mut ordinary = out(12);
+        ordinary.category = "general".into();
+        let b = apply_result(&queued(true, None), &ordinary, "m", 70, now());
+        assert_eq!(b.importance, 70);
     }
 
     #[test]

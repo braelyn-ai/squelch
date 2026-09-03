@@ -341,6 +341,21 @@ shape of every piece. Names here are the names in the code.
    known-contact floor (`stage1.known_contact_importance`) is applied to the
    model's `notify_importance` the way Stage-1 applies it to `importance`, so
    the [[known-contact guarantee]] holds in both lanes without a skip.
+
+   THE ONE PLACE THE TWO LANES DIFFER, and they differ because §11.5 says they
+   must: the deliberate lane exempts some categories from that floor
+   (`stage1_llm::floor_exempt_category` — records, which the Banking rail owns,
+   and `marketing`, which the Newsletters zone owns and on which the floor's
+   premise is false). This lane cannot make that call and must not learn to.
+   Category is the deliberate lane's business, and buying the exemption here
+   would mean either a second classification in front of the buzz or a
+   structural guess like `List-Unsubscribe`, which on a real mailbox is carried
+   by rental check-ins, delivery updates and support-ticket receipts.
+   CONSEQUENCE, stated rather than hidden: a promotional blast from a sender the
+   user has written to can still be floored to `known_contact_importance` here
+   and buzz, even though the deliberate lane running behind will score it low
+   and leave it out of the attention bands. Narrowing that is a change to this
+   contract, not a patch to the lane.
 3. **The score is stored.** `notify_importance` lands in the ledger row and is
    the event row's `importance`.
 4. **A sent buzz is never rewritten.** `UNIQUE(message_id)` on `events`
