@@ -608,6 +608,17 @@ struct GroupHistoryEntry: Codable, Sendable, Identifiable, Hashable {
 
     /// True when this went to every member it was measured against.
     var reachedEveryone: Bool { group_size > 0 && reached >= group_size }
+
+    /// Was this mail SENT THROUGH the group, or merely matched to it afterwards?
+    ///
+    /// The distinction decides what the reach count MEANS, and getting it wrong
+    /// libels the mailbox. A recorded send aimed at everyone, so "1 of 2" is a
+    /// shortfall and worth saying loudly. A derived entry is ordinary mail the
+    /// daemon matched to this membership after the fact — it never aimed at the
+    /// group, so "1 of 2" describes nothing that went wrong, and rendering it in
+    /// the shortfall's own styling turns a year of normal correspondence into a
+    /// page of apparent delivery failures.
+    var isRecorded: Bool { group_send_id != nil }
 }
 
 struct GroupHistoryPage: Codable, Sendable {
