@@ -1040,10 +1040,16 @@ final class AssistantSession {
     /// a single run task, and that task is inside this await for as long as it
     /// holds. `resume()` and `clear()` are the only two things that resume it,
     /// and both nil the slot before they do.
+    /// A LOOP, NOT ONE WAIT. A woken task does not re-read the flag on its own,
+    /// so a resume followed by a pause in the same main-actor turn (opening the
+    /// panel and closing it again) would let this boundary through and start
+    /// the very request the hold exists to prevent. Re-checking is one line and
+    /// removes the whole class.
     private func holdWhilePaused() async {
-        guard isPaused else { return }
-        await withCheckedContinuation { continuation in
-            pauseWaiter = continuation
+        while isPaused {
+            await withCheckedContinuation { continuation in
+                pauseWaiter = continuation
+            }
         }
     }
 
