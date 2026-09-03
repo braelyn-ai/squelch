@@ -571,8 +571,7 @@ struct GreetingLine: View {
             // order) and only while the editor is up.
             .keyBindings(
                 .sitrep,
-                editing
-                    ? [KeyBinding("Escape", "cancel", allowInInput: true) { editing = false }] : []
+                editing ? [KeyBinding("Escape", "cancel", allowInInput: true) { close() }] : []
             )
         #endif
     }
@@ -612,6 +611,7 @@ struct GreetingLine: View {
             .onChange(of: focused) { _, nowFocused in
                 if !nowFocused { editing = false }
             }
+            .submitLabel(.done)
             .onAppear { focused = true }
     }
 
@@ -647,10 +647,20 @@ struct GreetingLine: View {
     /// way back, which is a lot to charge for a stray Enter.
     private func commit() {
         let typed = draft.trimmed
-        editing = false
+        close()
         guard !typed.isEmpty else { return }
         // The setter is what records the name as CHOSEN — see Prefs.userName.
         prefs.userName = typed
+    }
+
+    /// Both exits go through here. Dropping `focused` EXPLICITLY rather than
+    /// leaning on SwiftUI to reset it when the field unmounts: cancel is the
+    /// one exit that leaves the pencil on screen, so it is the one exit with a
+    /// second open behind it, and a `focused` still stuck true would make that
+    /// open's `.onAppear` a no-op — a field you click into and cannot type in.
+    private func close() {
+        focused = false
+        editing = false
     }
 
     static func greeting(now: Date = Date()) -> String {

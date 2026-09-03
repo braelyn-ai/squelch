@@ -314,18 +314,25 @@ final class Prefs {
     /// The human's display name, for the Sitrep greeting only. Client-side —
     /// the human door has no such field.
     ///
-    /// SETTING THIS IS A CHOICE, and the setter records it as one: whoever
-    /// assigns here is a human at a text field (the Settings row, or the
-    /// greeting's own inline editor), which is what retires the pencil beside
-    /// the greeting for good. The seed below writes the stored value directly,
-    /// precisely so a guess the app made about you never counts as your answer.
+    /// SETTING THIS TO A NAME IS A CHOICE, and the setter records it as one:
+    /// whoever assigns here is a human at a text field (the Settings row, or
+    /// the greeting's own inline editor), which is what retires the pencil
+    /// beside the greeting for good. The seed below writes the stored value
+    /// directly, precisely so a guess the app made about you never counts as
+    /// your answer.
+    ///
+    /// EMPTY IS NOT A CHOICE, and that is not pedantry: the Settings row binds
+    /// straight to this pref, so it lands here on every keystroke — including
+    /// the empty string in the middle of select-all-and-retype. Counting that
+    /// as an answer would strand anyone who got distracted mid-edit with a bare
+    /// greeting AND no pencil, the one state with no way back but Settings.
     private var _userName: String
     var userName: String {
         get { _userName }
         set {
             _userName = newValue.trimmingCharacters(in: .whitespaces)
             defaults.set(_userName, forKey: Key.userName)
-            if !_nameChosen {
+            if !_nameChosen, !_userName.isEmpty {
                 _nameChosen = true
                 defaults.set(true, forKey: Key.nameChosen)
             }
@@ -345,13 +352,20 @@ final class Prefs {
     /// Fires AT MOST ONCE per install. The guard is the stored key's absence,
     /// not emptiness, so clearing the name in Settings stays cleared and an
     /// account switch never re-guesses over a name you already have. A nil
-    /// address (daemon too old to say) and a local part that comes back empty
+    /// address (daemon too old to say) and anything that is not address-shaped
     /// both mean the same thing here: seed nothing, greet the way we always did.
+    ///
+    /// SPLIT WOULD BE WRONG. `split(separator:)` omits empty subsequences, so
+    /// "@gmail.com" hands back the DOMAIN and a bare "nobody" hands back
+    /// itself — and self-host never checks the shape of `account_email` (the
+    /// config only requires it non-empty), so both are reachable. The guess is
+    /// one-shot and keyed on the key's absence, so a wrong one is permanent:
+    /// this takes the text before the first "@" and insists there was one.
     func seedUserName(fromEmail email: String?) {
         guard !_nameChosen, defaults.object(forKey: Key.userName) == nil else { return }
-        guard let local = email?.split(separator: "@").first.map(String.init),
-            !local.isEmpty
-        else { return }
+        guard let email, let at = email.firstIndex(of: "@") else { return }
+        let local = String(email[..<at])
+        guard !local.isEmpty else { return }
         _userName = local
         defaults.set(local, forKey: Key.userName)
     }
