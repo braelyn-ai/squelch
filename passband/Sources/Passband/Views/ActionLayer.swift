@@ -286,7 +286,7 @@ struct ShortcutsOverlay: View {
         Group(
             title: "Navigate",
             items: [
-                (["1", "2", "3", "4", "5"], "sitrep · emails · auth · rules · audit"),
+                (["1", "2", "3", "4", "5"], "sitrep · emails · auth · rules · groups"),
                 (["⌘["], "back"),
                 (["⌘]"], "forward"),
                 (["a"], "browse all mail"),
@@ -297,7 +297,7 @@ struct ShortcutsOverlay: View {
                 (["⌘,"], "settings"),
                 (["g"], "auth messages"),
                 (["T"], "rules"),
-                (["A"], "audit log"),
+                (["A"], "audit log (in settings)"),
             ]),
         Group(
             title: "App",

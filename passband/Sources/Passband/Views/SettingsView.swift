@@ -34,37 +34,50 @@ struct SettingsView: View {
         VStack(spacing: 0) {
             // RoutedHeader lives in App/RootView.swift, which is the Mac's window
             // shell and is excluded from the iOS target. The phone titles this
-            // screen with a navigation bar instead, and files the search order
-            // as a card (see PassbandiOS/Views/AccountPage.swift) because it has
-            // no header to hang a control from.
+            // screen with a navigation bar instead.
+            //
+            // NOTHING RIDES IN THE CORNER. The search-order picker used to, and
+            // it was the one control on this screen that was not filed under
+            // anything: a segmented pair of words in a corner, reachable from
+            // every tab and explained by none of them. It is a Mail setting, so
+            // it is a card on the Mail pane now (`SearchSection`) — the same one
+            // the phone has always shown, off the same preference.
             #if os(macOS)
-                RoutedHeader(title: "Settings") {
-                    HStack(spacing: 8) {
-                        // Labelled, because a bare pair of words in a corner is
-                        // a puzzle. It sits in the header rather than in a card
-                        // under one tab so the answer is reachable from every
-                        // tab, the way the version stamp is.
-                        Text("search")
-                            .font(Typo.rowSub)
-                            .foregroundStyle(Palette.inkDim)
-                        SearchSortPicker()
-                    }
-                }
+                RoutedHeader(title: "Settings")
             #endif
             HStack(alignment: .top, spacing: 0) {
                 nav
-                ScrollView {
-                    VStack(alignment: .leading, spacing: 16) {
-                        if searching {
-                            results
-                        } else {
-                            pane(prefs.settingsSection)
+                // ONE PANE DOES NOT SCROLL AS A PANE. Every other section is a
+                // column of cards, and a column of cards is read top to bottom
+                // through the window — so the window scrolls it. The audit log
+                // is a table with a filter rail beside it, and scrolling THAT
+                // as one page would carry the filters off the top of the screen
+                // just as you started using them. So the ledger is given the
+                // height instead, and does its own scrolling inside it.
+                if fullHeightPane {
+                    pane(prefs.settingsSection)
+                        .padding(.horizontal, 22)
+                        .padding(.vertical, 18)
+                        .frame(
+                            maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+                } else {
+                    ScrollView {
+                        VStack(alignment: .leading, spacing: 16) {
+                            if searching {
+                                results
+                            } else {
+                                pane(prefs.settingsSection)
+                            }
                         }
+                        .padding(.horizontal, 22)
+                        .padding(.vertical, 18)
+                        // 720 IS A READING MEASURE, not a layout habit: a
+                        // column of labelled switches stops being scannable
+                        // long before it stops fitting, so every pane is capped
+                        // at one.
+                        .frame(maxWidth: 720, alignment: .leading)
+                        .frame(maxWidth: .infinity, alignment: .leading)
                     }
-                    .padding(.horizontal, 22)
-                    .padding(.vertical, 18)
-                    .frame(maxWidth: 720, alignment: .leading)
-                    .frame(maxWidth: .infinity, alignment: .leading)
                 }
             }
             // Outside the ScrollView and outside the section switch, so it sits
@@ -95,6 +108,14 @@ struct SettingsView: View {
         ])
     }
 
+    /// Whether the section on the right is handed the window's whole height and
+    /// left to scroll itself, instead of being a card in a scrolling column.
+    /// See the note at the branch that reads it. Searching is never one of
+    /// these: the results pane is cards again, whatever it found.
+    private var fullHeightPane: Bool {
+        !searching && prefs.settingsSection == .audit
+    }
+
     /// One category's cards, in the order that category presents them. The
     /// switch is the ONLY place that ordering lives; search results reuse the
     /// same card views through `SettingsCardView`.
@@ -110,6 +131,7 @@ struct SettingsView: View {
             YouSection()
         case .mail:
             MailSection()
+            SearchSection()
             SignatureSection()
             ReadTrackingSection()
         case .triage:
@@ -120,6 +142,8 @@ struct SettingsView: View {
             AssistantSection()
         case .privacy:
             PrivacySection()
+        case .audit:
+            AuditSection()
         case .account:
             AccountSection()
         }
@@ -300,6 +324,7 @@ struct SettingsCardView: View {
         case .developer: DeveloperSection()
         case .you: YouSection()
         case .mail: MailSection()
+        case .search: SearchSection()
         case .signature: SignatureSection()
         case .readTracking: ReadTrackingSection()
         case .triagePipeline: TriagePipelineSection()
@@ -307,6 +332,9 @@ struct SettingsCardView: View {
         case .ranking: RankingSection()
         case .assistant: AssistantSection()
         case .privacy: PrivacySection()
+        // The ledger, drawn as a card like everything else — searching for
+        // "who archived this" lands you on the live log, not a link to it.
+        case .audit: AuditSection()
         // The one card that is really three (accounts, the live account,
         // invites): AccountSection owns its own stack, so a hit on "invite"
         // brings the whole account pane rather than a card that does not exist
@@ -797,6 +825,27 @@ struct MailSection: View {
             }
             SettingsHint(
                 "Automatic draws short back and forth threads as chat and everything else as email. Email stacks every message as its own card. Chat draws the thread as bubbles, with the ones you sent on the right. Any thread can be switched on its own while you read it (b), and it keeps that answer."
+            )
+        }
+    }
+}
+
+/// THE SEARCH ORDER — how a search ranks what it found, not what it finds.
+///
+/// Filed under Mail, beside the rest of what searching turns up, on BOTH
+/// shells. It used to hang in the Mac's settings header instead, on the theory
+/// that a control in the corner is reachable from every tab; what it actually
+/// was is the one setting on the screen that belonged to no category and
+/// carried no explanation. A card can say what the two words mean.
+///
+/// The same control also sits in the search panel itself, next to the results
+/// it orders. One preference behind all three.
+struct SearchSection: View {
+    var body: some View {
+        SectionCard(label: "Search") {
+            InlineRow(key: "order") { SearchSortPicker() }
+            SettingsHint(
+                "Recent ranks newer mail higher when two matches are close, which is usually the one you meant. Best match ignores the date and ranks on the words alone, for a thread you can quote but cannot place. Either way the search itself is unchanged: this is the order results come back in, not which mail is found."
             )
         }
     }

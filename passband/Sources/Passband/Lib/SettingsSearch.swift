@@ -23,7 +23,7 @@ import Foundation
 /// bucket of entries. Keeping the three in one file is what lets the whole lot
 /// compile into a headless test with no app around it.
 enum SettingsSection: String, CaseIterable, Sendable {
-    case general, mail, triage, assistant, privacy, account
+    case general, mail, triage, assistant, privacy, audit, account
 
     var label: String {
         switch self {
@@ -32,6 +32,7 @@ enum SettingsSection: String, CaseIterable, Sendable {
         case .triage: "Triage"
         case .assistant: "Assistant"
         case .privacy: "Privacy"
+        case .audit: "Audit"
         case .account: "Account"
         }
     }
@@ -50,20 +51,22 @@ enum SettingsSection: String, CaseIterable, Sendable {
 /// The raw values are stable ids; `label` mirrors what `SectionCard` prints.
 enum SettingsCard: String, CaseIterable, Sendable {
     case connection, appearance, notifications, tour, whatsNew, developer, you
-    case mail, signature, readTracking
+    case mail, search, signature, readTracking
     case triagePipeline, triageBudget, ranking
     case assistant
     case privacy
+    case audit
     case account
 
     var section: SettingsSection {
         switch self {
         case .connection, .appearance, .notifications, .tour, .whatsNew, .developer, .you:
             .general
-        case .mail, .signature, .readTracking: .mail
+        case .mail, .search, .signature, .readTracking: .mail
         case .triagePipeline, .triageBudget, .ranking: .triage
         case .assistant: .assistant
         case .privacy: .privacy
+        case .audit: .audit
         case .account: .account
         }
     }
@@ -92,6 +95,7 @@ enum SettingsCard: String, CaseIterable, Sendable {
         case .developer: "Developer"
         case .you: "You"
         case .mail: "Mail"
+        case .search: "Search"
         case .signature: "Signature"
         case .readTracking: "Read tracking"
         case .triagePipeline: "How triage works"
@@ -99,6 +103,7 @@ enum SettingsCard: String, CaseIterable, Sendable {
         case .ranking: "For your eyes"
         case .assistant: "Assistant"
         case .privacy: "Developer Telemetry"
+        case .audit: "Audit log"
         case .account: "Accounts"
         }
     }
@@ -130,7 +135,7 @@ enum SettingsSearch {
     /// control nobody can find by describing it, which is why the coverage
     /// assertion in the test suite fails a card that gains one and no words.
     static let entries: [SettingsEntry] = generalEntries + mailEntries + triageEntries
-        + assistantEntries + privacyEntries + accountEntries
+        + assistantEntries + privacyEntries + auditEntries + accountEntries
 
     private static let generalEntries: [SettingsEntry] = [
         SettingsEntry(
@@ -231,6 +236,15 @@ enum SettingsSearch {
                 "thread", "threads", "thread style", "conversation", "conversations",
                 "chat", "bubbles", "messages", "email style", "layout", "view", "display",
                 "automatic", "reading",
+            ]),
+        SettingsEntry(
+            card: .search,
+            title: "Search result order",
+            blurb: "Whether search leans on recent mail or on the words alone when it ranks.",
+            keywords: [
+                "search", "search order", "results", "ranking", "rank", "sort", "sorting",
+                "order", "recent", "recency", "newest", "best match", "relevance",
+                "oldest first", "date",
             ]),
         SettingsEntry(
             card: .signature,
@@ -368,6 +382,18 @@ enum SettingsSearch {
                 "telemetry", "analytics", "privacy", "tracking", "posthog", "data",
                 "usage data", "anonymous", "opt out", "opt-out", "stop sending",
                 "diagnostics", "metrics", "share data",
+            ]),
+    ]
+
+    private static let auditEntries: [SettingsEntry] = [
+        SettingsEntry(
+            card: .audit,
+            title: "Audit log",
+            blurb: "Every action the agent and this app have taken on your mail, newest first.",
+            keywords: [
+                "audit", "audit log", "log", "history", "activity", "actions", "ledger",
+                "record", "trail", "what happened", "who did this", "agent", "mcp",
+                "archived", "revealed", "undo", "who archived", "changed my mail",
             ]),
     ]
 

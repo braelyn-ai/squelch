@@ -46,7 +46,7 @@ struct AccountPage: View {
     /// beside the pane is a map, and a map you can read at a glance has no
     /// reason to lead with anything.
     private static let order: [SettingsSection] = [
-        .account, .general, .mail, .triage, .assistant, .privacy,
+        .account, .general, .mail, .triage, .assistant, .privacy, .audit,
     ]
 
     private var accounts: [AccountRecord] { AccountManager.shared.accounts }
@@ -234,6 +234,8 @@ struct AccountPage: View {
                     AssistantSection()
                 case .privacy:
                     PrivacySection()
+                case .audit:
+                    AuditSection()
                 case .account:
                     AccountSection()
                 }
@@ -257,6 +259,7 @@ struct AccountPage: View {
         case .triage: "arrow.triangle.branch"
         case .assistant: "sparkles"
         case .privacy: "hand.raised"
+        case .audit: "scroll"
         case .account: "person.crop.circle"
         }
     }
@@ -268,29 +271,9 @@ struct AccountPage: View {
         case .triage: "how it works, daily caps, ranking"
         case .assistant: "your own api key, and which model"
         case .privacy: "what telemetry leaves the app"
+        case .audit: "what the agent and this app have done"
         case .account: "the mailboxes this install knows"
         }
     }
 }
 
-/// THE SEARCH ORDER, on the phone. The Mac hangs the same control in the
-/// settings header, top right beside the title (SettingsView), where it is
-/// reachable from every tab. This screen has no header to hang it from, so it
-/// becomes a card like every other preference here — filed under Mail, next to
-/// the rest of what searching turns up.
-///
-/// Lives in the iOS shell rather than beside the shared section cards because
-/// it is PACKAGING, not the setting: the control and the preference are both
-/// shared, and only the frame around them is a phone decision.
-struct SearchSection: View {
-    @Environment(Prefs.self) private var prefs
-
-    var body: some View {
-        SectionCard(label: "Search") {
-            InlineRow(key: "order") { SearchSortPicker() }
-            SettingsHint(
-                "Recent ranks newer mail higher when two matches are close, which is usually the one you meant. Best match ignores the date and ranks on the words alone, for a thread you can quote but cannot place. Either way the search itself is unchanged: this is the order results come back in, not which mail is found."
-            )
-        }
-    }
-}

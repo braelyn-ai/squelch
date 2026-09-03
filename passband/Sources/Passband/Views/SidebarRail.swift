@@ -1,4 +1,4 @@
-// SIDEBAR — the slim icon rail: Sitrep / Emails / Auth / Rules / Audit on the
+// SIDEBAR — the slim icon rail: Sitrep / Emails / Auth / Rules / Groups on the
 // 1..5 keys; Share + Usage + Settings sit below a divider, out of that sequence
 // so adding one never renumbers it. Share is the odd one there: it opens a sheet
 // rather than routing, so it carries no selector (see `shareButton`). ONE long-lived pane behind the icons is the selector,
