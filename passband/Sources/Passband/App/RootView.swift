@@ -395,6 +395,7 @@ struct RoutedHost<Content: View>: View {
         switch view {
         case .rules: ("Rules", "sender rules")
         case .audit: ("Audit", "agent & app actions")
+        case .groups: ("Groups", "named audiences")
         default: (view.label, nil)
         }
     }
