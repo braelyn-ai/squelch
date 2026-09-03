@@ -321,6 +321,13 @@ conf" then "abstract conference wifi" is one refinement, the second. Twelve
 refinements in one lane and it is reset and started fresh on the next: a
 conversation that long is a search that changed subject.
 
+A settled query whose WORDS have not changed is not a refinement at all, and
+the lane is not told about it. The panel resettles for things the reader did
+not type (flipping the sort re-ranks the same query; a failed fetch is
+retried), and each of those would otherwise buy a turn, a request and one of
+the twelve to tell the model that the reader narrowed the search to what it
+is already reading.
+
 ### 6.3 Pause and hold
 
 Closing the panel pauses the lane; nothing is lost. There is no such thing as
