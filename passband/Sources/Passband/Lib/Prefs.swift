@@ -129,6 +129,7 @@ final class Prefs {
         static let searchSort = "passband.pref.searchSort"
         static let notificationSound = "passband.pref.notificationSound"
         static let userName = "passband.name"
+        static let nameChosen = "passband.name.chosen"
         static let signature = "passband.pref.signature"
         static let assistantModel = "passband.assistant.model"
         static let assistantTransport = "passband.assistant.transport"
@@ -166,7 +167,13 @@ final class Prefs {
             ?? .system
         _telemetry =
             TelemetryLevel(rawValue: defaults.string(forKey: Key.telemetry) ?? "") ?? .full
-        _userName = defaults.string(forKey: Key.userName) ?? ""
+        let storedName = defaults.string(forKey: Key.userName) ?? ""
+        _userName = storedName
+        // A NAME TYPED BEFORE THE FLAG EXISTED is a chosen name. Deliberately
+        // NOT in `register(defaults:)` above: a registered default reads exactly
+        // like a stored one, and this needs to see absence — the same reason
+        // `tourCompleted` is written the way it is.
+        _nameChosen = defaults.object(forKey: Key.nameChosen) as? Bool ?? !storedName.isEmpty
         _signature = defaults.string(forKey: Key.signature) ?? ""
         _assistantModel =
             AssistantModel.migrating(rawValue: defaults.string(forKey: Key.assistantModel) ?? "")
@@ -174,6 +181,14 @@ final class Prefs {
         _assistantTransport =
             AssistantTransport(rawValue: defaults.string(forKey: Key.assistantTransport) ?? "")
             ?? .relay
+        // LAST, because it writes: the verdict above has to be PINNED on the
+        // launch that reaches it, not re-derived on the next one. A seed lands
+        // in the name key with no flag beside it, so a re-derivation would read
+        // the app's own guess as the human's answer and quietly retire the
+        // pencil that exists to correct it. Runs once per install.
+        if defaults.object(forKey: Key.nameChosen) == nil {
+            defaults.set(_nameChosen, forKey: Key.nameChosen)
+        }
     }
 
     /// Load remote (network) images in email HTML automatically. When false,
@@ -298,13 +313,61 @@ final class Prefs {
 
     /// The human's display name, for the Sitrep greeting only. Client-side —
     /// the human door has no such field.
+    ///
+    /// SETTING THIS TO A NAME IS A CHOICE, and the setter records it as one:
+    /// whoever assigns here is a human at a text field (the Settings row, or
+    /// the greeting's own inline editor), which is what retires the pencil
+    /// beside the greeting for good. The seed below writes the stored value
+    /// directly, precisely so a guess the app made about you never counts as
+    /// your answer.
+    ///
+    /// EMPTY IS NOT A CHOICE, and that is not pedantry: the Settings row binds
+    /// straight to this pref, so it lands here on every keystroke — including
+    /// the empty string in the middle of select-all-and-retype. Counting that
+    /// as an answer would strand anyone who got distracted mid-edit with a bare
+    /// greeting AND no pencil, the one state with no way back but Settings.
     private var _userName: String
     var userName: String {
         get { _userName }
         set {
             _userName = newValue.trimmingCharacters(in: .whitespaces)
             defaults.set(_userName, forKey: Key.userName)
+            if !_nameChosen, !_userName.isEmpty {
+                _nameChosen = true
+                defaults.set(true, forKey: Key.nameChosen)
+            }
         }
+    }
+
+    /// Whether the human has ever named themselves. False means the greeting is
+    /// running on a seeded guess (or on nothing), which is the one state that
+    /// offers an edit affordance — a permanent pencil on a greeting is chrome,
+    /// and the name lives in Settings like every other pref.
+    private var _nameChosen: Bool
+    var nameChosen: Bool { _nameChosen }
+
+    /// First-run display name: the mailbox's local part, the first time a
+    /// daemon tells us which mailbox this is.
+    ///
+    /// Fires AT MOST ONCE per install. The guard is the stored key's absence,
+    /// not emptiness, so clearing the name in Settings stays cleared and an
+    /// account switch never re-guesses over a name you already have. A nil
+    /// address (daemon too old to say) and anything that is not address-shaped
+    /// both mean the same thing here: seed nothing, greet the way we always did.
+    ///
+    /// SPLIT WOULD BE WRONG. `split(separator:)` omits empty subsequences, so
+    /// "@gmail.com" hands back the DOMAIN and a bare "nobody" hands back
+    /// itself — and self-host never checks the shape of `account_email` (the
+    /// config only requires it non-empty), so both are reachable. The guess is
+    /// one-shot and keyed on the key's absence, so a wrong one is permanent:
+    /// this takes the text before the first "@" and insists there was one.
+    func seedUserName(fromEmail email: String?) {
+        guard !_nameChosen, defaults.object(forKey: Key.userName) == nil else { return }
+        guard let email, let at = email.firstIndex(of: "@") else { return }
+        let local = String(email[..<at])
+        guard !local.isEmpty else { return }
+        _userName = local
+        defaults.set(local, forKey: Key.userName)
     }
 
     /// The email signature, as markdown — same dialect as the compose body.

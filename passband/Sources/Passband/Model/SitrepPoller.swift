@@ -163,6 +163,11 @@ final class SitrepPoller {
             // value difference, so writing an identical read model every 10s
             // re-lays out the whole dashboard for nothing.
             if next != store.sitrep { store.sitrep = next }
+            // FIRST SIGHT OF THE MAILBOX = the first chance to know the human's
+            // name well enough to guess. Here rather than at connect time
+            // because this is where the address arrives, and unconditional
+            // because the pref itself is what fires once — see seedUserName.
+            Prefs.shared.seedUserName(fromEmail: st.account_email)
             // A REPLY THAT LANDED IN THE THREAD ON SCREEN. The live event feed
             // usually gets there first, and this is the backstop that has to
             // hold anyway: the feed only carries mail triage judged worth a
