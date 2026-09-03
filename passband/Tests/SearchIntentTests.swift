@@ -30,6 +30,10 @@ struct SearchIntentTests {
         reasonsReadLikeSentences()
         digitsAreNotFirstPerson()
         punctuationAloneIsNotAQuestion()
+        // what the setting lets a verdict do
+        offStopsALaneThatIsAlreadyRunning()
+        onRequestNeverSpendsUnasked()
+        aStartedLaneTakesEverySettledQuery()
         // the refinement slot
         theNewestRefinementWins()
         theSameWordsAreNotANarrowing()
@@ -220,6 +224,69 @@ struct SearchIntentTests {
             SearchIntent.classify(query: "wifi?", diagnostics: diagnostics(strict: 1))
                 == .deeper(trigger: .questionShaped),
             "one real word with a question mark still is a question")
+    }
+
+    // MARK: - what the setting lets a verdict do
+
+    /// THE PROMISE UNDER THE PICKER: "No model reads your mail." Off has to
+    /// mean the lane is not running, not merely that it will not start again.
+    static func offStopsALaneThatIsAlreadyRunning() {
+        expect(
+            DeeperSearchPolicy.preferenceChanged(to: .off, laneStarted: true) == .stop,
+            "flipping to off tears down a conversation in flight")
+        expect(
+            DeeperSearchPolicy.preferenceChanged(to: .off, laneStarted: false) == .nothing,
+            "with nothing running there is nothing to stop")
+        expect(
+            DeeperSearchPolicy.preferenceChanged(to: .automatic, laneStarted: true) == .nothing
+                && DeeperSearchPolicy.preferenceChanged(to: .onRequest, laneStarted: true)
+                    == .nothing,
+            "and no other move touches a running lane")
+        expect(
+            DeeperSearchPolicy.settled(
+                verdict: .deeper(trigger: .questionShaped), choice: .off, laneStarted: true)
+                == .stop,
+            "a settled query under off stops the lane rather than refining it")
+        expect(
+            DeeperSearchPolicy.settled(
+                verdict: .deeper(trigger: .questionShaped), choice: .off, laneStarted: false)
+                == .nothing,
+            "and off never starts one")
+        expect(
+            !DeeperSearchChoice.off.blurb.contains("\u{2014}")
+                && !DeeperSearchChoice.automatic.blurb.contains("\u{2014}"),
+            "no em dash in the copy under the picker")
+    }
+
+    /// On request spends nothing until the band's button is pressed.
+    static func onRequestNeverSpendsUnasked() {
+        expect(
+            DeeperSearchPolicy.settled(
+                verdict: .deeper(trigger: .noStrictHits), choice: .onRequest, laneStarted: false)
+                == .nothing,
+            "a question-shaped query under on-request waits to be asked")
+        expect(
+            DeeperSearchPolicy.settled(
+                verdict: .deeper(trigger: .noStrictHits), choice: .automatic, laneStarted: false)
+                == .start(trigger: .noStrictHits),
+            "automatic is the only choice that spends by itself")
+        expect(
+            DeeperSearchPolicy.settled(
+                verdict: .lookup, choice: .automatic, laneStarted: false) == .nothing,
+            "and a lookup starts nothing under any choice")
+    }
+
+    /// Once a lane is going, every settled query is the same need narrowed,
+    /// including one the classifier would not have started anything for.
+    static func aStartedLaneTakesEverySettledQuery() {
+        expect(
+            DeeperSearchPolicy.settled(
+                verdict: .lookup, choice: .automatic, laneStarted: true) == .refine,
+            "a lookup typed into a running lane is still a narrowing of it")
+        expect(
+            DeeperSearchPolicy.settled(
+                verdict: .lookup, choice: .onRequest, laneStarted: true) == .refine,
+            "on request too: the reader already pressed the button once")
     }
 
     // MARK: - the refinement slot

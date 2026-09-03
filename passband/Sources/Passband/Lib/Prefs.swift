@@ -89,37 +89,9 @@ enum NotificationSound: String, CaseIterable, Sendable {
     }
 }
 
-/// WHETHER A SEARCH MAY SPEND MONEY BY ITSELF. The deeper-search lane runs a
-/// model over the reader's mail when a query looks like a question the results
-/// list cannot answer (docs/SEARCH.md §5), on the user's own key or on the
-/// hosted plan's budget. That is spend nobody tapped for, so it is a setting.
-///
-/// `automatic` is the default because the lane is worth having: the query that
-/// motivated the whole design was answered by an agent in one pass and by the
-/// search panel not at all.
-enum DeeperSearchChoice: String, CaseIterable, Sendable {
-    case automatic, onRequest = "on_request", off
-
-    var label: String {
-        switch self {
-        case .automatic: "Automatic"
-        case .onRequest: "On request"
-        case .off: "Off"
-        }
-    }
-
-    /// What the setting promises, in one line, under the picker.
-    var blurb: String {
-        switch self {
-        case .automatic:
-            "A question-shaped search reads your mail and answers it, unasked."
-        case .onRequest:
-            "A question-shaped search offers a button, and waits for you to press it."
-        case .off:
-            "Search stays keyword and meaning only. No model reads your mail."
-        }
-    }
-}
+// `DeeperSearchChoice` is NOT here: it lives beside the rule that reads it
+// (Lib/DeeperSearch.swift), which is pure so test.sh can assert what `off`
+// does to a lane that is already running. This file is only its storage.
 
 /// Two palettes selected explicitly; `system` follows the OS and is the default.
 enum ThemeChoice: String, CaseIterable, Sendable {

@@ -394,26 +394,25 @@ struct SearchView: View {
     private func judge(_ term: String) {
         let verdict = SearchIntent.classify(query: term, diagnostics: store.search.diagnostics)
         store.search.lastVerdict = verdict
-        guard prefs.deeperSearch != .off else {
-            // Turned off with a conversation still open: the next settled query
-            // is where that takes effect, because "off" has to mean the lane is
-            // not running rather than merely not visible.
-            if store.search.laneStarted { store.resetSearchLane(keepingVerdict: true) }
-            return
-        }
-        // ONCE STARTED, EVERY SETTLED QUERY IS A REFINEMENT — including one the
-        // classifier would not have started a lane for. Somebody who typed a
-        // question and then deleted a word has not stopped asking it, and a
-        // lane that only heard about the queries that re-triggered it would be
-        // answering the question before last.
-        if store.search.laneStarted {
+        // WHAT that verdict is allowed to do is `DeeperSearchPolicy`'s and not
+        // this view's, because the rule about `off` also has to serve the
+        // picker being flipped under a lane that is already running (see
+        // ShellWatchers) — and a rule spelled twice is a rule that will
+        // disagree with itself. The moves are executed here; the deciding is
+        // pure and asserted in test.sh.
+        switch DeeperSearchPolicy.settled(
+            verdict: verdict, choice: prefs.deeperSearch,
+            laneStarted: store.search.laneStarted)
+        {
+        case .nothing:
+            break
+        case .stop:
+            store.resetSearchLane(keepingVerdict: true)
+        case .refine:
             store.refineDeeperSearch()
-            return
+        case .start(let trigger):
+            store.startDeeperSearch(trigger: trigger)
         }
-        // On request, the band offers a button and nothing runs until it is
-        // pressed. Automatic is the only path that spends unasked.
-        guard prefs.deeperSearch == .automatic, let trigger = verdict.trigger else { return }
-        store.startDeeperSearch(trigger: trigger)
     }
 
     /// Append the page after the one on screen. Cursors are only meaningful

@@ -23,6 +23,7 @@
 		0D05989412C01C429266CDBA /* ThreadStyle.swift in Sources */ = {isa = PBXBuildFile; fileRef = A5B25E3187C89277DBE8DEF3 /* ThreadStyle.swift */; };
 		0D35FE1914DBB68CAB817177 /* TriageTargets.swift in Sources */ = {isa = PBXBuildFile; fileRef = 74A0D0F666787312F4991788 /* TriageTargets.swift */; };
 		0DA5549C7654618C1D97DC96 /* SearchLanePrompt.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9C4011E6AF1CD8193898F627 /* SearchLanePrompt.swift */; };
+		0ED6DA0EF049E4B8C3349A60 /* DeeperSearch.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8418478A0084D45C077A9305 /* DeeperSearch.swift */; };
 		0FE1B2AACB4D13002E0F5381 /* GroupEditor.swift in Sources */ = {isa = PBXBuildFile; fileRef = F8FF235DC1DB2B57F7C06220 /* GroupEditor.swift */; };
 		120F38E19705221A8EAA5ECF /* SidePanel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 992EA99CCF93A2EA929D6E3B /* SidePanel.swift */; };
 		13068136E70BA1E4AD4A9709 /* PushRegistration.swift in Sources */ = {isa = PBXBuildFile; fileRef = 083E104C0BABF65C4BB44673 /* PushRegistration.swift */; };
@@ -165,6 +166,7 @@
 		811AE61DFEA4A6D99E9AFE40 /* SitrepPoller.swift in Sources */ = {isa = PBXBuildFile; fileRef = A31EE886D87910F0348A94AB /* SitrepPoller.swift */; };
 		81B5932453A50D4974259435 /* GroupPicker.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0119D99E10BB97CC572DCA69 /* GroupPicker.swift */; };
 		822AC7C019AE85919C9B4181 /* QuickLookPanel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 361AB4D81F3740E2B072C5BA /* QuickLookPanel.swift */; };
+		823DFE5AD7F10600046D1459 /* DeeperSearch.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8418478A0084D45C077A9305 /* DeeperSearch.swift */; };
 		8344C251CDFE9A73A78B574B /* SharePanel.swift in Sources */ = {isa = PBXBuildFile; fileRef = D8F60C8D4A9145D5DD96DC2A /* SharePanel.swift */; };
 		837D6250A05319ED273F3C1F /* ImageStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2569BA5D1461BBA2A95D77F3 /* ImageStore.swift */; };
 		84F6860CDCC32C143703EF41 /* MarkdownStyle.swift in Sources */ = {isa = PBXBuildFile; fileRef = A77BC580144CC1AF7B5B8AEF /* MarkdownStyle.swift */; };
@@ -455,6 +457,7 @@
 		82CD5D3AEF359995F968DB53 /* Sparkle.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Sparkle.framework; path = vendor/Sparkle/Sparkle.framework; sourceTree = "<group>"; };
 		83BF084E665545489EDF2D5E /* newsreader-italic-var.ttf */ = {isa = PBXFileReference; lastKnownFileType = file; path = "newsreader-italic-var.ttf"; sourceTree = "<group>"; };
 		84043CEC5CA50FFDDB4CC2DC /* PassbandiOSNotify.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = PassbandiOSNotify.entitlements; sourceTree = "<group>"; };
+		8418478A0084D45C077A9305 /* DeeperSearch.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DeeperSearch.swift; sourceTree = "<group>"; };
 		848BEC54D1FCD1F0FC5BE1A5 /* SpamNotice.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SpamNotice.swift; sourceTree = "<group>"; };
 		88151BD4CF9D97EE43150B72 /* NotificationIcon.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NotificationIcon.swift; sourceTree = "<group>"; };
 		8860DE0FE5AA0366C7BE9922 /* JSONValue.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = JSONValue.swift; sourceTree = "<group>"; };
@@ -646,6 +649,7 @@
 				40EDDA2423A09A989C77CAED /* AuthLabels.swift */,
 				9C9C77BCE41A573ED04E49AA /* CidImages.swift */,
 				E1C033DDA02DD344F437F943 /* Concurrency.swift */,
+				8418478A0084D45C077A9305 /* DeeperSearch.swift */,
 				5883BA424612265657845246 /* Format.swift */,
 				B5C36FCC4B2230B257E66F84 /* FromOperator.swift */,
 				579ABC2B7707848B4AED6F18 /* HTMLImg.swift */,
@@ -1064,6 +1068,7 @@
 				D83D2EEAF55EE8AC5B9EBEAE /* Concurrency.swift in Sources */,
 				41C4ED1EF887939603866DC0 /* ConnectView.swift in Sources */,
 				A4DAE234F5C7BDED52D12A55 /* ConnectionHealth.swift in Sources */,
+				0ED6DA0EF049E4B8C3349A60 /* DeeperSearch.swift in Sources */,
 				3FBFC0C93CC79B3FD2624085 /* DeeperSearchBand.swift in Sources */,
 				2530ADC217749D5FEEFFA4D9 /* DraftSaver.swift in Sources */,
 				918EB3663E912FF4F36229C2 /* EmailWebCore.swift in Sources */,
@@ -1212,6 +1217,7 @@
 				37323F67BEB78A71E32524ED /* Concurrency.swift in Sources */,
 				16E483911006F01000C2CEC8 /* ConnectView.swift in Sources */,
 				4AC6AF18555B3DB2FE69CC91 /* ConnectionHealth.swift in Sources */,
+				823DFE5AD7F10600046D1459 /* DeeperSearch.swift in Sources */,
 				3D45D6FA3BBF96A82531286A /* DeeperSearchBand.swift in Sources */,
 				2305ADF476A30E034D2EC27C /* DraftSaver.swift in Sources */,
 				903D181BC549637A0AEEB564 /* EmailWebCore.swift in Sources */,

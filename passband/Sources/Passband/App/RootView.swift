@@ -124,23 +124,43 @@ private struct LoadingGate: View {
     }
 }
 
-/// THE SHELL'S TWO STORE WATCHERS, in a view of their own size — which is
-/// nothing.
+/// THE SHELL'S STORE WATCHERS, in a view of their own size — which is nothing.
 ///
 /// `onChange(of:)` reads the value it watches, so watching from MainShell's own
 /// body made that body a reader of `lastRefresh` — a fresh `Date` written by
 /// every poll, on a ten-second clock. The whole shell was then rebuilt every
 /// ten seconds: the rail, the routed page, the reader's wrapper chain, the
 /// global key bindings. Nothing about it had changed; the app had merely
-/// checked its mail. Down here the same two watchers invalidate a zero-sized
-/// nothing at the same rate, and both actions are unchanged.
+/// checked its mail. Down here the same watchers invalidate a zero-sized
+/// nothing at the same rate, and every action is unchanged.
 private struct ShellWatchers: View {
     @Environment(AppStore.self) private var store
+    @Environment(Prefs.self) private var prefs
 
     var body: some View {
         Color.clear
             .frame(width: 0, height: 0)
             .allowsHitTesting(false)
+            // DEEPER SEARCH, TURNED OFF, STOPS A LANE THAT IS ALREADY RUNNING
+            // (docs/SEARCH.md §6.5). The setting's own line promises that no
+            // model reads your mail, so the flip has to be the stopping point:
+            // the picker lives on a page the reader walks to, and once they are
+            // there the panel they left behind may never see another settled
+            // query to notice on.
+            //
+            // WATCHED FROM THE SHELL, not from the search panel, because the
+            // panel is the thing that may not be mounted. Esc closes it on the
+            // way to Settings and that only HOLDS the lane (§6.3) — history,
+            // cards and all — so a watcher living inside it would be gone at
+            // exactly the moment it was needed.
+            .onChange(of: prefs.deeperSearch) { _, choice in
+                let move = DeeperSearchPolicy.preferenceChanged(
+                    to: choice, laneStarted: store.search.laneStarted)
+                // The verdict stays: the words in the bar are still the same
+                // question, so flipping back to automatic can offer to run it
+                // again without the reader retyping anything.
+                if move == .stop { store.resetSearchLane(keepingVerdict: true) }
+            }
             .onChange(of: store.sitrep.sealed) { _, sealed in
                 AuthArrival.shared.observe(sealed: sealed)
             }
