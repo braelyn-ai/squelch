@@ -20,13 +20,17 @@
 //! whole point is to be safe to paste into a PR description.
 //!
 //! Opening the copy runs the normal `SqliteStore::open` path, migrations
-//! included, so the `messages_fts` tokenizer rebuild happens here too and its
-//! cost on a real mailbox is printed rather than guessed.
+//! included, so the `messages_fts` rebuild happens here too and its cost on a
+//! real mailbox is printed rather than guessed. That rebuild is a `DROP TABLE`
+//! and a full reindex, which is why "copy it first" is enforced by
+//! [`refuse_the_live_mailbox`] rather than left to this comment: a scratch
+//! daemon has already picked up the real mailbox in this repo once, from a path
+//! nobody typed.
 
 use std::sync::Arc;
 use std::time::Instant;
 
-use squelch_core::config::EmbedConfig;
+use squelch_core::config::{EmbedConfig, resolve_db_path};
 use squelch_core::embed::FastEmbedder;
 use squelch_core::store::{SearchFilter, SearchSort, SqliteStore, Store};
 
@@ -48,6 +52,8 @@ fn main() {
             std::process::exit(2);
         }
     };
+
+    refuse_the_live_mailbox(&path);
 
     let t0 = Instant::now();
     let store = SqliteStore::open(&path).expect("open the copy");
@@ -108,6 +114,41 @@ fn main() {
                 print_hits(&hits, t);
             }
         }
+    }
+}
+
+/// REFUSE TO OPEN THE MAILBOX THE DAEMON SERVES.
+///
+/// `SqliteStore::open` runs the migration chain, and the chain now contains a
+/// `DROP TABLE messages_fts` plus a full reindex. Run against the live file
+/// that is a write, a long write-lock, and a rebuild nobody asked for while the
+/// daemon is serving off it. The doc comment at the top of this file said
+/// "copy it first" and a doc comment is not a control.
+///
+/// The check is the same resolution every binary uses (`SQUELCH_DB_PATH`, its
+/// legacy alias, then the platform default), compared after canonicalising both
+/// sides so a symlink or a `./` cannot walk around it. An unreadable path
+/// (the copy does not exist yet) falls back to the literal comparison, which is
+/// the conservative direction: it can only refuse more.
+fn refuse_the_live_mailbox(path: &str) {
+    let asked = std::path::Path::new(path);
+    let live = resolve_db_path();
+    let same = match (asked.canonicalize(), live.canonicalize()) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => asked == live,
+    };
+    if same {
+        eprintln!(
+            "search_probe refuses {}: that is the mailbox squelchd serves, and",
+            live.display()
+        );
+        eprintln!("opening it runs the migrations, which rebuild the FTS index");
+        eprintln!("under whatever is using it. Copy it first, then probe the copy:");
+        eprintln!(
+            "  sqlite3 \"file:{}?mode=ro\" \".backup '/tmp/corpus.db'\"",
+            live.display()
+        );
+        std::process::exit(2);
     }
 }
 

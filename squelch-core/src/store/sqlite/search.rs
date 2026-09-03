@@ -840,11 +840,17 @@ impl SqliteStore {
         let mut args = vec![Value::Integer(account_id), Value::Text(expr.to_string())];
         push_filter_clauses(&mut sql, &mut args, filter);
         let mut stmt = conn.prepare(&sql)?;
-        // Same reading as every other MATCH here: unparseable means nothing
-        // matched, not "the search failed".
-        let n: i64 = stmt
-            .query_row(params_from_iter(args), |r| r.get(0))
-            .unwrap_or(0);
+        // THIS ONE PROPAGATES, unlike every sibling MATCH on this leg, and the
+        // asymmetry is deliberate. The siblings read a query error as "no
+        // hits", which is a truthful degradation of a LIST. This count is not
+        // a list: it is the seam between the strict page and the any-only one,
+        // and a zero here is not "nothing matched" but "start the any-only
+        // pass at the wrong offset". A count that failed while the page beside
+        // it succeeded (different statements, so a busy timeout is enough)
+        // would skip rows on page two and serve the strict block nowhere at
+        // all. Exact pagination is the claim; failing loudly is how it stays
+        // one.
+        let n: i64 = stmt.query_row(params_from_iter(args), |r| r.get(0))?;
         Ok(n.max(0) as u32)
     }
 
