@@ -179,6 +179,25 @@ impl SqliteStore {
                 "DELETE FROM banking WHERE account_id = ?1 AND message_id = ?2",
                 params![account_id, message_id],
             )?;
+            // AND THE RECEIPT, which was missing from this list. It is the same
+            // shape as the two above — a specialist row holding a merchant and
+            // an amount lifted straight out of the mail — and it renders on the
+            // Receipts zone of the Sitrep, so leaving it kept sealed-derived
+            // money on a card the seal exists to clear.
+            tx.execute(
+                "DELETE FROM receipts WHERE account_id = ?1 AND message_id = ?2",
+                params![account_id, message_id],
+            )?;
+            // AND THE CALENDAR ROW, missing for the same reason and carrying the
+            // same kind of thing: an event title and an ORGANISER'S NAME lifted
+            // out of the mail, rendered by GET /client/calendar.
+            // `list_calendar_updates` still says "No sealed filter needed:
+            // detection never runs on sealed mail" — true of the first ingest
+            // and not of a message sealed afterwards, which is this block.
+            tx.execute(
+                "DELETE FROM calendar_updates WHERE account_id = ?1 AND message_id = ?2",
+                params![account_id, message_id],
+            )?;
             // Shipments are keyed by tracking number, not message, so the row
             // outlives any one email — but its item name, status, and click
             // target all came from the mail that fed it. When the row's latest

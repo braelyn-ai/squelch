@@ -1112,9 +1112,22 @@ impl SqliteStore {
             // The sensitivity guard is REPEATED here rather than trusted from
             // the id query above, because this is the statement that actually
             // reads a body: a detector must never run over sealed mail, and the
-            // check belongs where the read happens. (Unlike shipments, sealing
-            // does NOT delete a receipts row - see `feedback.rs` - so this
-            // clause is the whole guarantee, not a belt on braces.)
+            // check belongs where the read happens.
+            //
+            // AND IT IS LOAD-BEARING, not decoration. An earlier draft of this
+            // comment said the state was "unreachable through the store" once
+            // `feedback.rs` scrubbed receipts on seal. That is wrong, and two
+            // reviewers reproduced it: SEALING HAS TWO ENTRANCES. `correct_triage`
+            // is the one this crate scrubs; the other is a RE-INGEST, where the
+            // triage upsert refreshes `sensitivity` from fresh detection for any
+            // row a human did not seal by hand (see `messages.rs`), flipping
+            // normal to sealed while merely SKIPPING the specialist write rather
+            // than deleting what is already there. A receipt row on a sealed
+            // message is therefore reachable today, through the public ingest
+            // path, and legacy rows predate the scrub besides.
+            //
+            // So this clause is the thing stopping a repair pass from re-reading
+            // a sealed body. Do not remove it on the strength of the scrub.
             type Row = (
                 Option<f64>,
                 String,
