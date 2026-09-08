@@ -1421,6 +1421,19 @@ async fn search_with_only_operators_lists_and_keeps_exclusions() {
     assert!(!t.contains(&"t-seal"), "sealed absent from the listing");
     assert!(!t.contains(&"t-sent"), "sent absent from the listing");
 
+    // NOTHING RETRIEVED THESE ROWS. `legs` is provenance, and a listing has
+    // none: no MATCH ran, nothing was ranked, and the diagnostics beside it are
+    // zeroes. Claiming the keyword leg here would say bm25 chose this order and
+    // that a term in the diagnostics found these rows, and neither is true.
+    for item in json["items"].as_array().unwrap() {
+        assert_eq!(
+            item["legs"],
+            serde_json::json!([]),
+            "a filter-only listing claims no leg"
+        );
+    }
+    assert_eq!(json["diagnostics"]["terms"], serde_json::json!([]));
+
     // A date-only listing spans every non-sealed, non-sent row.
     let json = body_json(
         app.clone()

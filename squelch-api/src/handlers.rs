@@ -842,7 +842,12 @@ impl From<SearchDiagnostics> for Diagnostics {
 /// One hit plus WHICH LEG produced it. The hit's own fields are flattened, so
 /// this is the same object the client already decodes with one array added
 /// beside them: `["keyword"]`, `["vector"]`, or both when both legs agreed.
-
+///
+/// IT IS RETRIEVAL PROVENANCE, so it can be EMPTY. A query of operators alone
+/// (`from:jane`) runs no MATCH and no KNN — it is a listing, ordered by date,
+/// and no leg retrieved anything. Claiming the keyword leg there would tell a
+/// client that bm25 ranked these rows and that a term in the diagnostics found
+/// them, and both are false.
 #[derive(Debug, Serialize)]
 struct SearchItem {
     #[serde(flatten)]
@@ -943,7 +948,11 @@ pub async fn search(
     //
     // With a filter it is a different question ("*** from:alice" still means
     // alice's mail), and that keeps falling through to the filter-only listing.
-    if filter.is_empty() && FtsQuery::build(&term, partial).is_empty() {
+    //
+    // The same builder answers a second question below: whether anything was
+    // RETRIEVED at all, or whether this is a listing wearing a search's clothes.
+    let ranks_on_text = !FtsQuery::build(&term, partial).is_empty();
+    if filter.is_empty() && !ranks_on_text {
         return Ok(Json(SearchPage::<SearchItem> {
             items: Vec::new(),
             match_kind: effective.as_str(),
@@ -984,11 +993,19 @@ pub async fn search(
                 if filter.is_empty() {
                     counted_strict = strict;
                 }
+                // A filter-only listing retrieved nothing: no MATCH ran, no
+                // ranking happened, and the rows are simply this account's
+                // newest mail. `legs` is provenance, so it is empty.
+                let legs: Vec<&'static str> = if ranks_on_text {
+                    vec!["keyword"]
+                } else {
+                    Vec::new()
+                };
                 (
                     hits.into_iter()
                         .map(|hit| SearchItem {
                             hit,
-                            legs: vec!["keyword"],
+                            legs: legs.clone(),
                         })
                         .collect(),
                     false,
@@ -1029,8 +1046,13 @@ pub async fn search(
                 (page, window_full)
             }
         };
-        let diagnostics =
-            store.search_diagnostics_with(account_id, &term, partial, include_sent, counted_strict)?;
+        let diagnostics = store.search_diagnostics_with(
+            account_id,
+            &term,
+            partial,
+            include_sent,
+            counted_strict,
+        )?;
         Ok((items, window_full, diagnostics))
     })
     .await?;
