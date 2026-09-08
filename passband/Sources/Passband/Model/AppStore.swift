@@ -2313,13 +2313,27 @@ final class AppStore {
         search.laneTrigger = trigger
         search.laneQuery = query
         search.refinementCount = 0
-        Analytics.capture(
-            "search_deeper_started",
-            [
-                "trigger": trigger.analyticsValue,
-                "model": Prefs.shared.searchLaneModel.shortLabel.lowercased(),
-            ])
+        captureLaneStart(trigger)
         searchLane.send(query, openEmail: nil, hits: search.hits)
+    }
+
+    /// ONE CONVERSATION, ONE EVENT, from the two places a conversation begins:
+    /// a query the classifier started a lane for, and the restart past the
+    /// twelfth narrowing. Written once so the second cannot quietly stop
+    /// counting, which is how a lane that restarts itself all afternoon reads
+    /// as one search in the funnel.
+    ///
+    /// The trigger is OPTIONAL because a restart's own query need not be
+    /// question-shaped: somebody who has narrowed twelve times may be down to
+    /// two plain words. Absent rather than invented, and rather than the stale
+    /// trigger of the conversation that just ended: the vocabulary is closed
+    /// and names signals, and "no signal, they just kept typing" is not one.
+    private func captureLaneStart(_ trigger: SearchIntent.Trigger?) {
+        var properties: [String: Any] = [
+            "model": Prefs.shared.searchLaneModel.shortLabel.lowercased()
+        ]
+        if let trigger { properties["trigger"] = trigger.analyticsValue }
+        Analytics.capture("search_deeper_started", properties)
     }
 
     /// EVERY SETTLED QUERY AFTER THE FIRST is the same need narrowed, whatever
@@ -2331,12 +2345,32 @@ final class AppStore {
         guard search.laneStarted else { return }
         let query = search.fetchedQuery ?? search.query.trimmed
         guard !query.isEmpty else { return }
-        searchLane.refine(query, hits: search.hits)
-        // Mirror the session's own count, and notice a reset: past the twelfth
-        // narrowing the session starts fresh on these words, so they are what
-        // the band's reason should be counting from here on.
-        if searchLane.refinementCount == 0 { search.laneQuery = query }
-        search.refinementCount = searchLane.refinementCount
+        // The session says which of the three things it did, because from out
+        // here a restart and an untouched conversation look identical: both
+        // leave the narrowing count at zero.
+        switch searchLane.refine(query, hits: search.hits) {
+        case .none, .duplicate:
+            // The same words the model already has (the sort flipped, a failed
+            // search was retried). Nothing narrowed, so nothing here moves
+            // either — least of all the count, which would otherwise walk to
+            // thirteen on queries nobody typed.
+            return
+        case .queued:
+            search.refinementCount = searchLane.refinementCount
+        case .restart:
+            // A DIFFERENT SEARCH, past the twelfth narrowing: the session threw
+            // the conversation away and opened a new one on these words. So
+            // everything that describes a conversation starts over with it. The
+            // trigger is re-derived from the verdict for THESE words, because
+            // the one on file was the signal that started a conversation which
+            // no longer exists, and the band prints it as the reason the lane is
+            // running. And it counts as a start, or the funnel hears about the
+            // first search of an afternoon and none of the rest.
+            search.laneTrigger = search.lastVerdict?.trigger
+            search.laneQuery = query
+            search.refinementCount = searchLane.refinementCount
+            captureLaneStart(search.laneTrigger)
+        }
     }
 
     /// Tear the deeper-search conversation down and forget that one ever ran

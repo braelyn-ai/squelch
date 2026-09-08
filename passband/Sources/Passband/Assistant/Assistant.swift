@@ -551,16 +551,25 @@ final class AssistantSession {
     /// query, a failed search is retried under it — and each of those would
     /// otherwise buy a turn, a request and one of the twelve to tell the model
     /// that the reader refined the search to what it is already reading.
-    func refine(_ text: String, hits: [SearchHit]) {
+    ///
+    /// RETURNS WHAT IT DECIDED, because the caller cannot work it out from the
+    /// outside. A restart leaves a conversation that is new in every way that
+    /// matters — its own trigger, its own start event, its own history — and
+    /// the only visible trace of one is the narrowing counter going back to
+    /// zero, which is also what an untouched conversation reads like. `nil`
+    /// when there were no words at all.
+    @discardableResult
+    func refine(_ text: String, hits: [SearchHit]) -> RefinementOutcome? {
         let words = text.trimmed
-        guard !words.isEmpty else { return }
+        guard !words.isEmpty else { return nil }
         let refinement = Refinement(text: words, hits: Self.promptHits(hits))
-        switch refinements.offer(refinement, key: words) {
+        let outcome = refinements.offer(refinement, key: words)
+        switch outcome {
         case .duplicate:
             // Nothing narrowed, so nothing is spent. The newer local hits are
             // dropped with it on purpose: they are context for a question, and
             // there is no new question to attach them to.
-            return
+            return outcome
         case .restart:
             // A different search, so the conversation goes and these words open
             // a new one. THE HOLD IS NOT PART OF WHAT IS TORN DOWN: `clear()`
@@ -572,7 +581,7 @@ final class AssistantSession {
             guard !held else {
                 heldByPanel = true
                 _ = refinements.offer(refinement, key: words)
-                return
+                return outcome
             }
             start(words, openEmail: nil, hits: refinement.hits)
         case .queued:
@@ -580,9 +589,10 @@ final class AssistantSession {
             // Running: it waits, and `drainRefinement` delivers it — or, if the
             // turn ends before any boundary comes, the run's own ending sends
             // it as the next question.
-            guard !running else { return }
+            guard !running else { return outcome }
             deliverPendingAsSend()
         }
+        return outcome
     }
 
     /// HOLD AT THE LOOP BOUNDARY. There is no such thing as pausing an HTTP

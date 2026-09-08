@@ -15,6 +15,24 @@
 
 import Foundation
 
+/// What the caller should do with a refinement it has just been handed.
+///
+/// TOP LEVEL, not nested in the slot, because the answer travels: the session
+/// hands it back out of `refine` so the store can tell a narrowing of one
+/// conversation from the start of a new one, and a type spelled
+/// `RefinementSlot<SomePrivateThing>.Outcome` cannot be named across that seam.
+enum RefinementOutcome: Equatable, Sendable {
+    /// Held for the next boundary, replacing whatever was waiting.
+    case queued
+    /// The same words the model already has. Nothing is queued, nothing is
+    /// counted, and the caller does nothing at all.
+    case duplicate
+    /// Past the limit: tear the conversation down and start it fresh on this
+    /// text. The slot is empty afterwards — a restart carries its own words, so
+    /// leaving a copy pending would deliver them twice.
+    case restart
+}
+
 /// The single-slot coalescing queue, plus the reset counter.
 struct RefinementSlot<Value: Sendable>: Sendable {
     /// Refinements since the last reset. Public so the panel can show where a
@@ -45,18 +63,9 @@ struct RefinementSlot<Value: Sendable>: Sendable {
 
     var isPending: Bool { pending != nil }
 
-    /// What the caller should do with a refinement it has just been handed.
-    enum Outcome: Equatable, Sendable {
-        /// Held for the next boundary, replacing whatever was waiting.
-        case queued
-        /// The same words the model already has. Nothing is queued, nothing is
-        /// counted, and the caller does nothing at all.
-        case duplicate
-        /// Past the limit: tear the conversation down and start it fresh on
-        /// this text. The slot is empty afterwards — a restart carries its own
-        /// words, so leaving a copy pending would deliver them twice.
-        case restart
-    }
+    /// The answer `offer` gives, under the name callers inside the slot's own
+    /// world already use.
+    typealias Outcome = RefinementOutcome
 
     /// Offer one narrowing, keyed by the text the model would be shown. The key
     /// is separate from the value because the value carries the local hits too,
