@@ -1,8 +1,19 @@
-// Sender rules from GET /client/rules as a dense table: pattern, disposition,
-// want_text (full only on the selected row), a client-side match count against
-// the loaded updates (0 means likely dead, rendered dim), and updated-at.
+// Sender rules from GET /client/rules, GROUPED: one section per disposition
+// (allow, filter, mute), and inside each one the rules gather by registrable
+// domain with subdomains nested under a header. A rule's `*@` never reaches the
+// screen — `*@futureme.org` is a rule about futureme.org and reads as one — and
+// a whole-domain rule carries that domain's icon.
+//
+// The disposition chip is GONE from the row: the section it sits in says the
+// same thing once instead of eleven times, which is what buys the width the
+// want text now has.
+//
+// `RuleGrouping` owns the shape and is unit-tested (`test.sh rule-grouping`),
+// because the nesting is invisible on a mailbox whose rules name a different
+// domain each — the shape has to be assertable without a window.
+//
 // Keys: j/k select · n new · Enter/e edit · x delete, undo-first — the 5s toast
-// recreates the deleted rule.
+// recreates the deleted rule. j/k walk DRAWN order, not fetch order.
 
 import SwiftUI
 
@@ -16,6 +27,20 @@ struct RulesView: View {
     /// next fetch is in flight.
     private var rules: [SenderRule] { rulesState.value ?? [] }
 
+    /// The display tree: sections, domain groups, rows.
+    private var sections: [RuleGrouping.Section] { RuleGrouping.sections(rules) }
+
+    /// Rules in DRAWN order. Selection indexes this, never `rules` — the fetch
+    /// order and the page order are different sequences, and j/k has to walk
+    /// the one the reader can see.
+    private var ordered: [SenderRule] { RuleGrouping.ordered(sections) }
+
+    /// rule id -> its position in `ordered`, so a row can tell whether it is the
+    /// selected one without searching the tree on every rebuild.
+    private var ordinals: [Int: Int] {
+        Dictionary(uniqueKeysWithValues: ordered.enumerated().map { ($0.element.id, $0.offset) })
+    }
+
     /// How many currently-loaded updates each rule matched, counted client-side
     /// from the store rather than through a new endpoint.
     private var matchCounts: [Int: Int] {
@@ -27,7 +52,15 @@ struct RulesView: View {
     }
 
     var body: some View {
-        Group {
+        // A VStack, NOT a Group. `Group` applies a modifier to EACH of its
+        // children rather than to the group as a whole, and the populated
+        // branch below has two: the scrolling body and the bar under it. The
+        // `maxHeight: .infinity` on the frame was therefore claimed TWICE, so
+        // the enclosing VStack in RoutedHost split the window between them and
+        // the page rendered at half height with its footer stranded in the
+        // middle. One real container means one frame, and the bar keeps its
+        // natural height while the body takes what is left.
+        VStack(spacing: 0) {
             if rulesState.isLoading && rules.isEmpty {
                 BandNote("loading rules…")
             } else if let error = rulesState.error {
@@ -49,21 +82,32 @@ struct RulesView: View {
             } else {
                 ScrollViewReader { proxy in
                     ScrollView {
+                        let ordinals = ordinals
                         LazyVStack(spacing: 1) {
-                            ForEach(Array(rules.enumerated()), id: \.element.id) { i, rule in
-                                RuleRow(
-                                    rule: rule, selected: i == index,
-                                    matchCount: matchCounts[rule.id] ?? 0,
-                                    onSelect: { index = i },
-                                    onEdit: { edit(rule) })
-                                .id(rule.id)
+                            ForEach(sections) { section in
+                                RuleSectionHeader(
+                                    disposition: section.disposition, count: section.ruleCount)
+                                ForEach(section.groups) { group in
+                                    if group.showsHeader {
+                                        DomainHeaderRow(group: group)
+                                    }
+                                    ForEach(group.rows) { row in
+                                        let i = ordinals[row.rule.id] ?? 0
+                                        RuleRow(
+                                            row: row, group: group, selected: i == index,
+                                            matchCount: matchCounts[row.rule.id] ?? 0,
+                                            onSelect: { index = i },
+                                            onEdit: { edit(row.rule) })
+                                        .id(row.rule.id)
+                                    }
+                                }
                             }
                         }
                         .padding(.horizontal, 18)
-                        .padding(.vertical, 10)
+                        .padding(.bottom, 10)
                     }
                     .onChange(of: index) { _, i in
-                        guard let rule = rules[safe: i] else { return }
+                        guard let rule = ordered[safe: i] else { return }
                         withAnimation(Motion.scrollFollow) {
                             proxy.scrollTo(rule.id, anchor: .center)
                         }
@@ -95,13 +139,13 @@ struct RulesView: View {
 
     private var bindings: [KeyBinding] {
         [
-            KeyBinding("j", "next") { index = min(rules.count - 1, index + 1) },
+            KeyBinding("j", "next") { index = min(ordered.count - 1, index + 1) },
             KeyBinding("k", "prev") { index = max(0, index - 1) },
             KeyBinding("n", "new rule") { create() },
-            KeyBinding("e", "edit rule") { if let r = rules[safe: index] { edit(r) } },
-            KeyBinding("Enter", "edit rule") { if let r = rules[safe: index] { edit(r) } },
+            KeyBinding("e", "edit rule") { if let r = ordered[safe: index] { edit(r) } },
+            KeyBinding("Enter", "edit rule") { if let r = ordered[safe: index] { edit(r) } },
             KeyBinding("x", "delete rule") {
-                if let r = rules[safe: index] { Task { await delete(r) } }
+                if let r = ordered[safe: index] { Task { await delete(r) } }
             },
         ]
     }
@@ -174,27 +218,114 @@ extension Disposition {
     }
 }
 
+/// The disposition band: one line naming what this run of rules does, so the
+/// row beneath it does not have to. Its tone is the chip colour the rows used
+/// to carry each.
+private struct RuleSectionHeader: View {
+    let disposition: Disposition
+    let count: Int
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Text(disposition.label.uppercased())
+                .font(.system(size: 10, weight: .semibold))
+                .tracking(0.9)
+                .foregroundStyle(disposition.tone)
+            Text("\(count)")
+                .font(Typo.num(10))
+                .foregroundStyle(Palette.inkFaintest)
+            Rectangle()
+                .fill(Palette.hairline)
+                .frame(height: 1)
+        }
+        .padding(.horizontal, 11)
+        .padding(.top, 18)
+        .padding(.bottom, 6)
+        .help(disposition.hint)
+    }
+}
+
+/// A domain carrying MORE THAN ONE rule: the icon and the domain sit here once,
+/// and the rules underneath say only what distinguishes them. A domain with a
+/// single rule never draws this — a header over one child is just an indent
+/// with extra steps.
+private struct DomainHeaderRow: View {
+    let group: RuleGrouping.DomainGroup
+
+    var body: some View {
+        HStack(spacing: 9) {
+            RuleIcon(domain: group.domain, eligible: group.iconEligible, size: 15)
+            Text(group.domain)
+                .font(Typo.mono(11))
+                .foregroundStyle(Palette.inkDim)
+            Text("\(group.rows.count) rules")
+                .font(Typo.micro)
+                .foregroundStyle(Palette.inkFaintest)
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, 11)
+        .padding(.top, 7)
+        .padding(.bottom, 2)
+    }
+}
+
+/// The icon for a domain. Falls back to the base label's own letters rather
+/// than a mailbox's initials — under a `garmin.com` header "GA" is the brand
+/// and "GC" (garmin·com) is a parsing artefact.
+private struct RuleIcon: View {
+    let domain: String
+    let eligible: Bool
+    var size: CGFloat = 15
+
+    private var baseLabel: String {
+        domain.split(separator: ".").first.map(String.init) ?? domain
+    }
+
+    var body: some View {
+        Avatar(
+            sender: baseLabel, size: size,
+            // nil unless the group earned it — see RuleGrouping.iconPattern.
+            domainOverride: eligible ? domain : nil)
+    }
+}
+
 private struct RuleRow: View {
-    let rule: SenderRule
+    let row: RuleGrouping.Row
+    let group: RuleGrouping.DomainGroup
     let selected: Bool
     let matchCount: Int
     let onSelect: () -> Void
     let onEdit: () -> Void
 
-    private var dispositionTone: Color { rule.disposition.tone }
+    private var rule: SenderRule { row.rule }
 
     var body: some View {
         ListRow(
             selected: selected, cornerRadius: 8, hPadding: 11, vPadding: 7, action: onSelect
         ) { selected, _ in
-            HStack(spacing: 10) {
-                Chip(text: rule.disposition.label, tone: dispositionTone, filled: true)
-                    .frame(width: 62, alignment: .leading)
-                Text(rule.match_pattern)
+            HStack(spacing: 9) {
+                if row.nested {
+                    // Indented under its domain header, which already carries
+                    // the icon. The rail is what makes the nesting readable at
+                    // a glance instead of just a gap.
+                    Rectangle()
+                        .fill(Palette.hairline)
+                        .frame(width: 1, height: 13)
+                        .padding(.leading, 7)
+                        .padding(.trailing, 6)
+                } else if RuleGrouping.isWildcard(rule.match_pattern) {
+                    RuleIcon(domain: group.domain, eligible: group.iconEligible, size: 15)
+                } else {
+                    // A mailbox rule names a person: initials, no network.
+                    Avatar(sender: rule.match_pattern, size: 15)
+                }
+                Text(row.label)
                     .font(Typo.mono(11))
                     .foregroundStyle(Palette.ink)
                     .lineLimit(1)
-                    .frame(width: 190, alignment: .leading)
+                    .truncationMode(.middle)
+                    .frame(width: row.nested ? 196 : 218, alignment: .leading)
+                    .help(rule.match_pattern)
                 Text(rule.want_text.isEmpty ? "·" : rule.want_text)
                     .font(Typo.micro)
                     .foregroundStyle(

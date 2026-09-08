@@ -5,6 +5,7 @@
 //! false positive costs a too-prominent email, a false negative costs a late fee.
 //! Relative dates ("due Friday") are out of scope; see the TODO in [`extract_due_at`].
 
+use crate::triage::money;
 use crate::triage::text::rx;
 use chrono::{DateTime, Datelike, NaiveDate, TimeZone, Utc};
 use regex::Regex;
@@ -31,8 +32,6 @@ struct BillDetector {
     signals: Vec<(Regex, &'static str)>,
     /// Explicit "already overdue" language.
     overdue: Vec<Regex>,
-    /// `$1,234.56` / `1,234.56 USD` / `USD 1,234.56` style amounts.
-    amount: Vec<Regex>,
     /// "due <date>", "by <date>", "payment due <date>", "due date: <date>".
     due_phrase: Vec<Regex>,
     /// "due on receipt" / "due upon receipt" — treated as due *now*.
@@ -81,14 +80,6 @@ fn detector() -> &'static BillDetector {
             (rx(r"\bunpaid\b"), "past_due"),
         ],
         overdue: vec![rx(r"\bpast[-\s]?due\b"), rx(r"\boverdue\b"), rx(r"\bunpaid\b")],
-        amount: vec![
-            // $1,234.56 or $42 or $42.10
-            rx(r"\$\s?([0-9][0-9,]*(?:\.[0-9]{2})?)"),
-            // 1,234.56 USD / 42.00 usd
-            rx(r"\b([0-9][0-9,]*(?:\.[0-9]{2})?)\s?(?:USD|usd)\b"),
-            // USD 1,234.56
-            rx(r"\b(?:USD|usd)\s?([0-9][0-9,]*(?:\.[0-9]{2})?)"),
-        ],
         due_phrase: vec![
             // ORDER MATTERS: year-bearing "Month D, YYYY" shapes come FIRST so the
             // day/year comma is captured whole instead of truncated to "January 5"
@@ -319,19 +310,13 @@ fn extract_due_at(text: &str, received_at: DateTime<Utc>) -> Option<(DateTime<Ut
 }
 
 /// Parse the first currency amount in `text`, returning `(amount, currency)`.
+///
+/// Delegates to [`crate::triage::money`], which is the point: this function used
+/// to carry its own copy of the patterns AND its own parse, so when the
+/// unrounded-float bug was fixed for receipts, bills went on storing the
+/// fractional tail of a total as the amount due.
 fn extract_amount(text: &str) -> Option<(f64, String)> {
-    let d = detector();
-    for re in &d.amount {
-        if let Some(cap) = re.captures(text)
-            && let Some(m) = cap.get(1)
-        {
-            let raw = m.as_str().replace(',', "");
-            if let Ok(v) = raw.parse::<f64>() {
-                return Some((v, "USD".to_string()));
-            }
-        }
-    }
-    None
+    money::first_amount(text).map(|v| (v, "USD".to_string()))
 }
 
 /// The heart of rung #1. Given the message surfaces, decide whether this is a
@@ -456,6 +441,35 @@ mod tests {
 
     fn at(y: i32, m: u32, d: u32) -> DateTime<Utc> {
         Utc.with_ymd_and_hms(y, m, d, 12, 0, 0).unwrap()
+    }
+
+    #[test]
+    fn a_bill_reads_an_unrounded_float_whole_like_a_receipt_does() {
+        // THE DRIFT THIS MODULE PAID FOR. deadline.rs carried its own byte-identical
+        // copy of the amount patterns and its own parse, so the fix that stopped
+        // receipts storing $28,999,999,999,999 never reached bills. Now both read
+        // one definition, and a bill from a sender that prints unrounded floats
+        // cannot put a trillion-dollar obligation on the card.
+        let hit = detect_bill(
+            "Your bill",
+            "Your bill\r\nAmount due\r\n67.28999999999999 USD\r\nPay by September 30, 2026",
+            now(),
+        )
+        .expect("an amount-due bill");
+        assert_eq!(hit.amount, Some(67.29));
+    }
+
+    #[test]
+    fn a_bill_amount_rounds_rather_than_truncating() {
+        // The old inline parse captured two decimals and dropped the rest, so
+        // this stored 1234.56. Money rounds.
+        let hit = detect_bill(
+            "Invoice",
+            "Balance due: $1234.56789 by September 30, 2026",
+            now(),
+        )
+        .expect("a balance-due bill");
+        assert_eq!(hit.amount, Some(1234.57));
     }
 
     #[test]

@@ -106,14 +106,16 @@ pub fn route_extract_row(
     // `body = ''` for its whole history, and the banking extractor came back
     // from one of those with this crate's own prompt text in the institution
     // field. The ingest fix means fewer rows arrive here empty; this means an
-    // empty one is never billed for a guess.
+    // empty one is never billed for a guess. BLANK means blank to a reader:
+    // `trim` leaves zero-width characters standing, and a body of one U+200B is
+    // exactly as unreadable as a body of none.
     //
     // The SUBJECT is deliberately not enough to proceed on. It carries a
     // headline number often enough to look tempting ("You paid Ana $50.00"),
     // and a record that confident about money deserves the body that backs it.
     // Stage-1 keeps its own rules: it must see every email, and tiering a
     // subject-only message is a judgement it can honestly make.
-    if row.body.trim().is_empty() {
+    if crate::triage::text::is_blank(&row.body) {
         return RowAction::NoBody;
     }
     match extractor_for_category(&row.category) {
@@ -396,7 +398,17 @@ mod tests {
         // scaffolding in the institution field.
         let now = Utc::now();
         let cutoff = now - Duration::days(30);
-        for empty in ["", "   ", "\n\r\n", "\t"] {
+        for empty in [
+            "",
+            "   ",
+            "\n\r\n",
+            "\t",
+            // Invisible to a reader and non-empty to `trim`: an extractor
+            // handed this has exactly as much to read as one handed "".
+            "\u{feff}",
+            "\u{200b}\u{200d}",
+            "\u{00ad}",
+        ] {
             let mut row = queued(Sensitivity::Normal);
             row.body = empty.into();
             assert_eq!(

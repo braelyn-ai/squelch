@@ -17,7 +17,7 @@ use crate::store::{BankingApplied, ExtractQueued};
 use crate::triage::extract::{ExtractContext, build_extract_user_message};
 use crate::triage::llm::{self, ClassifyError, LlmOutcome, LlmRequest, classify_entrypoint};
 use crate::triage::stage1_llm::RECORD_CATEGORIES;
-use crate::triage::text::{truncate_chars, truncate_trimmed};
+use crate::triage::text::{self, truncate_chars, truncate_trimmed};
 use serde::{Deserialize, Serialize};
 
 /// The categories this extractor handles: exactly the RECORD categories, which
@@ -187,11 +187,23 @@ pub fn apply_result(q: &ExtractQueued, out: &BankingOutput, model: &str) -> Bank
 /// Hard cap for the stored institution name, in characters.
 const MAX_INSTITUTION_CHARS: usize = 80;
 
-/// The most words a real institution name runs to. The longest ones anybody
-/// banks with are four ("Bank of the West", "JPMorgan Chase Bank, N.A."), so
-/// five is already generous; past it the model is writing prose, not naming a
-/// bank.
-const MAX_INSTITUTION_WORDS: usize = 5;
+/// The most words a real institution name runs to.
+///
+/// SEVEN, NOT FIVE, and the difference is nine real banks. Five was picked by
+/// looking at American retail brands ("Bank of the West", "JPMorgan Chase Bank,
+/// N.A.") and it refused, among others, "Industrial and Commercial Bank of
+/// China", "The Hongkong and Shanghai Banking Corporation" (HSBC's legal name,
+/// which is what a statement footer carries) and "PayPal (Europe) S.a r.l. et
+/// Cie, S.C.A." — the entity every EU PayPal receipt is issued by. The
+/// systematic case is credit unions: "&lt;City or Employer&gt; Federal Credit Union"
+/// reaches six as a matter of course.
+///
+/// Seven still refuses both strings this check exists for, because a model that
+/// keeps generating trips the line and fence rules long before the word count.
+/// The count is the coarsest of the three guards, so it is the one that should
+/// be generous: NULLing a real bank costs a user their label on every row that
+/// bank ever sent, and the backfill applies it retroactively to history.
+const MAX_INSTITUTION_WORDS: usize = 7;
 
 /// Reduce a model-emitted institution to a SAFE display name, or `None`.
 ///
@@ -226,20 +238,32 @@ pub fn sanitize_institution(raw: Option<&str>) -> Option<String> {
     let plain: String = raw?
         .chars()
         .filter(|c| !c.is_control() || c.is_whitespace())
+        .filter(|c| !text::ZERO_WIDTH.contains(c))
         .filter(|c| {
             !matches!(
                 c,
-                '\u{200E}' | '\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}'
+                '\u{200E}' | '\u{200F}' | '\u{061C}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}'
             )
         })
         .collect();
+    // Strip ONE layer of matched wrapping quotes before judging: a model
+    // handing back its own answer as `"Chase"` is a routine artifact, and
+    // refusing it while accepting 'Chase' is an arbitrary asymmetry.
     let plain = plain.trim();
+    let plain = plain
+        .strip_prefix('"')
+        .and_then(|t| t.strip_suffix('"'))
+        .unwrap_or(plain)
+        .trim();
     if plain.is_empty() {
         return None;
     }
-    // ONE LINE. Checked after the trim, so a merely trailing newline is
-    // innocent and an interior one is not.
-    if plain.contains('\n') || plain.contains('\r') {
+    // ONE LINE — and every character that can START one, not just the ASCII
+    // pair. U+2028, U+0085 and the vertical/form feeds all render as a break,
+    // so checking `\n` and `\r` alone is the production bug with a different
+    // separator byte. `text::LINE_SEPARATORS` is the crate's single answer to
+    // "what begins a new visual line".
+    if plain.contains(text::LINE_SEPARATORS) {
         return None;
     }
     if plain
@@ -251,21 +275,41 @@ pub fn sanitize_institution(raw: Option<&str>) -> Option<String> {
     if plain.split_whitespace().count() > MAX_INSTITUTION_WORDS {
         return None;
     }
-    if !plain.chars().any(char::is_alphabetic) {
-        return None;
-    }
+    // TRUNCATE FIRST, THEN JUDGE WHAT SURVIVED. Judging `plain` and storing a
+    // truncation of it is how this stopped being a fixed point: a value whose
+    // only letters live past character 80 passed the alphabetic check and was
+    // stored as 80 characters of punctuation, which the NEXT run then refused.
+    // The migration backfill re-runs this over stored rows and documents its
+    // output as a fixed point, so the two must agree on the first pass.
     let name = truncate_chars(&redact_digit_runs(plain), MAX_INSTITUTION_CHARS);
     let name = name.trim();
-    if name.is_empty() {
-        None
-    } else {
-        Some(name.to_string())
+    if !name.chars().any(char::is_alphabetic) {
+        return None;
     }
+    Some(name.to_string())
 }
 
-/// Replace any run of more than 4 digits (counting digits across the common
-/// separators space/dash/dot, so "1234 5678 9012 3456" is one run) with "####".
-/// Real institution names never carry such runs.
+/// Does `c` join two digit groups into ONE number to a reader? See
+/// [`redact_digit_runs`] — the set has to cover every way a card or account
+/// number gets typed out, because each one it misses is a full PAN stored
+/// verbatim.
+fn is_group_separator(c: char) -> bool {
+    matches!(
+        c,
+        ' ' | '-' | '.' | ',' | '/' | '_' | '\u{00A0}' | '\u{2007}' | '\u{202F}'
+    )
+}
+
+/// Replace any run of more than 4 digits (counting digits across the group
+/// separators in [`is_group_separator`], so "1234 5678 9012 3456" is one run)
+/// with "####". Real institution names never carry such runs.
+///
+/// THE SEPARATOR SET IS THE WHOLE GUARANTEE. It was space/dash/dot only, which
+/// let "4111,1111,1111,1234" and the NBSP-separated form through intact — a
+/// 16-digit card number in the one text field on this row that is not
+/// `account_hint`. This matters more since the word cap was widened to seven:
+/// "IBAN DE89 3704 0044 0532 0130 00" used to be refused only for being too
+/// many words, so the redaction has to actually hold on its own.
 fn redact_digit_runs(s: &str) -> String {
     let chars: Vec<char> = s.chars().collect();
     let mut out = String::with_capacity(s.len());
@@ -275,9 +319,7 @@ fn redact_digit_runs(s: &str) -> String {
             let start = i;
             let mut digits = 0usize;
             let mut j = i;
-            while j < chars.len()
-                && (chars[j].is_ascii_digit() || matches!(chars[j], ' ' | '-' | '.'))
-            {
+            while j < chars.len() && (chars[j].is_ascii_digit() || is_group_separator(chars[j])) {
                 if chars[j].is_ascii_digit() {
                     digits += 1;
                 }
@@ -442,20 +484,131 @@ mod tests {
 
     #[test]
     fn prose_is_not_a_name() {
-        // The single most discriminating signal that a model kept talking.
         assert_eq!(
-            sanitize_institution(Some("Chase Bank which is the issuer of this card")),
+            sanitize_institution(Some(
+                "Chase Bank which is the issuer of this card and also the servicer"
+            )),
             None
         );
-        // Five words is the line, and it is inclusive.
+        // Seven words is the line, and it is inclusive.
         assert_eq!(
-            sanitize_institution(Some("one two three four five")).as_deref(),
-            Some("one two three four five")
+            sanitize_institution(Some("one two three four five six seven")).as_deref(),
+            Some("one two three four five six seven")
         );
         assert_eq!(
-            sanitize_institution(Some("one two three four five six")),
+            sanitize_institution(Some("one two three four five six seven eight")),
             None
         );
+    }
+
+    #[test]
+    fn the_long_real_names_a_five_word_cap_destroyed() {
+        // Every one of these is a real institution that a statement footer
+        // actually carries, and every one was NULLed by the first cut of this
+        // function - including retroactively, through the migration, on rows
+        // already stored. Credit unions are the systematic case.
+        for name in [
+            "Industrial and Commercial Bank of China",
+            "The Hongkong and Shanghai Banking Corporation",
+            "The Bank of New York Mellon",
+            "First Citizens Bank & Trust Company",
+            "Federal Home Loan Bank of Boston",
+            "Municipal Credit Union of New York",
+            "Police and Fire Federal Credit Union",
+            "State Farm Mutual Automobile Insurance Company",
+        ] {
+            assert_eq!(
+                sanitize_institution(Some(name)).as_deref(),
+                Some(name),
+                "{name:?} is a real institution and must survive"
+            );
+        }
+    }
+
+    #[test]
+    fn every_line_separator_refuses_not_just_the_ascii_pair() {
+        // U+2028 and friends render as a break exactly like \n does, so a model
+        // that kept generating past one is the SAME bug with a different byte.
+        for sep in [
+            '\n', '\r', '\u{000B}', '\u{000C}', '\u{0085}', '\u{2028}', '\u{2029}',
+        ] {
+            let raw = format!("Venmo{sep}owner refinement follows here");
+            assert_eq!(
+                sanitize_institution(Some(&raw)),
+                None,
+                "separator {sep:?} must refuse"
+            );
+        }
+    }
+
+    #[test]
+    fn a_card_number_is_redacted_whatever_joins_its_groups() {
+        // Space/dash/dot was the whole separator set, so a comma- or
+        // NBSP-grouped PAN was stored in full in the one text field on this row
+        // that is not account_hint. Load-bearing now the word cap is seven.
+        for raw in [
+            "Visa 4111 1111 1111 1234",
+            "Visa 4111,1111,1111,1234",
+            "Visa 4111/1111/1111/1234",
+            "Visa 4111_1111_1111_1234",
+            "Visa 4111-1111-1111-1234",
+            "Visa 4111\u{00A0}1111\u{00A0}1111\u{00A0}1234",
+        ] {
+            let out = sanitize_institution(Some(raw)).unwrap_or_default();
+            assert!(
+                !out.contains("1234") && out.contains("####"),
+                "{raw:?} left digits behind: {out:?}"
+            );
+        }
+        // A whitespace-grouped IBAN, which used to be refused only for word count.
+        let iban = sanitize_institution(Some("IBAN DE89 3704 0044 0532 0130 00"));
+        assert!(
+            !iban.unwrap_or_default().contains("3704"),
+            "an IBAN must not survive as an institution name"
+        );
+    }
+
+    #[test]
+    fn the_character_cap_is_enforced() {
+        // The one mutation the first test suite did not kill: raising
+        // MAX_INSTITUTION_CHARS to 100000 left everything green.
+        let long = format!("Bank {}", "o".repeat(200));
+        let out = sanitize_institution(Some(&long)).expect("two words, still a name");
+        assert_eq!(out.chars().count(), MAX_INSTITUTION_CHARS);
+    }
+
+    #[test]
+    fn letters_past_the_character_cap_do_not_survive_truncation() {
+        // THE IDEMPOTENCE BREAK. The alphabetic check ran on the untruncated
+        // value, so this passed once and was stored as 80 characters of
+        // punctuation, which the next run refused - two writes, two boots, and
+        // a migration that documents its output as a fixed point.
+        let raw = format!("{} Bank", ".".repeat(85));
+        assert_eq!(sanitize_institution(Some(&raw)), None);
+    }
+
+    #[test]
+    fn a_model_quoting_its_own_answer_is_not_punished_for_it() {
+        assert_eq!(
+            sanitize_institution(Some("\"Chase\"")).as_deref(),
+            Some("Chase")
+        );
+        assert_eq!(
+            sanitize_institution(Some("'Chase'")).as_deref(),
+            Some("'Chase'")
+        );
+        // An UNMATCHED quote is still fence punctuation and still refused.
+        assert_eq!(sanitize_institution(Some("\"Chase")), None);
+    }
+
+    #[test]
+    fn zero_width_characters_do_not_survive() {
+        // Invisible to a reader, and a homograph/dedup hazard stored verbatim.
+        assert_eq!(
+            sanitize_institution(Some("Cha\u{200B}se")).as_deref(),
+            Some("Chase")
+        );
+        assert_eq!(sanitize_institution(Some("\u{FEFF}\u{200D}")), None);
     }
 
     #[test]
@@ -523,13 +676,49 @@ mod tests {
         // The one-shot backfill re-runs this over stored rows, so its output has
         // to be a FIXED POINT or the pass would keep finding work to do.
         for raw in [
-            "Chase",
-            "Visa 4111111111111234",
-            "  Chase\n",
-            PROMPT_ECHO,
-            DEGENERATED,
+            "Chase".to_string(),
+            "Visa 4111111111111234".to_string(),
+            "  Chase\n".to_string(),
+            PROMPT_ECHO.to_string(),
+            DEGENERATED.to_string(),
+            // The class a targeted fuzz found: letters living past char 80, so
+            // truncation changes the verdict between passes.
+            format!("{} Bank", ".".repeat(85)),
+            format!("{} Bank", "-".repeat(120)),
+            format!("Bank {}", "o".repeat(200)),
+            "\"Chase\"".to_string(),
         ] {
+            let raw = raw.as_str();
             let once = sanitize_institution(Some(raw));
+            let twice = sanitize_institution(once.as_deref());
+            assert_eq!(once, twice, "not a fixed point: {raw:?}");
+        }
+    }
+
+    #[test]
+    fn sanitizing_is_a_fixed_point_under_a_fuzz() {
+        // The migration re-runs this over stored rows on EVERY open and
+        // documents the output as a fixed point; a counterexample means a write
+        // on every boot forever. Biased toward the shapes that actually broke
+        // it: long non-letter runs with a letter hiding past the cap.
+        let alphabet = [
+            "a", "Bank", ".", "-", "*", " ", "1", "9", "=", "\u{2028}", "\"", "\u{200B}", ",",
+            "\u{00A0}", "&", "(", ")",
+        ];
+        // Deterministic LCG: a reproducible corpus, no dev-dependency.
+        let mut seed = 0x2026_0901_u64;
+        let mut next = move || {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (seed >> 33) as usize
+        };
+        for _ in 0..20_000 {
+            let len = next() % 40;
+            let raw: String = (0..len)
+                .map(|_| alphabet[next() % alphabet.len()])
+                .collect();
+            let once = sanitize_institution(Some(&raw));
             let twice = sanitize_institution(once.as_deref());
             assert_eq!(once, twice, "not a fixed point: {raw:?}");
         }

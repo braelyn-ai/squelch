@@ -33,7 +33,15 @@ struct GroupsView: View {
     private var selected: SendGroup? { groups[safe: index] }
 
     var body: some View {
-        Group {
+        // A VStack, NOT a Group. `Group` applies a modifier to EACH of its
+        // children rather than to the group as a whole, and the populated
+        // branch below has two: the scrolling body and the bar under it. The
+        // `maxHeight: .infinity` on the frame was therefore claimed TWICE, so
+        // the enclosing VStack in RoutedHost split the window between them and
+        // the page rendered at half height with its footer stranded in the
+        // middle. One real container means one frame, and the bar keeps its
+        // natural height while the body takes what is left.
+        VStack(spacing: 0) {
             if groupsState.isLoading && groups.isEmpty {
                 BandNote("loading groups…")
             } else if let error = groupsState.error, groups.isEmpty {
@@ -103,6 +111,22 @@ struct GroupsView: View {
                 }
                 .padding(.horizontal, 10)
                 .padding(.vertical, 10)
+
+                // A mailbox with one group leaves this column almost entirely
+                // empty, and an empty column reads as something failing to load
+                // rather than as a list with one thing in it. One quiet line
+                // under the list says which it is.
+                if groups.count < 3 {
+                    HStack(spacing: 4) {
+                        Text("press").font(Typo.micro)
+                        Kbd("n")
+                        Text("for another").font(Typo.micro)
+                    }
+                    .foregroundStyle(Palette.inkFaintest)
+                    .padding(.horizontal, 16)
+                    .padding(.top, 2)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                }
             }
             .onChange(of: index) { _, i in
                 guard let group = groups[safe: i] else { return }
@@ -183,6 +207,18 @@ struct GroupsView: View {
     private var historySection: some View {
         VStack(alignment: .leading, spacing: 7) {
             SectionHead("sent to this group")
+            // TWO SOURCES, ONE QUESTION. The list unions sends made THROUGH the
+            // group with mail matched to its membership afterwards, and the
+            // reader wants both under "what have I sent these people". Saying
+            // which is which per row cost a repeated count that was structurally
+            // always true — an "individually" group reaches exactly one person
+            // per message, so every row read "1 of 2" forever. It is one fact
+            // about the list, so the list says it once.
+            if (history.value ?? []).contains(where: { !$0.isRecorded }) {
+                Text("includes mail you already had with these people")
+                    .font(Typo.micro)
+                    .foregroundStyle(Palette.inkFaintest)
+            }
             if history.isLoading && history.value == nil {
                 Text("loading…").font(Typo.micro).foregroundStyle(Palette.inkFaintest)
             } else if let error = history.error, history.value == nil {
@@ -398,12 +434,21 @@ private struct GroupHistoryRow: View {
     let onOpen: () -> Void
 
     /// "12 of 12" reads as noise on every row that reached everyone, which is
-    /// most of them. The count earns its place only when it is a shortfall.
+    /// most of them. The count earns its place only when it is a shortfall —
+    /// AND ONLY A RECORDED SEND CAN HAVE ONE.
+    ///
+    /// A derived entry never aimed at the group: it is ordinary mail the daemon
+    /// matched to this membership afterwards, so "1 of 2" describes nothing that
+    /// went wrong. Showing it here put a shortfall on every row of a year's
+    /// correspondence and made a working mailbox look like a page of failed
+    /// deliveries. Derived rows say what they are instead, once, in `origin`.
     private var reach: String? {
+        guard entry.isRecorded else { return nil }
         if entry.failed > 0 { return "\(entry.reached) of \(entry.group_size)" }
         if entry.reachedEveryone { return nil }
         return "\(entry.reached) of \(entry.group_size)"
     }
+
 
     var body: some View {
         ListRow(selected: false, cornerRadius: 8, hPadding: 10, vPadding: 7, action: onOpen) {
@@ -414,6 +459,12 @@ private struct GroupHistoryRow: View {
                         .font(Typo.row)
                         .foregroundStyle(Palette.ink)
                         .lineLimit(1)
+                        .help(
+                            entry.isRecorded
+                                ? "sent through this group"
+                                : "mail you already had with "
+                                    + "\(entry.reached) of the \(entry.group_size) people in "
+                                    + "this group, not sent through it")
                     if !entry.snippet.isEmpty {
                         Text(entry.snippet)
                             .font(Typo.micro)
@@ -432,7 +483,12 @@ private struct GroupHistoryRow: View {
                     Text(reach)
                         .font(Typo.num(10))
                         .foregroundStyle(entry.failed > 0 ? Palette.danger : Palette.inkFaint)
+                        .help(
+                            entry.failed > 0
+                                ? "the fan-out did not reach everyone"
+                                : "sent through this group, before its membership changed")
                 }
+
                 if entry.opens > 0 {
                     HStack(spacing: 3) {
                         Image(systemName: "eye").font(.system(size: 8))

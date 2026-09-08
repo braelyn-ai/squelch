@@ -10,6 +10,7 @@
 //! phrasing, so the two classifiers never double-claim a message. Refunds /
 //! inbound money and pure marketing return `None`.
 
+use crate::triage::money::{self, parse_amount};
 use crate::triage::text::rx;
 use regex::Regex;
 use std::sync::OnceLock;
@@ -29,8 +30,6 @@ struct ReceiptDetector {
     /// Past-transaction / purchase-record phrasing; any one classifies the
     /// message as a receipt, subject to the exclusions below.
     receipt_phrases: Vec<Regex>,
-    /// Currency amount patterns.
-    amount: Vec<Regex>,
     /// An amount ADJACENT to a total-word, preferred over the largest amount in
     /// the body. Captures the amount in group 1.
     total_adjacent: Vec<Regex>,
@@ -68,14 +67,6 @@ fn detector() -> &'static ReceiptDetector {
             rx(r"\b(ride|trip) receipt\b"),
             rx(r"\breceipt for your (ride|trip)\b"),
             rx(r"\bthanks for (riding|your ride)\b"),
-        ],
-        amount: vec![
-            // $1,234.56 or $42 or $42.10
-            rx(r"\$\s?([0-9][0-9,]*(?:\.[0-9]+)?)"),
-            // 1,234.56 USD / 42.00 usd
-            rx(r"\b([0-9][0-9,]*(?:\.[0-9]+)?)\s?(?:USD|usd)\b"),
-            // USD 1,234.56
-            rx(r"\b(?:USD|usd)\s?([0-9][0-9,]*(?:\.[0-9]+)?)"),
         ],
         total_adjacent: vec![
             // "order total: $3.49" / "grand total $12" / "total $3.49" /
@@ -123,33 +114,6 @@ fn has_obligation(text: &str) -> bool {
     detector().obligation.iter().any(|re| re.is_match(text))
 }
 
-/// Parse a single amount token ("1,234.56") to `f64`, ROUNDED TO CENTS.
-///
-/// The fraction the patterns above capture is deliberately unbounded (`[0-9]+`,
-/// not `[0-9]{2}`), and this is the other half of that decision. A two-digit
-/// fraction looks like the only thing a price can have right up until a real
-/// sender does its arithmetic in binary floating point and prints the result
-/// unrounded — Amazon's shipment mail says
-///
-/// ```text
-/// Total
-/// 67.28999999999999 USD
-/// ```
-///
-/// A pattern that admits exactly two decimals cannot match that at all, so the
-/// engine used to give up on the "67" and resume scanning INSIDE the number,
-/// where `28999999999999 USD` matches beautifully. Every affected receipt was
-/// stored as its own fractional tail: a $67.29 order became $28,999,999,999,999
-/// on the card. Taking the whole number and rounding here is what keeps the
-/// value and the cents both honest.
-fn parse_amount(raw: &str) -> Option<f64> {
-    let v = raw.replace(',', "").parse::<f64>().ok()?;
-    if !v.is_finite() {
-        return None;
-    }
-    Some((v * 100.0).round() / 100.0)
-}
-
 /// Extract the receipt TOTAL: an amount adjacent to a total-word if there is
 /// one, else the LARGEST currency amount (the total is almost always the largest
 /// line on a receipt). `None` when nothing parses.
@@ -165,17 +129,7 @@ fn extract_total(text: &str) -> Option<(f64, String)> {
         }
     }
     // 2. Else the largest currency amount anywhere in the text.
-    let mut best: Option<f64> = None;
-    for re in &d.amount {
-        for cap in re.captures_iter(text) {
-            if let Some(m) = cap.get(1)
-                && let Some(v) = parse_amount(m.as_str())
-            {
-                best = Some(best.map_or(v, |b| b.max(v)));
-            }
-        }
-    }
-    best.map(|v| (v, "USD".to_string()))
+    money::largest_amount(text).map(|v| (v, "USD".to_string()))
 }
 
 /// The text every rule here reads: the sender, the subject and the body, in that
@@ -359,6 +313,31 @@ mod tests {
         let r = detect_receipt("a@b.com", "Your receipt", "Total: $14.530000000000001")
             .expect("receipt");
         assert_eq!(r.amount, Some(14.53));
+    }
+
+    #[test]
+    fn a_total_word_beats_a_bigger_line_item_even_with_a_long_fraction() {
+        // PINS THE total_adjacent FAMILY ON ITS OWN. Reverting only these two
+        // patterns to a two-decimal fraction used to leave every test green,
+        // because the largest-amount fallback quietly rescued them. Here it
+        // cannot: the biggest number on the page is not the total, so a
+        // total_adjacent that fails to match answers 999.00 instead of 67.29.
+        let body = "Thank you for your order\r\n\
+                    Insurance coverage up to $999.00\r\n\
+                    Total: $67.28999999999999\r\n";
+        let r = detect_receipt("orders@shop.com", "Your order", body).expect("receipt");
+        assert_eq!(r.amount, Some(67.29));
+    }
+
+    #[test]
+    fn a_long_fraction_is_read_whole_with_no_total_word_at_all() {
+        // PINS THE amount FALLBACK FAMILY ON ITS OWN, which is the shape the
+        // production Amazon mail would have had without its "Total" line.
+        let body =
+            "Thank you for your order\r\n\r\nGap Filler Syringe\r\n67.28999999999999 USD\r\n";
+        let r =
+            detect_receipt("orders@amazon.com", "Thank you for your order", body).expect("receipt");
+        assert_eq!(r.amount, Some(67.29));
     }
 
     #[test]

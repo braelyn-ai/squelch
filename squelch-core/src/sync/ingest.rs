@@ -14,6 +14,7 @@ use crate::triage::receipt;
 use crate::triage::seal::{self, SealInput};
 use crate::triage::shipment;
 use crate::triage::stage1_with_config;
+use crate::triage::text as text_util;
 use crate::types::{AccountId, AttachmentInfo, FieldReasons, NewMessage, Sensitivity, Tier};
 use chrono::{DateTime, Utc};
 use mail_parser::{Address, MessageParser, MimeHeaders};
@@ -1007,7 +1008,10 @@ pub fn ingest(
             // through OUR flattener, exactly like the body_html capture
             // below.
             //
-            // A BLANK plain part reads as ABSENT. Senders that build both
+            // A BLANK plain part reads as ABSENT — blank TO A READER, which is
+            // not what `trim` measures: a part holding one U+FEFF is non-empty
+            // to `str::trim` and invisible to a human, so `text_util::is_blank`
+            // discounts the zero-width set this file already knows about. Senders that build both
             // alternatives from a template routinely ship an EMPTY (or
             // whitespace-only) text/plain part beside a full HTML one; taking
             // it literally stored `body = ''` for the whole sender while
@@ -1020,7 +1024,7 @@ pub fn ingest(
                 Some(p) if !p.is_text_html() => p.text_contents().unwrap_or_default().to_string(),
                 _ => String::new(),
             };
-            let text = if plain.trim().is_empty() {
+            let text = if text_util::is_blank(&plain) {
                 let flattened = m
                     .html_part(0)
                     .and_then(|p| p.text_contents())
@@ -1029,7 +1033,7 @@ pub fn ingest(
                 // Only PREFER the flattened HTML when it actually says
                 // something; otherwise keep the plain part, so a genuinely
                 // empty email is still stored exactly as it arrived.
-                if flattened.trim().is_empty() {
+                if text_util::is_blank(&flattened) {
                     plain
                 } else {
                     flattened
@@ -1678,6 +1682,68 @@ mod tests {
         assert!(
             t.message.body.contains("Ellie Huxtable paid you"),
             "a whitespace-only plain part must not shadow the HTML: {:?}",
+            t.message.body
+        );
+    }
+
+    #[test]
+    fn a_zero_width_only_plain_part_also_falls_through() {
+        // `str::trim` uses White_Space, which EXCLUDES U+FEFF and the rest of
+        // the zero-width set - so a part holding one BOM read as non-empty to
+        // the first cut of this fix and shadowed the HTML exactly like the
+        // production bug it was written to close.
+        for invisible in ["\u{feff}", "\u{200b}", "\u{200c}", "\u{00ad}", "\u{2060}"] {
+            let eml = format!(
+                "From: Venmo <venmo@venmo.com>\r\n\
+                 Subject: Your transfer\r\n\
+                 Date: Thu, 20 Aug 2026 23:16:16 +0000\r\n\
+                 MIME-Version: 1.0\r\n\
+                 Content-Type: multipart/alternative; boundary=X\r\n\
+                 \r\n\
+                 --X\r\n\
+                 Content-Type: text/plain; charset=utf-8\r\n\
+                 \r\n\
+                 {invisible}\r\n\
+                 --X\r\n\
+                 Content-Type: text/html; charset=utf-8\r\n\
+                 \r\n\
+                 <div>THE HTML SAYS SOMETHING</div>\r\n\
+                 --X--\r\n"
+            );
+            let f = raw(1, "g-zw", &eml, false);
+            let t = ingest(&f, &Stage1Config::default(), Utc::now(), |_| false);
+            assert!(
+                t.message.body.contains("THE HTML SAYS SOMETHING"),
+                "invisible {invisible:?} must not shadow the HTML: {:?}",
+                t.message.body
+            );
+        }
+    }
+
+    #[test]
+    fn an_email_with_nothing_in_either_part_stores_nothing() {
+        // Pins the "flattened is blank too -> keep plain" branch, which was
+        // otherwise a no-op no test could see.
+        let eml = "From: Nobody <n@example.com>\r\n\
+                   Subject: subject only\r\n\
+                   Date: Thu, 20 Aug 2026 23:16:16 +0000\r\n\
+                   MIME-Version: 1.0\r\n\
+                   Content-Type: multipart/alternative; boundary=X\r\n\
+                   \r\n\
+                   --X\r\n\
+                   Content-Type: text/plain; charset=utf-8\r\n\
+                   \r\n\
+                   \r\n\
+                   --X\r\n\
+                   Content-Type: text/html; charset=utf-8\r\n\
+                   \r\n\
+                   <div><span></span></div>\r\n\
+                   --X--\r\n";
+        let f = raw(1, "g-empty", eml, false);
+        let t = ingest(&f, &Stage1Config::default(), Utc::now(), |_| false);
+        assert!(
+            crate::triage::text::is_blank(&t.message.body),
+            "a genuinely empty email stays empty: {:?}",
             t.message.body
         );
     }

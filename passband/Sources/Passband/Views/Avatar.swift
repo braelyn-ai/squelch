@@ -11,12 +11,22 @@ struct Avatar: View {
     var size: CGFloat = 22
     /// Draw a subtle accent ring (e.g. a known contact).
     var known = false
+    /// Resolve THIS domain's icon instead of asking `SenderIdentity` whether
+    /// `sender` has earned one.
+    ///
+    /// The default (nil) is the privacy rule this file is built on: a human
+    /// correspondent's domain never leaves the device. An override is a caller
+    /// asserting it holds a domain that names a SERVICE, on evidence this view
+    /// cannot see — the rules page passes one only for a whole-domain rule
+    /// (`*@garmin.com`), which the owner wrote as a statement about a domain.
+    /// A caller that cannot make that case must not pass this.
+    var domainOverride: String?
 
     @State private var favicon: PlatformImage?
     @State private var failed = false
 
     private var resolved: SenderID.Resolved { SenderCache.resolved(sender) }
-    private var domain: String? { resolved.faviconDomain }
+    private var domain: String? { domainOverride ?? resolved.faviconDomain }
 
     /// Prefer this frame's image, else a synchronous cache read: a row rebuilt
     /// because a selection flip switched which branch of a conditional modifier
