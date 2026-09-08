@@ -718,6 +718,54 @@ struct SearchHit: Codable, Sendable, Identifiable, Hashable {
     var subject: String
     var received_at: String
     var snippet: String
+    /// Which retrieval legs produced this row: `["keyword"]`, `["vector"]`, or
+    /// both when both did (docs/SEARCH.md §4.8). OPTIONAL because an older
+    /// daemon sends no such field, and a client that required it would fail to
+    /// decode every hit from one — the whole search panel dark over a
+    /// diagnostic.
+    var legs: [String]?
+}
+
+/// WHAT RETRIEVAL DID WITH THE READER'S WORDS, straight from the daemon: how
+/// many messages carry ALL the terms, how many carry ANY, and how common each
+/// term is in the mailbox. Facts for the classifier in `SearchIntent`, which
+/// otherwise has only the shape of the query to go on.
+///
+/// Every count is account-scoped and excludes sealed AND spam rows on the
+/// daemon side. That is not a nicety: a document frequency that counted sealed
+/// mail would be an oracle for what sealed mail contains, one query at a time.
+struct SearchDiagnostics: Codable, Sendable, Hashable {
+    /// Messages matching ALL the terms. Zero over three or more terms is the
+    /// motivating query's own shape: the words are right, no one message uses
+    /// them all.
+    var strict_hits: Int
+    /// Messages matching ANY of them.
+    var any_hits: Int
+    var terms: [Term]
+
+    /// One term as the daemon ranked it, with the number of messages it
+    /// appears in.
+    struct Term: Codable, Sendable, Hashable {
+        var text: String
+        var df: Int
+    }
+}
+
+/// A page of search hits WITH the daemon's account of the search that produced
+/// them. Its own envelope rather than `Page<SearchHit>` because the extra
+/// fields are search's alone, and because every one of them is optional: the
+/// panel must keep working against a daemon that predates wave 1 and sends
+/// none of them (the classifier then has only the query's shape to judge on).
+struct SearchPage: Codable, Sendable {
+    var items: [SearchHit]
+    var next_cursor: String?
+    /// Which mode actually ran (`keyword`, `semantic`, `hybrid`), as the daemon
+    /// resolved it. A String rather than `SearchMode` so a mode this client has
+    /// never heard of decodes instead of failing the page.
+    var match_kind: String?
+    /// The order the hits were ranked under, echoed back.
+    var sort: String?
+    var diagnostics: SearchDiagnostics?
 }
 
 struct AuditEntry: Codable, Sendable, Identifiable, Hashable {
@@ -1219,6 +1267,18 @@ struct ContactHit: Codable, Sendable, Equatable, Identifiable {
     var display_name: String?
     var sent_count: Int
     var last_sent_at: String?
+
+    var id: String { addr }
+}
+
+/// One row of the daemon's sender directory (GET /client/senders): somebody who
+/// has written to this account, for the search field's `from:` menu. The other
+/// direction of mail from `ContactHit`, which is who the user writes TO.
+struct SenderHit: Codable, Sendable, Equatable, Identifiable {
+    var addr: String
+    var display_name: String?
+    var msg_count: Int
+    var last_received_at: String
 
     var id: String { addr }
 }

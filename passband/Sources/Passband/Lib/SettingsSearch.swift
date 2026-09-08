@@ -298,7 +298,41 @@ enum SettingsSearch {
             ]),
     ]
 
-    private static let assistantEntries: [SettingsEntry] = [
+    /// The assistant pane's settings. The last two are the deeper-search lane's
+    /// and are MAC ONLY, for the reason AssistantSection fences the card
+    /// itself: the phone's search still counts spaces and has no lane, so a
+    /// phone search that offered these would render a card without them.
+    private static let assistantEntries: [SettingsEntry] = {
+        var entries = baseAssistantEntries
+        #if os(macOS)
+            entries += deeperSearchEntries
+        #endif
+        return entries
+    }()
+
+    private static let deeperSearchEntries: [SettingsEntry] = [
+        SettingsEntry(
+            card: .assistant,
+            title: "Deeper search",
+            blurb:
+                "Whether a question-shaped search reads your mail and answers it, asks first, "
+                + "or never runs.",
+            keywords: [
+                "deeper search", "deep search", "agent search", "smart search", "ai search",
+                "search assistant", "question", "answer my search", "read my mail",
+                "automatic", "on request", "off",
+            ]),
+        SettingsEntry(
+            card: .assistant,
+            title: "Deeper search model",
+            blurb: "Which Claude model reads your mail when a search goes deeper.",
+            keywords: [
+                "search model", "deeper search model", "lane model", "haiku", "opus",
+                "which model searches", "search llm", "search ai",
+            ]),
+    ]
+
+    private static let baseAssistantEntries: [SettingsEntry] = [
         SettingsEntry(
             card: .assistant,
             title: "Chats via",

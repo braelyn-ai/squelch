@@ -142,6 +142,19 @@ struct SearchView: View {
             .padding(.top, 12)
             .padding(.bottom, 8)
 
+            // THE SENDER MENU, under the well, for exactly as long as the
+            // trailing token is a `from:` operator being typed (see
+            // FromOperator). Mounted by the fragment and the focus rather than
+            // by a flag of its own, so a space, a finished address, or the
+            // reader opening a hit all take it down without anybody having to
+            // remember to; and mounted AFTER the field, so its arrows and Enter
+            // register later than this panel's and win only while it is up.
+            if focused, let fragment = FromOperator.fragment(in: store.search.query) {
+                SenderSuggestions(query: $store.search.query, fragment: fragment)
+                    .padding(.horizontal, 16)
+                    .padding(.bottom, 8)
+            }
+
             // THE ORDER, beside the thing that produces it. A sort control is
             // about the answer, so it belongs next to the question and not
             // three screens away — the same preference is in Settings, and the
@@ -160,45 +173,32 @@ struct SearchView: View {
             if let error = store.search.error { BandNote(error) }
             if answered && store.search.hits.isEmpty { BandNote("no matches.") }
 
-            ScrollViewReader { proxy in
-                ScrollView {
-                    LazyVStack(spacing: expanded ? 10 : 6) {
-                        ForEach(Array(store.search.hits.enumerated()), id: \.element.id) { i, hit in
-                            // One click opens: the reader sits beside this list,
-                            // so opening a hit costs the results nothing.
-                            HitRow(
-                                hit: hit, terms: terms, selected: i == store.search.index,
-                                expanded: expanded
-                            ) {
-                                store.search.index = i
-                                open()
-                            }
-                            .id(hit.id)
-                            // Reaching the last row IS the request for the next
-                            // page. On the row rather than a footer sentinel so
-                            // it fires in both the strip and fullscreen, where
-                            // the column widths (and so the row counts) differ.
-                            .onAppear {
-                                guard hit.id == store.search.hits.last?.id else { return }
-                                Task { await loadMore() }
-                            }
-                        }
-                        // Rows just stopping is indistinguishable from the end
-                        // of the results, so the append announces itself.
-                        if loadingMore { BandNote("loading more…") }
+            // THE STRIP IS TOO NARROW FOR TWO COLUMNS (460pt), so there the
+            // lane is a band ABOVE the hits; expanded, it becomes the right
+            // column beside them and the results keep their reading width. Same
+            // view either way — see DeeperSearchBand.
+            //
+            // ONE `results` CALL, IN ONE PLACE IN THIS TREE, and that is
+            // structural rather than tidy: written as two branches of `if
+            // expanded`, the two calls are different slots, so SwiftUI gives
+            // them different identities and tears the whole ScrollView down and
+            // rebuilds it on every Enter. The scroll offset went back to the
+            // top, and a remount fires no `onChange(of: index)`, so a reader
+            // thirty rows down who expanded landed at row one with their
+            // selection off screen. Here only the band moves; the hits keep
+            // their place because they never leave theirs.
+            if bandMounted && !expanded {
+                strippedBand
+            }
+            HStack(alignment: .top, spacing: 0) {
+                results(expanded: expanded)
+                if bandMounted && expanded {
+                    ScrollView {
+                        DeeperSearchBand(expanded: true)
+                            .padding(.horizontal, 16)
+                            .padding(.bottom, 14)
                     }
-                    // Fullscreen keeps a reading-width column: match text in
-                    // window-wide rows is a treadmill for the eyes.
-                    .frame(maxWidth: expanded ? 780 : .infinity)
-                    .frame(maxWidth: .infinity)
-                    .padding(.horizontal, expanded ? 24 : 14)
-                    .padding(.bottom, 14)
-                }
-                .onChange(of: store.search.index) { _, i in
-                    guard let hit = store.search.hits[safe: i] else { return }
-                    withAnimation(Motion.scrollFollow) {
-                        proxy.scrollTo(hit.id, anchor: .center)
-                    }
+                    .frame(minWidth: 320, idealWidth: 380, maxWidth: 440)
                 }
             }
         }
@@ -227,6 +227,84 @@ struct SearchView: View {
         // screen until the reader edits their query. An array because tuples do
         // not conform to Equatable and `task(id:)` needs one value.
         .task(id: [store.search.query, prefs.searchSort.rawValue]) { await runSearch() }
+    }
+
+    /// The hits themselves, extracted so the strip (band above) and the
+    /// expanded layout (band beside) can both draw them without a second copy.
+    private func results(expanded: Bool) -> some View {
+        ScrollViewReader { proxy in
+            ScrollView {
+                LazyVStack(spacing: expanded ? 10 : 6) {
+                    ForEach(Array(store.search.hits.enumerated()), id: \.element.id) { i, hit in
+                        // One click opens: the reader sits beside this list,
+                        // so opening a hit costs the results nothing.
+                        HitRow(
+                            hit: hit, terms: terms, selected: i == store.search.index,
+                            expanded: expanded
+                        ) {
+                            store.search.index = i
+                            open()
+                        }
+                        .id(hit.id)
+                        // Reaching the last row IS the request for the next
+                        // page. On the row rather than a footer sentinel so
+                        // it fires in both the strip and fullscreen, where
+                        // the column widths (and so the row counts) differ.
+                        .onAppear {
+                            guard hit.id == store.search.hits.last?.id else { return }
+                            Task { await loadMore() }
+                        }
+                    }
+                    // Rows just stopping is indistinguishable from the end
+                    // of the results, so the append announces itself.
+                    if loadingMore { BandNote("loading more…") }
+                }
+                // Fullscreen keeps a reading-width column: match text in
+                // window-wide rows is a treadmill for the eyes.
+                .frame(maxWidth: expanded ? 780 : .infinity)
+                .frame(maxWidth: .infinity)
+                .padding(.horizontal, expanded ? 24 : 14)
+                .padding(.bottom, 14)
+            }
+            .onChange(of: store.search.index) { _, i in
+                guard let hit = store.search.hits[safe: i] else { return }
+                withAnimation(Motion.scrollFollow) {
+                    proxy.scrollTo(hit.id, anchor: .center)
+                }
+            }
+        }
+    }
+
+    /// The band as the STRIP draws it: above the hits, and never allowed to
+    /// take the whole panel.
+    ///
+    /// The ceiling is the point. `show_emails` shows up to eight cards a batch
+    /// and the band renders every batch the lane has shown, so one answer is
+    /// around 620pt and a refined one twice that — in a 460pt strip that pushed
+    /// the results list, the panel's whole reason for existing, down to zero
+    /// height, with the band's own overflow clipped rather than scrollable so
+    /// neither could be read. Scrolling inside a bounded frame gives the hits a
+    /// floor and the cards a way to be reached; `fixedSize` is what keeps a
+    /// two-line band two lines tall instead of always claiming the ceiling.
+    private var strippedBand: some View {
+        ScrollView {
+            DeeperSearchBand(expanded: false)
+        }
+        .frame(maxHeight: Self.stripBandCeiling)
+        .fixedSize(horizontal: false, vertical: true)
+    }
+
+    /// The most of a 460pt strip the lane may occupy. Roughly four cards, which
+    /// is enough to read an answer without the hits going away.
+    private static let stripBandCeiling: CGFloat = 320
+
+    /// Whether the deeper-search band is on screen at all. It appears once THIS
+    /// panel session has judged a query deeper (or has already started a lane),
+    /// so a reader whose searches are all lookups never sees it; `off` mounts
+    /// nothing, ever.
+    private var bandMounted: Bool {
+        guard prefs.deeperSearch != .off else { return false }
+        return store.search.laneStarted || store.search.lastVerdict?.isDeeper == true
     }
 
     private var bindings: [KeyBinding] {
@@ -271,11 +349,16 @@ struct SearchView: View {
         // Read at fetch time, not captured on mount: the panel is often built
         // before a trip to Settings and rebuilt after one.
         let sort = prefs.searchSort
-        guard !term.isEmpty else {
+        // A bare operator (`from:` with the menu opening under it) is not a
+        // search yet: the daemon would drop the valueless token and 400 the
+        // empty query, and that refusal is not something to show a reader who
+        // is halfway through typing a sender.
+        guard !term.isEmpty, !FromOperator.awaitingValue(in: term) else {
             store.search.hits = []
             store.search.error = nil
             store.search.fetchedQuery = nil
             store.search.fetchedSort = nil
+            store.search.diagnostics = nil
             store.search.nextCursor = nil
             loading = false
             return
@@ -305,8 +388,22 @@ struct SearchView: View {
         // used to be covering for).
         guard !Task.isCancelled else { return }
         do {
-            let page = try await APIClient.shared.search(term, limit: 50, sort: sort)
+            // PARTIAL, because this fetch fires while somebody is still typing:
+            // the trailing token is matched as a prefix, so "wif" finds "wifi"
+            // instead of nothing. The agent's own searches never ask for it.
+            let page = try await APIClient.shared.search(
+                term, limit: 50, sort: sort, partial: true)
+            // AND AGAIN AFTER THE AWAIT, which the iOS twin has always done
+            // (`MobileSearchView`). A response landing in the window between
+            // `task(id:)` cancelling this task and URLSession noticing resolves
+            // normally, so without this a superseded fetch stamps its hits over
+            // the live ones. That much was self-correcting; `judge` below is
+            // not. It would start a paid conversation about words the reader
+            // deleted 200ms ago, and the next fetch would then hand the live
+            // words to it as a "refinement".
+            guard !Task.isCancelled, term == store.search.query.trimmed else { return }
             store.search.hits = page.items
+            store.search.diagnostics = page.diagnostics
             store.search.nextCursor = page.next_cursor
             // Fresh results land un-armed: Enter straight from the bar means
             // "show me more", not "open whatever floated to the top".
@@ -320,6 +417,11 @@ struct SearchView: View {
             for hit in page.items.prefix(5) {
                 ThreadPrefetch.shared.prefetch(hit.thread_id)
             }
+            // AFTER THE FETCH, NEVER MID-KEYSTROKE. The classifier is a
+            // decision to spend money, so it is made once per SETTLED query —
+            // past the 220ms debounce, with the daemon's own diagnostics for
+            // exactly these words in hand.
+            judge(term)
         } catch {
             // Cancellation surfaces here too (URLError.cancelled mid-request):
             // that is a superseded task, not a failure, and writing an error
@@ -331,11 +433,52 @@ struct SearchView: View {
             // resurrecting a stale error over stale hits.
             store.search.fetchedQuery = nil
             store.search.fetchedSort = nil
+            // The diagnostics go with the query they described: judging the
+            // next search on the last one's counts is exactly the mistake
+            // pairing them prevents.
+            store.search.diagnostics = nil
             // And drop the cursor with it: it belongs to a page set this view
             // is no longer showing.
             store.search.nextCursor = nil
         }
         loading = false
+    }
+
+    /// Keyword or question, for the query whose hits are now on screen
+    /// (docs/SEARCH.md §5). The verdict is recorded whatever the preference
+    /// says, because it is also what mounts the band on request; only STARTING
+    /// is the preference's business.
+    private func judge(_ term: String) {
+        // ONLY FOR WORDS THAT ARE STILL THE READER'S. Judging is where money
+        // gets spent, so the contract lives here rather than only at the fetch
+        // that calls it: the term is judged when it is still what the field
+        // says, which is the same test `answered` applies before the panel will
+        // claim the hits belong to the query on screen. A reader who typed on
+        // is judged by the next settled query, one debounce away, and a lane
+        // started for words they deleted would take the live ones as a
+        // "refinement" of a question nobody asked.
+        guard term == store.search.query.trimmed else { return }
+        let verdict = SearchIntent.classify(query: term, diagnostics: store.search.diagnostics)
+        store.search.lastVerdict = verdict
+        // WHAT that verdict is allowed to do is `DeeperSearchPolicy`'s and not
+        // this view's, because the rule about `off` also has to serve the
+        // picker being flipped under a lane that is already running (see
+        // ShellWatchers) — and a rule spelled twice is a rule that will
+        // disagree with itself. The moves are executed here; the deciding is
+        // pure and asserted in test.sh.
+        switch DeeperSearchPolicy.settled(
+            verdict: verdict, choice: prefs.deeperSearch,
+            laneStarted: store.search.laneStarted)
+        {
+        case .nothing:
+            break
+        case .stop:
+            store.resetSearchLane(keepingVerdict: true)
+        case .refine:
+            store.refineDeeperSearch()
+        case .start(let trigger):
+            store.startDeeperSearch(trigger: trigger)
+        }
     }
 
     /// Append the page after the one on screen. Cursors are only meaningful
@@ -357,7 +500,7 @@ struct SearchView: View {
         defer { loadingMore = false }
         do {
             let page = try await APIClient.shared.search(
-                term, limit: 50, cursor: cursor, sort: sort)
+                term, limit: 50, cursor: cursor, sort: sort, partial: true)
             guard term == store.search.fetchedQuery, store.search.nextCursor == cursor else {
                 return
             }

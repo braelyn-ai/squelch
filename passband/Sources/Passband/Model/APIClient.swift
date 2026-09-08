@@ -254,18 +254,24 @@ actor APIClient {
     /// A cursor is only meaningful beside the sort it was issued under — the
     /// offset indexes one particular ranking — so a caller paging must pass the
     /// same sort it opened with.
+    /// `partial` asks the daemon to match the TRAILING token as a prefix, which
+    /// is what makes "wif" find "wifi" while somebody is still typing. The
+    /// debounced panel fetch sends it; the agent's `search_mail` never does — a
+    /// model's query is a settled sentence, not a half-typed word, and prefixing
+    /// its last token would quietly widen every search it makes.
     func search(
         _ q: String,
         limit: Int? = nil,
         cursor: String? = nil,
         mode: SearchMode? = nil,
-        sort: SearchSortChoice? = nil
-    ) async throws -> Page<SearchHit> {
+        sort: SearchSortChoice? = nil,
+        partial: Bool = false
+    ) async throws -> SearchPage {
         try await get(
             "/client/search",
             query: [
                 "q": q, "limit": limit.map(String.init), "cursor": cursor, "mode": mode?.rawValue,
-                "sort": sort?.rawValue,
+                "sort": sort?.rawValue, "partial": partial ? "1" : nil,
             ])
     }
 
@@ -273,6 +279,13 @@ actor APIClient {
     /// actually written to). Ranked server-side; empty fragment returns [].
     func contacts(_ q: String, limit: Int = 8) async throws -> [ContactHit] {
         try await get("/client/contacts", query: ["q": q, "limit": String(limit)])
+    }
+
+    /// The search field's `from:` menu: who has written to this account, ranked
+    /// for `q`. An EMPTY `q` is a real question here (the senders with the most
+    /// mail), unlike `contacts`, so it is sent rather than short-circuited.
+    func senders(_ q: String, limit: Int = 8) async throws -> [SenderHit] {
+        try await get("/client/senders", query: ["q": q, "limit": String(limit)])
     }
 
     /// The sent page: mail the user WROTE, newest first, already ordered by the

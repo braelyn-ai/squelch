@@ -477,7 +477,27 @@ impl SquelchServer {
         let account_id = self.account_id;
         let query = query.to_string();
         let (hits, _window_full) = tokio::task::spawn_blocking(move || {
-            store.hybrid_search(account_id, &query, &Default::default(), sort, k)
+            // `partial: false` — an agent sends settled words, so nothing is
+            // matched as a prefix. The as-you-type widening belongs to a human
+            // still typing (the panel's `partial=1`), and applying it here
+            // would rank `passwordless` beside a query for `password`.
+            //
+            // `want_windows: false` — this door builds its result from the
+            // SUBJECT and never reads the snippet, and windowing is one extra
+            // FTS query per hydrated hit, up to `k`. The legs come back too and
+            // are dropped: `hybrid_search_legs` is the shape that lets a caller
+            // say what it does not need.
+            store
+                .hybrid_search_legs(
+                    account_id,
+                    &query,
+                    &Default::default(),
+                    sort,
+                    false,
+                    false,
+                    k,
+                )
+                .map(|(hits, full)| (hits.into_iter().map(|h| h.hit).collect::<Vec<_>>(), full))
         })
         .await
         .map_err(|_| ErrorData::internal_error("internal error", None))?

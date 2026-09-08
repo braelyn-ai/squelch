@@ -89,6 +89,10 @@ enum NotificationSound: String, CaseIterable, Sendable {
     }
 }
 
+// `DeeperSearchChoice` is NOT here: it lives beside the rule that reads it
+// (Lib/DeeperSearch.swift), which is pure so test.sh can assert what `off`
+// does to a lane that is already running. This file is only its storage.
+
 /// Two palettes selected explicitly; `system` follows the OS and is the default.
 enum ThemeChoice: String, CaseIterable, Sendable {
     case system, light, dark
@@ -133,6 +137,8 @@ final class Prefs {
         static let signature = "passband.pref.signature"
         static let assistantModel = "passband.assistant.model"
         static let assistantTransport = "passband.assistant.transport"
+        static let searchLaneModel = "passband.search.lane.model"
+        static let deeperSearch = "passband.search.deeper"
         static let telemetry = TelemetryLevel.prefKey
     }
 
@@ -148,6 +154,7 @@ final class Prefs {
             Key.searchSort: SearchSortChoice.recent.rawValue,
             Key.notificationSound: NotificationSound.system.rawValue,
             Key.telemetry: TelemetryLevel.full.rawValue,
+            Key.deeperSearch: DeeperSearchChoice.automatic.rawValue,
         ])
         _loadRemoteImages = defaults.bool(forKey: Key.loadRemoteImages)
         _settingsSection =
@@ -181,6 +188,13 @@ final class Prefs {
         _assistantTransport =
             AssistantTransport(rawValue: defaults.string(forKey: Key.assistantTransport) ?? "")
             ?? .relay
+        _searchLaneModel =
+            AssistantModel.migrating(rawValue: defaults.string(forKey: Key.searchLaneModel) ?? "")
+            ?? .haiku
+        _deeperSearch =
+            DeeperSearchChoice(rawValue: defaults.string(forKey: Key.deeperSearch) ?? "")
+            ?? .automatic
+
         // LAST, because it writes: the verdict above has to be PINNED on the
         // launch that reaches it, not re-derived on the next one. A seed lands
         // in the name key with no flag beside it, so a re-derivation would read
@@ -415,6 +429,30 @@ final class Prefs {
         set {
             _assistantTransport = newValue
             defaults.set(newValue.rawValue, forKey: Key.assistantTransport)
+        }
+    }
+
+    /// The model the SEARCH LANE runs on, independent of the ⌘K chat's. Its own
+    /// preference because the two spend differently: the lane runs on every
+    /// deeper query, unasked, while the chat runs when somebody types a
+    /// question — so Haiku is the honest default here even for a reader who
+    /// picked Opus for their chat.
+    private var _searchLaneModel: AssistantModel
+    var searchLaneModel: AssistantModel {
+        get { _searchLaneModel }
+        set {
+            _searchLaneModel = newValue
+            defaults.set(newValue.rawValue, forKey: Key.searchLaneModel)
+        }
+    }
+
+    /// Whether a question-shaped search may start the agent lane by itself.
+    private var _deeperSearch: DeeperSearchChoice
+    var deeperSearch: DeeperSearchChoice {
+        get { _deeperSearch }
+        set {
+            _deeperSearch = newValue
+            defaults.set(newValue.rawValue, forKey: Key.deeperSearch)
         }
     }
 

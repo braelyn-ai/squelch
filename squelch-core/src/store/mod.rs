@@ -8,7 +8,9 @@ pub mod recency;
 pub mod search_query;
 pub mod sqlite;
 
-pub use search_query::{SearchFilter, SearchSort, parse_search_query};
+pub use search_query::{
+    FtsQuery, SearchDiagnostics, SearchFilter, SearchSort, TermDf, parse_search_query,
+};
 pub use sqlite::SqliteStore;
 
 use crate::error::Result;
@@ -143,6 +145,20 @@ pub struct ContactEntry {
     pub display_name: Option<String>,
     pub sent_count: i64,
     pub last_sent_at: Option<DateTime<Utc>>,
+}
+
+/// One row of the sender directory (`senders`): an address that has written to
+/// the account, as the search field's `from:` autocomplete hit shape.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SenderEntry {
+    pub addr: String,
+    /// The newest display name seen on this sender's mail, when any was.
+    pub display_name: Option<String>,
+    /// Inbound, non-spam messages from this address. Sealed ones are counted
+    /// (sealing is decided after the count is taken); a sender with ONLY sealed
+    /// mail is never returned at all.
+    pub msg_count: i64,
+    pub last_received_at: DateTime<Utc>,
 }
 
 /// A fully-triaged message committed in one transaction by
@@ -952,6 +968,22 @@ pub struct MissingVector {
     pub body: String,
 }
 
+/// A hybrid-search hit plus WHICH RECALL LEG produced it: the keyword list, the
+/// vector list, or both. See
+/// [`SqliteStore::hybrid_search_legs`](crate::store::SqliteStore::hybrid_search_legs).
+///
+/// The two facts are separate bools rather than an enum because a hit really
+/// can be on both lists, and "both" is the interesting case: it is the one that
+/// says the words AND the meaning agree.
+#[derive(Debug, Clone)]
+pub struct LeggedHit {
+    pub hit: SearchHit,
+    /// The FTS5 keyword leg returned this row.
+    pub keyword: bool,
+    /// The vector KNN returned this row.
+    pub vector: bool,
+}
+
 /// A locally-stored sealed message, exposed ONLY to the TUI. This type never
 /// crosses the MCP boundary.
 #[derive(Debug, Clone)]
@@ -1479,6 +1511,16 @@ pub trait Store: Send + Sync {
     fn merge_harvested_contacts(&self, account_id: AccountId, batch: &[ContactEntry])
     -> Result<()>;
 
+    /// HUMAN-DOOR ONLY (`/client/senders`): rank the sender directory for a
+    /// typed fragment — the search field's `from:` autocomplete. MUST NOT be
+    /// reachable from MCP, for the reason `search_contacts` gives.
+    fn search_senders(
+        &self,
+        account_id: AccountId,
+        q: &str,
+        limit: u32,
+    ) -> Result<Vec<SenderEntry>>;
+
     /// Read the sync cursor for a mailbox key, if one has been persisted.
     fn sync_state(&self, account_id: AccountId, mailbox: &str) -> Result<Option<SyncState>>;
 
@@ -1628,12 +1670,18 @@ pub trait Store: Send + Sync {
     /// standing preference rather than part of the query, which is why it
     /// arrives beside `filter` instead of inside it: a filter says which mail
     /// counts, a sort says how to order whatever did.
+    /// `partial` matches the LAST word as a prefix, which is what an
+    /// as-you-type fetch wants and what a settled query must not have: an agent
+    /// sending finished words would otherwise have `password` widened to
+    /// `password*` and rank `passwordless` beside it.
+    #[allow(clippy::too_many_arguments)] // the query, the operators, the order, the page
     fn search_filtered(
         &self,
         account_id: AccountId,
         text: &str,
         filter: &SearchFilter,
         sort: SearchSort,
+        partial: bool,
         limit: u32,
         offset: u32,
     ) -> Result<Vec<SearchHit>>;

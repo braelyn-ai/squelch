@@ -147,6 +147,9 @@ fn client_router(state: ApiState) -> Router {
         // Recipient autocomplete over Sent-derived contacts. Human door only —
         // the agent door must never see who the user writes to.
         .route("/client/contacts", get(handlers::get_contacts))
+        // Sender autocomplete for the search field's `from:` operator: who
+        // writes to the user. Human door only, for the reason contacts is.
+        .route("/client/senders", get(handlers::get_senders))
         .merge(groups::routes())
         .route("/client/sealed", get(handlers::list_sealed))
         .route(

@@ -118,6 +118,23 @@ fn upsert_message_conn(conn: &Connection, msg: &NewMessage) -> Result<i64> {
         params![id, msg.subject, msg.body],
     )?;
 
+    // The sender directory, for the search field's `from:` menu. Inbound and
+    // non-spam only: sent mail's From is the user, and spam is a structural
+    // exclusion everywhere else too. Judged on THIS sighting's flags rather
+    // than the row's sticky ones on purpose: a message first seen as spam and
+    // now seen outside the label has just become visible, and this is the
+    // sighting that should register its sender (the count is recomputed from
+    // the row, so the sticky flags still decide what it says).
+    if !msg.is_sent && !msg.is_spam {
+        super::senders::bump_sender_conn(
+            conn,
+            msg.account_id,
+            &msg.from_addr,
+            msg.from_name.as_deref(),
+            &msg.received_at.to_rfc3339(),
+        )?;
+    }
+
     // Contacts are NOT seeded here: Sent mail's From header is the user's own
     // address. They come from the To/Cc recipients in `ingest_message`.
     Ok(id)
@@ -334,6 +351,22 @@ impl SqliteStore {
                     status = 'new', surfaced_at = NULL, resolved_at = NULL
               WHERE account_id = ?1 AND message_id = ?2 AND sensitivity != 'sealed'",
             params![account_id, message_id, now],
+        )?;
+        // The row just became visible WITHOUT passing through the upsert, so
+        // its sender registers here or not at all: a sender whose only mail
+        // was misfiled as spam has no directory row until this moment.
+        let (from_addr, from_name, received_at): (String, Option<String>, String) = tx.query_row(
+            "SELECT from_addr, from_name, received_at FROM messages
+                 WHERE account_id = ?1 AND id = ?2",
+            params![account_id, message_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )?;
+        super::senders::bump_sender_conn(
+            &tx,
+            account_id,
+            &from_addr,
+            from_name.as_deref(),
+            &received_at,
         )?;
         tx.commit()?;
         Ok(true)

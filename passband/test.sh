@@ -256,6 +256,25 @@ run_suite sealed-event \
   Sources/Passband/Model/EventBanner.swift \
   Tests/SealedEventTests.swift
 
+# Whether a search is a lookup or a question, what the setting lets that verdict
+# do, the single-slot queue that keeps the agent lane narrowing one need instead
+# of restarting, and the prompt it does that under. All four are pure by design
+# (docs/SEARCH.md §5, §6): the classifier decides to spend money on somebody's
+# key, the policy decides whether it may, the slot's rule is only ever wrong
+# later, and a prompt's dashes and data markers are invisible on screen.
+# WireTypes rides along for SearchDiagnostics, SubjectText for the marker
+# sanitizer the hits block frames every subject with.
+run_suite search-intent \
+  Sources/Passband/Model/SubjectText.swift \
+  Sources/Passband/Model/WireTypes.swift \
+  Sources/Passband/Lib/Format.swift \
+  Sources/Passband/Lib/AsyncMemo.swift \
+  Sources/Passband/Lib/SearchIntent.swift \
+  Sources/Passband/Lib/DeeperSearch.swift \
+  Sources/Passband/Lib/RefinementSlot.swift \
+  Sources/Passband/Lib/SearchLanePrompt.swift \
+  Tests/SearchIntentTests.swift
+
 # The settings search. A ranking is the one kind of code where a green build
 # says nothing at all: the matcher compiles whatever weights it is given, and
 # only a fixture says whether "dark mode" lands on the theme switch. One file,
@@ -264,3 +283,9 @@ run_suite sealed-event \
 run_suite settings-search \
   Sources/Passband/Lib/SettingsSearch.swift \
   Tests/SettingsSearchTests.swift
+
+# The search field's `from:` operator: when the sender menu is open and what
+# accepting a sender does to the text. Pure string work, Foundation only.
+run_suite from-operator \
+  Sources/Passband/Lib/FromOperator.swift \
+  Tests/FromOperatorTests.swift

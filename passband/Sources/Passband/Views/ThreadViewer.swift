@@ -1214,16 +1214,6 @@ struct ThreadViewer: View {
                 // subject headers; `openComposeForward` resolves the two.
                 store.openComposeForward(message: m, fallbackSubject: thread?.subject ?? "")
             },
-            // `s` = the search `f` used to be, moved rather than dropped: the
-            // sender lookup is worth a key in here, it just is not worth THE
-            // key. The SELECTED message's sender, not the thread's newest: on a
-            // back-and-forth the two differ, and the one you are looking at is
-            // the one you mean. Search opens as the strip beside the reader, so
-            // this does not cost you the email you are reading.
-            KeyBinding("s", "search this sender") {
-                guard let m = messages[safe: index] else { return }
-                store.openSearch(seed: "from:\(m.from_addr)")
-            },
             // THE PAIR: `e`/`d` finish this email and leave, `E`/`D` finish it
             // and open the next one in the queue. One letter, one verb, on every
             // surface — the shifted twin is the SAME verb with the walk attached,

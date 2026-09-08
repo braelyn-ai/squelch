@@ -1,6 +1,8 @@
 //! Migration + init upgrade-path tests.
 
-use super::super::migrate::migrate;
+use super::super::migrate::{
+    canonical_fts_create, migrate, normalize_fts_sql, rebuild_fts_if_stale,
+};
 use super::super::*;
 use super::support::*;
 use crate::types::Sensitivity;
@@ -1198,4 +1200,366 @@ fn the_no_body_sweep_survives_a_messages_table_with_no_body_column() {
         )
         .unwrap();
     assert_eq!(stamp.as_deref(), Some("skip-no-body"));
+}
+
+#[test]
+fn migrate_backfills_the_sender_directory_from_existing_mail_exactly_once() {
+    // An install predating `senders`: schema.sql creates the table empty while
+    // `messages` is full. The migration fills it under every listing's rule
+    // (sent and spam excluded), with each sender's newest name, and does NOT
+    // touch a directory that already has rows.
+    use chrono::TimeZone;
+    let at = |day: u32| Utc.with_ymd_and_hms(2026, 8, day, 12, 0, 0).unwrap();
+    let (store, acct) = store();
+    triaged(acct, "g1", "t")
+        .from("dan@example.com")
+        .from_name(Some("Dan Smith"))
+        .received_at(at(1))
+        .upsert(&store);
+    triaged(acct, "g2", "t")
+        .from("dan@example.com")
+        .from_name(Some("Dan"))
+        .received_at(at(3))
+        .upsert(&store);
+    triaged(acct, "g3", "t")
+        .from("me@example.com")
+        .is_sent(true)
+        .upsert(&store);
+    triaged(acct, "g4", "t")
+        .from("spam@x.example")
+        .is_spam(true)
+        .upsert(&store);
+    {
+        let conn = store.lock().unwrap();
+        // Simulate the pre-table install: the rows ingest wrote never existed.
+        conn.execute("DELETE FROM senders", []).unwrap();
+        migrate(&conn).unwrap();
+        let rows: Vec<(String, Option<String>, i64, String, String)> = conn
+            .prepare(
+                "SELECT addr, display_name, msg_count, first_seen, last_received_at
+                 FROM senders ORDER BY addr",
+            )
+            .unwrap()
+            .query_map([], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+            })
+            .unwrap()
+            .collect::<std::result::Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            rows.len(),
+            1,
+            "sent and spam mail register nobody: {rows:?}"
+        );
+        assert_eq!(rows[0].0, "dan@example.com");
+        assert_eq!(rows[0].1.as_deref(), Some("Dan"), "the newest name wins");
+        assert_eq!(rows[0].2, 2);
+        assert_eq!(rows[0].3, at(1).to_rfc3339());
+        assert_eq!(rows[0].4, at(3).to_rfc3339());
+        // A populated directory is left exactly as it is.
+        conn.execute("UPDATE senders SET msg_count = 99", [])
+            .unwrap();
+        migrate(&conn).unwrap();
+        let count: i64 = conn
+            .query_row("SELECT msg_count FROM senders", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 99, "a second open must not rebuild the directory");
+    }
+    // And the reader sees what the backfill wrote.
+    let hits = store.search_senders(acct, "dan", 8).unwrap();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].last_received_at, at(3));
+}
+
+#[test]
+fn migrate_rebuilds_the_fts_index_with_the_porter_tokenizer() {
+    // An install whose `messages_fts` predates the stemmer. The migration has
+    // to notice from the stored CREATE text, rebuild the table, and refill it
+    // from `messages` — losing a row here would make mail silently unfindable,
+    // which is the one failure a search index can have that nobody reports.
+    let conn = Connection::open_in_memory().unwrap();
+    conn.execute_batch(
+        "CREATE TABLE messages(
+             id INTEGER PRIMARY KEY, account_id INTEGER NOT NULL,
+             gmail_msg_id TEXT NOT NULL, subject TEXT NOT NULL DEFAULT '',
+             body TEXT NOT NULL DEFAULT '');
+         CREATE VIRTUAL TABLE messages_fts USING fts5(subject, body);
+         INSERT INTO messages(id, account_id, gmail_msg_id, subject, body)
+             VALUES (1, 1, 'g1', 'venue details', 'the wifi passwords are on the agenda page'),
+                    (2, 1, 'g2', 'shipping update', 'your parcel shipped this morning');
+         INSERT INTO messages_fts(rowid, subject, body)
+             SELECT id, subject, body FROM messages;",
+    )
+    .unwrap();
+
+    // Before: the exact word only.
+    let matches = |conn: &Connection, q: &str| -> i64 {
+        conn.query_row(
+            "SELECT COUNT(*) FROM messages_fts WHERE messages_fts MATCH ?1",
+            params![q],
+            |r| r.get(0),
+        )
+        .unwrap()
+    };
+    assert_eq!(matches(&conn, "\"password\""), 0, "no stemming yet");
+
+    migrate(&conn).unwrap();
+    migrate(&conn).unwrap(); // idempotent: the second open rebuilds nothing
+
+    let created: String = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE name = 'messages_fts'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(created.contains("porter"), "tokenizer replaced: {created}");
+    assert!(created.contains("prefix"), "prefix index added: {created}");
+
+    assert_eq!(
+        matches(&conn, "\"password\""),
+        1,
+        "singular now finds the plural"
+    );
+    assert_eq!(matches(&conn, "\"shipping\""), 1, "and shipped/shipping");
+    let rows: i64 = conn
+        .query_row("SELECT COUNT(*) FROM messages_fts", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(rows, 2, "every message survived the rebuild");
+
+    // The window still reads back the ORIGINAL text, not a stem: `snippet()`
+    // cuts the stored column, and the stemmer only ever touched the index.
+    let window: String = conn
+        .query_row(
+            "SELECT snippet(messages_fts, 1, '', '', '…', 24)
+             FROM messages_fts WHERE messages_fts MATCH ?1",
+            params!["\"password\""],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(
+        window.contains("passwords"),
+        "snippet returns the sender's own word: {window:?}"
+    );
+}
+
+#[test]
+fn migrate_rebuilds_an_index_that_stems_but_has_no_prefix_index() {
+    // The in-between state: a mailbox opened by a build that had the stemmer
+    // and not the prefix index. Checking only for "porter" would have called
+    // that current and left the as-you-type expansion walking the whole term
+    // list forever, which is the failure mode of a one-marker drift check.
+    let conn = Connection::open_in_memory().unwrap();
+    conn.execute_batch(
+        "CREATE TABLE messages(
+             id INTEGER PRIMARY KEY, account_id INTEGER NOT NULL,
+             gmail_msg_id TEXT NOT NULL, subject TEXT NOT NULL DEFAULT '',
+             body TEXT NOT NULL DEFAULT '');
+         CREATE VIRTUAL TABLE messages_fts USING fts5(
+             subject, body, tokenize = 'porter unicode61');
+         INSERT INTO messages(id, account_id, gmail_msg_id, subject, body)
+             VALUES (1, 1, 'g1', 'venue details', 'the wifi passwords are on the agenda page');
+         INSERT INTO messages_fts(rowid, subject, body)
+             SELECT id, subject, body FROM messages;",
+    )
+    .unwrap();
+
+    migrate(&conn).unwrap();
+    migrate(&conn).unwrap(); // idempotent: the second open rebuilds nothing
+
+    let created: String = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE name = 'messages_fts'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(created.contains("prefix"), "prefix index added: {created}");
+    assert!(created.contains("porter"), "stemmer kept: {created}");
+    let rows: i64 = conn
+        .query_row("SELECT COUNT(*) FROM messages_fts", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(rows, 1, "the message survived the rebuild");
+}
+
+/// The fixture the FTS drift tests share: a `messages` table and whatever
+/// `messages_fts` definition the caller wants to have been created by an older
+/// build, filled from `messages` the way the upsert would have.
+fn fts_fixture(fts_create: &str) -> Connection {
+    let conn = Connection::open_in_memory().unwrap();
+    conn.execute_batch(&format!(
+        "CREATE TABLE messages(
+             id INTEGER PRIMARY KEY, account_id INTEGER NOT NULL,
+             gmail_msg_id TEXT NOT NULL, subject TEXT NOT NULL DEFAULT '',
+             body TEXT NOT NULL DEFAULT '');
+         {fts_create};
+         INSERT INTO messages(id, account_id, gmail_msg_id, subject, body)
+             VALUES (1, 1, 'g1', 'venue details', 'the wifi passwords are on the agenda page');
+         INSERT INTO messages_fts(rowid, subject, body)
+             SELECT id, subject, body FROM messages;"
+    ))
+    .unwrap();
+    conn
+}
+
+fn stored_fts_sql(conn: &Connection) -> String {
+    conn.query_row(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'messages_fts'",
+        [],
+        |r| r.get(0),
+    )
+    .unwrap()
+}
+
+fn fts_rows(conn: &Connection) -> i64 {
+    conn.query_row("SELECT COUNT(*) FROM messages_fts", [], |r| r.get(0))
+        .unwrap()
+}
+
+#[test]
+fn an_fts_definition_that_differs_at_all_is_rebuilt() {
+    // Not "does it say porter" — ANY difference from `schema.sql`'s own line.
+    // A marker list only notices the options somebody remembered to list, so
+    // the next edit to that line (the prefix index was one) would have shipped
+    // silently unmigrated: a mailbox searching an index that does not match its
+    // own schema, with nothing on the outside to say so.
+    //
+    // This definition differs in every way at once: no stemmer, no prefix
+    // index, columns the other way round.
+    let conn = fts_fixture("CREATE VIRTUAL TABLE messages_fts USING fts5(body, subject)");
+
+    migrate(&conn).unwrap();
+
+    assert_eq!(
+        normalize_fts_sql(&stored_fts_sql(&conn)),
+        normalize_fts_sql(canonical_fts_create().expect("schema.sql carries the definition")),
+        "the rebuilt index is the schema's own definition, exactly"
+    );
+    assert_eq!(fts_rows(&conn), 1, "the message survived the rebuild");
+}
+
+#[test]
+fn the_schemas_own_definition_is_never_rebuilt() {
+    // The other half of the same claim, and the one that keeps this cheap: a
+    // mailbox created by a current build must open without a full reindex. The
+    // proof is a row in `messages` that no FTS row was ever written for — a
+    // rebuild refills from `messages`, so it would pick that row up.
+    let canonical = canonical_fts_create().expect("schema.sql carries the definition");
+    let conn = fts_fixture(canonical);
+    conn.execute_batch(
+        "DELETE FROM messages_fts;
+         INSERT INTO messages(id, account_id, gmail_msg_id, subject, body)
+             VALUES (2, 1, 'g2', 'shipping update', 'your parcel shipped this morning');",
+    )
+    .unwrap();
+
+    // What SQLite stored when it created the canonical statement differs from
+    // the statement itself only in the ways `normalize_fts_sql` folds away
+    // (`IF NOT EXISTS`, the terminator, whitespace). If that ever stopped being
+    // true, every open would rebuild the whole index.
+    assert_eq!(
+        normalize_fts_sql(&stored_fts_sql(&conn)),
+        normalize_fts_sql(canonical),
+    );
+
+    migrate(&conn).unwrap();
+    migrate(&conn).unwrap();
+    assert_eq!(fts_rows(&conn), 0, "nothing was refilled, so nothing ran");
+}
+
+#[test]
+fn two_opens_in_a_row_rebuild_the_index_once() {
+    // Idempotence, measured rather than assumed. The first open rebuilds; the
+    // second compares the definition it just wrote against the schema's, finds
+    // them equal, and does nothing. A row added to `messages` alone between the
+    // two is the tell: only a second rebuild could put it in the index.
+    let conn = fts_fixture("CREATE VIRTUAL TABLE messages_fts USING fts5(subject, body)");
+
+    migrate(&conn).unwrap();
+    assert_eq!(fts_rows(&conn), 1, "the first open rebuilds");
+    assert_eq!(
+        normalize_fts_sql(&stored_fts_sql(&conn)),
+        normalize_fts_sql(canonical_fts_create().unwrap()),
+    );
+
+    conn.execute_batch(
+        "INSERT INTO messages(id, account_id, gmail_msg_id, subject, body)
+             VALUES (2, 1, 'g2', 'shipping update', 'your parcel shipped this morning');",
+    )
+    .unwrap();
+    migrate(&conn).unwrap();
+    assert_eq!(
+        fts_rows(&conn),
+        1,
+        "the second open rebuilt nothing, so the un-indexed row stayed out"
+    );
+}
+
+#[test]
+fn a_rebuild_that_cannot_run_leaves_the_old_index_serving() {
+    // Two processes really do open one mailbox here (`squelchd token issue`
+    // runs while `serve` holds the file). A rebuild that loses that race must
+    // not take the whole open down with it: the old index still finds mail,
+    // just unstemmed, and the next open tries again. A second connection holds
+    // a write lock to stand in for the busy daemon.
+    //
+    // The rebuild is called directly rather than through `migrate`, because
+    // under an exclusive lock EVERY write in the chain fails and the assertion
+    // would stop being about this one.
+    let dir = std::env::temp_dir().join(format!("squelch-fts-busy-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("busy.db");
+    // A leftover file from a previous run would test the wrong thing.
+    let _ = std::fs::remove_file(&path);
+    let conn = Connection::open(&path).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE messages(
+             id INTEGER PRIMARY KEY, account_id INTEGER NOT NULL,
+             gmail_msg_id TEXT NOT NULL, subject TEXT NOT NULL DEFAULT '',
+             body TEXT NOT NULL DEFAULT '');
+         CREATE VIRTUAL TABLE messages_fts USING fts5(subject, body);
+         INSERT INTO messages(id, account_id, gmail_msg_id, subject, body)
+             VALUES (1, 1, 'g1', 'venue details', 'the wifi passwords are here');
+         INSERT INTO messages_fts(rowid, subject, body)
+             SELECT id, subject, body FROM messages;",
+    )
+    .unwrap();
+
+    let blocker = Connection::open(&path).unwrap();
+    blocker
+        .busy_timeout(std::time::Duration::from_millis(1))
+        .unwrap();
+    // RESERVED, not EXCLUSIVE: a writer is blocked and a reader is not, which
+    // is what one daemon mid-write actually looks like to a second handle.
+    blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+    conn.busy_timeout(std::time::Duration::from_millis(1))
+        .unwrap();
+
+    rebuild_fts_if_stale(&conn).expect("a busy sibling is not a failed migration");
+
+    // Still the old definition, still holding every row: nothing was dropped.
+    let created: String = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE name = 'messages_fts'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(!created.contains("porter"), "not rebuilt: {created}");
+    let rows: i64 = conn
+        .query_row("SELECT COUNT(*) FROM messages_fts", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(rows, 1, "the index the reader still searches is intact");
+
+    // And the next open, once the sibling has let go, does the work.
+    blocker.execute_batch("ROLLBACK").unwrap();
+    rebuild_fts_if_stale(&conn).unwrap();
+    let created: String = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE name = 'messages_fts'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(created.contains("porter"), "rebuilt on retry: {created}");
 }

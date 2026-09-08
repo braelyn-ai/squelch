@@ -23,6 +23,10 @@ Spam you can see, charts you can enjoy, and login codes that arrive on time.
 - Fun usage page
 - The greeting knows your name
 - Auth mail arrival is instant. Get 2FA codes without waiting for an LLM to see it
+- Deeper search. When a query reads like a question, or no email has all of its words, the agent starts looking alongside the results: it searches with other words, reads the likely threads, and answers with the emails and one line saying where the answer is. Keep typing and it refines instead of starting over; close the panel and it waits for you. Automatic, on request, or off in Settings.
+- Typing from: in the search field offers the people who write to you, most frequent first. Pick one and the operator is filled in.
+- Search results say why they matched, and a hit found by meaning shows the sentence with your word in it rather than the top of the message.
+- The s key no longer searches a sender from the reader; f does, from the list.
 
 ### iPhone
 
@@ -49,6 +53,11 @@ Spam you can see, charts you can enjoy, and login codes that arrive on time.
 - Newsletters don't show in FYE just because you emailed support once
 - Support for usage page
 - Various bug fixes
+- A search whose words are not all in one email finds the best partial matches instead of nothing. Exact matches still come first.
+- Word forms match each other: password finds passwords, shipped finds shipping. Typing the start of a word finds it as you go.
+- A word in the subject counts more than the same word in the body.
+- Quoted phrases search for the words side by side.
+- Search over a big mailbox no longer stalls the daemon while it counts.
 
 ## 0.0.6 (2026-08-27)
 

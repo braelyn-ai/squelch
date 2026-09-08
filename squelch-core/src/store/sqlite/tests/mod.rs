@@ -12,6 +12,7 @@ mod migrate;
 mod notify;
 mod rules;
 mod search;
+mod senders;
 mod spam;
 mod specialists;
 mod support;

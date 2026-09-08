@@ -21,6 +21,7 @@ mod migrate;
 mod notify;
 mod rules;
 mod search;
+mod senders;
 mod specialists;
 #[cfg(test)]
 mod tests;
@@ -40,13 +41,14 @@ use crate::error::{CoreError, Result};
 use crate::metrics::{NotifyDecision, NotifyLane};
 use crate::store::{
     AttachmentBytes, BankingApplied, ContactEntry, Device, DeviceToken, Draft, DraftFields,
-    ExtractQueued, InboxUnread, IssuedDeviceToken, MailActivityDay, MarketingApplied,
-    MarketingOffer, MessageOpen, MessageUnsub, MintedPairingCode, MissingVector, NewAuditEntry,
-    NewEvent, NewNotifyDecision, NotifyDecisionRow, RevisitQueued, SPAM_SYNCED_AT_KEY, SealedBody,
-    SealedMessage, SearchFilter, SearchSort, SeedVerdict, SenderHistory, SentMessage,
-    SentMissingRecipients, SitrepBand, SpamScope, Stage1Applied, Stage1Queued, Stage2Applied,
-    Stage2CapOverrides, Stage2Queued, Stage2Usage, Stage2UsageDay, Store, SyncState, ThreadSibling,
-    TrackedMessage, TriageDebug, TriagedMessage, UsageTokens,
+    ExtractQueued, FtsQuery, InboxUnread, IssuedDeviceToken, LeggedHit, MailActivityDay,
+    MarketingApplied, MarketingOffer, MessageOpen, MessageUnsub, MintedPairingCode, MissingVector,
+    NewAuditEntry, NewEvent, NewNotifyDecision, NotifyDecisionRow, RevisitQueued,
+    SPAM_SYNCED_AT_KEY, SealedBody, SealedMessage, SearchDiagnostics, SearchFilter, SearchSort,
+    SeedVerdict, SenderEntry, SenderHistory, SentMessage, SentMissingRecipients, SitrepBand,
+    SpamScope, Stage1Applied, Stage1Queued, Stage2Applied, Stage2CapOverrides, Stage2Queued,
+    Stage2Usage, Stage2UsageDay, Store, SyncState, TermDf, ThreadSibling, TrackedMessage,
+    TriageDebug, TriagedMessage, UsageTokens,
 };
 use crate::types::{
     AccountId, AttachmentInfo, AttentionStatus, AttentionUpdate, AuditEntry, BandCounts, Banking,
@@ -799,6 +801,15 @@ impl Store for SqliteStore {
         self.merge_harvested_contacts(account_id, batch)
     }
 
+    fn search_senders(
+        &self,
+        account_id: AccountId,
+        q: &str,
+        limit: u32,
+    ) -> Result<Vec<SenderEntry>> {
+        self.search_senders(account_id, q, limit)
+    }
+
     fn sync_state(&self, account_id: AccountId, mailbox: &str) -> Result<Option<SyncState>> {
         self.sync_state(account_id, mailbox)
     }
@@ -834,16 +845,18 @@ impl Store for SqliteStore {
         self.search(account_id, query, limit, offset)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn search_filtered(
         &self,
         account_id: AccountId,
         text: &str,
         filter: &SearchFilter,
         sort: SearchSort,
+        partial: bool,
         limit: u32,
         offset: u32,
     ) -> Result<Vec<SearchHit>> {
-        self.search_filtered(account_id, text, filter, sort, limit, offset)
+        self.search_filtered(account_id, text, filter, sort, partial, limit, offset)
     }
 
     fn attention_updates(
