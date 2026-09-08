@@ -218,7 +218,7 @@ struct TourOverlay: View {
         guard let stats = store.sitrep.stats, stats.total > 0 else { return nil }
         let noise = stats.tier_counts["noise"] ?? 0
         let standing = store.sitrep.standing.count
-        let today = SitrepView.needTodayCount(store.sitrep.standing)
+        let today = NeedToday.count(store.sitrep.standing)
         let first = stats.inbox_unread.map { ($0.messages, "unread") } ?? (stats.total, "triaged")
         let line =
             today > 0

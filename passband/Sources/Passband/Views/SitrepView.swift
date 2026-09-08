@@ -292,17 +292,10 @@ struct SitrepView: View {
     }
 
     /// Obligations that are overdue or due by end of today — the "need you" set.
-    private var needNow: Int { Self.needTodayCount(store.sitrep.standing) }
-
-
-    static func needTodayCount(_ items: [AttentionUpdate], now: Date = Date()) -> Int {
-        let endOfDay = Calendar.current.date(
-            bySettingHour: 23, minute: 59, second: 59, of: now) ?? now
-        return items.filter { u in
-            guard let t = Fmt.date(u.deadline) else { return false }
-            return t <= endOfDay
-        }.count
-    }
+    /// The count itself lives in `Lib/NeedToday.swift`: the app icon's badge says
+    /// this same number, and the badge is read without the sentence beside it
+    /// that would correct a disagreement.
+    private var needNow: Int { NeedToday.count(store.sitrep.standing) }
 
     // MARK: - (a) for your eyes
 
@@ -690,7 +683,7 @@ private struct DashHero: View {
     }
 
     private var title: String {
-        let today = SitrepView.needTodayCount(standing)
+        let today = NeedToday.count(standing)
         let total = standing.count
         if today > 0 {
             return "\(Self.spell(today)) item\(today == 1 ? "" : "s") "

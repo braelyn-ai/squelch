@@ -197,7 +197,7 @@ struct MobileSitrepView: View {
     }
 
     private var headline: String {
-        let today = SitrepView.needTodayCount(store.sitrep.standing)
+        let today = NeedToday.count(store.sitrep.standing)
         let total = store.sitrep.standing.count
         if today > 0 {
             return "\(Self.spell(today)) item\(today == 1 ? "" : "s") "

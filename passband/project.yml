@@ -229,6 +229,11 @@ targets:
       # which imports SwiftUI and could never be on this list.
       - path: Sources/Passband/Lib/AuthLabels.swift
       - path: Sources/Passband/Lib/Format.swift
+      # The due-today count, shared with the app so the icon's badge and the
+      # sitrep's headline can never be two different numbers. Foundation-only
+      # for exactly this reason — it used to be a static on SitrepView, which no
+      # list this target can hold could ever load.
+      - path: Sources/Passband/Lib/NeedToday.swift
       - path: Sources/Passband/Lib/AsyncMemo.swift
       - path: Sources/Passband/Lib/Sessions.swift
     settings:
