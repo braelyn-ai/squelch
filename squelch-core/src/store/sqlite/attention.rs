@@ -64,11 +64,12 @@ const WITHIN_WINDOW: &str = "(m.received_at >= ?2
 ///
 /// STANDING IS A PROPERTY, NOT A TIMESTAMP: the band is mail owed the user's
 /// attention — a dated obligation (`past_due`/`deadline`), a fired reminder, or
-/// live correspondence: a thread the user has written in, or a sender the user
-/// has written to. A dateless "can you send me the form?" from a real
-/// correspondent is exactly as owed as a bill, and the surfacing clock must
-/// never rotate it out. Because this is a definition over stored rows, widening
-/// it is retroactive: mail already triaged joins the band on the next read.
+/// live correspondence: a thread the user has written in, or non-marketing mail
+/// from a sender the user has written to. A dateless "can you send me the form?"
+/// from a real correspondent is exactly as owed as a bill, and the surfacing
+/// clock must never rotate it out. Because this is a definition over stored
+/// rows, both widening it and narrowing it are RETROACTIVE: mail already triaged
+/// joins or leaves the band on the next read, with no re-triage and no backfill.
 ///
 /// THE REMINDER ARM (`reminded_at IS NOT NULL`) carries no tier test on purpose.
 /// Every other arm infers what the user cares about; this one is the user saying
@@ -82,6 +83,34 @@ const WITHIN_WINDOW: &str = "(m.received_at >= ?2
 /// and it is outside this expression), and it never surfaces the user's own
 /// sent mail — the sent sibling is evidence, and `m.is_sent = 0` keeps it out
 /// of every listing.
+///
+/// THE HAVING-WRITTEN-TO-THEM ARM IS NOT A MARKETING PASS. It is the weakest
+/// arm by construction — one email, ever, to an address — and it carries no
+/// tier or importance floor, so on its own it hands a permanent standing-band
+/// seat to every shop whose `info@` the user once asked about an order. That is
+/// the arm working as designed for a person and backwards for a mailing list:
+/// the guarantee exists to rescue BELOW-THRESHOLD mail from someone the user
+/// actually corresponds with, and a promotional blast is not that mail however
+/// it arrived. So the arm alone is gated on `category != 'marketing'`.
+///
+/// The gate is the CLASSIFIER'S verdict and deliberately not the
+/// `List-Unsubscribe` header, which reads like a newsletter marker and is not
+/// one: on a real mailbox it is carried by rental check-ins, eBay delivery
+/// updates, support-ticket receipts and a friend's WeTransfer link. Suppressing
+/// on the header would take out exactly the below-threshold transactional mail
+/// this arm exists to keep. A newsletter the classifier labels `general` stays
+/// in the band, and the fix for that is the classifier, not a second heuristic
+/// here.
+///
+/// `COALESCE(..., '')` because the comparison is three-valued: `category` is
+/// NULL on every row triage never reached and on rows older than the column,
+/// and a bare `!=` against NULL is NULL, which is not TRUE, which would drop
+/// those rows out of the band — the opposite of the intent.
+///
+/// The other three arms are ungated on purpose. A dated obligation, a reminder
+/// the user set themselves, and a thread the user has WRITTEN IN are each a
+/// stronger claim than the category is: mail the user replied to is a
+/// conversation they joined, whatever it was classified as on arrival.
 ///
 /// Address matching folds case on BOTH sides: `messages.from_addr` is stored as
 /// the header spelled it, and `contacts.addr` is lowercased by the Sent-history
@@ -97,11 +126,11 @@ pub(super) const STANDING_BAND: &str = "(t.tier IN ('past_due','deadline')
                 WHERE s.account_id = m.account_id
                   AND s.thread_id = m.thread_id
                   AND s.is_sent = 1))
-        OR EXISTS(
+        OR (COALESCE(t.category, '') != 'marketing' AND EXISTS(
                 SELECT 1 FROM contacts c
                 WHERE c.account_id = t.account_id
                   AND c.addr = lower(trim(m.from_addr)) COLLATE NOCASE
-                  AND c.sent_count > 0))
+                  AND c.sent_count > 0)))
        AND t.status != 'done'";
 
 impl SqliteStore {
@@ -167,6 +196,20 @@ impl SqliteStore {
         // importance 0 and no reminder, so every band but `new` would be empty
         // anyway, and `new` would be the same list under a name that promises
         // the user something needs doing about it.
+        //
+        // THE STANDING BAND ENFORCES THAT rather than trusting it. `band` and
+        // `spam` arrive as independent query parameters, so nothing upstream
+        // stops `?band=standing&spam=only` — a request for the mail owed the
+        // user's attention, restricted to the mail the provider called junk.
+        // That is a contradiction in terms, and the band is the one listing
+        // where the answer must never be "here is your spam": overriding is
+        // right where a 400 would be pedantry about an impossible question.
+        // The other bands keep the caller's scope; only this one is absolute.
+        let spam = if band == Some(SitrepBand::Standing) {
+            SpamScope::Exclude
+        } else {
+            spam
+        };
         let spam_sql = spam.predicate();
         let mut where_sql = format!(
             "WHERE t.account_id = ?1
