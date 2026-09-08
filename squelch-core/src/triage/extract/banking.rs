@@ -706,7 +706,7 @@ mod tests {
             "\u{00A0}", "&", "(", ")",
         ];
         // Deterministic LCG: a reproducible corpus, no dev-dependency.
-        let mut seed = 0x2026_09_01_u64;
+        let mut seed = 0x2026_0901_u64;
         let mut next = move || {
             seed = seed
                 .wrapping_mul(6364136223846793005)
