@@ -12,6 +12,44 @@ updates itself, the phone comes through TestFlight, and the daemon is
 rolled onto hosted accounts or pulled as an image on a self-host box,
 so every note says which one it landed in.
 
+## 0.0.7 (2026-09-08)
+
+Spam you can see, charts you can enjoy, and login codes that arrive on time.
+
+### Mac
+
+- View gmail spam - now you can see your gmail spam tab directly. gmail categorizes this, not Passband
+- Better spoof sender protection
+- Fun usage page
+- The greeting knows your name
+- Auth mail arrival is instant. Get 2FA codes without waiting for an LLM to see it
+
+### iPhone
+
+- New email button in the top right
+- Auth page button moved to quick look
+- A live login code shows at the top of sitrep
+- The composer has been redesigned for better ios usage
+- The tracking-pixel switch is desktop only. The account default still decides and review still names a tracked send.
+- Push banners for auth mail happen right away
+- Small UX improvements
+- All mac improvements above
+
+### Daemon
+
+- Notifications arrive when the mail does
+- A fast lane decides buzz or no-buzz at ingest on Haiku 4.5. The deliberate lane still owns the rest of triage.
+- Sealed mail gets a body-free notification path, kind-derived phrase only. Ships off by default.
+- A re-ingest can no longer undo a seal you set by hand.
+- Provider spam exists locally now and is structurally excluded from every Passband triage feature
+- Empty bodies are no longer stored when a sender's plain-text part is blank beside a full HTML part. This leads to better triage
+- Extractors refuse an empty body instead of guessing an amount from the subject, with their own skip stamp.
+- Receipt totals parse the whole number and round it
+- Better deterministic 2FA detection
+- Newsletters don't show in FYE just because you emailed support once
+- Support for usage page
+- Various bug fixes
+
 ## 0.0.6 (2026-08-27)
 
 Move through emails faster, better search, and notifications to your phone.
