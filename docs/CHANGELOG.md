@@ -14,7 +14,7 @@ so every note says which one it landed in.
 
 ## 0.0.7 (2026-09-08)
 
-Spam you can see, charts you can enjoy, and login codes that arrive on time.
+Deeper search, gmail spam, and 2FA codes the moment they land.
 
 ### Mac
 
@@ -23,10 +23,15 @@ Spam you can see, charts you can enjoy, and login codes that arrive on time.
 - Fun usage page
 - The greeting knows your name
 - Auth mail arrival is instant. Get 2FA codes without waiting for an LLM to see it
-- Deeper search. When a query reads like a question, or no email has all of its words, the agent starts looking alongside the results: it searches with other words, reads the likely threads, and answers with the emails and one line saying where the answer is. Keep typing and it refines instead of starting over; close the panel and it waits for you. Automatic, on request, or off in Settings.
-- Typing from: in the search field offers the people who write to you, most frequent first. Pick one and the operator is filled in.
-- Search results say why they matched, and a hit found by meaning shows the sentence with your word in it rather than the top of the message.
-- The s key no longer searches a sender from the reader; f does, from the list.
+- The dock icon shows how many things are due today
+- Rules are grouped by what they do, then by domain
+- Groups no longer report a delivery shortfall on individual sends
+- Page headers have a subtitle
+- Rules, audit and groups pages fill the window again
+- Deeper search. When keywords aren't enough, the agent searches alongside the results and points at the answer. Automatic, on request, or off in Settings
+- Type from: in search to pick from the people who write to you
+- Search results say why they matched
+- Search-this-sender moved from s in the reader to f in the list
 
 ### iPhone
 
@@ -36,6 +41,7 @@ Spam you can see, charts you can enjoy, and login codes that arrive on time.
 - The composer has been redesigned for better ios usage
 - The tracking-pixel switch is desktop only. The account default still decides and review still names a tracked send.
 - Push banners for auth mail happen right away
+- The app icon shows how many things are due today. Turn on Badges in Settings if you don't see it
 - Small UX improvements
 - All mac improvements above
 
@@ -52,12 +58,16 @@ Spam you can see, charts you can enjoy, and login codes that arrive on time.
 - Better deterministic 2FA detection
 - Newsletters don't show in FYE just because you emailed support once
 - Support for usage page
+- Bills get the same total parsing fix as receipts
+- Long bank names are no longer dropped
+- Messages skipped for an empty body get extracted once the body arrives
+- Sealing a message removes its receipt
+- Search finds the best partial match instead of nothing. Exact matches still win
+- Search matches word forms. password finds passwords
+- Subject words count more than body words in search
+- Quoted phrases search for the exact phrase
+- Search no longer stalls the daemon on a big mailbox
 - Various bug fixes
-- A search whose words are not all in one email finds the best partial matches instead of nothing. Exact matches still come first.
-- Word forms match each other: password finds passwords, shipped finds shipping. Typing the start of a word finds it as you go.
-- A word in the subject counts more than the same word in the body.
-- Quoted phrases search for the words side by side.
-- Search over a big mailbox no longer stalls the daemon while it counts.
 
 ## 0.0.6 (2026-08-27)
 
