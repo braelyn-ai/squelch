@@ -64,6 +64,45 @@ const SNIPPET_MARK: char = '\u{1}';
 /// term on every keystroke of an as-you-type search.
 pub const DIAGNOSTIC_COUNT_CAP: u32 = 1_000;
 
+// THE FTS TABLE DRIVES EVERY JOIN. Each query on this leg reads
+// `FROM messages_fts f CROSS JOIN messages m ON m.id = f.rowid`, and the CROSS
+// is load-bearing: it forbids the planner from reordering the pair. Left to
+// itself, the planner sees `WHERE m.account_id = ?`, picks `idx_messages_from`
+// as the OUTER loop and drives the MATCH as the inner one, which re-evaluates
+// the FTS query once per candidate message instead of once. Measured on a copy
+// of a 1,700-message mailbox: a single-term count 17 ms, a four-term OR count
+// 62 ms, the strict/any seam count 97 ms, and with `partial=1` (the shape the
+// panel sends on every debounced keystroke) 169-201 ms, all CPU, all under the
+// store mutex. Pinned, every one of them returns the same rows in 0-1 ms.
+// `the_fts_table_drives_every_join` in tests/search.rs holds the line.
+
+/// The SQL behind [`SqliteStore::fts_count`]: params are `?1` account, `?2` the
+/// MATCH expression, `?3` the cap. A free function so a test can `EXPLAIN` the
+/// exact statement the store runs.
+pub(super) fn fts_count_sql(include_sent: bool) -> String {
+    let sent = if include_sent {
+        ""
+    } else {
+        " AND m.is_sent = 0"
+    };
+    // The LIMIT sits INSIDE the counted subquery, which is what stops the
+    // scan; a LIMIT on the COUNT itself would only limit the one row it
+    // returns, after the whole doclist had been walked.
+    format!(
+        "SELECT COUNT(*) FROM (
+             SELECT 1
+             FROM messages_fts f
+             CROSS JOIN messages m ON m.id = f.rowid
+             LEFT JOIN triage t ON t.message_id = m.id
+             WHERE m.account_id = ?1
+               AND COALESCE(t.sensitivity, 'normal') != 'sealed'
+               AND m.is_spam = 0{sent}
+               AND messages_fts MATCH ?2
+             LIMIT ?3
+         )"
+    )
+}
+
 /// A `BODY_WINDOW_PROBED` value is a real match window only if the marker is
 /// present — otherwise the terms hit the subject (or nothing) and the caller
 /// should keep the stored snippet.
@@ -484,7 +523,7 @@ impl SqliteStore {
         let sql = format!(
             "SELECT {BODY_WINDOW}
              FROM messages_fts f
-             JOIN messages m ON m.id = f.rowid
+             CROSS JOIN messages m ON m.id = f.rowid
              LEFT JOIN triage t ON t.message_id = m.id
              WHERE f.rowid = ?1
                AND m.account_id = ?2
@@ -612,7 +651,7 @@ impl SqliteStore {
         let mut sql = String::from(
             "SELECT m.id, m.received_at
              FROM messages_fts f
-             JOIN messages m ON m.id = f.rowid
+             CROSS JOIN messages m ON m.id = f.rowid
              LEFT JOIN triage t ON t.message_id = m.id
              WHERE m.account_id = ?
                AND COALESCE(t.sensitivity, 'normal') != 'sealed'
@@ -743,7 +782,7 @@ impl SqliteStore {
             "SELECT m.id, m.thread_id, m.from_addr, m.from_name, m.subject,
                     m.received_at, m.snippet, {BODY_WINDOW_PROBED}
              FROM messages_fts f
-             JOIN messages m ON m.id = f.rowid
+             CROSS JOIN messages m ON m.id = f.rowid
              LEFT JOIN triage t ON t.message_id = m.id
              WHERE m.account_id = ?
                AND COALESCE(t.sensitivity, 'normal') != 'sealed'
@@ -829,7 +868,7 @@ impl SqliteStore {
         let mut sql = String::from(
             "SELECT COUNT(*)
              FROM messages_fts f
-             JOIN messages m ON m.id = f.rowid
+             CROSS JOIN messages m ON m.id = f.rowid
              LEFT JOIN triage t ON t.message_id = m.id
              WHERE m.account_id = ?
                AND COALESCE(t.sensitivity, 'normal') != 'sealed'
@@ -1117,27 +1156,7 @@ impl SqliteStore {
         expr: &str,
         include_sent: bool,
     ) -> Result<u32> {
-        let sent = if include_sent {
-            ""
-        } else {
-            " AND m.is_sent = 0"
-        };
-        // The LIMIT sits INSIDE the counted subquery, which is what stops the
-        // scan; a LIMIT on the COUNT itself would only limit the one row it
-        // returns, after the whole doclist had been walked.
-        let sql = format!(
-            "SELECT COUNT(*) FROM (
-                 SELECT 1
-                 FROM messages_fts f
-                 JOIN messages m ON m.id = f.rowid
-                 LEFT JOIN triage t ON t.message_id = m.id
-                 WHERE m.account_id = ?1
-                   AND COALESCE(t.sensitivity, 'normal') != 'sealed'
-                   AND m.is_spam = 0{sent}
-                   AND messages_fts MATCH ?2
-                 LIMIT ?3
-             )"
-        );
+        let sql = fts_count_sql(include_sent);
         // Same reading as every other MATCH on this leg.
         let n: i64 = conn
             .query_row(

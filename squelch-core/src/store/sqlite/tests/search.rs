@@ -2,7 +2,7 @@
 
 use super::super::*;
 use super::support::*;
-use crate::store::sqlite::search::DIAGNOSTIC_COUNT_CAP;
+use crate::store::sqlite::search::{DIAGNOSTIC_COUNT_CAP, fts_count_sql};
 use crate::store::{SearchFilter, SearchSort, parse_search_query};
 use crate::types::{SealedKind, Tier};
 use chrono::Duration;
@@ -1916,5 +1916,72 @@ fn a_caller_that_drops_the_snippet_can_decline_the_window() {
     assert_eq!(
         bare[0].hit.id, windowed[0].hit.id,
         "the same search either way"
+    );
+}
+
+/// THE PLANNER MUST NOT REORDER THE FTS JOIN (see the note beside
+/// `DIAGNOSTIC_COUNT_CAP`). Two guards, because the failure is silent: the
+/// query still returns the right rows, only 200 times slower, and only on a
+/// mailbox big enough that nobody runs the tests against it.
+///
+/// The first asks SQLite for the plan of the exact count statement the store
+/// runs and requires the virtual table to be the OUTER loop. The second reads
+/// this module's own source and requires every `FROM messages_fts f` to be
+/// followed by a `CROSS JOIN`: the plan check covers one statement, the source
+/// check covers the next one somebody adds.
+#[test]
+fn the_fts_table_drives_every_join() {
+    let (store, acct) = store();
+    triaged(acct, "g1", "t")
+        .subject("wifi")
+        .body("the password is on the agenda page")
+        .upsert(&store);
+    for include_sent in [false, true] {
+        let conn = store.lock().unwrap();
+        let mut stmt = conn
+            .prepare(&format!(
+                "EXPLAIN QUERY PLAN {}",
+                fts_count_sql(include_sent)
+            ))
+            .unwrap();
+        let plan: Vec<String> = stmt
+            .query_map(rusqlite::params![acct, "\"wifi\"", 1000], |r| {
+                r.get::<_, String>(3)
+            })
+            .unwrap()
+            .collect::<std::result::Result<_, _>>()
+            .unwrap();
+        let fts = plan
+            .iter()
+            .position(|d| d.contains("VIRTUAL TABLE"))
+            .unwrap_or_else(|| panic!("no FTS step in the plan: {plan:?}"));
+        let messages = plan
+            .iter()
+            .position(|d| d.contains(" m ") || d.ends_with(" m") || d.contains("messages"))
+            .unwrap_or_else(|| panic!("no messages step in the plan: {plan:?}"));
+        assert!(
+            fts < messages,
+            "the FTS scan must be the outer loop (include_sent={include_sent}): {plan:?}"
+        );
+    }
+
+    let source = include_str!("../search.rs");
+    let mut unpinned = Vec::new();
+    let lines: Vec<&str> = source.lines().collect();
+    for (i, line) in lines.iter().enumerate() {
+        if line.trim_end().ends_with("FROM messages_fts f") {
+            let next = lines.get(i + 1).map(|l| l.trim_start()).unwrap_or("");
+            if !next.starts_with("CROSS JOIN messages m") {
+                unpinned.push(format!("search.rs:{}: {next}", i + 2));
+            }
+        }
+    }
+    assert!(
+        unpinned.is_empty(),
+        "every FTS join must be a CROSS JOIN with the FTS table outer: {unpinned:?}"
+    );
+    assert!(
+        source.matches("FROM messages_fts f").count() >= 5,
+        "the source guard found fewer FTS joins than this file has; was the pattern renamed?"
     );
 }
