@@ -885,6 +885,43 @@ impl SqliteStore {
         limit: u32,
         offset: u32,
     ) -> Result<Vec<SearchHit>> {
+        Ok(self
+            .search_filtered_counted(account_id, text, filter, sort, partial, limit, offset)?
+            .0)
+    }
+
+    /// [`search_filtered`](Self::search_filtered) plus THE STRICT COUNT IT
+    /// ALREADY TOOK, for a caller that would otherwise take it again.
+    ///
+    /// The seam between the strict page and the any-only one is a `COUNT(*)`
+    /// over the strict expression (see [`keyword_total`](Self::keyword_total)),
+    /// and the diagnostics beside the page report that same number as
+    /// `strict_hits`. Counting it twice per request is one full doclist walk
+    /// more than the question needs, under the store mutex that sync, triage
+    /// and notify also queue on.
+    ///
+    /// `None` when no count was taken, which is not the same as zero: a
+    /// one-term query needs no seam (strict and any are the same expression)
+    /// and a filter-only listing runs no MATCH at all.
+    ///
+    /// THE COUNT IS NOT UNIVERSALLY REUSABLE, and the caller owns that. It
+    /// carries this query's operator predicates, so it answers the diagnostics'
+    /// question ("how many messages match every term") only when there are no
+    /// operators; with a `from:` or a date bound the two are different
+    /// questions and both deserve their own count. It also excludes the
+    /// reader's own sent mail, exactly as keyword mode's hits do, so it is the
+    /// keyword leg's number and not the recall legs'.
+    #[allow(clippy::too_many_arguments)] // the query, the operators, the order, the page
+    pub fn search_filtered_counted(
+        &self,
+        account_id: AccountId,
+        text: &str,
+        filter: &SearchFilter,
+        sort: SearchSort,
+        partial: bool,
+        limit: u32,
+        offset: u32,
+    ) -> Result<(Vec<SearchHit>, Option<u32>)> {
         let fts = FtsQuery::build(text, partial);
         if fts.is_empty() {
             // No text AND no filter is not a search — it is "page me the whole
@@ -898,9 +935,12 @@ impl SqliteStore {
                 if text.trim().is_empty() {
                     return Err(CoreError::InvalidInput("empty search query".into()));
                 }
-                return Ok(Vec::new());
+                return Ok((Vec::new(), None));
             }
-            return self.filter_only_listing(account_id, filter, limit, offset);
+            // No MATCH ran, so there is no strict set and nothing to report a
+            // count of.
+            let hits = self.filter_only_listing(account_id, filter, limit, offset)?;
+            return Ok((hits, None));
         }
         let conn = self.lock()?;
         // ONE TERM means strict and any are the same expression, so there is no
@@ -909,7 +949,7 @@ impl SqliteStore {
         // an identical MATCH would correctly return nothing, and paying for two
         // more FTS scans to learn that is silly.
         if fts.terms.len() == 1 {
-            return self.keyword_page(
+            let hits = self.keyword_page(
                 &conn,
                 account_id,
                 &fts.strict,
@@ -918,7 +958,8 @@ impl SqliteStore {
                 sort,
                 limit,
                 offset,
-            );
+            )?;
+            return Ok((hits, None));
         }
         let strict_total = self.keyword_total(&conn, account_id, &fts.strict, filter)?;
         let mut out = Vec::new();
@@ -953,7 +994,7 @@ impl SqliteStore {
             )?;
             out.extend(rest);
         }
-        Ok(out)
+        Ok((out, Some(strict_total)))
     }
 
     /// WHAT RETRIEVAL MADE OF THE READER'S WORDS: how many messages match every
@@ -984,6 +1025,36 @@ impl SqliteStore {
         partial: bool,
         include_sent: bool,
     ) -> Result<SearchDiagnostics> {
+        self.search_diagnostics_with(account_id, text, partial, include_sent, None)
+    }
+
+    /// [`search_diagnostics`](Self::search_diagnostics), told a strict count
+    /// the caller has ALREADY TAKEN.
+    ///
+    /// The keyword page counts its own strict set to place the seam between the
+    /// two passes ([`search_filtered_counted`](Self::search_filtered_counted)),
+    /// and that is the same number `strict_hits` reports. Handing it over turns
+    /// two doclist walks per request into one.
+    ///
+    /// WHAT THE CALLER IS PROMISING, because nothing here can check it: that
+    /// the number came from the SAME question these counts ask — this account,
+    /// no operator predicates, sealed and spam excluded, and sent mail excluded
+    /// exactly as `include_sent = false` would. A count taken under a `from:`
+    /// belongs to a different set and must not be passed; the two predicates
+    /// differ and two counts are then the honest answer.
+    ///
+    /// It is CLAMPED to [`DIAGNOSTIC_COUNT_CAP`] on the way in, because the
+    /// page's count is exact and everything the door reports here stops at the
+    /// cap. A `strict_hits` above a capped `any_hits` would read as a mailbox
+    /// where more messages match every term than match any of them.
+    pub fn search_diagnostics_with(
+        &self,
+        account_id: AccountId,
+        text: &str,
+        partial: bool,
+        include_sent: bool,
+        counted_strict: Option<u32>,
+    ) -> Result<SearchDiagnostics> {
         let fts = FtsQuery::build(text, partial);
         if fts.is_empty() {
             // Operators only, or punctuation only: nothing was looked up, and
@@ -991,20 +1062,38 @@ impl SqliteStore {
             return Ok(SearchDiagnostics::default());
         }
         let conn = self.lock()?;
+        let strict_hits = match counted_strict {
+            Some(n) => n.min(DIAGNOSTIC_COUNT_CAP),
+            None => self.fts_count(&conn, account_id, &fts.strict, include_sent)?,
+        };
+        // A ONE-TERM QUERY IS ONE EXPRESSION THREE TIMES: strict, any and the
+        // term itself are the same string, and this count is a pure function of
+        // (account, expression, include_sent). Asking SQLite the identical
+        // question twice more would only cost the store mutex.
+        let any_hits = if fts.any == fts.strict {
+            strict_hits
+        } else {
+            self.fts_count(&conn, account_id, &fts.any, include_sent)?
+        };
         let mut terms = Vec::with_capacity(fts.terms.len());
         for (term, expr) in fts.terms.iter().zip(fts.term_exprs.iter()) {
             // Each term is counted BY THE EXPRESSION THAT RANKED IT, straight
             // off the builder — with `partial` on, the tail matched a whole OR
             // group, and a df for the bare word would describe a search nobody
             // ran. Rebuilding the string here is what let the two drift.
+            let df = if expr == &fts.strict {
+                strict_hits
+            } else {
+                self.fts_count(&conn, account_id, expr, include_sent)?
+            };
             terms.push(TermDf {
                 text: term.clone(),
-                df: self.fts_count(&conn, account_id, expr, include_sent)?,
+                df,
             });
         }
         Ok(SearchDiagnostics {
-            strict_hits: self.fts_count(&conn, account_id, &fts.strict, include_sent)?,
-            any_hits: self.fts_count(&conn, account_id, &fts.any, include_sent)?,
+            strict_hits,
+            any_hits,
             terms,
         })
     }

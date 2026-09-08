@@ -197,6 +197,86 @@ fn a_quoted_phrase_matches_only_the_words_side_by_side() {
 }
 
 #[test]
+fn the_keyword_page_hands_back_the_strict_count_it_took() {
+    // The seam count and `diagnostics.strict_hits` are the same number, and a
+    // request should walk that doclist once. The page hands it over; `None`
+    // means it never took one, which is not the same as zero.
+    let (store, acct) = store();
+
+    for i in 0..2 {
+        triaged(acct, &format!("g-s{i}"), &format!("t-s{i}"))
+            .subject("vendor contract")
+            .body("the signed vendor contract is attached")
+            .seed(&store);
+    }
+    triaged(acct, "g-any", "t-any")
+        .subject("contract")
+        .body("a contract, with nobody named")
+        .seed(&store);
+
+    let counted = |text: &str, filter: &SearchFilter| -> (usize, Option<u32>) {
+        let (hits, strict) = store
+            .search_filtered_counted(acct, text, filter, SearchSort::Recent, false, 10, 0)
+            .unwrap();
+        (hits.len(), strict)
+    };
+
+    let (n, strict) = counted("vendor contract", &SearchFilter::default());
+    assert_eq!(n, 3, "two strict, one any-only");
+    assert_eq!(strict, Some(2), "the count the seam was placed with");
+
+    // The strict count carries the operator predicates, which is exactly why
+    // the door only shares it when there are none.
+    let (_, filter) = parse_search_query("vendor contract from:nobody");
+    assert_eq!(counted("vendor contract", &filter).1, Some(0));
+
+    // ONE TERM needs no seam: strict and any are the same expression, so no
+    // count is taken and none is reported.
+    assert_eq!(counted("contract", &SearchFilter::default()).1, None);
+
+    // A filter-only listing runs no MATCH at all.
+    let (_, filter) = parse_search_query("from:nobody");
+    let (_, strict) = store
+        .search_filtered_counted(acct, "", &filter, SearchSort::Recent, false, 10, 0)
+        .unwrap();
+    assert_eq!(strict, None, "a listing has no strict set");
+}
+
+#[test]
+fn a_handed_over_strict_count_is_reported_and_capped() {
+    // The page's count is EXACT and everything the door reports here stops at
+    // the cap, so the number is clamped on the way in. A `strict_hits` above a
+    // capped `any_hits` would describe a mailbox where more messages match
+    // every term than match any of them.
+    let (store, acct) = store();
+    triaged(acct, "g1", "t1")
+        .subject("vendor contract")
+        .body("the signed vendor contract is attached")
+        .seed(&store);
+
+    let plain = store
+        .search_diagnostics(acct, "vendor contract", false, false)
+        .unwrap();
+    assert_eq!(plain.strict_hits, 1);
+
+    let handed = store
+        .search_diagnostics_with(acct, "vendor contract", false, false, Some(1))
+        .unwrap();
+    assert_eq!(handed, plain, "the same answer, one doclist walk cheaper");
+
+    let huge = store
+        .search_diagnostics_with(
+            acct,
+            "vendor contract",
+            false,
+            false,
+            Some(DIAGNOSTIC_COUNT_CAP + 5),
+        )
+        .unwrap();
+    assert_eq!(huge.strict_hits, DIAGNOSTIC_COUNT_CAP, "clamped to the cap");
+}
+
+#[test]
 fn a_phrase_is_one_term_in_the_diagnostics() {
     // A df is per TERM, and a quoted run is one term: the count is how many
     // messages carry the phrase, not how many carry either word. Reporting the

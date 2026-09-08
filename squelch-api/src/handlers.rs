@@ -842,6 +842,7 @@ impl From<SearchDiagnostics> for Diagnostics {
 /// One hit plus WHICH LEG produced it. The hit's own fields are flattened, so
 /// this is the same object the client already decodes with one array added
 /// beside them: `["keyword"]`, `["vector"]`, or both when both legs agreed.
+
 #[derive(Debug, Serialize)]
 struct SearchItem {
     #[serde(flatten)]
@@ -960,18 +961,29 @@ pub async fn search(
     // The diagnostics are counted in the SAME store call, and told which leg
     // ran: the keyword leg excludes the reader's own sent mail and the recall
     // legs include it, so counts taken under the other rule would contradict
-    // the list they sit beside. NOT under the same LOCK, though: the counts
-    // take the store mutex and give it back before the search takes it again,
-    // so an ingest landing between the two leaves the counts describing a
-    // mailbox one message older than the page. Harmless, and written down
-    // because "the same store call" is easy to misread as "atomically".
+    // the list they sit beside. They are counted AFTER the page, because the
+    // keyword page has already counted the strict set to place its own seam and
+    // hands that number over rather than have it walked a second time. NOT
+    // under the same LOCK, though: the page takes the store mutex and gives it
+    // back before the counts take it again, so an ingest landing between the
+    // two leaves the counts describing a mailbox one message newer than the
+    // page. Harmless, and written down because "the same store call" is easy to
+    // misread as "atomically".
     let (items, window_full, diagnostics) = store_call(&state, move |store, account_id| {
         let include_sent = effective != SearchMode::Keyword;
-        let diagnostics = store.search_diagnostics(account_id, &term, partial, include_sent)?;
+        // The strict count worth sharing, and only when it answers the same
+        // question the diagnostics ask: no operator predicates. With a `from:`
+        // or a date bound the page counted a narrower set, and the two deserve
+        // their own counts.
+        let mut counted_strict = None;
         let (items, window_full): (Vec<SearchItem>, bool) = match effective {
             SearchMode::Keyword => {
-                let hits = store
-                    .search_filtered(account_id, &term, &filter, sort, partial, limit, offset)?;
+                let (hits, strict) = store.search_filtered_counted(
+                    account_id, &term, &filter, sort, partial, limit, offset,
+                )?;
+                if filter.is_empty() {
+                    counted_strict = strict;
+                }
                 (
                     hits.into_iter()
                         .map(|hit| SearchItem {
@@ -1017,6 +1029,8 @@ pub async fn search(
                 (page, window_full)
             }
         };
+        let diagnostics =
+            store.search_diagnostics_with(account_id, &term, partial, include_sent, counted_strict)?;
         Ok((items, window_full, diagnostics))
     })
     .await?;

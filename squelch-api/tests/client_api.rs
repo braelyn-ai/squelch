@@ -1445,6 +1445,60 @@ async fn search_with_only_operators_lists_and_keeps_exclusions() {
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }
 
+/// The strict count is taken ONCE per request when the two questions are the
+/// same one, and TWICE when they are not.
+///
+/// The keyword page counts its strict set to place the seam between its two
+/// passes, and `diagnostics.strict_hits` reports the same number — but only
+/// while there are no operators. Under a `from:` the page's count carries that
+/// predicate and the diagnostics' does not, so sharing the page's number would
+/// make the wire report a mailbox-wide count that had been narrowed to one
+/// sender: "no message says all of this" for a mailbox where one does.
+#[tokio::test]
+async fn diagnostics_keep_their_own_strict_count_under_an_operator() {
+    let Harness { app, .. } = harness(seed_operator_corpus);
+
+    // "invoice bob": only Bob's message carries both words, and it is not
+    // Jane's, so the FILTERED strict set is empty and the page is Jane's two
+    // invoices off the any-only pass.
+    let json = body_json(
+        app.clone()
+            .oneshot(authed("GET", "/client/search?q=invoice%20bob%20from:jane"))
+            .await
+            .unwrap(),
+    )
+    .await;
+    let t: Vec<&str> = json["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| i["thread_id"].as_str().unwrap())
+        .collect();
+    assert_eq!(t.len(), 2, "jane's invoices, off the any-only pass: {t:?}");
+    assert!(!t.contains(&"t-bob"), "the operator still filters the page");
+    assert_eq!(
+        json["diagnostics"]["strict_hits"], 1,
+        "one message in the mailbox says both words, and the count says so"
+    );
+
+    // Without the operator the two questions coincide, and the answer is the
+    // same number the page seams on.
+    let json = body_json(
+        app.oneshot(authed("GET", "/client/search?q=invoice%20bob"))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(json["diagnostics"]["strict_hits"], 1);
+    let t: Vec<&str> = json["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| i["thread_id"].as_str().unwrap())
+        .collect();
+    assert_eq!(t.first(), Some(&"t-bob"), "the strict hit leads: {t:?}");
+}
+
 #[tokio::test]
 async fn reveal_writes_audit_and_returns_body() {
     let Harness { app, store, acct } = harness(|store, acct| {
