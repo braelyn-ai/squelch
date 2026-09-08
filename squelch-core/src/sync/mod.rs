@@ -4425,8 +4425,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sealed_mail_never_emits_an_event() {
-        // SEAL INVARIANT end to end: an OTP must never reach a lock screen.
+    async fn sealed_mail_emits_a_kind_only_event_and_never_its_contents() {
+        // SEAL INVARIANT end to end, on the DEFAULT config. Since 0.0.6 a login
+        // code does reach the lock screen, as "a code arrived" and nothing
+        // else: the event carries the kind, and not the code, the subject or
+        // one word of the body. notify_lane.rs pins the row shape with the
+        // knob explicitly on; this pins that the engine's default path is that
+        // path, so a default drifting back to false (every ping silently
+        // gone) or a body fragment reaching the event both fail here.
         let store = Arc::new(SqliteStore::open_in_memory().unwrap());
         let acct = store.ensure_account("me@example.com").unwrap();
         let now = Utc::now();
@@ -4440,9 +4446,31 @@ mod tests {
             now.to_rfc2822()
         );
         let f = fixture(acct, "g-otp", &eml, false);
-        let (_, ev) = ingest_and_notify(&store, acct, &f, now, IngestOrigin::Incremental).await;
-        assert_eq!(ev, None, "sealed mail must never notify");
-        assert!(store.events_after(acct, 0, 100).unwrap().is_empty());
+        let (mid, ev) = ingest_and_notify(&store, acct, &f, now, IngestOrigin::Incremental).await;
+        let ev_id = ev.expect("sealed mail rings on the default config");
+        let evs = store.events_after(acct, 0, 100).unwrap();
+        assert_eq!(evs.len(), 1, "exactly one event, from the sealed path");
+        let ev = &evs[0];
+        assert_eq!(ev.id, ev_id);
+        assert_eq!(ev.message_id, mid);
+        assert_eq!(
+            ev.sealed_kind,
+            Some(crate::types::SealedKind::Otp),
+            "the client routes the tap by this, not by a thread fetch"
+        );
+        for text in [ev.one_line.as_str(), ev.sender.as_str()] {
+            assert!(
+                !text.contains("483920"),
+                "the code reached the event: {text:?}"
+            );
+            let lower = text.to_lowercase();
+            for word in ["passcode", "verification", "continue"] {
+                assert!(
+                    !lower.contains(word),
+                    "a word of the mail reached the event: {text:?}"
+                );
+            }
+        }
         assert_eq!(
             store.sealed_messages(acct).unwrap().len(),
             1,

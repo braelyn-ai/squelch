@@ -285,12 +285,14 @@ pub struct NotifyConfig {
     /// Whether a SEALED message may ring at all (docs/NOTIFY.md §11.6). Off
     /// means the sealed path records nothing and emits nothing.
     ///
-    /// DEFAULT FALSE, AND THAT IS AN ORDERING GUARD RATHER THAN A DESIGN HEDGE:
-    /// an app that predates `Event.sealed_kind` renders a sealed event as an
-    /// ordinary thread banner whose tap fetches a thread the seal makes the
-    /// daemon 404. It flips to true in the release that pairs this daemon with
-    /// a client that routes the tap to the auth flow. The daemon side is
-    /// complete either way. Env: `SQUELCH_NOTIFY_SEALED_ENABLED`.
+    /// DEFAULT TRUE SINCE DAEMON 0.0.6, the release paired with Mac 0.0.7 and
+    /// iPhone 0.0.4, which route a sealed event's tap to the auth flow. It
+    /// shipped false for exactly one release, as an ordering guard rather than
+    /// a design hedge: an app that predates `Event.sealed_kind` renders a
+    /// sealed event as an ordinary thread banner whose tap fetches a thread the
+    /// seal makes the daemon 404. A fleet whose clients have not caught up
+    /// turns it back off from the environment. Env:
+    /// `SQUELCH_NOTIFY_SEALED_ENABLED`.
     pub sealed_enabled: bool,
     /// The model the fast lane asks. A SMALL one on purpose: the question it
     /// answers ("does this deserve to interrupt the phone right now") is asked
@@ -349,9 +351,9 @@ impl Default for NotifyConfig {
             freshness_window_secs: 900,
             rescue_window_secs: 3600,
             fast_enabled: true,
-            // OFF until a client ships that routes a sealed event's tap to the
-            // auth flow; see the field doc.
-            sealed_enabled: false,
+            // ON since 0.0.6; the field doc names the client release it waited
+            // on.
+            sealed_enabled: true,
             model: "claude-haiku-4-5".to_string(),
             // Haiku 4.5 has no effort support, and sending the field is a 400.
             effort: None,
@@ -3356,18 +3358,20 @@ backfill_days = 90
     }
 
     /// THE FAST LANE'S DEFAULTS, asserted one by one because two of them are
-    /// safety properties rather than taste: `sealed_enabled` is FALSE (a sealed
-    /// event on a client that predates `Event.sealed_kind` is a banner with a
-    /// dead tap, docs/NOTIFY.md §11.6), and `effort` is ABSENT because the
-    /// default model 400s on every call that carries the field.
+    /// safety properties rather than taste: `sealed_enabled` is TRUE (it was
+    /// the ordering guard for a client that routes a sealed tap to the auth
+    /// flow, docs/NOTIFY.md §11.6; that client shipped as Mac 0.0.7 and iPhone
+    /// 0.0.4, and a daemon that drifted back to false would silently drop
+    /// every login-code ping), and `effort` is ABSENT because the default
+    /// model 400s on every call that carries the field.
     #[test]
-    fn the_notify_fast_lane_ships_off_for_sealed_and_effortless_by_default() {
+    fn the_notify_fast_lane_ships_sealed_on_and_effortless_by_default() {
         let _g = ENV_LOCK.lock().unwrap();
         let c = Config::default();
         assert!(c.notify.fast_enabled, "the model path is on");
         assert!(
-            !c.notify.sealed_enabled,
-            "sealed rings only once a client can route the tap"
+            c.notify.sealed_enabled,
+            "sealed rings by default now that the clients route the tap"
         );
         assert_eq!(c.notify.model, "claude-haiku-4-5");
         assert_eq!(
@@ -3392,7 +3396,7 @@ backfill_days = 90
         assert_eq!(c.notify.min_importance, 60, "the file's own value");
         assert_eq!(c.notify.model, "claude-haiku-4-5");
         assert!(c.notify.fast_enabled);
-        assert!(!c.notify.sealed_enabled);
+        assert!(c.notify.sealed_enabled);
         assert_eq!(c.notify.fast_timeout_secs, 8);
     }
 
@@ -3406,19 +3410,21 @@ backfill_days = 90
         unsafe {
             std::env::set_var("SQUELCH_NOTIFY_MODEL", "claude-sonnet-5");
             std::env::set_var("SQUELCH_NOTIFY_EFFORT", "low");
-            std::env::set_var("SQUELCH_NOTIFY_SEALED_ENABLED", "true");
+            std::env::set_var("SQUELCH_NOTIFY_SEALED_ENABLED", "false");
             std::env::set_var("SQUELCH_NOTIFY_FAST_ENABLED", "false");
             std::env::set_var("SQUELCH_NOTIFY_DAILY_CAP", "25");
             std::env::set_var("SQUELCH_NOTIFY_PRICE_IN_PER_MTOK", "3.0");
         }
         let mut c: Config =
-            toml::from_str("[notify]\nmodel = \"from-the-file\"\nsealed_enabled = false\n")
-                .unwrap();
+            toml::from_str("[notify]\nmodel = \"from-the-file\"\nsealed_enabled = true\n").unwrap();
         assert_eq!(c.notify.model, "from-the-file", "the file, before env");
         c.apply_env_overrides();
         assert_eq!(c.notify.model, "claude-sonnet-5", "env beats the file");
         assert_eq!(c.notify.effort.as_deref(), Some("low"));
-        assert!(c.notify.sealed_enabled, "the release knob flips from env");
+        assert!(
+            !c.notify.sealed_enabled,
+            "the sealed switch turns OFF from env, the direction a lagging fleet needs"
+        );
         assert!(!c.notify.fast_enabled, "and so does the kill switch");
         assert_eq!(c.notify.daily_cap, 25);
         assert_eq!(c.notify.price_in_per_mtok, 3.0);
