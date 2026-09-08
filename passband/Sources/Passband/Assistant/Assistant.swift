@@ -1056,7 +1056,14 @@ final class AssistantSession {
         // that touch the mailbox. Refused with an ordinary tool_result so the
         // conversation stays well-formed and the model simply carries on with
         // what it does have.
-        guard lane.toolNames.contains(call.name) else {
+        //
+        // NOT IN THE CHAT, which is offered every tool there is. The only name
+        // this could catch there is one the model invented, and `AgentTools.run`
+        // has always answered that with its own "unknown tool" failure. Sending
+        // it through here instead would change what ⌘K says to a model that
+        // hallucinated a tool, in a lane whose behaviour this wave is not
+        // supposed to touch at all.
+        guard lane == .chat || lane.toolNames.contains(call.name) else {
             markTool(call.id, summary: "not available here", state: .failed)
             return .toolResult(
                 toolUseId: call.id,
