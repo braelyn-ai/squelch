@@ -36,12 +36,21 @@ use squelch_core::store::{SearchFilter, SearchSort, SqliteStore, Store};
 
 /// The queries the wave-1 work is judged on. The first is the motivating one:
 /// the mail that answers it contains neither "conference" nor "password".
+///
+/// The last is a PHRASE, and it is here because a phrase is the one thing a
+/// fixture cannot argue about: quoted, it must find strictly less mail than the
+/// same two words unquoted, and on a real mailbox the gap is wide (roughly a
+/// third of the messages carrying both words carry them side by side). The
+/// builder takes the reader's text as typed, quotes and all, so this string is
+/// what a reader would put in the box.
 const QUERIES: &[&str] = &[
     "abstract conference wifi password",
     "conference wifi password",
     "wifi password",
     "stripe payout receipt",
     "abstract",
+    "tracking number",
+    r#""tracking number""#,
 ];
 
 fn main() {
