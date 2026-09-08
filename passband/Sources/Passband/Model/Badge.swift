@@ -6,11 +6,23 @@
 // that would correct it. Two counts would eventually differ and the badge is the
 // one nobody can check.
 //
-// WRITTEN FROM ONE PLACE — `AppStore.sitrep`'s `didSet`. Every path that can
-// change the number ends in an assignment to that property: the poller's pull,
-// a resolve, a re-triage, the wipe on disconnect. Hooking the property instead
-// of the callers is what makes "the badge is stale" impossible to reintroduce by
-// adding a fifth path.
+// WRITTEN FROM TWO PLACES, and the second one is not redundant.
+//
+// `AppStore.sitrep`'s `didSet` catches every CHANGE: the poller's pull, a
+// resolve, a re-triage, the wipe on disconnect all end in an assignment to that
+// property, so hooking it rather than the callers is what stops a sixth path
+// from shipping a stale number by forgetting to call anything.
+//
+// What a didSet cannot catch is a CONFIRMATION. `SitrepPoller` assigns only when
+// the read model actually differs — writing an identical one every ten seconds
+// would re-lay out the dashboard for nothing — so "the daemon agrees with what
+// we already had" produces no assignment and no observer. That is fine for
+// anything whose only writer is this process, and wrong for the badge, whose
+// other writer runs while this process does not. A launch begins with an empty
+// standing band; if the extension left a 3 on the icon and the daemon now agrees
+// the band is empty, nothing is assigned and the 3 survives with the app open in
+// front of it. So the poller refreshes unconditionally after each successful
+// pull, which is the only place that learns the number is still right.
 //
 // AND A SECOND WRITER THAT IS NOT THIS FILE. The badge has to be right while the
 // app is CLOSED, which is exactly when this code is not running, so the

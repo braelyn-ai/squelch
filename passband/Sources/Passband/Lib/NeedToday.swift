@@ -22,6 +22,20 @@
 import Foundation
 
 enum NeedToday {
+    /// How many standing rows either surface reads before it stops counting.
+    ///
+    /// IT LIVES HERE BECAUSE TWO CALLERS MUST AGREE ON IT, and they are in
+    /// different targets: the app's poller fetches the band for the dashboard,
+    /// and the notification extension fetches it again for the badge. The daemon
+    /// pages this route and defaults to FIFTY when the caller says nothing, so
+    /// an extension that simply omitted the parameter counted a different set of
+    /// rows than the headline it is supposed to agree with — and quietly
+    /// under-reported, since the band is ordered by importance rather than by
+    /// deadline and the rows past the cut are not the least due ones.
+    ///
+    /// The daemon clamps to 500, so this is a real ceiling and not a suggestion.
+    static let bandLimit = 200
+
     /// How many of these obligations are overdue or due by the end of today.
     ///
     /// `now` is injected so the boundary can be tested rather than trusted: the

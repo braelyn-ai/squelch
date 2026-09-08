@@ -14,7 +14,11 @@ final class SitrepPoller {
     static let shared = SitrepPoller()
 
     private static let pollInterval: Duration = .seconds(10)
-    private static let pageLimit = 200
+    /// Shared with the notification extension, which fetches the same standing
+    /// band to compute the app icon's badge. One constant because the badge and
+    /// the dashboard's headline are supposed to be the same number, and they
+    /// only are if both read the same rows — see NeedToday.bandLimit.
+    private static let pageLimit = NeedToday.bandLimit
 
     /// Failure backoff. The base sits at TWICE the healthy cadence so its
     /// jittered floor equals `pollInterval`: a wedged daemon is never polled
@@ -163,6 +167,25 @@ final class SitrepPoller {
             // value difference, so writing an identical read model every 10s
             // re-lays out the whole dashboard for nothing.
             if next != store.sitrep { store.sitrep = next }
+            // THE BADGE IS REFRESHED EVEN WHEN NOTHING CHANGED, and this is the
+            // second write point rather than an accident. `AppStore.sitrep`'s
+            // didSet catches every CHANGE; it cannot catch a confirmation, and
+            // the line above deliberately skips the assignment when the read
+            // model is identical.
+            //
+            // Which breaks precisely the case that matters most. The badge has a
+            // writer that runs while the app does not — the notification
+            // extension — so the icon can already say 3 when this process
+            // starts. A launch begins with `standing: []`; if the daemon now
+            // also says empty (the items were dealt with on the Mac), `next`
+            // equals the read model, nothing is assigned, nothing observes, and
+            // a stale 3 sits on the icon for the whole session with the app open
+            // in front of it. Going to zero is the common case and was the
+            // broken one.
+            //
+            // Counted off `next` rather than the store: identical in either
+            // branch, and this is the value we just got from the daemon.
+            Badge.refresh(next.standing)
             // FIRST SIGHT OF THE MAILBOX = the first chance to know the human's
             // name well enough to guess. Here rather than at connect time
             // because this is where the address arrives, and unconditional

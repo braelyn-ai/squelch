@@ -58,6 +58,26 @@ final class NotificationService: UNNotificationServiceExtension {
         timeout: 10, resource: 20,
         cachePolicy: .reloadIgnoringLocalCacheData, emptyHeaders: true)
 
+    /// A SECOND SESSION, ON A SHORTER LEASH, for the badge count alone.
+    ///
+    /// The two fetches are awaited together, so the banner cannot be delivered
+    /// until the slower one finishes — a stalled count would delay the alert
+    /// itself. That is the wrong way round: the badge is a nicety and the banner
+    /// is the reason this process exists, so the count gets a fraction of the
+    /// time and drops out quietly when it cannot be had cheaply.
+    ///
+    /// ITS OWN SESSION rather than a shorter `timeoutInterval` on the request,
+    /// because the configuration's `timeoutIntervalForRequest` and the request's
+    /// own value both apply and which one wins is not a thing to guess at in a
+    /// process that gets killed for being slow. Two configurations, two
+    /// unambiguous ceilings.
+    ///
+    /// Not a theoretical hazard: reads of this band go through the daemon's
+    /// store mutex, and a slow one there is a thing that has actually happened.
+    private nonisolated(unsafe) static let countSession = Sessions.ephemeral(
+        timeout: 4, resource: 8,
+        cachePolicy: .reloadIgnoringLocalCacheData, emptyHeaders: true)
+
     /// Held so `serviceExtensionTimeWillExpire` can still answer: the system
     /// kills this process if nothing calls the handler, and a killed extension
     /// delivers the original push anyway — but only after making the human wait
@@ -143,10 +163,17 @@ final class NotificationService: UNNotificationServiceExtension {
         comps.queryItems = [
             URLQueryItem(name: "band", value: "standing"),
             URLQueryItem(name: "peek", value: "true"),
+            // THE SAME PAGE THE APP READS. This route defaults to fifty rows
+            // when nobody says otherwise, and the poller asks for
+            // NeedToday.bandLimit — so omitting it here counted a smaller set
+            // than the headline the badge is meant to agree with, and under-
+            // reported, because this band is ordered by importance and the rows
+            // past a cut are not the least due ones.
+            URLQueryItem(name: "limit", value: String(NeedToday.bandLimit)),
         ]
         guard let url = comps.url else { return nil }
 
-        var request = URLRequest(url: url, timeoutInterval: 10)
+        var request = URLRequest(url: url, timeoutInterval: 4)
         request.setValue("Bearer \(settings.apiToken)", forHTTPHeaderField: "Authorization")
         request.setValue("application/json", forHTTPHeaderField: "Accept")
 
@@ -154,7 +181,7 @@ final class NotificationService: UNNotificationServiceExtension {
         // the URL names the user's daemon and the header held a capability. A
         // miss here costs a stale badge, which the app corrects the moment it is
         // opened.
-        guard let (data, response) = try? await Self.session.data(for: request),
+        guard let (data, response) = try? await Self.countSession.data(for: request),
             (response as? HTTPURLResponse)?.statusCode == 200,
             let page = try? JSONDecoder().decode(Page<AttentionUpdate>.self, from: data)
         else { return nil }
