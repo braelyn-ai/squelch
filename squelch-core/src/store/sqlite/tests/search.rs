@@ -129,6 +129,101 @@ fn a_strict_match_never_ranks_below_a_partial_one() {
 }
 
 #[test]
+fn a_quoted_phrase_matches_only_the_words_side_by_side() {
+    // The reader's quotes reach the index as an FTS5 phrase, which is the
+    // whole point of typing them: "wifi password" means those two words in
+    // that order, not the mail that happens to contain both somewhere.
+    //
+    // Splitting on the quote made this query WIDER than the unquoted one (the
+    // any-only pass ORs what strict could not AND), so quoting used to be
+    // strictly worse than not bothering.
+    let (store, acct) = store();
+
+    let adjacent = triaged(acct, "g-adj", "t-adj")
+        .subject("venue details")
+        .body("the wifi password is printed on your badge")
+        .seed(&store);
+    let apart = triaged(acct, "g-apart", "t-apart")
+        .subject("account help")
+        .body("the password for the guest wifi is at reception")
+        .seed(&store);
+
+    let ids = |q: &str| -> Vec<i64> {
+        let (text, filter) = parse_search_query(q);
+        store
+            .search_filtered(acct, &text, &filter, SearchSort::Recent, false, 10, 0)
+            .unwrap()
+            .iter()
+            .map(|h| h.id)
+            .collect()
+    };
+
+    assert_eq!(
+        ids(r#""wifi password""#),
+        vec![adjacent],
+        "the phrase matches one message and only one"
+    );
+    // Unquoted, both words in any arrangement match, which is the behaviour the
+    // phrase exists to narrow.
+    let loose = ids("wifi password");
+    assert_eq!(loose.len(), 2, "both, unquoted: {loose:?}");
+    assert!(loose.contains(&apart));
+
+    // Word order is part of the phrase: reversed, it matches neither.
+    assert!(
+        ids(r#""password wifi""#).is_empty(),
+        "a phrase is ordered, and neither message says it that way"
+    );
+
+    // The phrase is one term beside a word: strict wants both.
+    assert_eq!(
+        ids(r#""wifi password" badge"#),
+        vec![adjacent],
+        "phrase AND word"
+    );
+
+    // Stemming still applies INSIDE a phrase — the index holds stems and the
+    // query tokenizer runs over the phrase's words too, so the singular finds
+    // the plural exactly as it does for a bare word.
+    let plural = triaged(acct, "g-plural", "t-plural")
+        .subject("more venue details")
+        .body("the wifi passwords rotate every morning")
+        .seed(&store);
+    let stemmed = ids(r#""wifi password""#);
+    assert!(
+        stemmed.contains(&plural),
+        "the stemmer reaches into a phrase: {stemmed:?}"
+    );
+}
+
+#[test]
+fn a_phrase_is_one_term_in_the_diagnostics() {
+    // A df is per TERM, and a quoted run is one term: the count is how many
+    // messages carry the phrase, not how many carry either word. Reporting the
+    // words separately would tell the classifier a query had more terms than
+    // the reader typed.
+    let (store, acct) = store();
+
+    triaged(acct, "g-adj", "t-adj")
+        .subject("venue details")
+        .body("the wifi password is printed on your badge")
+        .seed(&store);
+    triaged(acct, "g-apart", "t-apart")
+        .subject("account help")
+        .body("the password for the guest wifi is at reception")
+        .seed(&store);
+
+    let diag = store
+        .search_diagnostics(acct, r#""wifi password""#, false, false)
+        .unwrap();
+    assert_eq!(diag.terms.len(), 1, "one term: {:?}", diag.terms);
+    assert_eq!(diag.terms[0].text, "wifi password");
+    assert_eq!(diag.terms[0].df, 1, "the df of the phrase, not of a word");
+    assert_eq!(diag.strict_hits, 1);
+    assert_eq!(diag.any_hits, 1);
+}
+
+#[test]
 fn pagination_is_exact_across_the_strict_boundary() {
     // Three messages carry both terms and three carry one, so the true
     // ordering is a block of three followed by a block of three. Walking it a

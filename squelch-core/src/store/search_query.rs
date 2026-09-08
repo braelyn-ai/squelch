@@ -201,10 +201,15 @@ pub struct FtsQuery {
     pub any: String,
     /// The terms as they are ranked, in the order typed, stripped of syntax and
     /// unquoted. What the door reports as `diagnostics.terms`.
+    ///
+    /// A RUN THE READER QUOTED IS ONE TERM, words and all (`signed contract`),
+    /// because that is what it is to the index: one phrase, matched or not as a
+    /// unit. Its df is the df of the phrase.
     pub terms: Vec<String>,
     /// The FTS5 expression each term was actually matched by, parallel to
-    /// `terms`. Usually just the quoted word; the as-you-type tail is a whole
-    /// OR group (see [`partial_tail_expr`]).
+    /// `terms`. Usually just the quoted word; a quoted run is the whole phrase
+    /// in one pair of quotes; the as-you-type tail is a whole OR group (see
+    /// [`partial_tail_expr`]).
     ///
     /// It exists so a per-term COUNT can be taken with the SAME expression the
     /// ranking used. `search_diagnostics` used to rebuild `"{term}"*` by hand,
@@ -220,11 +225,105 @@ pub struct FtsQuery {
 /// becomes the two terms the index actually holds instead of the one word
 /// `recontract`, which it holds nowhere.
 ///
-/// `"` is here too even though quoting is FTS5's own escape (`""`). A phrase
-/// the reader quoted survives as an AND of its words, which finds the same mail
-/// a rank or two differently, and that is a better trade than carrying quote
-/// state through a tokenizer that exists to make one class of error impossible.
-const FTS_SYNTAX: &[char] = &['"', '(', ')', '*', '^', ':', '-', '+'];
+/// `"` is NOT here: it is the one character the reader uses on purpose. It
+/// delimits a phrase ([`scan_query`]) and is doubled on the way out, which is
+/// FTS5's own escape. Splitting on it instead is what silently turned
+/// `"signed contract"` into two ORed words, so a reader who quoted got a WIDER
+/// search than one who did not.
+const FTS_SYNTAX: &[char] = &['(', ')', '*', '^', ':', '-', '+'];
+
+/// One unit of the reader's query, in the order they typed it.
+///
+/// The distinction survives the scan because the two are built into different
+/// expressions and only one of them can be widened by `partial`.
+#[derive(Debug, PartialEq, Eq)]
+enum QueryToken {
+    /// A bare word: whatever sat between separators, with no syntax left in it.
+    Word(String),
+    /// The inside of a MATCHED pair of double quotes, cleaned the same way a
+    /// word is (syntax characters split it into further words, exactly as the
+    /// tokenizer splits them in the index) but kept as one run.
+    Phrase(String),
+}
+
+/// Split the reader's text into words and quoted phrases.
+///
+/// WHY A SCANNER RATHER THAN A `split`. A phrase is the one FTS5 construct that
+/// is safe BY CONSTRUCTION — everything between the quotes is read as text, and
+/// the only character that can end it is a quote, which we escape — so quotes
+/// are the one piece of query syntax the reader can be given without giving
+/// them the whole language. That means carrying quote state, which a `split`
+/// cannot.
+///
+/// A quote that never closes is not an error and not a dropped clause: the
+/// reader is typing, and the panel asks on every keystroke. Its contents become
+/// ordinary words, which is what they were an instant ago and what they will be
+/// again when the closing quote arrives.
+fn scan_query(text: &str) -> Vec<QueryToken> {
+    let mut out: Vec<QueryToken> = Vec::new();
+    let mut word = String::new();
+    let mut phrase = String::new();
+    let mut in_phrase = false;
+
+    // A word or a phrase with no letter or digit in it is not something the
+    // index holds — and `""` is not even a legal FTS5 phrase, so passing one on
+    // would fail the whole MATCH. Dropping it is what makes a query of pure
+    // punctuation an empty expression rather than a syntax error.
+    fn push_word(out: &mut Vec<QueryToken>, w: String) {
+        if w.chars().any(char::is_alphanumeric) {
+            out.push(QueryToken::Word(w));
+        }
+    }
+
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if in_phrase {
+            if c == '"' {
+                // `""` inside a phrase is FTS5's escape for one quote, and it
+                // is how a bounced operator token carrying a quote arrives here
+                // (see [`as_fts_phrase`]). Consuming both keeps the round trip
+                // exact instead of splitting the phrase in half.
+                if chars.peek() == Some(&'"') {
+                    chars.next();
+                    phrase.push('"');
+                    continue;
+                }
+                in_phrase = false;
+                let done: String = phrase.split_whitespace().collect::<Vec<_>>().join(" ");
+                phrase.clear();
+                if done.chars().any(char::is_alphanumeric) {
+                    out.push(QueryToken::Phrase(done));
+                }
+                continue;
+            }
+            // Inside the quotes the syntax characters still cannot reach FTS5,
+            // and they still split rather than vanish: `"re: your invoice"` is
+            // the three adjacent tokens the index actually holds.
+            phrase.push(if FTS_SYNTAX.contains(&c) { ' ' } else { c });
+            continue;
+        }
+        if c == '"' {
+            push_word(&mut out, std::mem::take(&mut word));
+            in_phrase = true;
+            continue;
+        }
+        if c.is_whitespace() || FTS_SYNTAX.contains(&c) {
+            push_word(&mut out, std::mem::take(&mut word));
+        } else {
+            word.push(c);
+        }
+    }
+    if in_phrase {
+        // Unterminated: what was gathered is words, in the order typed. The
+        // syntax characters were already turned into separators above, so this
+        // splits exactly as the outside path would have.
+        for w in phrase.split_whitespace() {
+            push_word(&mut out, w.to_string());
+        }
+    }
+    push_word(&mut out, word);
+    out
+}
 
 impl FtsQuery {
     /// Turn the reader's text into the two MATCH expressions the keyword leg
@@ -248,40 +347,54 @@ impl FtsQuery {
     /// from a search box. The defensive empty-on-error handling downstream
     /// stays anyway: this is not the only caller SQLite has.
     ///
+    /// QUOTES ARE THE READER'S, AND THEY MEAN WHAT THEY LOOK LIKE. A run
+    /// between a matched pair of double quotes is ONE term: one FTS5 phrase,
+    /// matched only where those words appear in that order, side by side. It is
+    /// one entry in `terms` and one entry in `term_exprs`, so it is also one
+    /// document frequency in the diagnostics, and the `partial` star is never
+    /// hung off it — a phrase is a statement about words the reader has
+    /// finished typing.
+    ///
+    /// This is the ONE piece of query syntax handed back to the reader, and it
+    /// is safe for the same reason the quoting above is: everything inside a
+    /// phrase is text to FTS5, and the only character that could end it early
+    /// is escaped. An unmatched quote is not an error — it is a reader
+    /// mid-word, and its contents rank as ordinary words (see [`scan_query`]).
+    ///
     /// `partial` widens the LAST token only, the word still being typed (see
     /// [`partial_tail_expr`]). The panel's debounced fetch asks for it; the
     /// agent door never does, because an agent sends settled words.
     pub fn build(text: &str, partial: bool) -> FtsQuery {
-        let terms: Vec<String> = text
-            .split(|c: char| c.is_whitespace() || FTS_SYNTAX.contains(&c))
-            // A token with no letter or digit in it is not a word the index
-            // holds — and `""` is not even a legal FTS5 phrase, so passing one
-            // on would fail the whole MATCH. Dropping it is what makes a query
-            // of pure punctuation an empty expression rather than a syntax
-            // error.
-            .filter(|t| t.chars().any(char::is_alphanumeric))
-            .map(|t| t.to_string())
-            .collect();
-        if terms.is_empty() {
+        let tokens = scan_query(text);
+        if tokens.is_empty() {
             return FtsQuery {
                 strict: String::new(),
                 any: String::new(),
-                terms,
+                terms: Vec::new(),
                 term_exprs: Vec::new(),
             };
         }
-        let last = terms.len() - 1;
-        let exprs: Vec<String> = terms
-            .iter()
-            .enumerate()
-            .map(|(i, t)| {
-                if partial && i == last {
-                    partial_tail_expr(t)
-                } else {
-                    format!("\"{t}\"")
+        let last = tokens.len() - 1;
+        let mut terms = Vec::with_capacity(tokens.len());
+        let mut exprs = Vec::with_capacity(tokens.len());
+        for (i, token) in tokens.into_iter().enumerate() {
+            match token {
+                QueryToken::Word(w) => {
+                    exprs.push(if partial && i == last {
+                        partial_tail_expr(&w)
+                    } else {
+                        format!("\"{w}\"")
+                    });
+                    terms.push(w);
                 }
-            })
-            .collect();
+                QueryToken::Phrase(p) => {
+                    // Doubled quotes are FTS5's escape, and the only way a
+                    // quote inside a phrase can survive without ending it.
+                    exprs.push(format!("\"{}\"", p.replace('"', "\"\"")));
+                    terms.push(p);
+                }
+            }
+        }
         FtsQuery {
             strict: exprs.join(" AND "),
             any: exprs.join(" OR "),
@@ -507,7 +620,9 @@ mod tests {
     #[test]
     fn fts_syntax_characters_are_stripped_not_escaped() {
         // Each of these is an operator to FTS5 and a word to the reader. None
-        // of them may survive into the expression.
+        // of them may survive into the expression. The double quote is the one
+        // exception and has its own tests below: it is the reader's, and it
+        // means a phrase.
         let q = FtsQuery::build(
             r#"-invoice re:contract "quoted" (paren) star* ^caret +plus"#,
             false,
@@ -612,11 +727,113 @@ mod tests {
         // The two halves in the order the door uses them: operators lifted out
         // first, then whatever words are left become the expression. A bounced
         // operator (`after:soon`) reaches the builder as a quoted phrase and
-        // comes out as its two ordinary words.
+        // stays one: the colon splits inside the quotes, so it matches the two
+        // words side by side, which is what the reader typed.
         let (text, filter) = parse_search_query("invoice from:jane after:soon");
         assert_eq!(filter.from.as_deref(), Some("jane"));
         let q = FtsQuery::build(&text, false);
-        assert_eq!(q.terms, vec!["invoice", "after", "soon"]);
+        assert_eq!(q.terms, vec!["invoice", "after soon"]);
+        assert_eq!(q.strict, r#""invoice" AND "after soon""#);
+    }
+
+    // ---- PHRASES -------------------------------------------------------
+    //
+    // The reader's quotes are the one piece of query syntax they get back, and
+    // a phrase is the one FTS5 construct that cannot be malformed from the
+    // inside. Splitting on the quote instead made a quoted search WIDER than an
+    // unquoted one, which is the opposite of what quoting means everywhere else
+    // a person has ever typed it.
+
+    #[test]
+    fn a_quoted_run_is_one_phrase_in_both_joins() {
+        let q = FtsQuery::build(r#""signed contract""#, false);
+        assert_eq!(q.strict, r#""signed contract""#);
+        assert_eq!(q.any, r#""signed contract""#);
+        assert_eq!(
+            q.terms,
+            vec!["signed contract"],
+            "one term, so one df in the diagnostics"
+        );
+        assert_eq!(q.term_exprs, vec![r#""signed contract""#]);
+    }
+
+    #[test]
+    fn a_phrase_and_a_bare_word_are_anded_in_strict_and_ored_in_any() {
+        // The phrase is ONE unit on both sides of the seam: the strict pass
+        // wants it and the word, the any-only pass takes either.
+        let q = FtsQuery::build(r#""signed contract" invoice"#, false);
+        assert_eq!(q.strict, r#""signed contract" AND "invoice""#);
+        assert_eq!(q.any, r#""signed contract" OR "invoice""#);
+        assert_eq!(q.terms, vec!["signed contract", "invoice"]);
+
+        // And in the order typed, whichever side the quotes are on.
+        let q = FtsQuery::build(r#"invoice "signed contract""#, false);
+        assert_eq!(q.terms, vec!["invoice", "signed contract"]);
+        assert_eq!(q.strict, r#""invoice" AND "signed contract""#);
+    }
+
+    #[test]
+    fn syntax_inside_a_phrase_splits_it_rather_than_reaching_fts5() {
+        // A colon inside the quotes is a separator to the tokenizer and would
+        // be a column filter to the parser, so it becomes what the index holds:
+        // three adjacent tokens.
+        let q = FtsQuery::build(r#""re: your invoice""#, false);
+        assert_eq!(q.terms, vec!["re your invoice"]);
+        assert_eq!(q.strict, r#""re your invoice""#);
+        for bad in ['*', '(', ')', '^', ':', '-', '+'] {
+            assert!(!q.strict.contains(bad), "{bad:?} survived {:?}", q.strict);
+        }
+    }
+
+    #[test]
+    fn a_quote_inside_a_phrase_is_carried_doubled() {
+        // `""` is FTS5's own escape, and the only way a quote can sit inside a
+        // phrase without ending it. It arrives that way from `as_fts_phrase`
+        // and it has to leave that way too.
+        let q = FtsQuery::build(r#""she said ""hello"" twice""#, false);
+        assert_eq!(q.terms, vec![r#"she said "hello" twice"#]);
+        assert_eq!(q.strict, r#""she said ""hello"" twice""#);
+    }
+
+    #[test]
+    fn an_unmatched_quote_leaves_ordinary_words() {
+        // The panel asks on every keystroke, so the instant after the opening
+        // quote is a state the reader passes THROUGH. Dropping the clause would
+        // blank their results until they closed it.
+        let q = FtsQuery::build(r#"wifi "conference room"#, false);
+        assert_eq!(q.terms, vec!["wifi", "conference", "room"]);
+        assert_eq!(q.strict, r#""wifi" AND "conference" AND "room""#);
+    }
+
+    #[test]
+    fn an_empty_phrase_is_dropped_not_passed_on() {
+        // `""` is not a legal FTS5 phrase; passing one on fails the whole
+        // MATCH, which is the exact class of error this builder removes.
+        let q = FtsQuery::build(r#""" wifi"#, false);
+        assert_eq!(q.terms, vec!["wifi"]);
+        assert_eq!(q.strict, r#""wifi""#);
+        for text in [r#""""#, r#""   ""#, r#"" :- ""#, r#""""""#] {
+            let q = FtsQuery::build(text, false);
+            assert!(q.is_empty(), "{text:?} must build nothing");
+            assert_eq!(q.strict, "");
+            assert_eq!(q.any, "");
+        }
+    }
+
+    #[test]
+    fn partial_never_stars_a_phrase() {
+        // A phrase is words the reader has finished typing — they closed the
+        // quote. Widening its last word would match text they explicitly asked
+        // not to be guessed at, and `"a b"*` is a prefix on the phrase's tail,
+        // not on the phrase.
+        let q = FtsQuery::build(r#"abstract "conference room""#, true);
+        assert_eq!(q.strict, r#""abstract" AND "conference room""#);
+        assert_eq!(q.any, r#""abstract" OR "conference room""#);
+        assert!(!q.strict.contains('*'), "no star: {:?}", q.strict);
+
+        // A word AFTER the phrase is still the tail, and still widens.
+        let q = FtsQuery::build(r#""conference room" wif"#, true);
+        assert_eq!(q.strict, r#""conference room" AND "wif"*"#);
     }
 
     fn day(y: i32, m: u32, d: u32) -> DateTime<Utc> {
