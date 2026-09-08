@@ -1,7 +1,8 @@
 # Search: keyword, meaning, and the agent lane
 
-Status: designed 2026-09-02; the build is the waves in §7. Wave 0 (the `s`
-key) ships with this document. This is the design record for making search
+Status: designed 2026-09-02, built 2026-09-02 to 2026-09-08 (waves 0 to 2 of
+§7 plus the `from:` menu of §4.1); this document was amended to what shipped
+where the build taught the design something. This is the design record for making search
 find the mail you mean, not just the mail that contains your words, and it
 starts from a query that the current search handled worse than a human did.
 
@@ -161,11 +162,17 @@ All in `squelch-core`, all covered by `store/sqlite/tests/search.rs`, and
 every ranking change is mutation-tested against the live mailbox (the recency
 PR's lesson: green proves nothing on a ranking change).
 
-1. **Tokenise and quote.** Split the reader's text on whitespace, drop FTS5
-   syntax characters, wrap every token in double quotes. The reader's text is
-   never again parsed as FTS5 syntax, so the "malformed MATCH means zero
-   hits" path becomes unreachable from a search box. Operators stay
-   `parse_search_query`'s business and are lifted out before this.
+1. **Tokenise and quote.** One builder (`FtsQuery::build`) for every MATCH.
+   The reader's text is split on whitespace AND on FTS5 syntax characters
+   (they SPLIT a token rather than being deleted from it, because unicode61
+   treats every one of them as a separator, so `re:contract` becomes the two
+   terms the index actually holds); each survivor is wrapped in double
+   quotes. The one exception is the reader's OWN quotes: a matched pair
+   passes through as a single FTS5 phrase (one term, one document frequency,
+   never a prefix star), so `"tracking number"` still means adjacency. The
+   reader's text is never again parsed as FTS5 syntax, so the "malformed
+   MATCH means zero hits" path is unreachable from a search box. Operators
+   stay `parse_search_query`'s business and are lifted out before this.
 2. **AND, then OR.** Run the strict all-terms match first. When it returns
    fewer than the page, append the any-term match (`"a" OR "b" OR "c"`)
    ranked by bm25, deduplicated, after the strict hits. Exact matches stay on
@@ -174,16 +181,25 @@ PR's lesson: green proves nothing on a ranking change).
    the same builder so the two modes cannot disagree about what a query
    means. Pagination on the keyword leg stays exact: the OR page is offset by
    the strict count.
-3. **Stem.** `tokenize = 'porter unicode61'`. `migrate.rs` detects the old
-   tokenizer from the `CREATE VIRTUAL TABLE` text in `sqlite_master`, drops
-   and recreates `messages_fts`, and refills it from `messages(subject,
-   body)` in one transaction. Idempotent; a fresh DB gets it from
-   `schema.sql`.
+3. **Stem.** `tokenize = 'porter unicode61'`, plus a prefix index for the
+   as-you-type tail (item 5). `migrate.rs` compares the stored `CREATE
+   VIRTUAL TABLE` text in `sqlite_master` against the definition cut out of
+   the embedded `schema.sql` itself (case, whitespace and `IF NOT EXISTS`
+   folded) and rebuilds on ANY mismatch, under `BEGIN IMMEDIATE`, refilling
+   from `messages(subject, body)`; a failed rebuild is not fatal to the open.
+   Comparing the whole text rather than sniffing one token is what makes the
+   next edit to that line unable to ship unmigrated. Idempotent; a fresh DB
+   gets it from `schema.sql`. About half a second once on a 1,700-message
+   mailbox.
 4. **Weight the subject.** `bm25(messages_fts, 4.0, 1.0)`. A word in the
    subject is the sender telling you what the mail is about.
-5. **Prefix the trailing token** while the query is being typed: the last
-   token gets `*` when the door is asked with `partial=1`, which the panel
-   sends from its debounced fetch and the agent never does.
+5. **Prefix the trailing token** while the query is being typed, when the
+   door is asked with `partial=1` (the panel's debounced fetch sends it, the
+   agent never does). Porter and a naive prefix cancel each other out: the
+   index holds stems, so `"shipp"*` matches nothing while `"ship"*` and
+   `"shipping"*` match hundreds. The shipped tail is an OR group of the
+   prefix query and every truncation of the token down to three characters,
+   which holds flat across every keystroke of a word.
 6. **Query instruction** for BGE on the query side only. Corpus vectors are
    untouched, so this is a search-time change with no backfill. The
    real-model e2e test (`embed_e2e_real_model_ranks_relevant_first`) grows a
@@ -195,10 +211,20 @@ PR's lesson: green proves nothing on a ranking change).
    all. Same size as the FTS window.
 8. **Diagnostics** on `SearchPage`: `strict_hits` (all terms), `any_hits`
    (any term), `terms: [{text, df}]`, and per-item `legs: ["keyword",
-   "vector"]`. Additive fields; the iOS client ignores what it does not
-   decode. Every count is account-scoped and excludes sealed AND spam rows
-   exactly as the hit queries do: a document frequency that counted sealed
-   mail would be an oracle for what sealed mail contains.
+   "vector"]` (empty for the filter-only listing, which ranks nothing).
+   Additive fields; the iOS client ignores what it does not decode. Every
+   count is account-scoped and excludes sealed AND spam rows exactly as the
+   hit queries do: a document frequency that counted sealed mail would be an
+   oracle for what sealed mail contains. Every count stops at a cap of 1,000
+   (zero, some and many is the whole vocabulary the classifier needs) and the
+   strict count is taken once per operator-free request, shared between the
+   page and the diagnostics.
+9. **The FTS table drives every join.** Every query on this leg reads `FROM
+   messages_fts f CROSS JOIN messages m`, because with `WHERE m.account_id`
+   beside it the planner otherwise picks `idx_messages_from` as the outer
+   loop and re-runs the MATCH once per candidate message: 17 to 200 ms per
+   count on 1,700 messages against 0.01 to 0.08 ms pinned, identical rows. A
+   plan test and a source guard hold it.
 
 ### 4.1 `from:` gets a sender menu
 

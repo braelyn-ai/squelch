@@ -142,6 +142,19 @@ struct SearchView: View {
             .padding(.top, 12)
             .padding(.bottom, 8)
 
+            // THE SENDER MENU, under the well, for exactly as long as the
+            // trailing token is a `from:` operator being typed (see
+            // FromOperator). Mounted by the fragment and the focus rather than
+            // by a flag of its own, so a space, a finished address, or the
+            // reader opening a hit all take it down without anybody having to
+            // remember to; and mounted AFTER the field, so its arrows and Enter
+            // register later than this panel's and win only while it is up.
+            if focused, let fragment = FromOperator.fragment(in: store.search.query) {
+                SenderSuggestions(query: $store.search.query, fragment: fragment)
+                    .padding(.horizontal, 16)
+                    .padding(.bottom, 8)
+            }
+
             // THE ORDER, beside the thing that produces it. A sort control is
             // about the answer, so it belongs next to the question and not
             // three screens away — the same preference is in Settings, and the
