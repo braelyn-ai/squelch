@@ -44,6 +44,8 @@ struct SearchIntentTests {
         // the prompt
         promptHasNoForbiddenDashes()
         promptFramesMailAsData()
+        theHitsBlockPointsAtRulesItAlwaysHas()
+        sealedMailIsNamedAsUnreachable()
         aSubjectCannotCloseItsOwnFrame()
         refinementCarriesTheWordsAndTheHits()
 
@@ -429,6 +431,40 @@ struct SearchIntentTests {
             SearchLanePrompt.system(today: "September 2, 2026", hits: [])
                 .contains("found nothing for these words"),
             "an empty local search says so rather than framing an empty block")
+    }
+
+    /// The hits block rides in two places: under the system prompt, where the
+    /// Trust block really is below it, and on a tool-result user message, where
+    /// there is nothing below it at all. One wording has to be true in both, or
+    /// the copy that is wrong is teaching a model to look for rules it cannot
+    /// see and to fall back on its own judgement about a stranger's subject
+    /// line.
+    static func theHitsBlockPointsAtRulesItAlwaysHas() {
+        let block = SearchLanePrompt.hitsBlock(sampleHits)
+        expect(
+            !block.contains("Trust rules below"),
+            "nothing below a refinement's hits block, so it cannot point down at rules")
+        expect(
+            block.contains("Trust rules in your instructions"),
+            "it points at the instructions, which the model has either way")
+        expect(
+            SearchLanePrompt.refinement(text: "abstract wifi", hits: sampleHits)
+                .contains("Trust rules in your instructions"),
+            "and the refinement carries that same wording")
+    }
+
+    /// The lane cannot see sealed mail, and a lane that does not know it will
+    /// spend its whole turn budget searching for a login code. The chat's
+    /// prompt has said so since it shipped; this one has to as well.
+    static func sealedMailIsNamedAsUnreachable() {
+        let prompt = SearchLanePrompt.system(today: "September 2, 2026", hits: sampleHits)
+        expect(prompt.contains("2FA"), "auth mail is named")
+        expect(
+            prompt.contains("password reset mail are invisible here on purpose"),
+            "and named as invisible on purpose rather than missing")
+        expect(
+            prompt.contains("say so in the one line, show no cards, and do not"),
+            "with the one thing to do about it: say so, and stop")
     }
 
     /// A subject is a stranger's sentence, and one that spelled the closing
