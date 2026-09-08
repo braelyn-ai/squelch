@@ -401,11 +401,29 @@ final class AssistantSession {
     /// suspended tool call: it MUST be resumed before it can be dropped.
     private var parked: [PendingAction.ID: CheckedContinuation<ActionResolution, Never>] = [:]
 
-    /// HELD, NOT STOPPED. True from `pause()` until `resume()`, and `running`
-    /// stays true right through it: the conversation is open, its history and
-    /// cards are intact, and the loop is simply sitting at a boundary. See
-    /// `pause()` for why there are exactly two of those.
+    /// HELD, NOT STOPPED. True while THIS RUN's loop is to sit at its next
+    /// boundary, and `running` stays true right through it: the conversation is
+    /// open, its history and cards are intact, and the loop is simply waiting.
+    /// See `pause()` for why there are exactly two of those.
+    ///
+    /// RUN-SCOPED, which is the whole reason it is not the only flag. It is
+    /// cleared when the run it belongs to ends, because a hold on a loop that
+    /// has finished has nothing left to hold: left set, it would catch the NEXT
+    /// question at its first boundary with nobody on screen to release it.
     private(set) var isPaused = false
+    /// THE PANEL'S INTENT, which outlives any one run. True from `pause()`
+    /// until `resume()` or `clear()`, and nothing else touches it.
+    ///
+    /// TWO FLAGS BECAUSE THERE ARE TWO FACTS, and running them together broke
+    /// the promise in docs/SEARCH.md §6.3 that a closed panel starts nothing.
+    /// The facts are "this loop stops at its next boundary" (run-scoped, above,
+    /// and it MUST die with the run) and "the reader has shut the panel"
+    /// (session-scoped, this, and it must NOT). With one flag serving both, a
+    /// turn that ended while the panel was closed cleared the hold in its own
+    /// defer and then delivered a pending narrowing as a whole new run: a fresh
+    /// request, tool calls reading the reader's mail, and a pause glyph nobody
+    /// can see, behind a panel that is not on screen.
+    private(set) var heldByPanel = false
     /// The loop, suspended at a boundary. Same contract as `parked`: a
     /// continuation in here MUST be resumed before it can be dropped, or the
     /// run task is leaked, suspended forever, holding its history.
@@ -528,7 +546,18 @@ final class AssistantSession {
             // there is no new question to attach them to.
             return
         case .restart:
+            // A different search, so the conversation goes and these words open
+            // a new one. THE HOLD IS NOT PART OF WHAT IS TORN DOWN: `clear()`
+            // drops it along with the conversation it belonged to, and a shut
+            // panel must no more start this run than any other, so it is carried
+            // over and the words wait in the fresh slot for `resume()`.
+            let held = heldByPanel
             clear()
+            guard !held else {
+                heldByPanel = true
+                _ = refinements.offer(refinement, key: words)
+                return
+            }
             start(words, openEmail: nil, hits: refinement.hits)
         case .queued:
             // Idle: nothing will reach a boundary, so this IS the next turn.
@@ -545,20 +574,31 @@ final class AssistantSession {
     /// finish (it is bounded by max_tokens and has already been paid for), and
     /// then nothing else happens until `resume()`.
     ///
-    /// A no-op when nothing is running, and that is load-bearing rather than
-    /// merely tidy: an idle session that latched this flag would hold its NEXT
-    /// question at the first boundary, with nobody left to press resume.
+    /// The HOLD is recorded whether or not anything is running, because it is
+    /// the reader's intent and not this loop's state: an idle session that is
+    /// held must not start the narrowing waiting in its slot either. Only the
+    /// run-scoped flag is guarded, and only because a loop that does not exist
+    /// cannot sit at a boundary.
     func pause() {
+        heldByPanel = true
         guard running else { return }
         isPaused = true
     }
 
-    /// Carry on from wherever the loop is sitting.
+    /// Carry on from wherever the loop is sitting, and — if the reader typed
+    /// while the panel was shut and the turn ended before those words could be
+    /// delivered — ask them now. This is §6.2's idle rule, arriving late: the
+    /// reopened panel is exactly the moment there is somebody to show it to.
     func resume() {
+        heldByPanel = false
         isPaused = false
-        guard let waiter = pauseWaiter else { return }
-        pauseWaiter = nil
-        waiter.resume()
+        if let waiter = pauseWaiter {
+            pauseWaiter = nil
+            waiter.resume()
+        }
+        // A no-op while the loop is still running (it will take the refinement
+        // at its own next boundary); this is only for the run that ended held.
+        deliverPendingAsSend()
     }
 
     /// Answer a confirm card. Idempotent: a second tap finds nothing parked.
@@ -593,6 +633,10 @@ final class AssistantSession {
             pauseWaiter = nil
             waiter.resume()
         }
+        // AND THE PANEL'S HOLD, which belonged to the conversation being torn
+        // down. The next one is nobody's business but its own: a seeded search
+        // arrives through here and must be free to run.
+        heldByPanel = false
         // LLMProxy.stream's onTermination takes the upstream connection down
         // with the consumer, so cancelling here really does stop the tokens.
         runTask?.cancel()
@@ -645,10 +689,13 @@ final class AssistantSession {
                 // A HOLD BELONGS TO A RUNNING LOOP. This one has ended, so a
                 // flag still set here would hold the NEXT question at its first
                 // boundary with nothing on screen asking anybody to resume.
+                // `heldByPanel` deliberately survives: the reader shutting the
+                // panel is not something this run's ending undoes.
                 isPaused = false
                 // A refinement that arrived after the last boundary is simply
                 // the next question — §6.2's idle rule, applied to the case
-                // where the turn ended before any boundary came.
+                // where the turn ended before any boundary came. Held, it stays
+                // in the slot until the panel comes back.
                 deliverPendingAsSend()
             }
         }
@@ -1058,6 +1105,13 @@ final class AssistantSession {
     /// callers reach it: `refine` on an idle session, and a run ending with a
     /// refinement that never met a boundary.
     private func deliverPendingAsSend() {
+        // NOT WHILE THE PANEL IS SHUT. §6.3 promises that a closed panel runs
+        // no tool and makes no next request, and this is the one door that
+        // would otherwise open a whole new run behind it — the run-scoped
+        // `isPaused` is gone by the time the ending defer calls this, which is
+        // exactly why the panel's own intent is a second flag. The words keep
+        // their place in the slot; `resume()` delivers them.
+        guard !heldByPanel else { return }
         guard !running, let refinement = refinements.take() else { return }
         // Through the same door a first question uses, so a refined search and
         // a fresh one are the same run from here on.
