@@ -112,9 +112,7 @@ enum ReleaseNotes {
         ReleaseNote(
             version: "0.0.7",
             date: "2026-09-08",
-            headline:
-                "Search that finds the mail you mean, spam you can see, and login codes "
-                + "that arrive on time.",
+            headline: "Deeper search, gmail spam, and 2FA codes the moment they land.",
             items: [
                 ReleaseItem(
                     .app,
@@ -129,17 +127,9 @@ enum ReleaseNotes {
                         + "see it"),
                 ReleaseItem(.app, "The dock icon shows how many things are due today"),
                 ReleaseItem(.app, "Rules are grouped by what they do, then by domain"),
-                ReleaseItem(
-                    .app,
-                    "Groups no longer report a delivery shortfall on sends that went out one "
-                        + "person at a time"),
-                ReleaseItem(
-                    .app,
-                    "Pages have a title and a subtitle instead of a title with a dash in it"),
-                ReleaseItem(
-                    .app,
-                    "Rules, audit and groups fill the window again instead of stopping "
-                        + "halfway down"),
+                ReleaseItem(.app, "Groups no longer report a delivery shortfall on individual sends"),
+                ReleaseItem(.app, "Page headers have a subtitle"),
+                ReleaseItem(.app, "Rules, audit and groups pages fill the window again"),
                 ReleaseItem(.ios, "New email button in the top right"),
                 ReleaseItem(.ios, "Auth page button moved to quick look"),
                 ReleaseItem(.ios, "A live login code shows at the top of sitrep"),
@@ -151,9 +141,8 @@ enum ReleaseNotes {
                 ReleaseItem(.ios, "Push banners for auth mail happen right away"),
                 ReleaseItem(
                     .ios,
-                    "The home screen icon shows how many things are due today, even while "
-                        + "the app is closed. If you allowed notifications before this "
-                        + "release, turn Badges on in Settings to see it"),
+                    "The app icon shows how many things are due today. Turn on Badges in "
+                        + "Settings if you don't see it"),
                 ReleaseItem(.ios, "Small UX improvements"),
                 ReleaseItem(.ios, "All mac improvements above"),
                 ReleaseItem(.daemon, "Notifications arrive when the mail does"),
@@ -185,46 +174,24 @@ enum ReleaseNotes {
                     "Newsletters don't show in FYE just because you emailed support once"),
                 ReleaseItem(.daemon, "Support for usage page"),
                 ReleaseItem(.daemon, "Bills get the same total parsing fix as receipts"),
+                ReleaseItem(.daemon, "Long bank names are no longer dropped"),
                 ReleaseItem(
-                    .daemon,
-                    "Institutions with long legal names are kept instead of dropped"),
-                ReleaseItem(
-                    .daemon,
-                    "A message skipped for having no body is extracted once the body "
-                        + "arrives"),
-                ReleaseItem(
-                    .daemon,
-                    "Sealing a message removes the receipt that was pulled from it"),
+                    .daemon, "Messages skipped for an empty body get extracted once the body arrives"),
+                ReleaseItem(.daemon, "Sealing a message removes its receipt"),
                 ReleaseItem(
                     .app,
-                    "Deeper search. When a query reads like a question, or no email has all of "
-                        + "its words, the agent starts looking alongside the results: it searches "
-                        + "with other words, reads the likely threads, and answers with the emails "
-                        + "and one line saying where the answer is. Keep typing and it refines "
-                        + "instead of starting over; close the panel and it waits for you. "
-                        + "Automatic, on request, or off in Settings."),
+                    "Deeper search. When keywords aren't enough, the agent searches alongside "
+                        + "the results and points at the answer. Automatic, on request, or off "
+                        + "in Settings"),
+                ReleaseItem(.app, "Type from: in search to pick from the people who write to you"),
+                ReleaseItem(.app, "Search results say why they matched"),
+                ReleaseItem(.app, "Search-this-sender moved from s in the reader to f in the list"),
                 ReleaseItem(
-                    .app,
-                    "Typing from: in the search field offers the people who write to you, most "
-                        + "frequent first. Pick one and the operator is filled in."),
-                ReleaseItem(
-                    .app,
-                    "Search results say why they matched, and a hit found by meaning shows the "
-                        + "sentence with your word in it rather than the top of the message."),
-                ReleaseItem(.app, "The s key no longer searches a sender from the reader; f does, from the list."),
-                ReleaseItem(
-                    .daemon,
-                    "A search whose words are not all in one email finds the best partial "
-                        + "matches instead of nothing. Exact matches still come first."),
-                ReleaseItem(
-                    .daemon,
-                    "Word forms match each other: password finds passwords, shipped finds "
-                        + "shipping. Typing the start of a word finds it as you go."),
-                ReleaseItem(.daemon, "A word in the subject counts more than the same word in the body."),
-                ReleaseItem(.daemon, "Quoted phrases search for the words side by side."),
-                ReleaseItem(
-                    .daemon,
-                    "Search over a big mailbox no longer stalls the daemon while it counts."),
+                    .daemon, "Search finds the best partial match instead of nothing. Exact matches still win"),
+                ReleaseItem(.daemon, "Search matches word forms. password finds passwords"),
+                ReleaseItem(.daemon, "Subject words count more than body words in search"),
+                ReleaseItem(.daemon, "Quoted phrases search for the exact phrase"),
+                ReleaseItem(.daemon, "Search no longer stalls the daemon on a big mailbox"),
                 ReleaseItem(.daemon, "Various bug fixes"),
             ]),
         ReleaseNote(
