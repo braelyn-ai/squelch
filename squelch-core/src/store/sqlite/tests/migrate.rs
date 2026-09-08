@@ -1070,3 +1070,84 @@ fn institution_relaundering_survives_a_db_without_a_banking_table() {
         .unwrap();
     migrate(&conn).unwrap();
 }
+
+#[test]
+fn migrate_requeues_a_no_body_row_once_its_body_arrives() {
+    // THE STAMP IS TERMINAL AND THE BODY IS RECOVERABLE, which is the whole
+    // problem: `extract_queue` selects on `extractor_model_used IS NULL`, a
+    // re-fetch heals `messages.body` without touching any triage column, and
+    // nothing else ever clears the marker. Between a daemon roll and that
+    // re-fetch, every extract tick permanently retires another row the ingest
+    // fix was written to rescue.
+    let conn = Connection::open_in_memory().unwrap();
+    conn.execute_batch(
+        "CREATE TABLE messages(
+             id INTEGER PRIMARY KEY, account_id INTEGER NOT NULL, body TEXT);
+         CREATE TABLE triage(
+             message_id INTEGER PRIMARY KEY, account_id INTEGER NOT NULL,
+             model_used TEXT, status TEXT NOT NULL DEFAULT 'new',
+             extractor_model_used TEXT);
+         INSERT INTO messages(id, account_id, body) VALUES
+             (1, 1, 'the body finally arrived'),
+             (2, 1, ''),
+             (3, 1, '   '),
+             (4, 1, 'plenty here'),
+             (5, 1, 'and here');
+         INSERT INTO triage(message_id, account_id, extractor_model_used) VALUES
+             (1, 1, 'skip-no-body'),
+             (2, 1, 'skip-no-body'),
+             (3, 1, 'skip-no-body'),
+             (4, 1, 'stale-skip'),
+             (5, 1, 'claude-opus-5');",
+    )
+    .unwrap();
+
+    migrate(&conn).unwrap();
+
+    let stamp = |id: i64| -> Option<String> {
+        conn.query_row(
+            "SELECT extractor_model_used FROM triage WHERE message_id = ?1",
+            rusqlite::params![id],
+            |r| r.get(0),
+        )
+        .unwrap()
+    };
+    assert_eq!(
+        stamp(1),
+        None,
+        "a body arrived, so the row goes back in the queue"
+    );
+    assert_eq!(
+        stamp(2).as_deref(),
+        Some("skip-no-body"),
+        "still empty: leave it refused, it will be refused again correctly"
+    );
+    assert_eq!(
+        stamp(3).as_deref(),
+        Some("skip-no-body"),
+        "whitespace is still nothing to read"
+    );
+    // THE OTHER STAMPS ARE NOT OURS TO CLEAR. A stale skip and a real
+    // extraction are both finished business; re-queuing them would re-bill an
+    // LLM call for a verdict that already exists.
+    assert_eq!(stamp(4).as_deref(), Some("stale-skip"));
+    assert_eq!(stamp(5).as_deref(), Some("claude-opus-5"));
+
+    // SELF-EXTINGUISHING: the predicate cannot re-match what it cleared, so a
+    // second open is free and no done-flag is needed.
+    migrate(&conn).unwrap();
+    assert_eq!(stamp(1), None);
+    assert_eq!(stamp(2).as_deref(), Some("skip-no-body"));
+}
+
+#[test]
+fn the_no_body_sweep_survives_a_schema_that_predates_the_column() {
+    // The migration suite builds deliberately partial schemas, and a pass that
+    // NAMES a column install never had is a hard SQL error, not a no-op.
+    let conn = Connection::open_in_memory().unwrap();
+    conn.execute_batch(
+        "CREATE TABLE messages(id INTEGER PRIMARY KEY, account_id INTEGER, body TEXT);",
+    )
+    .unwrap();
+    migrate(&conn).unwrap();
+}

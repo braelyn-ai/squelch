@@ -475,7 +475,19 @@ pub(super) fn migrate(conn: &Connection) -> Result<()> {
     // its output is a fixed point, so a completed pass matches nothing and a
     // re-run is free. No done-flag needed for a pass this cheap - one short
     // string per banking row, no bodies read.
-    resanitize_institutions(conn)?;
+    let relaundered = resanitize_institutions(conn)?;
+    if relaundered > 0 {
+        // A pass that can NULL a stored institution on a real database says so.
+        // Counts only, never a value: both siblings report the same way.
+        eprintln!("squelch: migration re-laundered {relaundered} institution name(s)");
+    }
+
+    // See the function: the ingest fix that shipped with the empty-body guard is
+    // what makes these rows recoverable, and nothing else ever clears the stamp.
+    let unstamped = clear_recoverable_no_body_markers(conn)?;
+    if unstamped > 0 {
+        eprintln!("squelch: migration re-queued {unstamped} row(s) whose body has since arrived");
+    }
 
     // Guarded on table existence — migration unit tests build partial schemas.
     if !tables_exist(conn, &["triage", "deadlines", "messages"])? {
@@ -730,27 +742,77 @@ fn backfill_message_recipients(conn: &Connection) -> Result<()> {
 /// kind and the card tail on that row are all still good, and the client falls
 /// back to the sender's display name for the label, so the card keeps reading
 /// "Venmo" without the paragraph after it.
-fn resanitize_institutions(conn: &Connection) -> Result<()> {
+fn resanitize_institutions(conn: &Connection) -> Result<usize> {
     use crate::triage::extract::banking::sanitize_institution;
 
-    if !tables_exist(conn, &["banking"])? {
-        return Ok(());
+    if !tables_exist(conn, &["banking"])? || !has_columns(conn, "banking", &["institution"])? {
+        return Ok(0);
     }
+    // ONE TRANSACTION, not one per row. These were bare autocommit `execute`s,
+    // which on a real WAL file cost 1.02s for 20,000 rewrites against 43ms
+    // inside a transaction — and left the table half-repaired on a crash
+    // mid-loop. Both sibling one-shots take a transaction; this one is a
+    // migration and had not.
+    // `unchecked_transaction` rather than `transaction`, so this stays a
+    // `&Connection` and the whole migrate() chain keeps its signature.
+    let tx = conn.unchecked_transaction()?;
     let rows: Vec<(i64, String)> = {
         let mut stmt =
-            conn.prepare("SELECT id, institution FROM banking WHERE institution IS NOT NULL")?;
+            tx.prepare("SELECT id, institution FROM banking WHERE institution IS NOT NULL")?;
         stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
             .collect::<std::result::Result<Vec<_>, _>>()?
     };
+    let mut changed = 0usize;
     for (id, stored) in rows {
         let clean = sanitize_institution(Some(&stored));
         if clean.as_deref() == Some(stored.as_str()) {
             continue;
         }
-        conn.execute(
+        changed += tx.execute(
             "UPDATE banking SET institution = ?2 WHERE id = ?1",
             rusqlite::params![id, clean],
         )?;
     }
-    Ok(())
+    tx.commit()?;
+    Ok(changed)
+}
+
+/// ONE-SHOT, SELF-EXTINGUISHING: un-stamp every row an extractor refused for
+/// having no body, whose message HAS a body now.
+///
+/// [`crate::triage::extract::RowAction::NoBody`] marks a row processed so an
+/// empty body is never billed for a guess, and that stamp is terminal —
+/// `extract_queue` selects on `extractor_model_used IS NULL`, and only a
+/// hand-requested re-triage clears it. But the ingest fix that shipped
+/// ALONGSIDE that guard is what makes those bodies recoverable: a re-fetch
+/// heals `messages.body` and touches no triage column, so the row is left
+/// permanently retired with the very content it was waiting for sitting in it.
+///
+/// That is not hypothetical. A sender shipping an empty text/plain part beside
+/// a full HTML one stored `body = ''` for its whole history (39 of 39 Venmo
+/// messages in one real mailbox), and every extract tick between the daemon
+/// roll and the re-fetch stamps another one.
+///
+/// The predicate IS the recovery, so nothing needs a done-flag: a row with a
+/// body no longer matches once cleared, and a row still empty is left alone to
+/// be refused again, correctly. Same shape and same reason as
+/// `clear_stale_no_extractor_markers`, which exists because the marketing
+/// dispatch bug stranded a corpus this way.
+fn clear_recoverable_no_body_markers(conn: &Connection) -> Result<usize> {
+    // BOTH columns, not just the marker's. The migration suite builds partial
+    // schemas on purpose, and a SELECT naming a column install never had is a
+    // hard SQL error that fails the whole open — `messages.body` is as much a
+    // read here as `triage.extractor_model_used` is.
+    if !tables_exist(conn, &["triage", "messages"])?
+        || !has_columns(conn, "triage", &["extractor_model_used"])?
+        || !has_columns(conn, "messages", &["body"])?
+    {
+        return Ok(0);
+    }
+    Ok(conn.execute(
+        "UPDATE triage SET extractor_model_used = NULL
+         WHERE extractor_model_used = ?1
+           AND message_id IN (SELECT id FROM messages WHERE TRIM(body) <> '')",
+        rusqlite::params![crate::triage::NO_BODY_SKIP_MODEL],
+    )?)
 }

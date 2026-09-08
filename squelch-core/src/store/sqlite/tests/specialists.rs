@@ -3084,3 +3084,101 @@ fn reparse_never_clears_an_amount_it_cannot_reproduce() {
         "an unreproducible amount is left standing, not cleared"
     );
 }
+
+fn reparse_flag(store: &SqliteStore, acct: AccountId) -> Option<String> {
+    store.get_app_setting(acct, "receipts_reparse_v1").unwrap()
+}
+
+#[test]
+fn the_reparse_flag_and_its_corrections_commit_together() {
+    // THE ONCE IS THE STORE'S JOB and it had no test: deleting the flag write
+    // outright left the reparse suite green, because the assertion that looked
+    // like it covered this (a second call returning 0) passes for a different
+    // reason — after the first pass the recompute equals the stored value and
+    // `same_cents` short-circuits. So the pass would silently run on EVERY boot
+    // and nothing would say so.
+    let (store, acct) = store();
+    assert_eq!(reparse_flag(&store, acct), None, "unrun");
+
+    triaged(acct, "g-amz", "t-amz")
+        .from("shipment-tracking@amazon.com")
+        .from_name(Some("Amazon.com"))
+        .subject("Shipped: 2 items")
+        .body(AMAZON_FLOAT_BODY)
+        .receipt(crate::triage::ReceiptInfo {
+            amount: Some(28_999_999_999_999.0),
+            currency: Some("USD".into()),
+        })
+        .ingest(&store);
+
+    assert_eq!(store.receipts_reparse_cleanup(acct).unwrap(), 1);
+    assert_eq!(
+        reparse_flag(&store, acct).as_deref(),
+        Some("done"),
+        "the flag commits with the corrections, not after them"
+    );
+}
+
+#[test]
+fn the_reparse_one_shot_records_itself_even_when_it_corrects_nothing() {
+    // A mailbox with nothing to fix must still be marked done, or the pass
+    // re-scans every receipt on every start forever.
+    let (store, acct) = store();
+    receipt_triaged(acct, "g-ok", "t-ok", Some(3.49))
+        .body("Thank you for your ride. Total: $3.49")
+        .ingest(&store);
+
+    assert_eq!(store.receipts_reparse_cleanup(acct).unwrap(), 0);
+    assert_eq!(reparse_flag(&store, acct).as_deref(), Some("done"));
+}
+
+#[test]
+fn sealing_a_message_takes_its_receipt_with_it() {
+    // The seal scrub drops the marketing and banking rows a sealed message fed
+    // and did NOT drop its receipt, so a merchant and an amount lifted out of
+    // mail the owner just called auth kept rendering on the Sitrep's Receipts
+    // zone — the exact leak the neighbouring deletes exist to prevent.
+    let (store, acct) = store();
+    let id = receipt_triaged(acct, "g-r1", "t-r1", Some(3.49)).ingest(&store);
+    assert_eq!(store.list_receipts(acct, 30).unwrap().len(), 1);
+
+    store
+        .correct_triage(
+            acct,
+            id,
+            TriageAxis::Sensitivity,
+            "sealed",
+            None,
+            Utc::now(),
+        )
+        .unwrap();
+
+    assert!(
+        store.list_receipts(acct, 30).unwrap().is_empty(),
+        "a sealed message keeps no receipt row"
+    );
+}
+
+#[test]
+fn sealed_mail_never_gets_a_receipt_row_in_the_first_place() {
+    // THE INVARIANT THE SQL GUARD IS A SECOND LAYER OF. `detect_receipt` is
+    // never run for sealed mail, so the table holds no sealed rows by
+    // construction — which is what makes `receipts_reparse_cleanup`'s
+    // `sensitivity = 'normal'` clause unexercisable defence in depth rather
+    // than a testable behaviour. It is asserted HERE, at the layer where it is
+    // actually decided, instead of with a store test that can only pass
+    // vacuously.
+    let (store, acct) = store();
+    receipt_triaged(acct, "g-sealed", "t-sealed", Some(3.49))
+        .body(AMAZON_FLOAT_BODY)
+        .sealed(SealedKind::Otp)
+        .ingest(&store);
+
+    assert!(
+        store.list_receipts(acct, 30).unwrap().is_empty(),
+        "sealed mail writes no receipt"
+    );
+    // And with no row to read, the repair pass has nothing to do — the state
+    // the guard defends against cannot be constructed through the store at all.
+    assert_eq!(store.receipts_reparse_cleanup(acct).unwrap(), 0);
+}

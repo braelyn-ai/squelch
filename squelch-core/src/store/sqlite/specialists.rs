@@ -1112,9 +1112,14 @@ impl SqliteStore {
             // The sensitivity guard is REPEATED here rather than trusted from
             // the id query above, because this is the statement that actually
             // reads a body: a detector must never run over sealed mail, and the
-            // check belongs where the read happens. (Unlike shipments, sealing
-            // does NOT delete a receipts row - see `feedback.rs` - so this
-            // clause is the whole guarantee, not a belt on braces.)
+            // check belongs where the read happens.
+            //
+            // DEFENCE IN DEPTH, not the guarantee. It was the guarantee while
+            // `feedback.rs` scrubbed marketing and banking on seal but not
+            // receipts; that gap is closed, so a sealed message now keeps no
+            // receipt row and this state is unreachable through the store. The
+            // clause stays for the rows a daemon predating that fix left on
+            // disk, which a repair pass is exactly the thing to go re-read.
             type Row = (
                 Option<f64>,
                 String,
