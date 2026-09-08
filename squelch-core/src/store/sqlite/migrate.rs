@@ -574,19 +574,44 @@ pub(super) fn migrate(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-/// The `messages_fts` definition `schema.sql` creates. The rebuild has to say
-/// it a second time (a `CREATE ... IF NOT EXISTS` is a no-op against a table
-/// that already exists), so the two live next to their own drift check:
-/// [`FTS_MARKERS`] is what a definition must contain to be current.
-const FTS_CREATE: &str = "CREATE VIRTUAL TABLE messages_fts USING fts5(
-     subject, body, tokenize = 'porter unicode61', prefix = '2 3'
- )";
+/// THE `messages_fts` DEFINITION, CUT OUT OF `schema.sql` ITSELF.
+///
+/// It is one string with two jobs — what a current index must look like, and
+/// what the rebuild creates — and it is READ FROM THE SCHEMA rather than
+/// written down a second time here, because the second copy is the bug. A
+/// hand-maintained list of options to look for ("does it say porter") notices
+/// only the options somebody remembered to list: the prefix index was added to
+/// this line and the check that was supposed to guard it went on passing,
+/// which is how a mailbox ends up serving search off an index nobody meant to
+/// ship. There is nothing to keep in step now; `schema.sql` IS the check.
+///
+/// `None` only if the statement cannot be found at all, which the unit tests
+/// make impossible to ship — the schema is compiled in, so this cannot depend
+/// on anything a mailbox did.
+pub(super) fn canonical_fts_create() -> Option<&'static str> {
+    static PARSED: std::sync::OnceLock<Option<&'static str>> = std::sync::OnceLock::new();
+    *PARSED.get_or_init(|| {
+        let start = SCHEMA.find("CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts")?;
+        // Through the closing paren of the fts5 argument list, without the
+        // statement terminator: that is the shape SQLite stores.
+        let end = start + SCHEMA[start..].find(");")? + 1;
+        Some(SCHEMA[start..end].trim())
+    })
+}
 
-/// What an up-to-date `messages_fts` definition says, lowercased. Every option
-/// this index depends on is listed: miss one and the rebuild silently stops
-/// noticing that option's absence, which is how a mailbox ends up serving
-/// search off an index nobody meant to ship.
-const FTS_MARKERS: &[&str] = &["porter", "prefix"];
+/// Fold two `CREATE VIRTUAL TABLE` texts to something comparable: lowercased,
+/// every run of whitespace one space, and `IF NOT EXISTS` gone.
+///
+/// Those three are exactly the differences SQLite itself introduces. It stores
+/// the statement's own text in `sqlite_master`, verbatim apart from dropping
+/// `IF NOT EXISTS` and the terminator, so a definition that differs from
+/// `schema.sql`'s in ANY other way — a tokenizer, a prefix list, a column
+/// order, a column name — is a different index and has to be rebuilt.
+pub(super) fn normalize_fts_sql(sql: &str) -> String {
+    let folded = sql.to_ascii_lowercase();
+    let collapsed = folded.split_whitespace().collect::<Vec<_>>().join(" ");
+    collapsed.replace("if not exists ", "")
+}
 
 /// THE FTS INDEX'S OPTIONS ARE NOT ALTERABLE, so a change to them is a
 /// DROP + CREATE + refill.
@@ -604,11 +629,17 @@ const FTS_MARKERS: &[&str] = &["porter", "prefix"];
 /// message upsert writes the FTS row from those same two columns, so this
 /// reproduces the index rather than reinterpreting it.
 ///
-/// The trigger is the CREATE text in `sqlite_master`, which is what SQLite
-/// itself stored when the table was made, so this is idempotent by
-/// construction: the next open reads a definition carrying every marker and
-/// does nothing. Guarded on both tables existing, because the migration unit
-/// tests build partial schemas.
+/// THE TRIGGER IS ANY DIFFERENCE AT ALL between the CREATE text in
+/// `sqlite_master` — what SQLite itself stored when the table was made — and
+/// [`canonical_fts_create`], compared through [`normalize_fts_sql`]. Not a list
+/// of options to look for: a list only ever notices the options somebody
+/// remembered to add to it, and the next edit to that line in `schema.sql`
+/// would ship silently unmigrated, which is a mailbox searching an index that
+/// does not match its own schema and no way to tell from the outside.
+///
+/// Idempotent by construction: the rebuild creates the canonical definition, so
+/// the next open compares it against itself and does nothing. Guarded on both
+/// tables existing, because the migration unit tests build partial schemas.
 ///
 /// TWO THINGS ABOUT THE TRANSACTION, both of them about the fact that this repo
 /// really does open one DB from two processes (`squelchd token issue` and
@@ -633,6 +664,13 @@ pub(super) fn rebuild_fts_if_stale(conn: &Connection) -> Result<()> {
     if !tables_exist(conn, &["messages_fts", "messages"])? {
         return Ok(());
     }
+    let Some(canonical) = canonical_fts_create() else {
+        // Unreachable in a shipped build (the schema is compiled in and a unit
+        // test reads this statement out of it), and if it ever were reached,
+        // rebuilding against a definition we could not find is the worse guess.
+        eprintln!("squelch: no messages_fts definition in the schema; leaving the index alone");
+        return Ok(());
+    };
     let created: Option<String> = conn
         .query_row(
             "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'messages_fts'",
@@ -643,19 +681,19 @@ pub(super) fn rebuild_fts_if_stale(conn: &Connection) -> Result<()> {
     // A NULL/absent definition reads as "already current": there is nothing to
     // act on, and rebuilding an index we cannot describe is the riskier guess.
     let current = match created.as_deref() {
-        Some(sql) => {
-            let sql = sql.to_ascii_lowercase();
-            FTS_MARKERS.iter().all(|m| sql.contains(m))
-        }
+        Some(sql) => normalize_fts_sql(sql) == normalize_fts_sql(canonical),
         None => true,
     };
     if current {
         return Ok(());
     }
+    // `IF NOT EXISTS` rides along in the canonical text and is a no-op one
+    // statement after the DROP; stripping it would mean editing the string,
+    // which is how the two copies started drifting in the first place.
     let batch = format!(
         "BEGIN IMMEDIATE;
          DROP TABLE messages_fts;
-         {FTS_CREATE};
+         {canonical};
          INSERT INTO messages_fts(rowid, subject, body)
              SELECT id, subject, body FROM messages;
          COMMIT;"

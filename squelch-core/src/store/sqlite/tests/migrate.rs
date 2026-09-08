@@ -1,6 +1,8 @@
 //! Migration + init upgrade-path tests.
 
-use super::super::migrate::{migrate, rebuild_fts_if_stale};
+use super::super::migrate::{
+    canonical_fts_create, migrate, normalize_fts_sql, rebuild_fts_if_stale,
+};
 use super::super::*;
 use super::support::*;
 use crate::types::Sensitivity;
@@ -1378,6 +1380,119 @@ fn migrate_rebuilds_an_index_that_stems_but_has_no_prefix_index() {
         .query_row("SELECT COUNT(*) FROM messages_fts", [], |r| r.get(0))
         .unwrap();
     assert_eq!(rows, 1, "the message survived the rebuild");
+}
+
+/// The fixture the FTS drift tests share: a `messages` table and whatever
+/// `messages_fts` definition the caller wants to have been created by an older
+/// build, filled from `messages` the way the upsert would have.
+fn fts_fixture(fts_create: &str) -> Connection {
+    let conn = Connection::open_in_memory().unwrap();
+    conn.execute_batch(&format!(
+        "CREATE TABLE messages(
+             id INTEGER PRIMARY KEY, account_id INTEGER NOT NULL,
+             gmail_msg_id TEXT NOT NULL, subject TEXT NOT NULL DEFAULT '',
+             body TEXT NOT NULL DEFAULT '');
+         {fts_create};
+         INSERT INTO messages(id, account_id, gmail_msg_id, subject, body)
+             VALUES (1, 1, 'g1', 'venue details', 'the wifi passwords are on the agenda page');
+         INSERT INTO messages_fts(rowid, subject, body)
+             SELECT id, subject, body FROM messages;"
+    ))
+    .unwrap();
+    conn
+}
+
+fn stored_fts_sql(conn: &Connection) -> String {
+    conn.query_row(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'messages_fts'",
+        [],
+        |r| r.get(0),
+    )
+    .unwrap()
+}
+
+fn fts_rows(conn: &Connection) -> i64 {
+    conn.query_row("SELECT COUNT(*) FROM messages_fts", [], |r| r.get(0))
+        .unwrap()
+}
+
+#[test]
+fn an_fts_definition_that_differs_at_all_is_rebuilt() {
+    // Not "does it say porter" — ANY difference from `schema.sql`'s own line.
+    // A marker list only notices the options somebody remembered to list, so
+    // the next edit to that line (the prefix index was one) would have shipped
+    // silently unmigrated: a mailbox searching an index that does not match its
+    // own schema, with nothing on the outside to say so.
+    //
+    // This definition differs in every way at once: no stemmer, no prefix
+    // index, columns the other way round.
+    let conn = fts_fixture("CREATE VIRTUAL TABLE messages_fts USING fts5(body, subject)");
+
+    migrate(&conn).unwrap();
+
+    assert_eq!(
+        normalize_fts_sql(&stored_fts_sql(&conn)),
+        normalize_fts_sql(canonical_fts_create().expect("schema.sql carries the definition")),
+        "the rebuilt index is the schema's own definition, exactly"
+    );
+    assert_eq!(fts_rows(&conn), 1, "the message survived the rebuild");
+}
+
+#[test]
+fn the_schemas_own_definition_is_never_rebuilt() {
+    // The other half of the same claim, and the one that keeps this cheap: a
+    // mailbox created by a current build must open without a full reindex. The
+    // proof is a row in `messages` that no FTS row was ever written for — a
+    // rebuild refills from `messages`, so it would pick that row up.
+    let canonical = canonical_fts_create().expect("schema.sql carries the definition");
+    let conn = fts_fixture(canonical);
+    conn.execute_batch(
+        "DELETE FROM messages_fts;
+         INSERT INTO messages(id, account_id, gmail_msg_id, subject, body)
+             VALUES (2, 1, 'g2', 'shipping update', 'your parcel shipped this morning');",
+    )
+    .unwrap();
+
+    // What SQLite stored when it created the canonical statement differs from
+    // the statement itself only in the ways `normalize_fts_sql` folds away
+    // (`IF NOT EXISTS`, the terminator, whitespace). If that ever stopped being
+    // true, every open would rebuild the whole index.
+    assert_eq!(
+        normalize_fts_sql(&stored_fts_sql(&conn)),
+        normalize_fts_sql(canonical),
+    );
+
+    migrate(&conn).unwrap();
+    migrate(&conn).unwrap();
+    assert_eq!(fts_rows(&conn), 0, "nothing was refilled, so nothing ran");
+}
+
+#[test]
+fn two_opens_in_a_row_rebuild_the_index_once() {
+    // Idempotence, measured rather than assumed. The first open rebuilds; the
+    // second compares the definition it just wrote against the schema's, finds
+    // them equal, and does nothing. A row added to `messages` alone between the
+    // two is the tell: only a second rebuild could put it in the index.
+    let conn = fts_fixture("CREATE VIRTUAL TABLE messages_fts USING fts5(subject, body)");
+
+    migrate(&conn).unwrap();
+    assert_eq!(fts_rows(&conn), 1, "the first open rebuilds");
+    assert_eq!(
+        normalize_fts_sql(&stored_fts_sql(&conn)),
+        normalize_fts_sql(canonical_fts_create().unwrap()),
+    );
+
+    conn.execute_batch(
+        "INSERT INTO messages(id, account_id, gmail_msg_id, subject, body)
+             VALUES (2, 1, 'g2', 'shipping update', 'your parcel shipped this morning');",
+    )
+    .unwrap();
+    migrate(&conn).unwrap();
+    assert_eq!(
+        fts_rows(&conn),
+        1,
+        "the second open rebuilt nothing, so the un-indexed row stayed out"
+    );
 }
 
 #[test]

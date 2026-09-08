@@ -814,8 +814,11 @@ CREATE INDEX IF NOT EXISTS idx_attachments_message ON attachments(account_id, me
 -- past three characters the expansion is already narrow, and each extra length
 -- is another index to write on every message.
 --
--- Changing this line means an existing index has to be rebuilt: `migrate.rs`
--- detects an out-of-date definition in `sqlite_master` and does exactly that.
+-- Changing this line means an existing index has to be rebuilt, and that is
+-- automatic: `migrate.rs` READS THIS STATEMENT out of the embedded schema and
+-- rebuilds any `messages_fts` whose stored definition differs from it at all.
+-- There is no second copy to update and no list of options to remember to
+-- extend, so an edit here cannot ship unmigrated.
 CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
     subject, body, tokenize = 'porter unicode61', prefix = '2 3'
 );
