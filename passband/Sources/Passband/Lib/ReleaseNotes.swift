@@ -112,7 +112,9 @@ enum ReleaseNotes {
         ReleaseNote(
             version: "0.0.7",
             date: "2026-09-08",
-            headline: "Spam you can see, charts you can enjoy, and login codes that arrive on time.",
+            headline:
+                "Search that finds the mail you mean, spam you can see, and login codes "
+                + "that arrive on time.",
             items: [
                 ReleaseItem(
                     .app,
@@ -125,6 +127,19 @@ enum ReleaseNotes {
                     .app,
                     "Auth mail arrival is instant. Get 2FA codes without waiting for an LLM to "
                         + "see it"),
+                ReleaseItem(.app, "The dock icon shows how many things are due today"),
+                ReleaseItem(.app, "Rules are grouped by what they do, then by domain"),
+                ReleaseItem(
+                    .app,
+                    "Groups no longer report a delivery shortfall on sends that went out one "
+                        + "person at a time"),
+                ReleaseItem(
+                    .app,
+                    "Pages have a title and a subtitle instead of a title with a dash in it"),
+                ReleaseItem(
+                    .app,
+                    "Rules, audit and groups fill the window again instead of stopping "
+                        + "halfway down"),
                 ReleaseItem(.ios, "New email button in the top right"),
                 ReleaseItem(.ios, "Auth page button moved to quick look"),
                 ReleaseItem(.ios, "A live login code shows at the top of sitrep"),
@@ -134,6 +149,11 @@ enum ReleaseNotes {
                     "The tracking-pixel switch is desktop only. The account default still "
                         + "decides and review still names a tracked send."),
                 ReleaseItem(.ios, "Push banners for auth mail happen right away"),
+                ReleaseItem(
+                    .ios,
+                    "The home screen icon shows how many things are due today, even while "
+                        + "the app is closed. If you allowed notifications before this "
+                        + "release, turn Badges on in Settings to see it"),
                 ReleaseItem(.ios, "Small UX improvements"),
                 ReleaseItem(.ios, "All mac improvements above"),
                 ReleaseItem(.daemon, "Notifications arrive when the mail does"),
@@ -164,7 +184,17 @@ enum ReleaseNotes {
                     .daemon,
                     "Newsletters don't show in FYE just because you emailed support once"),
                 ReleaseItem(.daemon, "Support for usage page"),
-                ReleaseItem(.daemon, "Various bug fixes"),
+                ReleaseItem(.daemon, "Bills get the same total parsing fix as receipts"),
+                ReleaseItem(
+                    .daemon,
+                    "Institutions with long legal names are kept instead of dropped"),
+                ReleaseItem(
+                    .daemon,
+                    "A message skipped for having no body is extracted once the body "
+                        + "arrives"),
+                ReleaseItem(
+                    .daemon,
+                    "Sealing a message removes the receipt that was pulled from it"),
                 ReleaseItem(
                     .app,
                     "Deeper search. When a query reads like a question, or no email has all of "
@@ -195,6 +225,7 @@ enum ReleaseNotes {
                 ReleaseItem(
                     .daemon,
                     "Search over a big mailbox no longer stalls the daemon while it counts."),
+                ReleaseItem(.daemon, "Various bug fixes"),
             ]),
         ReleaseNote(
             version: "0.0.6",
