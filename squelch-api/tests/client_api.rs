@@ -8792,8 +8792,6 @@ async fn senders_autocomplete_ranks_prefix_then_volume_and_hides_spam_and_sent()
         .unwrap();
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 }
-    );
-}
 
 // --- search: diagnostics, legs and the as-you-type prefix -------------------
 //
@@ -8970,11 +8968,13 @@ async fn keyword_diagnostics_exclude_sent_mail_exactly_as_the_leg_does() {
     assert!(
         json["items"].as_array().unwrap().is_empty(),
         "sent excluded"
+    );
     assert_eq!(
         json["diagnostics"]["any_hits"], 0,
         "the count agrees with the list beside it"
     );
     assert_eq!(json["diagnostics"]["terms"][0]["df"], 0);
+}
 
 /// `partial` is the panel's as-you-type flag: the LAST word matches as a
 /// prefix, and only then. An unreadable value is refused rather than guessed.
