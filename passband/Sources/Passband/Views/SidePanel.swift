@@ -432,6 +432,15 @@ struct SearchView: View {
     /// says, because it is also what mounts the band on request; only STARTING
     /// is the preference's business.
     private func judge(_ term: String) {
+        // ONLY FOR WORDS THAT ARE STILL THE READER'S. Judging is where money
+        // gets spent, so the contract lives here rather than only at the fetch
+        // that calls it: the term is judged when it is still what the field
+        // says, which is the same test `answered` applies before the panel will
+        // claim the hits belong to the query on screen. A reader who typed on
+        // is judged by the next settled query, one debounce away, and a lane
+        // started for words they deleted would take the live ones as a
+        // "refinement" of a question nobody asked.
+        guard term == store.search.query.trimmed else { return }
         let verdict = SearchIntent.classify(query: term, diagnostics: store.search.diagnostics)
         store.search.lastVerdict = verdict
         // WHAT that verdict is allowed to do is `DeeperSearchPolicy`'s and not
