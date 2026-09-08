@@ -9,12 +9,12 @@
 use crate::config::Stage1Config;
 use crate::store::{SqliteStore, Store, TriagedMessage};
 use crate::sync::html::sanitize_email_html;
-use crate::triage::text as text_util;
 use crate::triage::calendar;
 use crate::triage::receipt;
 use crate::triage::seal::{self, SealInput};
 use crate::triage::shipment;
 use crate::triage::stage1_with_config;
+use crate::triage::text as text_util;
 use crate::types::{AccountId, AttachmentInfo, FieldReasons, NewMessage, Sensitivity, Tier};
 use chrono::{DateTime, Utc};
 use mail_parser::{Address, MessageParser, MimeHeaders};

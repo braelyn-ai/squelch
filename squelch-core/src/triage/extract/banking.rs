@@ -294,7 +294,10 @@ pub fn sanitize_institution(raw: Option<&str>) -> Option<String> {
 /// number gets typed out, because each one it misses is a full PAN stored
 /// verbatim.
 fn is_group_separator(c: char) -> bool {
-    matches!(c, ' ' | '-' | '.' | ',' | '/' | '_' | '\u{00A0}' | '\u{2007}' | '\u{202F}')
+    matches!(
+        c,
+        ' ' | '-' | '.' | ',' | '/' | '_' | '\u{00A0}' | '\u{2007}' | '\u{202F}'
+    )
 }
 
 /// Replace any run of more than 4 digits (counting digits across the group
@@ -316,9 +319,7 @@ fn redact_digit_runs(s: &str) -> String {
             let start = i;
             let mut digits = 0usize;
             let mut j = i;
-            while j < chars.len()
-                && (chars[j].is_ascii_digit() || is_group_separator(chars[j]))
-            {
+            while j < chars.len() && (chars[j].is_ascii_digit() || is_group_separator(chars[j])) {
                 if chars[j].is_ascii_digit() {
                     digits += 1;
                 }
@@ -528,7 +529,9 @@ mod tests {
     fn every_line_separator_refuses_not_just_the_ascii_pair() {
         // U+2028 and friends render as a break exactly like \n does, so a model
         // that kept generating past one is the SAME bug with a different byte.
-        for sep in ['\n', '\r', '\u{000B}', '\u{000C}', '\u{0085}', '\u{2028}', '\u{2029}'] {
+        for sep in [
+            '\n', '\r', '\u{000B}', '\u{000C}', '\u{0085}', '\u{2028}', '\u{2029}',
+        ] {
             let raw = format!("Venmo{sep}owner refinement follows here");
             assert_eq!(
                 sanitize_institution(Some(&raw)),
@@ -586,8 +589,14 @@ mod tests {
 
     #[test]
     fn a_model_quoting_its_own_answer_is_not_punished_for_it() {
-        assert_eq!(sanitize_institution(Some("\"Chase\"")).as_deref(), Some("Chase"));
-        assert_eq!(sanitize_institution(Some("'Chase'")).as_deref(), Some("'Chase'"));
+        assert_eq!(
+            sanitize_institution(Some("\"Chase\"")).as_deref(),
+            Some("Chase")
+        );
+        assert_eq!(
+            sanitize_institution(Some("'Chase'")).as_deref(),
+            Some("'Chase'")
+        );
         // An UNMATCHED quote is still fence punctuation and still refused.
         assert_eq!(sanitize_institution(Some("\"Chase")), None);
     }
@@ -699,12 +708,16 @@ mod tests {
         // Deterministic LCG: a reproducible corpus, no dev-dependency.
         let mut seed = 0x2026_09_01_u64;
         let mut next = move || {
-            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             (seed >> 33) as usize
         };
         for _ in 0..20_000 {
             let len = next() % 40;
-            let raw: String = (0..len).map(|_| alphabet[next() % alphabet.len()]).collect();
+            let raw: String = (0..len)
+                .map(|_| alphabet[next() % alphabet.len()])
+                .collect();
             let once = sanitize_institution(Some(&raw));
             let twice = sanitize_institution(once.as_deref());
             assert_eq!(once, twice, "not a fixed point: {raw:?}");

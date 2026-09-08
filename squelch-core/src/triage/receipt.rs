@@ -333,9 +333,10 @@ mod tests {
     fn a_long_fraction_is_read_whole_with_no_total_word_at_all() {
         // PINS THE amount FALLBACK FAMILY ON ITS OWN, which is the shape the
         // production Amazon mail would have had without its "Total" line.
-        let body = "Thank you for your order\r\n\r\nGap Filler Syringe\r\n67.28999999999999 USD\r\n";
-        let r = detect_receipt("orders@amazon.com", "Thank you for your order", body)
-            .expect("receipt");
+        let body =
+            "Thank you for your order\r\n\r\nGap Filler Syringe\r\n67.28999999999999 USD\r\n";
+        let r =
+            detect_receipt("orders@amazon.com", "Thank you for your order", body).expect("receipt");
         assert_eq!(r.amount, Some(67.29));
     }
 

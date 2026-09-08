@@ -61,9 +61,11 @@ pub fn parse_amount(raw: &str) -> Option<f64> {
 /// The FIRST currency amount in `text`, by pattern order. What a detector wants
 /// when the text has no structure to prefer (a bill states its amount once).
 pub fn first_amount(text: &str) -> Option<f64> {
-    amount_patterns()
-        .iter()
-        .find_map(|re| re.captures(text)?.get(1).and_then(|m| parse_amount(m.as_str())))
+    amount_patterns().iter().find_map(|re| {
+        re.captures(text)?
+            .get(1)
+            .and_then(|m| parse_amount(m.as_str()))
+    })
 }
 
 /// The LARGEST currency amount anywhere in `text`. What a receipt wants as its
@@ -73,7 +75,9 @@ pub fn largest_amount(text: &str) -> Option<f64> {
         .iter()
         .flat_map(|re| re.captures_iter(text))
         .filter_map(|cap| parse_amount(cap.get(1)?.as_str()))
-        .fold(None, |best: Option<f64>, v| Some(best.map_or(v, |b| b.max(v))))
+        .fold(None, |best: Option<f64>, v| {
+            Some(best.map_or(v, |b| b.max(v)))
+        })
 }
 
 #[cfg(test)]

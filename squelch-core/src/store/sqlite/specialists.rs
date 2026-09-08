@@ -1115,7 +1115,15 @@ impl SqliteStore {
             // check belongs where the read happens. (Unlike shipments, sealing
             // does NOT delete a receipts row - see `feedback.rs` - so this
             // clause is the whole guarantee, not a belt on braces.)
-            type Row = (Option<f64>, String, Option<String>, i64, String, String, String);
+            type Row = (
+                Option<f64>,
+                String,
+                Option<String>,
+                i64,
+                String,
+                String,
+                String,
+            );
             let row: Option<Row> = tx
                 .query_row(
                     "SELECT r.amount, r.from_addr, r.from_name, r.message_id, r.received_at,
