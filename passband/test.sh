@@ -179,6 +179,16 @@ run_suite spam-wire \
   Sources/Passband/Lib/AsyncMemo.swift \
   Tests/SpamWireTests.swift
 
+# The usage page's arithmetic: two sparse UTC-keyed series off the wire into
+# dense, aligned windows, the rolling share and the deltas against the window
+# before. Foundation only, so it builds with the wire types alone; the charts
+# that draw it are the one part that cannot be asserted here.
+run_suite usage-series \
+  Sources/Passband/Model/SubjectText.swift \
+  Sources/Passband/Model/WireTypes.swift \
+  Sources/Passband/Lib/UsageSeries.swift \
+  Tests/UsageSeriesTests.swift
+
 run_suite sender-identity \
   Sources/Passband/Model/SubjectText.swift \
   Sources/Passband/Model/WireTypes.swift \

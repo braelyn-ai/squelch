@@ -310,3 +310,45 @@ async fn stages_always_report_extractors_only_once_seen() {
     assert!(categories["stage1"]["rows"].as_array().unwrap().is_empty());
     assert_eq!(body["totals"]["calls"], 0);
 }
+
+/// Every day's row is priced, at the category's own rates, and the rows add
+/// up to the window total — so a client charting spend per day and a client
+/// reading the total are reading the same arithmetic.
+#[tokio::test]
+async fn every_row_is_priced_and_the_rows_add_up_to_the_total() {
+    let app = priced_harness(|store, acct| {
+        for (day, input) in [("2026-07-08", 1_000), ("2026-07-09", 3_000)] {
+            store
+                .stage2_bump_usage(
+                    acct,
+                    day,
+                    UsageTokens {
+                        input,
+                        output: 100,
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+        }
+    })
+    .app;
+
+    let body = get_usage(app).await;
+    let stage2 = &body["categories"]["stage2"];
+    let rows = stage2["rows"].as_array().expect("rows");
+    assert_eq!(rows.len(), 2);
+
+    let summed: f64 = rows
+        .iter()
+        .map(|r| r["est_cost_usd"].as_f64().expect("a priced row"))
+        .sum();
+    let total = stage2["totals"]["est_cost_usd"].as_f64().unwrap();
+    assert!((summed - total).abs() < 1e-9, "{summed} vs {total}");
+
+    // 1,000 in at $3/MTok + 100 out at $15/MTok.
+    let first = rows.iter().find(|r| r["day"] == "2026-07-08").unwrap();
+    assert!((first["est_cost_usd"].as_f64().unwrap() - 0.0045).abs() < 1e-12);
+
+    // The flat legacy shape carries it too.
+    assert!(body["rows"][0]["est_cost_usd"].is_f64());
+}
