@@ -110,6 +110,63 @@ enum ReleaseNotes {
     /// THE TABLE. Newest first, and the only place a release note is written.
     static let all: [ReleaseNote] = [
         ReleaseNote(
+            version: "0.0.7",
+            date: "2026-09-08",
+            headline: "Spam you can see, charts you can enjoy, and login codes that arrive on time.",
+            items: [
+                ReleaseItem(
+                    .app,
+                    "View gmail spam - now you can see your gmail spam tab directly. gmail "
+                        + "categorizes this, not Passband"),
+                ReleaseItem(.app, "Better spoof sender protection"),
+                ReleaseItem(.app, "Fun usage page"),
+                ReleaseItem(.app, "The greeting knows your name"),
+                ReleaseItem(
+                    .app,
+                    "Auth mail arrival is instant. Get 2FA codes without waiting for an LLM to "
+                        + "see it"),
+                ReleaseItem(.ios, "New email button in the top right"),
+                ReleaseItem(.ios, "Auth page button moved to quick look"),
+                ReleaseItem(.ios, "A live login code shows at the top of sitrep"),
+                ReleaseItem(.ios, "The composer has been redesigned for better ios usage"),
+                ReleaseItem(
+                    .ios,
+                    "The tracking-pixel switch is desktop only. The account default still "
+                        + "decides and review still names a tracked send."),
+                ReleaseItem(.ios, "Push banners for auth mail happen right away"),
+                ReleaseItem(.ios, "Small UX improvements"),
+                ReleaseItem(.ios, "All mac improvements above"),
+                ReleaseItem(.daemon, "Notifications arrive when the mail does"),
+                ReleaseItem(
+                    .daemon,
+                    "A fast lane decides buzz or no-buzz at ingest on Haiku 4.5. The "
+                        + "deliberate lane still owns the rest of triage."),
+                ReleaseItem(
+                    .daemon,
+                    "Sealed mail gets a body-free notification path, kind-derived phrase only. "
+                        + "Ships off by default."),
+                ReleaseItem(.daemon, "A re-ingest can no longer undo a seal you set by hand."),
+                ReleaseItem(
+                    .daemon,
+                    "Provider spam exists locally now and is structurally excluded from every "
+                        + "Passband triage feature"),
+                ReleaseItem(
+                    .daemon,
+                    "Empty bodies are no longer stored when a sender's plain-text part is blank "
+                        + "beside a full HTML part. This leads to better triage"),
+                ReleaseItem(
+                    .daemon,
+                    "Extractors refuse an empty body instead of guessing an amount from the "
+                        + "subject, with their own skip stamp."),
+                ReleaseItem(.daemon, "Receipt totals parse the whole number and round it"),
+                ReleaseItem(.daemon, "Better deterministic 2FA detection"),
+                ReleaseItem(
+                    .daemon,
+                    "Newsletters don't show in FYE just because you emailed support once"),
+                ReleaseItem(.daemon, "Support for usage page"),
+                ReleaseItem(.daemon, "Various bug fixes"),
+            ]),
+        ReleaseNote(
             version: "0.0.6",
             date: "2026-08-27",
             headline: "Move through emails faster, better search, and notifications to your phone.",
