@@ -38,6 +38,8 @@ struct SearchIntentTests {
         theNewestRefinementWins()
         theSameWordsAreNotANarrowing()
         theThirteenthRestarts()
+        aRolledBackRefinementIsAskedAgain()
+        aNewerNarrowingOutranksTheOneComingBack()
         aResetForgets()
         // the prompt
         promptHasNoForbiddenDashes()
@@ -342,6 +344,42 @@ struct SearchIntentTests {
         expect(
             !slot.isPending,
             "and nothing is left pending: a restart carries its own words")
+    }
+
+    /// A turn that fails AFTER the boundary that took a refinement rolls the
+    /// wire history back past the message carrying it, so those words reached
+    /// the model nowhere. They belong back in the slot, still deliverable: the
+    /// counter must not charge them twice, and `lastDelivered` (which records
+    /// what the MODEL has, and after a rollback the model has nothing) must not
+    /// turn the redelivery into a duplicate.
+    static func aRolledBackRefinementIsAskedAgain() {
+        var slot = RefinementSlot<String>()
+        _ = slot.offer("abstract wifi", key: "abstract wifi")
+        guard let taken = slot.take() else {
+            expect(false, "the boundary takes the pending narrowing")
+            return
+        }
+        expect(!slot.isPending, "and the slot is empty while the turn runs")
+        slot.putBack(taken)
+        expect(slot.isPending, "a failed turn puts those words back")
+        expect(slot.count == 1, "without counting the narrowing a second time")
+        expect(
+            slot.take() == "abstract wifi",
+            "and they are the words the reader typed, waiting to be asked again")
+    }
+
+    /// The reader narrowed again while the doomed turn was in flight. What is
+    /// in the slot is what they are still asking; the words coming back are the
+    /// question they moved on from, and coalescing says the newest wins.
+    static func aNewerNarrowingOutranksTheOneComingBack() {
+        var slot = RefinementSlot<String>()
+        _ = slot.offer("abstract wifi", key: "abstract wifi")
+        let taken = slot.take()
+        _ = slot.offer("abstract wifi password", key: "abstract wifi password")
+        slot.putBack(taken ?? "")
+        expect(
+            slot.take() == "abstract wifi password",
+            "the newer narrowing keeps the slot")
     }
 
     static func aResetForgets() {

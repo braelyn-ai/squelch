@@ -88,6 +88,26 @@ struct RefinementSlot<Value: Sendable>: Sendable {
         return pending
     }
 
+    /// PUT ONE BACK, because taking it is not the same as the model getting it.
+    /// The lane takes a refinement at a tool-result boundary and writes it into
+    /// the wire history; if the turn after that fails, the history rolls back
+    /// past the very message carrying it, and those words reached nobody. The
+    /// slot is where they wait to be asked again.
+    ///
+    /// A NEWER PENDING ONE WINS, which is the coalescing rule doing its usual
+    /// job rather than an edge case: if the reader narrowed again while the
+    /// doomed turn was in flight, what is in the slot is what they are still
+    /// asking, and the words coming back are the question they moved on from.
+    ///
+    /// Neither the count nor `lastDelivered` moves. This is not a new
+    /// narrowing, and the words have to stay deliverable even though they were
+    /// offered once already: `lastDelivered` records what the MODEL has, and
+    /// after a rollback the model has nothing.
+    mutating func putBack(_ value: Value) {
+        guard pending == nil else { return }
+        pending = value
+    }
+
     /// Back to a conversation that has never been narrowed. Called wherever the
     /// lane itself is torn down (a new search, a seeded one, an account
     /// switch), so the counter never outlives the conversation it counts.

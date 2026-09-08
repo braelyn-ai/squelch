@@ -445,6 +445,19 @@ final class AssistantSession {
     /// run can put it back (see `end`).
     private var rollbackMark = 0
 
+    /// THE REFINEMENT THIS RUN HAS TAKEN BUT NOT YET GOT AN ANSWER FOR. Set
+    /// when a tool-result boundary writes one into the wire history, cleared
+    /// the moment the run ends cleanly (the model saw it) or a new run starts.
+    ///
+    /// It exists because `end` rolls the history back to `rollbackMark`, which
+    /// is BEHIND the message a boundary put those words in: a turn that fails
+    /// after the boundary erases the reader's newest words from the
+    /// conversation entirely. So they go back in the slot and are asked again.
+    /// Only the last one is kept, for the same reason only the newest
+    /// refinement is delivered: two boundaries in one failed run means the
+    /// second is the narrower question and the first is the one it replaced.
+    private var deliveredAtBoundary: Refinement?
+
     private var runTask: Task<Void, Never>?
     /// Bumped by `clear()`. Every await in a run re-checks it, so a torn-down
     /// conversation can never write into the one that replaced it.
@@ -508,6 +521,9 @@ final class AssistantSession {
         // typing (the sort flipping, a failed search retried), and each of
         // those arrives here as a settled query with characters unchanged.
         refinements.markDelivered(question)
+        // Whatever an earlier run owed the slot is settled by now, one way or
+        // the other; nothing this run has taken is at risk yet.
+        deliveredAtBoundary = nil
         running = true
         let gen = generation
         runTask = Task { [weak self] in await self?.run(question, pin: pin, gen: gen) }
@@ -653,8 +669,10 @@ final class AssistantSession {
         readIds.removeAll()
         shownIds.removeAll()
         // A fresh conversation has been narrowed zero times, and the words
-        // somebody typed into the old one are not the new one's business.
+        // somebody typed into the old one are not the new one's business —
+        // including any this run still owed the slot.
         refinements.reset()
+        deliveredAtBoundary = nil
         streamTick = 0
     }
 
@@ -887,7 +905,14 @@ final class AssistantSession {
                 // with it, and the reader's newest words would simply never
                 // reach the model. Left pending, the run's own ending sends
                 // them as the next question instead.
+                //
+                // TAKEN IS NOT DELIVERED, either. The message below is inside
+                // this run's rollback range, so a turn that fails AFTER this
+                // boundary takes the words out of the slot and then throws away
+                // the only copy the provider ever had. Remembered here, `end`
+                // puts them back (see `deliveredAtBoundary`).
                 if !cutOff, let refinement = refinements.take() {
+                    deliveredAtBoundary = refinement
                     append(.user, text: refinement.text)
                     results.append(
                         .text(
@@ -1144,6 +1169,9 @@ final class AssistantSession {
         outputTokens: Int, wroteText: Bool
     ) {
         guard alive(gen) else { return }
+        // The answer stands, so every refinement that reached the model is
+        // spoken for: nothing to put back.
+        deliveredAtBoundary = nil
         if !wroteText { append(.assistant, text: "(the assistant returned no text)") }
         let picked = pickCitations()
         if !picked.isEmpty { append(.citations, citations: picked) }
@@ -1191,6 +1219,18 @@ final class AssistantSession {
     ) {
         guard alive(gen) else { return }
         if history.count > rollbackMark { history.removeSubrange(rollbackMark...) }
+        // AND THE REFINEMENT GOES BACK IN THE SLOT. The rollback above is why:
+        // a narrowing taken at a tool-result boundary rode on a message that
+        // has just been deleted, so the reader's newest words are now nowhere
+        // in the conversation. Pending again, the run's own ending asks them as
+        // the next question (or `resume()` does, if the panel is shut). The
+        // transcript row they already wrote stays: the tray is the visible
+        // record of what was asked, it never rolls back, and the words will be
+        // asked again under it rather than instead of it.
+        if let owed = deliveredAtBoundary {
+            deliveredAtBoundary = nil
+            refinements.putBack(owed)
+        }
         // The pin goes back with it. A question the provider never saw cannot
         // be a turn the next one has to be told it switched away from.
         if !askedThreadIds.isEmpty { askedThreadIds.removeLast() }
