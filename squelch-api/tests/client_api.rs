@@ -8755,24 +8755,29 @@ async fn senders_autocomplete_ranks_prefix_then_volume_and_hides_spam_and_sent()
     }
 
     // An empty fragment is the volume listing, spam and sent still absent; and
-    // the limit is honoured and capped.
-    let resp = app
-        .clone()
-        .oneshot(authed("GET", "/client/senders?q=%20%20"))
-        .await
-        .unwrap();
-    let items = body_json(resp).await;
-    let addrs: Vec<&str> = items
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|i| i["addr"].as_str().unwrap())
-        .collect();
-    assert_eq!(
-        addrs,
-        vec!["dan@example.com", "ann@example.com", "joanne@example.com"],
-        "volume first, then recency, then address"
-    );
+    // the limit is honoured and capped. Asked THREE ways, because the Mac
+    // client drops empty query values when it builds a URL: a blank `q`, a
+    // whitespace `q`, and no `q` at all must all be the same question.
+    for uri in [
+        "/client/senders?q=%20%20",
+        "/client/senders?q=",
+        "/client/senders",
+    ] {
+        let resp = app.clone().oneshot(authed("GET", uri)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "{uri}");
+        let items = body_json(resp).await;
+        let addrs: Vec<&str> = items
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|i| i["addr"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            addrs,
+            vec!["dan@example.com", "ann@example.com", "joanne@example.com"],
+            "{uri}: volume first, then recency, then address"
+        );
+    }
     let resp = app
         .clone()
         .oneshot(authed("GET", "/client/senders?q=example&limit=1"))

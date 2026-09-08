@@ -1660,6 +1660,12 @@ pub async fn get_contacts(
 
 #[derive(Debug, Deserialize)]
 pub struct SendersQuery {
+    /// OPTIONAL, unlike the search box's `q`: a missing fragment IS the
+    /// empty fragment. The Mac client drops empty query values when it builds
+    /// a URL, so "the reader has typed from: and nothing else" arrives here
+    /// with no `q` at all, and refusing it would blank the menu at exactly the
+    /// moment it is supposed to open.
+    #[serde(default)]
     q: String,
     #[serde(default)]
     limit: Option<u32>,
