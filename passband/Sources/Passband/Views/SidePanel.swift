@@ -349,7 +349,11 @@ struct SearchView: View {
         // Read at fetch time, not captured on mount: the panel is often built
         // before a trip to Settings and rebuilt after one.
         let sort = prefs.searchSort
-        guard !term.isEmpty else {
+        // A bare operator (`from:` with the menu opening under it) is not a
+        // search yet: the daemon would drop the valueless token and 400 the
+        // empty query, and that refusal is not something to show a reader who
+        // is halfway through typing a sender.
+        guard !term.isEmpty, !FromOperator.awaitingValue(in: term) else {
             store.search.hits = []
             store.search.error = nil
             store.search.fetchedQuery = nil

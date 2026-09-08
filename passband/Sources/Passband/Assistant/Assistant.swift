@@ -1189,7 +1189,13 @@ final class AssistantSession {
         // The answer stands, so every refinement that reached the model is
         // spoken for: nothing to put back.
         deliveredAtBoundary = nil
-        if !wroteText { append(.assistant, text: "(the assistant returned no text)") }
+        // Cards ARE an answer. The search lane is told to answer with cards and
+        // at most one line, and a chat asked to "show me" the emails does the
+        // same, so a turn that showed cards and wrote nothing has done its job;
+        // the placeholder is for a turn that produced nothing at all.
+        if !wroteText && shownIds.isEmpty {
+            append(.assistant, text: "(the assistant returned no text)")
+        }
         let picked = pickCitations()
         if !picked.isEmpty { append(.citations, citations: picked) }
         recordUsage(model: model, transport: transport, inputTokens: inputTokens,

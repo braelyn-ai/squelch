@@ -17,6 +17,7 @@ struct FromOperatorTests {
         anEarlierOperatorIsFinishedBusiness()
         acceptingCompletesTheOperator()
         acceptingOutsideTheOperatorChangesNothing()
+        bareOperatorsAreNotASearchYet()
 
         if failures > 0 {
             print("FAILED: \(failures) of \(checks) checks")
@@ -76,7 +77,31 @@ struct FromOperatorTests {
         accepting("dan@example.com", in: "", gives: "")
     }
 
+    static func bareOperatorsAreNotASearchYet() {
+        awaiting("from:", is: true)
+        awaiting("From:", is: true)
+        awaiting("after:", is: true)
+        awaiting("from: before:", is: true)
+        awaiting("  from:  ", is: true)
+        // Anything with content is a search, even alongside a bare operator.
+        awaiting("from:d", is: false)
+        awaiting("wifi from:", is: false)
+        awaiting("from:dan", is: false)
+        awaiting("after:2026-01-01", is: false)
+        awaiting("", is: false)
+        awaiting("   ", is: false)
+    }
+
     // MARK: - helpers
+
+    static func awaiting(_ query: String, is expected: Bool) {
+        checks += 1
+        let got = FromOperator.awaitingValue(in: query)
+        if got != expected {
+            failures += 1
+            print("FAIL awaitingValue(\(query.debugDescription)) = \(got), expected \(expected)")
+        }
+    }
 
     static func fragment(of query: String, is expected: String?) {
         checks += 1

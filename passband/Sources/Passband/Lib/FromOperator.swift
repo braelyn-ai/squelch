@@ -48,6 +48,20 @@ enum FromOperator {
         return "\(head)\(prefix)\(address) "
     }
 
+    /// True when the query has no searchable content YET: every token is an
+    /// operator with nothing after its colon (`from:`, `after:`, `before:`).
+    /// The daemon drops a valueless operator and then refuses the empty search
+    /// with a 400, which is right for a finished query and wrong for the half
+    /// second in which the reader has typed `from:` and the menu is opening;
+    /// the panel uses this to wait rather than to show the refusal.
+    static func awaitingValue(in query: String) -> Bool {
+        let tokens = query.split(whereSeparator: { $0.isWhitespace || $0.isNewline })
+        guard !tokens.isEmpty else { return false }
+        return tokens.allSatisfy { token in
+            ["from:", "after:", "before:"].contains(token.lowercased())
+        }
+    }
+
     /// The last whitespace-separated token, or nil when the text is empty or
     /// ends in whitespace (the caret is past the last token, so no token is
     /// being typed).
