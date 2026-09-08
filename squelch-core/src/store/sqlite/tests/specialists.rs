@@ -3090,13 +3090,19 @@ fn reparse_flag(store: &SqliteStore, acct: AccountId) -> Option<String> {
 }
 
 #[test]
-fn the_reparse_flag_and_its_corrections_commit_together() {
+fn the_reparse_records_itself_after_a_correcting_run() {
     // THE ONCE IS THE STORE'S JOB and it had no test: deleting the flag write
     // outright left the reparse suite green, because the assertion that looked
     // like it covered this (a second call returning 0) passes for a different
     // reason — after the first pass the recompute equals the stored value and
     // `same_cents` short-circuits. So the pass would silently run on EVERY boot
     // and nothing would say so.
+    //
+    // NAMED FOR WHAT IT PROVES. An earlier name claimed the flag and the
+    // corrections "commit together", and this does not show that: moving the
+    // flag write to AFTER `tx.commit()` still passes. Real atomicity needs a
+    // failure injected between the two, which the store offers no seam for, so
+    // the claim is dropped rather than implied.
     let (store, acct) = store();
     assert_eq!(reparse_flag(&store, acct), None, "unrun");
 
@@ -3133,6 +3139,41 @@ fn the_reparse_one_shot_records_itself_even_when_it_corrects_nothing() {
 }
 
 #[test]
+fn sealing_a_message_takes_its_calendar_row_with_it() {
+    // Same leak, one table over, and the one the reviewers rated highest: a
+    // calendar row holds an event title and an ORGANISER'S NAME lifted out of
+    // the mail and renders them on GET /client/calendar.
+    let (store, acct) = store();
+    let id = triaged(acct, "g-cal", "t-cal")
+        .from("sam@example.com")
+        .subject("Design review")
+        .calendar(crate::triage::CalendarInfo {
+            kind: crate::triage::CalendarKind::Invite,
+            event_title: Some("Design review".into()),
+            starts_at: None,
+            organizer: Some("Sam Doe".into()),
+        })
+        .ingest(&store);
+    assert_eq!(store.list_calendar_updates(acct, 30).unwrap().len(), 1);
+
+    store
+        .correct_triage(
+            acct,
+            id,
+            TriageAxis::Sensitivity,
+            "sealed",
+            None,
+            Utc::now(),
+        )
+        .unwrap();
+
+    assert!(
+        store.list_calendar_updates(acct, 30).unwrap().is_empty(),
+        "a sealed message keeps no calendar row"
+    );
+}
+
+#[test]
 fn sealing_a_message_takes_its_receipt_with_it() {
     // The seal scrub drops the marketing and banking rows a sealed message fed
     // and did NOT drop its receipt, so a merchant and an amount lifted out of
@@ -3160,14 +3201,19 @@ fn sealing_a_message_takes_its_receipt_with_it() {
 }
 
 #[test]
-fn sealed_mail_never_gets_a_receipt_row_in_the_first_place() {
-    // THE INVARIANT THE SQL GUARD IS A SECOND LAYER OF. `detect_receipt` is
-    // never run for sealed mail, so the table holds no sealed rows by
-    // construction — which is what makes `receipts_reparse_cleanup`'s
-    // `sensitivity = 'normal'` clause unexercisable defence in depth rather
-    // than a testable behaviour. It is asserted HERE, at the layer where it is
-    // actually decided, instead of with a store test that can only pass
-    // vacuously.
+fn sealed_mail_gets_no_receipt_at_first_ingest() {
+    // FIRST INGEST ONLY, and the name says so now. The store refuses to write a
+    // receipt for a row it is sealing, which is worth pinning — but it is NOT
+    // the stronger claim an earlier version of this test made ("the table holds
+    // no sealed rows by construction", used to argue the repair pass's
+    // sensitivity clause was unexercisable). Two reviewers reproduced the
+    // counter-example: a RE-INGEST can flip an already-written row to sealed
+    // through fresh detection, skipping the specialist write rather than
+    // deleting the row that is already there. That clause is load-bearing.
+    //
+    // The `receipts_reparse_cleanup(acct) == 0` assertion this test used to
+    // carry is gone: with no rows there are no corrections whatever the
+    // function does, so it asserted the fixture, not the code.
     let (store, acct) = store();
     receipt_triaged(acct, "g-sealed", "t-sealed", Some(3.49))
         .body(AMAZON_FLOAT_BODY)
@@ -3178,7 +3224,4 @@ fn sealed_mail_never_gets_a_receipt_row_in_the_first_place() {
         store.list_receipts(acct, 30).unwrap().is_empty(),
         "sealed mail writes no receipt"
     );
-    // And with no row to read, the repair pass has nothing to do — the state
-    // the guard defends against cannot be constructed through the store at all.
-    assert_eq!(store.receipts_reparse_cleanup(acct).unwrap(), 0);
 }

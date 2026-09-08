@@ -1114,12 +1114,20 @@ impl SqliteStore {
             // reads a body: a detector must never run over sealed mail, and the
             // check belongs where the read happens.
             //
-            // DEFENCE IN DEPTH, not the guarantee. It was the guarantee while
-            // `feedback.rs` scrubbed marketing and banking on seal but not
-            // receipts; that gap is closed, so a sealed message now keeps no
-            // receipt row and this state is unreachable through the store. The
-            // clause stays for the rows a daemon predating that fix left on
-            // disk, which a repair pass is exactly the thing to go re-read.
+            // AND IT IS LOAD-BEARING, not decoration. An earlier draft of this
+            // comment said the state was "unreachable through the store" once
+            // `feedback.rs` scrubbed receipts on seal. That is wrong, and two
+            // reviewers reproduced it: SEALING HAS TWO ENTRANCES. `correct_triage`
+            // is the one this crate scrubs; the other is a RE-INGEST, where the
+            // triage upsert refreshes `sensitivity` from fresh detection for any
+            // row a human did not seal by hand (see `messages.rs`), flipping
+            // normal to sealed while merely SKIPPING the specialist write rather
+            // than deleting what is already there. A receipt row on a sealed
+            // message is therefore reachable today, through the public ingest
+            // path, and legacy rows predate the scrub besides.
+            //
+            // So this clause is the thing stopping a repair pass from re-reading
+            // a sealed body. Do not remove it on the strength of the scrub.
             type Row = (
                 Option<f64>,
                 String,
