@@ -13,6 +13,7 @@
 // mail, just not what it is. A silent notification would be worse than a vague
 // one.
 
+import Foundation
 import UserNotifications
 
 /// Which mailbox, and which of its events. The push's `event_id` is
@@ -50,7 +51,10 @@ struct PushRoute {
 /// checked fact.
 @MainActor
 final class NotificationService: UNNotificationServiceExtension {
-    private let session = Sessions.ephemeral(
+    /// STATIC, so the two fetches below can be static too. See the launch
+    /// site: they run as concurrent children and this object is a
+    /// main-actor class, so anything they touch has to not be `self`.
+    private nonisolated(unsafe) static let session = Sessions.ephemeral(
         timeout: 10, resource: 20,
         cachePolicy: .reloadIgnoringLocalCacheData, emptyHeaders: true)
 
@@ -74,11 +78,87 @@ final class NotificationService: UNNotificationServiceExtension {
         }
         work = Task { @MainActor [weak self] in
             guard let self else { return }
-            guard let event = await self.fetch(route) else {
-                return self.deliver(request.content)
+            // BOTH CALLS AT ONCE, because there is one timeout for the pair.
+            // `async let` spawns a CONCURRENT child, which is why both
+            // fetches are STATIC: this is a main-actor class and not Sendable,
+            // so a child task that captured `self` — even to call a nonisolated
+            // method on it — would be sending it across. Neither call needs the
+            // instance anyway; each is a keychain read, a request and a decode.
+            // The handler and the expiry timer, which is what the isolation is
+            // actually for, stay up here where the results land.
+            // The banner's own fetch and the badge's are independent questions
+            // to the same daemon, and running them back to back would spend two
+            // round trips out of the seconds this process gets — enough, on a
+            // slow link, to lose the enrichment that is the whole point of the
+            // extension in order to add a number to an icon.
+            async let banner = Self.fetch(route)
+            async let due = Self.dueToday(route)
+            let (event, count) = await (banner, due)
+            guard let event else {
+                return self.deliver(Self.badged(request.content, count: count))
             }
-            self.deliver(Self.content(for: event, accountId: route.accountId))
+            self.deliver(
+                Self.badged(Self.content(for: event, accountId: route.accountId), count: count))
         }
+    }
+
+    /// The app icon's number, stamped onto whatever banner is about to go out.
+    ///
+    /// A NIL COUNT LEAVES THE BADGE ALONE, which is why this takes an optional
+    /// rather than defaulting to zero: `badge = 0` CLEARS the icon, so a failed
+    /// or timed-out fetch that fell back to zero would tell someone with four
+    /// overdue bills that they were clear. Not knowing and knowing it is nothing
+    /// are different answers and the payload can say both.
+    private static func badged(_ content: UNNotificationContent, count: Int?)
+        -> UNNotificationContent
+    {
+        guard let count,
+            let mutable = content.mutableCopy() as? UNMutableNotificationContent
+        else { return content }
+        mutable.badge = NSNumber(value: count)
+        return mutable
+    }
+
+    /// How many obligations are overdue or due by end of today, for the mailbox
+    /// this push came from — the same `NeedToday.count` the app's own sitrep
+    /// headline is built from, over the same standing band.
+    ///
+    /// `peek=true` IS LOAD-BEARING AND NOT AN OPTIMIZATION. A plain read of this
+    /// band STAMPS every row it returns as surfaced (see the daemon's updates
+    /// handler: peek's only effect is skipping that ledger write), which would
+    /// promote `new` to `open` and empty the new band. Refreshing a number must
+    /// not be able to mark mail as seen — least of all from a background process
+    /// the user never opened.
+    ///
+    /// Counted HERE rather than asked for: the daemon serves no due-today
+    /// figure, and inventing one server-side would be a second definition of
+    /// "today" evaluated in a second timezone. The rows come back and the shared
+    /// pure function decides, exactly as it does in the app.
+    private static func dueToday(_ route: PushRoute) async -> Int? {
+        guard let settings = try? SettingsStore.load(accountId: route.accountId) else { return nil }
+
+        var base = settings.serverURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        while base.hasSuffix("/") { base.removeLast() }
+        guard var comps = URLComponents(string: base + "/client/updates") else { return nil }
+        comps.queryItems = [
+            URLQueryItem(name: "band", value: "standing"),
+            URLQueryItem(name: "peek", value: "true"),
+        ]
+        guard let url = comps.url else { return nil }
+
+        var request = URLRequest(url: url, timeoutInterval: 10)
+        request.setValue("Bearer \(settings.apiToken)", forHTTPHeaderField: "Authorization")
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+
+        // Silent on every failure, like the fetch above and for the same reason:
+        // the URL names the user's daemon and the header held a capability. A
+        // miss here costs a stale badge, which the app corrects the moment it is
+        // opened.
+        guard let (data, response) = try? await Self.session.data(for: request),
+            (response as? HTTPURLResponse)?.statusCode == 200,
+            let page = try? JSONDecoder().decode(Page<AttentionUpdate>.self, from: data)
+        else { return nil }
+        return NeedToday.count(page.items)
     }
 
     /// Out of time. Whatever the fetch was doing, the original alert goes out
@@ -99,7 +179,7 @@ final class NotificationService: UNNotificationServiceExtension {
     /// Ask THIS account's daemon what the event was. The bearer comes from the
     /// same per-account keychain slots the app writes, which is the whole
     /// reason the extension shares its keychain access group.
-    private func fetch(_ route: PushRoute) async -> Event? {
+    private static func fetch(_ route: PushRoute) async -> Event? {
         guard let settings = try? SettingsStore.load(accountId: route.accountId) else { return nil }
 
         var base = settings.serverURL.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -114,7 +194,7 @@ final class NotificationService: UNNotificationServiceExtension {
         // fallback, not an error worth distinguishing. Nothing about the
         // failure is logged: the URL names the user's daemon and the header
         // held a capability.
-        guard let (data, response) = try? await session.data(for: request),
+        guard let (data, response) = try? await Self.session.data(for: request),
             (response as? HTTPURLResponse)?.statusCode == 200
         else { return nil }
         return try? JSONDecoder().decode(Event.self, from: data)

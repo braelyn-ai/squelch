@@ -578,7 +578,18 @@ final class AppStore {
     private(set) var shareOrigin: ShareOrigin = .settings
 
     // MARK: sitrep slice
-    var sitrep = SitrepData()
+
+    /// THE ONE WRITE POINT FOR THE APP ICON'S BADGE. Every path that can change
+    /// how much is due — the poller's pull, a resolve, a re-triage, the wipe on
+    /// disconnect — lands here, so hooking the property rather than the callers
+    /// is what keeps a sixth path from silently shipping a stale number. See
+    /// Model/Badge.swift.
+    var sitrep = SitrepData() {
+        didSet {
+            guard sitrep.standing != oldValue.standing else { return }
+            Badge.refresh(sitrep.standing)
+        }
+    }
     var lastRefresh: Date?
     var refreshError: RefreshError?
 

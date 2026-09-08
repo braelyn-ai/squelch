@@ -26,6 +26,12 @@ final class PushRegistration {
     private var syncing = false
     private var needsAnotherSync = false
 
+    /// `.badge` rides along because the app icon carries the due-today count
+    /// (Model/Badge.swift). It is a separate grant from `.alert`, so a user can
+    /// keep banners and refuse the number, and `setBadgeCount` then does nothing
+    /// — which is the correct outcome, not a failure to handle.
+    private static let wanted: UNAuthorizationOptions = [.alert, .sound, .badge]
+
     private init() {}
 
     func start() {
@@ -37,10 +43,24 @@ final class PushRegistration {
         let settings = await center.notificationSettings()
         switch settings.authorizationStatus {
         case .notDetermined:
-            guard (try? await center.requestAuthorization(options: [.alert, .sound])) == true else {
+            guard (try? await center.requestAuthorization(options: Self.wanted)) == true else {
                 return
             }
-        case .authorized, .provisional, .ephemeral:
+        case .authorized:
+            // BEST EFFORT, FOR THE INSTALLS THAT PREDATE THE BADGE. `.badge` was
+            // not in the set this app asked for until the icon started carrying
+            // the due-today count, and iOS grants what was asked for at the
+            // time — so an install that said yes to alerts a month ago has no
+            // badge permission and no prompt is coming. Asking again is silent
+            // and instant on an already-authorized app (the system does not
+            // re-prompt), so it costs nothing and may pick the option up.
+            //
+            // Not done for `.provisional` or `.ephemeral`: a full request from
+            // those states DOES raise the dialog, and a permission prompt
+            // nobody asked for, to add a number to an icon, is not a trade
+            // worth making.
+            _ = try? await center.requestAuthorization(options: Self.wanted)
+        case .provisional, .ephemeral:
             break
         case .denied:
             return

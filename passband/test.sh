@@ -166,6 +166,18 @@ run_suite gmail-health \
   Sources/Passband/Lib/AsyncMemo.swift \
   Tests/GmailHealthTests.swift
 
+# The due-today count, which is now the app icon's badge as well as the sitrep's
+# headline. It gets a suite because of the badge specifically: a sentence on a
+# dashboard is read with the list under it and corrects itself, while a red pill
+# on a home screen is read with nothing beside it at all.
+run_suite need-today \
+  Sources/Passband/Model/WireTypes.swift \
+  Sources/Passband/Model/SubjectText.swift \
+  Sources/Passband/Lib/Format.swift \
+  Sources/Passband/Lib/AsyncMemo.swift \
+  Sources/Passband/Lib/NeedToday.swift \
+  Tests/NeedTodayTests.swift
+
 # The spam page's wire contract, against verbatim daemon responses. It exists
 # because the seam it covers is checked by nobody else: these suites never build
 # APIClient, and the Rust tests know nothing of Swift's types. A response type
