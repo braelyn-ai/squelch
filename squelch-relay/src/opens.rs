@@ -192,8 +192,13 @@ impl Inner {
     }
 
     /// Evict down to `max_rows`, taking from the tokens holding the MOST rows
-    /// first. Separate from the clock so the eviction can be exercised without a
-    /// million-row fixture.
+    /// first, and return how many rows that deleted. Separate from the clock so
+    /// the eviction can be exercised without a million-row fixture.
+    ///
+    /// The count is returned rather than only logged because it is the whole
+    /// observable result of a trim: the rows are gone, so a caller — a test
+    /// included — has nothing else to look at. A failed trim reports 0, which is
+    /// true of the table either way.
     ///
     /// Keeping the newest globally would make this a censorship primitive: the
     /// relay cannot tell a minted token from an invented one, so junk inserted
@@ -201,7 +206,7 @@ impl Inner {
     /// within a token instead means every token keeps its first row before any
     /// token keeps a second, and the id tie-break spends the newest rows first —
     /// a flood pays for itself twice over, and can never choose what it deletes.
-    fn trim_to(&mut self, max_rows: i64) {
+    fn trim_to(&mut self, max_rows: i64) -> usize {
         // Counting first keeps the window sort off the ordinary path, where the
         // table is under the ceiling and nothing is evicted at all.
         let excess: i64 = match self.conn.query_row(
@@ -212,11 +217,11 @@ impl Inner {
             Ok(n) => n,
             Err(e) => {
                 tracing::warn!(error = %e, "open buffer trim failed");
-                return;
+                return 0;
             }
         };
         if excess == 0 {
-            return;
+            return 0;
         }
         match self.conn.execute(
             "DELETE FROM opens WHERE id IN (
@@ -229,14 +234,21 @@ impl Inner {
              )",
             params![excess],
         ) {
-            Ok(0) => {}
+            Ok(0) => 0,
             // Never silent, and never a token: an operator whose buffer is being
-            // evicted is losing opens nobody has acknowledged.
-            Ok(deleted) => tracing::warn!(
-                deleted,
-                "open buffer over the global ceiling: evicted buffered opens the daemon had not drained"
-            ),
-            Err(e) => tracing::warn!(error = %e, "open buffer trim failed"),
+            // evicted is losing opens nobody has acknowledged. `deleted` is the
+            // only field, and the only one there is a variable for.
+            Ok(deleted) => {
+                tracing::warn!(
+                    deleted,
+                    "open buffer over the global ceiling: evicted buffered opens the daemon had not drained"
+                );
+                deleted
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "open buffer trim failed");
+                0
+            }
         }
     }
 }
@@ -247,39 +259,6 @@ mod tests {
 
     fn store() -> OpenStore {
         OpenStore::open(None).unwrap()
-    }
-
-    /// Collects `tracing` output on this thread so a log line can be asserted on
-    /// like any other output.
-    #[derive(Clone, Default)]
-    struct Capture(std::sync::Arc<Mutex<Vec<u8>>>);
-
-    impl std::io::Write for Capture {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(buf);
-            Ok(buf.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Capture {
-        type Writer = Self;
-        fn make_writer(&'a self) -> Self::Writer {
-            self.clone()
-        }
-    }
-
-    fn logs_of(f: impl FnOnce()) -> String {
-        let capture = Capture::default();
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(capture.clone())
-            .with_ansi(false)
-            .finish();
-        tracing::subscriber::with_default(subscriber, f);
-        let bytes = capture.0.lock().unwrap().clone();
-        String::from_utf8(bytes).unwrap()
     }
 
     #[test]
@@ -391,10 +370,10 @@ mod tests {
         }
 
         // Under the ceiling nothing moves.
-        s.lock().trim_to(28);
+        assert_eq!(s.lock().trim_to(28), 0);
         assert_eq!(s.drain(0).unwrap().len(), 28);
 
-        s.lock().trim_to(10);
+        assert_eq!(s.lock().trim_to(10), 18);
         let rows = s.drain(0).unwrap();
         assert_eq!(rows.len(), 10);
         // Every quiet token kept its single open; the flood paid the whole bill,
@@ -432,7 +411,7 @@ mod tests {
             s.record(&format!("junk{i}"), 2_000 + i, None).unwrap();
         }
 
-        s.lock().trim_to(50);
+        assert_eq!(s.lock().trim_to(50), 500);
         let rows = s.drain(0).unwrap();
         assert_eq!(rows.len(), 50);
         assert!(
@@ -441,22 +420,31 @@ mod tests {
         );
     }
 
-    /// An eviction is data loss nobody acknowledged, so it must reach the log —
-    /// with a count, and never with a token.
+    /// An eviction is data loss nobody acknowledged, so the trim has to report
+    /// what it took: the rows are gone, and the count is the only trace of them
+    /// a caller can still see. It is what the warning carries.
+    ///
+    /// Asserted on the returned count and on the rows that survive, NOT on
+    /// captured `tracing` output. The old capture installed a subscriber and
+    /// read back formatted text, which depends on process-global subscriber
+    /// state: under a loaded `cargo test --workspace` the line could go missing
+    /// and redden CI on a branch that never touched the relay (issue #64). The
+    /// count is the same property with nothing global underneath it — and it
+    /// cannot pass by staying empty, which is how that assertion failed.
     #[test]
-    fn an_eviction_is_never_silent() {
+    fn a_trim_reports_what_it_evicted() {
         let s = store();
         for i in 0..6 {
             s.record(&format!("tok{i}"), 100 + i, None).unwrap();
         }
 
-        let quiet = logs_of(|| s.lock().trim_to(6));
-        assert!(quiet.is_empty(), "nothing was deleted: {quiet}");
+        // At the ceiling nothing is deleted, so there is nothing to report.
+        assert_eq!(s.lock().trim_to(6), 0);
+        assert_eq!(s.drain(0).unwrap().len(), 6);
 
-        let noisy = logs_of(|| s.lock().trim_to(2));
-        assert!(noisy.contains("WARN"), "{noisy}");
-        assert!(noisy.contains("deleted=4"), "{noisy}");
-        assert!(!noisy.contains("tok"), "a token reached the log: {noisy}");
+        // Under it, the count is the rows that actually left the table.
+        assert_eq!(s.lock().trim_to(2), 4);
+        assert_eq!(s.drain(0).unwrap().len(), 2);
     }
 
     /// A trim is not an ack: eviction must not resurrect ids, or a row inserted
@@ -468,7 +456,7 @@ mod tests {
             s.record(&format!("tok{i}"), 100 + i, None).unwrap();
         }
         let highest = s.drain(0).unwrap().last().unwrap().id;
-        s.lock().trim_to(1);
+        assert_eq!(s.lock().trim_to(1), 4);
         s.record("after", 200, None).unwrap();
         assert!(s.drain(0).unwrap().last().unwrap().id > highest);
     }
