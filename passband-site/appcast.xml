@@ -7,6 +7,15 @@
         <title>Passband</title>
         <link>https://passband.app/appcast.xml</link>
         <item>
+            <title>0.0.7</title>
+            <pubDate>Wed, 09 Sep 2026 00:14:04 +0000</pubDate>
+            <sparkle:version>988</sparkle:version>
+            <sparkle:shortVersionString>0.0.7</sparkle:shortVersionString>
+            <sparkle:minimumSystemVersion>26.0</sparkle:minimumSystemVersion>
+            <sparkle:hardwareRequirements>arm64</sparkle:hardwareRequirements>
+            <enclosure url="https://passband.app/download/Passband-0.0.7.zip" length="7207332" type="application/octet-stream" sparkle:edSignature="R11d4GRR5IfsTrny/oBD2Iil5z6q7Q3SSy26sPuBtvMr7K8pQyjagzrRFkl7vLhml2PyDOEbl9OGWh+uDXkfBw=="/>
+        </item>
+        <item>
             <title>0.0.6</title>
             <pubDate>Fri, 28 Aug 2026 03:54:00 +0000</pubDate>
             <sparkle:version>856</sparkle:version>
@@ -23,15 +32,6 @@
             <sparkle:minimumSystemVersion>26.0</sparkle:minimumSystemVersion>
             <sparkle:hardwareRequirements>arm64</sparkle:hardwareRequirements>
             <enclosure url="https://passband.app/download/Passband-0.0.5.zip" length="6778994" type="application/octet-stream" sparkle:edSignature="6c1u8j/RDW26albg2P2lzc7Hq+ytnFxIMKLc7Mputh2+SXk6jNEyGLii+H5ZA4Es7zXK7cJSFI0JMafIhM59DQ=="/>
-        </item>
-        <item>
-            <title>0.0.4</title>
-            <pubDate>Tue, 25 Aug 2026 00:17:33 +0000</pubDate>
-            <sparkle:version>716</sparkle:version>
-            <sparkle:shortVersionString>0.0.4</sparkle:shortVersionString>
-            <sparkle:minimumSystemVersion>26.0</sparkle:minimumSystemVersion>
-            <sparkle:hardwareRequirements>arm64</sparkle:hardwareRequirements>
-            <enclosure url="https://passband.app/download/Passband-0.0.4.zip" length="6552700" type="application/octet-stream" sparkle:edSignature="2a+ux62+7i38R38Brs0EeDFo8w8kOR10iQ/cFZN1ASPz3jvBi/h+FsXEuiBpi4Q2i7ORiC+XkGIRPqpkfaxQCA=="/>
         </item>
     </channel>
 </rss>
