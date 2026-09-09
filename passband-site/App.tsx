@@ -335,8 +335,13 @@ const CTA_CSS = `
 .pb-rig {
   position: relative;
   isolation: isolate;
+  /* A COLUMN, because there are two things to give now and three controls will
+     not fit across 28rem: at that width the address slot ends up too narrow to
+     show a whole address, and on a phone it clips mid-domain. So the rig
+     grows downward instead of squeezing sideways, and stays ONE piece of
+     hardware with two slots cut in it rather than becoming two controls. */
   display: flex;
-  align-items: stretch;
+  flex-direction: column;
   width: min(28rem, 100%);
   margin-top: 0.65rem;
   border-radius: 0.9rem;
@@ -372,6 +377,15 @@ const CTA_CSS = `
 }
 .pb-rig:hover::before,
 .pb-rig:focus-within::before { opacity: 1; }
+/* The bottom slot's row. It carries the meter, so the instrument's floor stays
+   exactly the height it was rather than growing with the rig: the bars are
+   drawn behind the address and the button, which is the half where the action
+   is, and the name sits above the whole display. */
+.pb-rig-row {
+  position: relative;
+  display: flex;
+  align-items: stretch;
+}
 /* The slot. No border and no ground of its own: it is an opening in the rig,
    not a control sitting on one. Its padding matches the button's exactly, so
    the address and the label sit on the same optical line. */
@@ -391,6 +405,19 @@ const CTA_CSS = `
 }
 .pb-rig-field::placeholder { color: #6b6b70; }
 .pb-rig-field:disabled { color: #a9a49a; }
+/* The name slot. Divided off from the row below by a hairline, so the two
+   openings read as machined out of one face rather than as one box with two
+   bits of text floating in it. Its own padding, because the address slot's
+   asymmetric bottom is clearance for the meter and there is no meter behind
+   this one. */
+.pb-rig-name {
+  flex: none;
+  padding: 0.85rem 1.1rem 0.8rem;
+  /* Brighter than the button's own divider, and it has to be: that one runs
+     down the lit half of the instrument, with the meter's glow behind it,
+     while this one crosses dark ground where the same 0.18 vanishes. */
+  border-bottom: 1px solid rgba(${BRASS}, 0.3);
+}
 /* The button, once the rig owns the material: no ground, no shell, no lift.
    What is left of it is the half that lights up, divided off by one hairline.
    The lift is dropped deliberately, because a button that rises out of the bar
@@ -752,6 +779,7 @@ const WAITLIST_PATH = "/waitlist";
 // perfectly still.
 function Waitlist() {
   const { chrome, handlers } = useMeter();
+  const [name, setName] = useState("");
   const [email, setEmail] = useState("");
   const [state, setState] = useState<"idle" | "busy" | "done" | "error">("idle");
 
@@ -764,7 +792,10 @@ function Waitlist() {
         method: "POST",
         // urlencoded keeps this a CORS simple request: no preflight round trip.
         headers: { "Content-Type": "application/x-www-form-urlencoded" },
-        body: new URLSearchParams({ email }),
+        // The name rides along beside the address. The control plane treats it
+        // as optional, so an older cached copy of this bundle posting an
+        // address alone still joins the list.
+        body: new URLSearchParams({ name, email }),
         credentials: "omit",
       });
       setState(res.ok ? "done" : "error");
@@ -776,9 +807,16 @@ function Waitlist() {
   // WHAT ARRIVES AND WHAT IS AT THE END OF IT, which is the only thing still
   // unanswered once somebody is on the list, and where the client lives now.
   if (state === "done") {
+    // BY NAME WHEN THERE IS ONE. It is the only thing the form now knows that
+    // it did not before, and answering with it is what makes the field read as
+    // having been asked rather than collected. First word only: a full name
+    // read back at somebody is a receipt, not a greeting.
+    const first = name.trim().split(/\s+/)[0];
     return (
       <>
-        <p style={styles.confirm}>you're on the list.</p>
+        <p style={styles.confirm}>
+          {first ? `you're on the list, ${first}.` : "you're on the list."}
+        </p>
         <p style={styles.status}>
           you will receive an email when a spot opens. it walks you through
           setup, and the app is waiting at the end of it.
@@ -790,23 +828,42 @@ function Waitlist() {
   return (
     <>
       <form className="pb-rig" onSubmit={submit} {...handlers}>
-        {chrome}
         <input
-          className="pb-rig-field"
-          type="email"
-          name="email"
+          className="pb-rig-field pb-rig-name"
+          type="text"
+          name="name"
           required
-          autoComplete="email"
-          placeholder="you@example.com"
-          aria-label="email address"
+          autoComplete="name"
+          placeholder="your name"
+          aria-label="your name"
+          // The same ceiling the control plane stores to, said here so a long
+          // name is stopped at the field rather than silently cut in half on
+          // the way in.
+          maxLength={128}
           // The button that opened this is gone from under the cursor, so the
-          // field takes the focus it left behind: press join, start typing.
+          // first field takes the focus it left behind: press join, start
+          // typing.
           autoFocus
-          value={email}
+          value={name}
           disabled={state === "busy"}
-          onChange={(event) => setEmail(event.target.value)}
+          onChange={(event) => setName(event.target.value)}
         />
-        <SubmitButton busy={state === "busy"} />
+        <div className="pb-rig-row">
+          {chrome}
+          <input
+            className="pb-rig-field"
+            type="email"
+            name="email"
+            required
+            autoComplete="email"
+            placeholder="you@example.com"
+            aria-label="email address"
+            value={email}
+            disabled={state === "busy"}
+            onChange={(event) => setEmail(event.target.value)}
+          />
+          <SubmitButton busy={state === "busy"} />
+        </div>
       </form>
       {state === "error" && (
         <p style={{ ...styles.status, color: "#d8a39a" }}>

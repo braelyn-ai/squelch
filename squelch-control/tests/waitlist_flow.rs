@@ -253,10 +253,24 @@ impl Harness {
         (status, headers, body)
     }
 
-    /// Join the list, the way the site's form does.
+    /// Join the list with an address and nothing else. NOT A LEGACY SHAPE
+    /// LEFT LYING AROUND: it is what a browser holding an older cached bundle
+    /// of the site posts, and every test in this file that does not care about
+    /// the name uses it, so the field stays optional on the wire by being
+    /// exercised that way.
     async fn join(&self, email: &str) -> (StatusCode, HeaderMap, String) {
         self.post_form("/waitlist", format!("email={}", urlencode(email)), None)
             .await
+    }
+
+    /// Join the list the way today's form does: a name beside the address.
+    async fn join_named(&self, name: &str, email: &str) -> (StatusCode, HeaderMap, String) {
+        self.post_form(
+            "/waitlist",
+            format!("name={}&email={}", urlencode(name), urlencode(email)),
+            None,
+        )
+        .await
     }
 
     /// Sign in and return the cookie pair a browser would send back.
@@ -390,6 +404,75 @@ async fn a_submission_lands_on_the_list_once() {
     assert_eq!(rows[0].status, "pending");
 }
 
+/// The name the form asks for reaches the row, tidied, and reaches the board.
+#[tokio::test]
+async fn a_name_arrives_with_the_address() {
+    let h = Harness::new().await;
+
+    // Spelled the way somebody typing fast spells it: padded, with a stray run
+    // of whitespace in the middle. The address normalizes to lowercase and the
+    // name does NOT, because a name is not a key and lowercasing it would only
+    // be a way to get somebody's spelling wrong.
+    let (status, _, body) = h.join_named("  Ada   Lovelace ", "Ada@Example.com").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let rows = h.state.store().list_users().await.unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].email, APPLICANT);
+    assert_eq!(rows[0].name.as_deref(), Some("Ada Lovelace"));
+
+    let cookie = h.sign_in().await;
+    let (_, _, board) = h.get("/admin", Some(&cookie)).await;
+    assert!(board.contains("Ada Lovelace"), "{board}");
+    assert!(board.contains(APPLICANT), "{board}");
+}
+
+/// An address with no name at all is a submission like any other. THE CASE
+/// THAT MATTERS IS NOT THE EMPTY FIELD: the browser requires it. It is a
+/// browser running an older bundle of the site, which posts no `name` key, and
+/// that must not be the one shape of submission that quietly fails.
+#[tokio::test]
+async fn an_address_without_a_name_still_joins() {
+    let h = Harness::new().await;
+
+    let (status, _, body) = h.join(APPLICANT).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let rows = h.state.store().list_users().await.unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].name, None, "no name rather than an empty one");
+
+    // And a field submitted empty is the same thing, not a row whose name is
+    // the empty string: the board would render it as a blank second line.
+    let (status, _, _) = h.join_named("   ", "grace@example.com").await;
+    assert_eq!(status, StatusCode::OK);
+    let rows = h.state.store().list_users().await.unwrap();
+    let grace = rows
+        .iter()
+        .find(|r| r.email == "grace@example.com")
+        .unwrap();
+    assert_eq!(grace.name, None);
+}
+
+/// A second submission of an address already on the list changes NOTHING,
+/// including the name. Anybody can post this form, so a name that could be
+/// rewritten from outside is a name the operator cannot trust beside an
+/// address — and an answer that depended on what was already stored would be
+/// the membership oracle the route is built not to be.
+#[tokio::test]
+async fn a_second_submission_does_not_rewrite_the_name() {
+    let h = Harness::new().await;
+    h.join_named("Ada Lovelace", APPLICANT).await;
+
+    let (status, _, body) = h.join_named("Somebody Else", "ADA@EXAMPLE.COM").await;
+    assert_eq!(status, StatusCode::OK, "same answer as a fresh address");
+    assert_eq!(body, r#"{"ok":true}"#);
+
+    let rows = h.state.store().list_users().await.unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].name.as_deref(), Some("Ada Lovelace"));
+}
+
 /// A refusal is a refusal ONLY for a string that is not an address, and it
 /// carries the same CORS headers, or the site cannot read it.
 #[tokio::test]
@@ -488,10 +571,24 @@ async fn the_dashboard_escapes_what_a_stranger_typed() {
     let (status, _, _) = h.join(hostile).await;
     assert_eq!(status, StatusCode::OK);
 
+    // THE NAME IS THE ONE FIELD SHAPED LIKE THIS ATTACK. An address has to get
+    // past `is_email` to be stored at all, which is most of why the hostile one
+    // above is so tame; a name is free text from a public form and goes to the
+    // row exactly as typed.
+    let (status, _, _) = h
+        .join_named(r#"<script>alert(1)</script>"#, "grace@example.com")
+        .await;
+    assert_eq!(status, StatusCode::OK);
+
     let cookie = h.sign_in().await;
     let (_, _, body) = h.get("/admin", Some(&cookie)).await;
     assert!(!body.contains(hostile), "{body}");
     assert!(body.contains("a&amp;&#39;b@evil.test"), "{body}");
+    assert!(!body.contains("<script>"), "{body}");
+    assert!(
+        body.contains("&lt;script&gt;alert(1)&lt;/script&gt;"),
+        "{body}"
+    );
 }
 
 /// The whole point of the feature: one click mints a real code, mails it, and

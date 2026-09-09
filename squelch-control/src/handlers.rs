@@ -144,6 +144,13 @@ const MAX_CODE: usize = 512;
 /// constant on.
 pub(crate) const MAX_EMAIL: usize = 254;
 
+/// The longest name the waitlist form will store. Generous rather than
+/// principled: there is no rule about how long a name is, and the only thing
+/// this bounds is how much of a public form's free text is carried around and
+/// rendered on the operator's board. Anything past it is cut rather than
+/// refused; see [`waitlist`].
+const MAX_NAME: usize = 128;
+
 /// Entropy behind a session id and behind the CSRF `state`. 32 bytes is 43
 /// unpadded base64url characters.
 const RANDOM_BYTES: usize = 32;
@@ -507,7 +514,21 @@ pub async fn waitlist(State(state): State<ControlState>, body: Bytes) -> Respons
         return waitlist_answer(origin, StatusCode::BAD_REQUEST, INVALID_EMAIL);
     }
 
-    match state.store().add_user_waiting(&email).await {
+    // TRUNCATED RATHER THAN REFUSED, which is the opposite of the rule one line
+    // up, and the difference is what happens to a value that is too long. A
+    // truncated address is a well-formed address belonging to somebody else, so
+    // it has to be refused; a truncated name is the same person with their name
+    // cut short, and refusing a signup over it would lose somebody the list
+    // wanted for a field nothing is ever decided on. The cap is a bound on the
+    // work done before the store sees it, not a validation.
+    //
+    // MISSING IS FINE AND STAYS FINE. The field is required by the browser and
+    // by nothing else: an older cached bundle of the site posts an address
+    // alone, and that has to keep landing on the list rather than becoming the
+    // one shape of submission that silently fails.
+    let name = field_capped(&body, "name", MAX_NAME);
+
+    match state.store().add_user_waiting(&email, Some(&name)).await {
         // PRIVACY: whether this submission created a row, and nothing else.
         // Never the address, on either branch.
         Ok(created) => {

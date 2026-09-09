@@ -902,12 +902,12 @@ this browser; rotating the admin token ends it everywhere.</p>"#,
                 .count(),
             session_days = crate::cookie::ADMIN_COOKIE_TTL_SECS / (24 * 60 * 60),
             waiting_table = table(
-                r#"<th>Email</th><th>Joined</th><th></th>"#,
+                r#"<th>Who</th><th>Joined</th><th></th>"#,
                 &waiting,
                 "Nobody is waiting.",
             ),
             history_table = table(
-                r#"<th>Email</th><th>Dates</th><th>Outcome</th>"#,
+                r#"<th>Who</th><th>Dates</th><th>Outcome</th>"#,
                 &history,
                 "Nobody has been approved yet.",
             ),
@@ -983,9 +983,16 @@ approved, minted, or mailed.</p>"#,
 /// that read it cannot drift to two different spellings.
 pub const CONFIRM_FIELD: &str = "confirmed";
 
-/// The "who" cell: the address this person is known by, and — when the Google
-/// account that actually signed up is a DIFFERENT address — a muted second line
-/// naming it.
+/// The "who" cell: the address this person is known by, the name they gave when
+/// they joined, and — when the Google account that actually signed up is a
+/// DIFFERENT address — a muted line naming that too.
+///
+/// THE ADDRESS STAYS ON TOP even though the name is the more human of the two.
+/// Every button on this page acts on an address, every refusal names one, and
+/// the operator's own question before approving anybody ("is this account on
+/// the Google test-user list?") is asked about an address. The name is context
+/// for that decision and is rendered as context: muted, beneath, and absent
+/// entirely on the rows that have none rather than padded out with a dash.
 ///
 /// AN INVITE IS A BEARER CODE, so the two are not promised to match: a person
 /// can be invited at work and sign up with a personal mailbox, or forward the
@@ -996,18 +1003,32 @@ pub const CONFIRM_FIELD: &str = "confirmed";
 /// Shown only on a MISMATCH. Repeating the same address twice on every signed-up
 /// row would be noise that trains the eye to skip the line that matters.
 ///
-/// Both are escaped, like everything else on this page: `account_email` comes
-/// from Google rather than from a form, and the rule here is that nothing is
-/// interpolated raw regardless of how well-behaved its source is believed to be.
+/// ALL THREE are escaped, like everything else on this page. `account_email`
+/// comes from Google and the address had to pass `is_email` to be stored at
+/// all, so the rule is not carried by either of them: the name is free text a
+/// stranger typed into a public form, and it is the one this page would break
+/// on. Nothing here is interpolated raw regardless of how well-behaved its
+/// source is believed to be.
 fn who_cell(r: &UserRow) -> String {
-    let email = escape_html(&r.email);
-    match r.account_email.as_deref() {
-        Some(account) if account != r.email => format!(
-            r#"{email}<br><span class="muted">signed up as {}</span>"#,
-            escape_html(account)
-        ),
-        _ => email,
+    let mut cell = escape_html(&r.email);
+    // Escaped like everything else here, and this one is the reason the rule
+    // exists: it is the only string on this page that a stranger typed into a
+    // public form.
+    if let Some(name) = r.name.as_deref() {
+        cell.push_str(&format!(
+            r#"<br><span class="muted">{}</span>"#,
+            escape_html(name)
+        ));
     }
+    if let Some(account) = r.account_email.as_deref()
+        && account != r.email
+    {
+        cell.push_str(&format!(
+            r#"<br><span class="muted">signed up as {}</span>"#,
+            escape_html(account)
+        ));
+    }
+    cell
 }
 
 /// The mailbox a row became, as a `<code>` label, or nothing at all.
@@ -1360,6 +1381,7 @@ mod tests {
         UserRow {
             id,
             email: email.to_string(),
+            name: None,
             created_at: at,
             status: crate::store::USER_APPROVED.to_string(),
             approved_at: Some(at),
@@ -1545,6 +1567,44 @@ mod tests {
             "{not_yet}"
         );
         assert!(!not_yet.contains(r#">active</span>"#), "{not_yet}");
+    }
+
+    /// The name is context under the address, on both tables, and only when
+    /// there is one: a row without a name is the row that has always been
+    /// there and renders exactly as it did.
+    #[tokio::test]
+    async fn a_name_sits_under_the_address_when_there_is_one() {
+        let named = UserRow {
+            name: Some("Ada Lovelace".to_string()),
+            status: crate::store::USER_PENDING.to_string(),
+            approved_at: None,
+            invite_id: None,
+            notified_at: None,
+            ..row(1, "ada@example.com", false)
+        };
+        let html = document_of(admin_page(&[named], &[], None)).await;
+        assert!(html.contains("ada@example.com"), "{html}");
+        assert!(
+            html.contains(r#"<span class="muted">Ada Lovelace</span>"#),
+            "{html}"
+        );
+        // The address is what every button here acts on, so it stays first.
+        let who = html.find("ada@example.com").unwrap();
+        assert!(who < html.find("Ada Lovelace").unwrap(), "{html}");
+
+        // The one string on this page a stranger typed into a public form.
+        let hostile = UserRow {
+            name: Some(r#"<script>alert(1)</script>"#.to_string()),
+            ..row(2, "eve@evil.test", true)
+        };
+        let html = document_of(admin_page(&[], &[hostile], None)).await;
+        assert!(!html.contains("<script>alert(1)"), "{html}");
+        assert!(html.contains("&lt;script&gt;alert(1)"), "{html}");
+
+        // No name, no second line and no empty one.
+        let html = document_of(admin_page(&[], &[row(3, "grace@example.com", true)], None)).await;
+        assert!(!html.contains(r#"<span class="muted"></span>"#), "{html}");
+        assert!(html.contains("grace@example.com"), "{html}");
     }
 
     /// AN INVITE IS A BEARER CODE, so the address that was invited and the

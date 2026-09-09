@@ -201,6 +201,17 @@ CREATE TABLE IF NOT EXISTS users (
     -- a CLI code that was addressed to nobody — the Google account they redeemed
     -- it with. Normalized, like every address in this schema.
     email           TEXT NOT NULL UNIQUE,
+    -- What this person typed into the name field, or NULL: the rows that
+    -- predate the field have none, and so does anybody an operator invited
+    -- directly, who was only ever an address.
+    --
+    -- FREE TEXT FROM A PUBLIC FORM, and treated as such everywhere. It is
+    -- normalized on the way in (see `normalize_name`) and escaped on the way
+    -- out, and it is never matched on, joined on, or mailed to: `email` stays
+    -- the identity in this table and this column only changes how the
+    -- operator's board addresses somebody. NOT UNIQUE and never checked
+    -- against anything, because two people are allowed to share a name.
+    name            TEXT,
     created_at      TEXT COLLATE \"C\" NOT NULL,
     -- 'pending' | 'approved'. The approval transition is the guard that makes
     -- one click mint one invite; see `approve_user`.
@@ -257,6 +268,16 @@ const ADDED_COLUMNS: [(&str, &str); 4] = [
     ("reserved_until", "TEXT COLLATE \"C\""),
     ("invited_by", "BIGINT"),
 ];
+
+/// The same, for `users`: the signup form asked for an address only until the
+/// name field was added beside it, so every database written before that has
+/// the table without this column.
+///
+/// NULLABLE, AND IT HAS TO BE. Every row already in the table joined without
+/// giving a name and there is nothing to backfill one from, so the column
+/// arrives empty for all of them and the board renders those rows exactly as it
+/// did before.
+const USER_ADDED_COLUMNS: [(&str, &str); 1] = [("name", "TEXT")];
 
 /// The same, for `tenants`: the triage virtual-key columns arrived after the
 /// first hosted deployment, the assistant pair after them, and the share token
@@ -340,6 +361,10 @@ pub struct UserRow {
     pub id: i64,
     /// Normalized (lowercased, trimmed), the way it was stored.
     pub email: String,
+    /// What they called themselves when they joined, normalized the way it was
+    /// stored, or `None` for a row that has no name: everybody who joined
+    /// before the field existed, and everybody an operator invited directly.
+    pub name: Option<String>,
     pub created_at: DateTime<Utc>,
     /// [`USER_PENDING`] or [`USER_APPROVED`]. The STORED half of the lifecycle;
     /// the rest of it is the stamps below.
@@ -1078,8 +1103,17 @@ impl ControlStore {
 
     // ---- users -----------------------------------------------------------
 
-    /// Record an address that asked for the hosted tier. `true` means this
-    /// submission created the row.
+    /// Record an address that asked for the hosted tier, and the name it gave.
+    /// `true` means this submission created the row.
+    ///
+    /// THE NAME IS ONLY EVER WRITTEN BY THE INSERT, which is what makes the
+    /// conflict below stay a no-op. Filling in a name on a row that already
+    /// exists reads as an improvement and is two problems: it makes the answer
+    /// depend on what was already stored (a longer path for a duplicate is the
+    /// oracle this route is built not to be), and it hands anybody who can post
+    /// the form the ability to rewrite the name the operator sees beside
+    /// somebody else's address. First submission wins, and a person who joined
+    /// before the field existed keeps no name rather than gaining a stranger's.
     ///
     /// `ON CONFLICT DO NOTHING` rather than a SELECT then an INSERT: the form is
     /// public, so two submissions can race, and a UNIQUE column plus a
@@ -1102,16 +1136,17 @@ impl ControlStore {
     /// every submission (a row per guess) or padding the response, and neither
     /// is worth it for a list whose members are a marketing signup; the route's
     /// own rate bucket is what bounds the probing.
-    pub async fn add_user_waiting(&self, email: &str) -> Result<bool> {
+    pub async fn add_user_waiting(&self, email: &str, name: Option<&str>) -> Result<bool> {
         let changed = self
             .client()
             .await?
             .execute(
-                "INSERT INTO users(email, created_at, status, analytics_id)
-                 VALUES($1, $2, $3, $4)
+                "INSERT INTO users(email, name, created_at, status, analytics_id)
+                 VALUES($1, $2, $3, $4, $5)
                  ON CONFLICT (email) DO NOTHING",
                 &[
                     &normalize_email(email),
+                    &name.and_then(normalize_name),
                     &stamp(Utc::now()),
                     &USER_PENDING,
                     &mint_analytics_id()?,
@@ -1521,6 +1556,10 @@ fn user_row(r: &Row) -> Result<UserRow> {
         tenant_label: r.try_get(8)?,
         account_email: r.try_get(9)?,
         first_paired_at: r.try_get::<_, Option<String>>(10)?.map(parse_ts),
+        // LAST rather than beside the address it belongs to: this list is read
+        // POSITIONALLY, so slotting a column into the middle would silently
+        // re-point every field after it at its neighbour's value.
+        name: r.try_get(11)?,
     })
 }
 
@@ -1565,7 +1604,7 @@ fn tenant_row(r: &Row) -> Result<TenantRow> {
 const USER_COLUMNS: &str = "u.id, u.email, u.created_at, u.status, u.approved_at,
         u.invite_id, u.notified_at,
         COALESCE(u.signed_up_at, i.used_at), COALESCE(u.tenant_label, i.used_by_label),
-        u.account_email, u.first_paired_at
+        u.account_email, u.first_paired_at, u.name
    FROM users u LEFT JOIN invite_codes i ON i.id = u.invite_id";
 
 /// Bring an older database's tables up to the schema above.
@@ -1581,6 +1620,7 @@ const USER_COLUMNS: &str = "u.id, u.email, u.created_at, u.status, u.approved_at
 async fn migrate(tx: &Transaction<'_>) -> Result<()> {
     add_missing_columns(tx, "invite_codes", &ADDED_COLUMNS).await?;
     add_missing_columns(tx, "tenants", &TENANT_ADDED_COLUMNS).await?;
+    add_missing_columns(tx, "users", &USER_ADDED_COLUMNS).await?;
     add_share_token_index(tx).await?;
     add_invited_by_index(tx).await?;
     backfill_expiry(tx).await?;
@@ -1918,6 +1958,60 @@ pub(crate) fn mint_analytics_id() -> Result<String> {
 /// capitalizing a letter.
 fn normalize_email(email: &str) -> String {
     email.trim().to_lowercase()
+}
+
+/// The one shape a submitted name is stored in, or `None` when what was
+/// submitted amounts to nothing.
+///
+/// THREE RULES, AND ALL THREE ARE ABOUT THE BOARD IT IS RENDERED ON rather than
+/// about the person. Control characters go, because a newline or a tab pasted
+/// into the field is a table cell that walks across the row it belongs to (and
+/// a `\r` in a log line is a line that overwrites the one above it). Runs of
+/// whitespace collapse to one space, because the field is public and a name
+/// padded out with fifty spaces is a row that pushes the buttons off the page.
+/// Case is LEFT ALONE, unlike an address: `van Dijk` and `McDonald` are how
+/// people spell themselves, nothing is ever compared against this, and
+/// lowercasing it would only be a way to get it wrong.
+///
+/// Empty in, `None` out — and that covers the two cases that reach here from a
+/// browser: a field the person left blank, and a form posted by a client that
+/// does not know the field exists.
+fn normalize_name(name: &str) -> Option<String> {
+    let cleaned = name
+        .split_whitespace()
+        .map(|word| {
+            word.chars()
+                .filter(|c| !is_invisible(*c))
+                .collect::<String>()
+        })
+        // AFTER the strip, not before: a "word" made only of the characters
+        // above is empty by the time it gets here, and keeping it would put a
+        // double space in the middle of somebody's name.
+        .filter(|word| !word.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    (!cleaned.is_empty()).then_some(cleaned)
+}
+
+/// Characters that are not a name and would be read as layout.
+///
+/// The control characters are the obvious half: a newline or a tab in a table
+/// cell walks across the row it belongs to, and a carriage return in a log line
+/// overwrites the line above it.
+///
+/// THE BIDI CONTROLS ARE THE HALF WORTH THE FUNCTION. They are format
+/// characters rather than control ones, so `is_control` says nothing about
+/// them, and they survive HTML escaping intact because they are not markup —
+/// they are an instruction to the text engine to reverse what comes after. One
+/// of them in a name field reorders the rest of the operator's row, which on a
+/// board whose whole job is deciding which address to mail an invite to is a
+/// way to be shown an address that is not the one that would be written.
+fn is_invisible(c: char) -> bool {
+    c.is_control()
+        || matches!(
+            c,
+            '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}'
+        )
 }
 
 /// The one shape a timestamp is written in: RFC3339, UTC, milliseconds, `Z`.
@@ -2503,6 +2597,65 @@ SQUELCH_TEST_PG_URL is not set, and these tests run against a real Postgres.
         assert_eq!(s.tenant_assistant_vk("ghost").await.unwrap(), None);
     }
 
+    /// A `users` table written before the form asked for a name opens, gains
+    /// the column, and takes a submission like any other.
+    ///
+    /// THE HIGHEST-RISK HALF OF ADDING A COLUMN, and the one a green suite
+    /// against a fresh schema says nothing about: every hosted deployment has
+    /// this table already, `CREATE TABLE IF NOT EXISTS` leaves it exactly as it
+    /// found it, and an INSERT naming a column that is not there is a 500 on
+    /// every submission the form makes.
+    #[tokio::test]
+    async fn a_users_table_from_before_the_name_field_gains_the_column() {
+        let url = fresh_schema().await;
+        let seed = raw_client(&url).await;
+        // The shape this crate wrote before the name field: everything else,
+        // and no `name`.
+        seed.batch_execute(
+            "CREATE TABLE users (
+                 id              BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+                 email           TEXT NOT NULL UNIQUE,
+                 created_at      TEXT NOT NULL,
+                 status          TEXT NOT NULL,
+                 approved_at     TEXT,
+                 invite_id       BIGINT,
+                 notified_at     TEXT,
+                 signed_up_at    TEXT,
+                 account_email   TEXT,
+                 tenant_label    TEXT,
+                 first_paired_at TEXT,
+                 analytics_id    TEXT NOT NULL UNIQUE
+             );",
+        )
+        .await
+        .unwrap();
+        seed.execute(
+            "INSERT INTO users(email, created_at, status, analytics_id)
+             VALUES('early@example.com', $1, 'pending', 'an-id')",
+            &[&stamp(Utc::now())],
+        )
+        .await
+        .unwrap();
+
+        let s = ControlStore::connect(&url).await.unwrap();
+
+        // The row that was already there is listed, unchanged, with no name.
+        let rows = s.list_users().await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].email, "early@example.com");
+        assert_eq!(rows[0].name, None);
+
+        // And the column is a column: a submission carrying a name lands.
+        assert!(
+            s.add_user_waiting("ada@example.com", Some("Ada Lovelace"))
+                .await
+                .unwrap()
+        );
+        let rows = s.list_users().await.unwrap();
+        let ada = rows.iter().find(|r| r.email == "ada@example.com").unwrap();
+        assert_eq!(ada.name.as_deref(), Some("Ada Lovelace"));
+    }
+
     /// A tenants table written before the vk columns existed opens, gains
     /// them, and takes a key id like any other row.
     #[tokio::test]
@@ -2612,9 +2765,13 @@ SQUELCH_TEST_PG_URL is not set, and these tests run against a real Postgres.
     #[tokio::test]
     async fn an_address_joins_the_funnel_once() {
         let s = store().await;
-        assert!(s.add_user_waiting("Ada@Example.com").await.unwrap());
-        assert!(!s.add_user_waiting("ada@example.com").await.unwrap());
-        assert!(!s.add_user_waiting("  ADA@EXAMPLE.COM  ").await.unwrap());
+        assert!(s.add_user_waiting("Ada@Example.com", None).await.unwrap());
+        assert!(!s.add_user_waiting("ada@example.com", None).await.unwrap());
+        assert!(
+            !s.add_user_waiting("  ADA@EXAMPLE.COM  ", None)
+                .await
+                .unwrap()
+        );
 
         let rows = s.list_users().await.unwrap();
         assert_eq!(rows.len(), 1);
@@ -2625,12 +2782,93 @@ SQUELCH_TEST_PG_URL is not set, and these tests run against a real Postgres.
         assert_eq!(rows[0].notified_at, None);
     }
 
+    /// What a public form can put in a text field, and what is stored instead.
+    ///
+    /// A PURE FUNCTION TEST, deliberately: every rule here is about how the
+    /// value renders on the operator's board, and asserting them one at a time
+    /// against the function is what says which rule broke when one does.
+    #[test]
+    fn a_submitted_name_is_tidied_before_it_is_stored() {
+        // Trimmed, and interior runs collapsed to one space.
+        assert_eq!(
+            normalize_name("  Ada   Lovelace \n"),
+            Some("Ada Lovelace".into())
+        );
+        // Case is left exactly as spelled, unlike an address.
+        assert_eq!(normalize_name("van Dijk"), Some("van Dijk".into()));
+        // Layout characters. A tab or a newline is whitespace, so it becomes
+        // the one space between two words rather than vanishing and running
+        // them together...
+        assert_eq!(normalize_name("Ada\tLovelace"), Some("Ada Lovelace".into()));
+        assert_eq!(
+            normalize_name("Ada\r\nLovelace"),
+            Some("Ada Lovelace".into())
+        );
+        // ...and a control character that is NOT whitespace simply goes.
+        assert_eq!(
+            normalize_name("Ada\u{7}Lovelace"),
+            Some("AdaLovelace".into())
+        );
+        // A bidi override survives HTML escaping and reorders the rest of the
+        // row it lands in, which on this board is the row an operator reads an
+        // address off. It does not survive this.
+        assert_eq!(
+            normalize_name("Ada\u{202e}Lovelace"),
+            Some("AdaLovelace".into())
+        );
+        // A word that was ONLY invisible characters leaves no gap behind it.
+        assert_eq!(
+            normalize_name("Ada \u{200f} Lovelace"),
+            Some("Ada Lovelace".into())
+        );
+        // Nothing in, nothing stored — never an empty string, which the board
+        // would render as a blank second line under the address.
+        assert_eq!(normalize_name(""), None);
+        assert_eq!(normalize_name("   \n\t "), None);
+        assert_eq!(normalize_name("\u{202a}\u{202c}"), None);
+    }
+
+    /// The name rides in on the INSERT and only on the insert: a later
+    /// submission of the same address cannot rewrite what the operator sees
+    /// beside it.
+    #[tokio::test]
+    async fn a_name_is_written_once_and_never_overwritten() {
+        let s = store().await;
+        assert!(
+            s.add_user_waiting("Ada@Example.com", Some(" Ada  Lovelace "))
+                .await
+                .unwrap()
+        );
+        assert!(
+            !s.add_user_waiting("ada@example.com", Some("Somebody Else"))
+                .await
+                .unwrap()
+        );
+
+        let rows = s.list_users().await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].name.as_deref(), Some("Ada Lovelace"));
+
+        // And an address that joined without one keeps none: there is nothing
+        // to backfill it from, and a later submission is not it.
+        s.add_user_waiting("grace@example.com", None).await.unwrap();
+        s.add_user_waiting("grace@example.com", Some("Grace"))
+            .await
+            .unwrap();
+        let rows = s.list_users().await.unwrap();
+        let grace = rows
+            .iter()
+            .find(|r| r.email == "grace@example.com")
+            .unwrap();
+        assert_eq!(grace.name, None);
+    }
+
     /// THE RACE THE ADMIN PAGE IS ABOUT: one row, two clicks. Only the first
     /// transition wins, so only one invite is ever minted for one person.
     #[tokio::test]
     async fn a_user_row_is_approved_exactly_once() {
         let s = store().await;
-        s.add_user_waiting("ada@example.com").await.unwrap();
+        s.add_user_waiting("ada@example.com", None).await.unwrap();
         let id = s.list_users().await.unwrap()[0].id;
         let now = now();
 
@@ -2654,7 +2892,7 @@ SQUELCH_TEST_PG_URL is not set, and these tests run against a real Postgres.
     #[tokio::test]
     async fn the_invite_and_its_delivery_stamp_ride_on_the_row() {
         let s = store().await;
-        s.add_user_waiting("ada@example.com").await.unwrap();
+        s.add_user_waiting("ada@example.com", None).await.unwrap();
         let id = s.list_users().await.unwrap()[0].id;
         let now = now();
         s.approve_user(id, now).await.unwrap();
@@ -2729,7 +2967,7 @@ SQUELCH_TEST_PG_URL is not set, and these tests run against a real Postgres.
     #[tokio::test]
     async fn a_stale_expectation_loses_the_pointer() {
         let s = store().await;
-        s.add_user_waiting("ada@example.com").await.unwrap();
+        s.add_user_waiting("ada@example.com", None).await.unwrap();
         let id = s.list_users().await.unwrap()[0].id;
         s.approve_user(id, now()).await.unwrap();
 
@@ -2758,7 +2996,7 @@ SQUELCH_TEST_PG_URL is not set, and these tests run against a real Postgres.
     async fn the_listing_puts_the_longest_wait_first() {
         let s = store().await;
         for who in ["a@example.com", "b@example.com", "c@example.com"] {
-            s.add_user_waiting(who).await.unwrap();
+            s.add_user_waiting(who, None).await.unwrap();
         }
         let ids: Vec<i64> = s.list_users().await.unwrap().iter().map(|r| r.id).collect();
         s.approve_user(ids[0], now()).await.unwrap();
@@ -3081,8 +3319,8 @@ SQUELCH_TEST_PG_URL is not set, and these tests run against a real Postgres.
     #[tokio::test]
     async fn an_analytics_id_is_minted_once_and_never_rotates() {
         let s = store().await;
-        s.add_user_waiting("ada@example.com").await.unwrap();
-        s.add_user_waiting("grace@example.com").await.unwrap();
+        s.add_user_waiting("ada@example.com", None).await.unwrap();
+        s.add_user_waiting("grace@example.com", None).await.unwrap();
         let rows = s.list_users().await.unwrap();
         let (ada, grace) = (rows[0].id, rows[1].id);
 
@@ -3122,7 +3360,7 @@ SQUELCH_TEST_PG_URL is not set, and these tests run against a real Postgres.
     #[tokio::test]
     async fn a_signup_lands_on_the_row_its_invite_was_minted_for() {
         let s = store().await;
-        s.add_user_waiting("ada@example.com").await.unwrap();
+        s.add_user_waiting("ada@example.com", None).await.unwrap();
         let id = s.list_users().await.unwrap()[0].id;
         s.approve_user(id, now()).await.unwrap();
         s.set_user_invite(id, 7, None).await.unwrap();
@@ -3195,7 +3433,7 @@ SQUELCH_TEST_PG_URL is not set, and these tests run against a real Postgres.
     #[tokio::test]
     async fn a_cli_signup_promotes_the_row_the_person_already_had() {
         let s = store().await;
-        s.add_user_waiting("ada@example.com").await.unwrap();
+        s.add_user_waiting("ada@example.com", None).await.unwrap();
         let id = s.list_users().await.unwrap()[0].id;
         let before = analytics_id(&s, id).await;
 
@@ -3284,7 +3522,9 @@ SQUELCH_TEST_PG_URL is not set, and these tests run against a real Postgres.
     async fn only_signed_up_unpaired_live_tenants_are_polled() {
         let s = store().await;
         // Waiting, never signed up.
-        s.add_user_waiting("waiting@example.com").await.unwrap();
+        s.add_user_waiting("waiting@example.com", None)
+            .await
+            .unwrap();
         // Signed up with a live tenant: the one candidate.
         s.insert_tenant("ada", "ada@example.com").await.unwrap();
         s.record_signup(404, "ada@example.com", "ada", now())
