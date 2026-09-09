@@ -1960,28 +1960,45 @@ fn normalize_email(email: &str) -> String {
     email.trim().to_lowercase()
 }
 
+/// The longest name this column stores, in characters.
+///
+/// HERE RATHER THAN AT THE ROUTE, and that is the whole reason the ceiling
+/// moved. Capping the WIRE value spends the budget on whitespace: two hundred
+/// pasted spaces followed by a name is a hundred and twenty-eight spaces once
+/// cut, which normalizes to nothing at all, so a person who pasted their name
+/// out of a document would be stored as nameless. The ceiling belongs to what
+/// is KEPT, and the route reads generously and lets this decide.
+pub(crate) const NAME_MAX_CHARS: usize = 128;
+
 /// The one shape a submitted name is stored in, or `None` when what was
 /// submitted amounts to nothing.
 ///
-/// THREE RULES, AND ALL THREE ARE ABOUT THE BOARD IT IS RENDERED ON rather than
-/// about the person. Control characters go, because a newline or a tab pasted
-/// into the field is a table cell that walks across the row it belongs to (and
-/// a `\r` in a log line is a line that overwrites the one above it). Runs of
-/// whitespace collapse to one space, because the field is public and a name
-/// padded out with fifty spaces is a row that pushes the buttons off the page.
-/// Case is LEFT ALONE, unlike an address: `van Dijk` and `McDonald` are how
-/// people spell themselves, nothing is ever compared against this, and
-/// lowercasing it would only be a way to get it wrong.
+/// EVERY RULE HERE IS ABOUT THE BOARD IT IS RENDERED ON rather than about the
+/// person. Control characters go, because a newline or a tab pasted into the
+/// field is a table cell that walks across the row it belongs to (and a `\r` in
+/// a log line is a line that overwrites the one above it). Runs of whitespace
+/// collapse to one space, because the field is public and a name padded out
+/// with fifty spaces is a row that pushes the buttons off the page. Case is
+/// LEFT ALONE, unlike an address: `van Dijk` and `McDonald` are how people
+/// spell themselves, nothing is ever compared against this, and lowercasing it
+/// would only be a way to get it wrong.
 ///
-/// Empty in, `None` out — and that covers the two cases that reach here from a
-/// browser: a field the person left blank, and a form posted by a client that
-/// does not know the field exists.
+/// WHAT COMES BACK PUTS INK ON THE PAGE, or nothing comes back. `Some("")` was
+/// never possible; `Some("\u{200b}")` was, and it renders as a blank muted line
+/// under somebody's address — a stated invariant of this function broken by one
+/// character nobody can see. So the emptiness test is not "are there any
+/// characters left" but "is any of what is left visible", and
+/// [`is_inkless`] is the list of what does not count.
+///
+/// Empty in, `None` out covers the two cases that reach here from a browser: a
+/// field the person left blank, and a form posted by a client that does not
+/// know the field exists.
 fn normalize_name(name: &str) -> Option<String> {
-    let cleaned = name
+    let cleaned: String = name
         .split_whitespace()
         .map(|word| {
             word.chars()
-                .filter(|c| !is_invisible(*c))
+                .filter(|c| !is_stripped(*c))
                 .collect::<String>()
         })
         // AFTER the strip, not before: a "word" made only of the characters
@@ -1989,11 +2006,17 @@ fn normalize_name(name: &str) -> Option<String> {
         // double space in the middle of somebody's name.
         .filter(|word| !word.is_empty())
         .collect::<Vec<_>>()
-        .join(" ");
-    (!cleaned.is_empty()).then_some(cleaned)
+        .join(" ")
+        .chars()
+        .take(NAME_MAX_CHARS)
+        .collect();
+    // Truncation can land just after a space; nothing else can leave one at
+    // either end by this point.
+    let cleaned = cleaned.trim_end().to_string();
+    cleaned.chars().any(|c| !is_inkless(c)).then_some(cleaned)
 }
 
-/// Characters that are not a name and would be read as layout.
+/// Characters a name does not get to contain.
 ///
 /// The control characters are the obvious half: a newline or a tab in a table
 /// cell walks across the row it belongs to, and a carriage return in a log line
@@ -2006,11 +2029,44 @@ fn normalize_name(name: &str) -> Option<String> {
 /// of them in a name field reorders the rest of the operator's row, which on a
 /// board whose whole job is deciding which address to mail an invite to is a
 /// way to be shown an address that is not the one that would be written.
-fn is_invisible(c: char) -> bool {
+///
+/// THE ZERO-WIDTH SET is that same argument one step quieter. A zero-width
+/// space, a byte-order mark or a soft hyphen puts nothing on the page, so
+/// `ad\u{ad}min` reads as `admin`, and a name made only of them reads as a blank
+/// line. Note who is NOT here: the zero-width joiner and non-joiner belong
+/// inside real names (Persian, Indic) and are left to [`is_inkless`], which
+/// lets them through a name but does not let them BE one.
+///
+/// THE CURLY QUOTES are this page's own frame rather than anything about the
+/// person. [`crate::pages`] wraps a name in them so an operator can tell a line
+/// somebody typed from a line the page is asserting; stripping them here is
+/// what makes that frame unforgeable.
+fn is_stripped(c: char) -> bool {
     c.is_control()
         || matches!(
             c,
+            // Bidi controls and isolates.
             '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}'
+            // Zero width and invisible.
+            | '\u{00ad}' | '\u{180e}' | '\u{200b}' | '\u{2060}'..='\u{2064}' | '\u{feff}'
+            // The frame `who_cell` puts around a name.
+            | '\u{201c}' | '\u{201d}'
+        )
+}
+
+/// Characters that survive [`is_stripped`] and still put no ink on the page.
+///
+/// They are allowed INSIDE a name and may not BE one. The joiners shape real
+/// names in Persian and in Indic scripts, so stripping them would misspell
+/// somebody. The fillers are letters and symbols by category — `U+3164` is a
+/// Hangul filler and `U+2800` an empty braille cell, and `is_alphanumeric` and
+/// its neighbours accept both — yet each renders as a blank, which is how a
+/// name that is nothing at all gets past a test for emptiness.
+fn is_inkless(c: char) -> bool {
+    c.is_whitespace()
+        || matches!(
+            c,
+            '\u{200c}' | '\u{200d}' | '\u{115f}' | '\u{1160}' | '\u{2800}' | '\u{3164}'
         )
 }
 
@@ -2611,19 +2667,24 @@ SQUELCH_TEST_PG_URL is not set, and these tests run against a real Postgres.
         let seed = raw_client(&url).await;
         // The shape this crate wrote before the name field: everything else,
         // and no `name`.
+        // COLLATE "C" ON EVERY TIMESTAMP, because that is what the real
+        // pre-name DDL carries and the whole job of this fixture is to be the
+        // shape production has. Nothing about adding a nullable TEXT column
+        // depends on it; the next migration that touches a timestamp column
+        // would, and would be tested against the wrong collation.
         seed.batch_execute(
             "CREATE TABLE users (
                  id              BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
                  email           TEXT NOT NULL UNIQUE,
-                 created_at      TEXT NOT NULL,
+                 created_at      TEXT COLLATE \"C\" NOT NULL,
                  status          TEXT NOT NULL,
-                 approved_at     TEXT,
+                 approved_at     TEXT COLLATE \"C\",
                  invite_id       BIGINT,
-                 notified_at     TEXT,
-                 signed_up_at    TEXT,
+                 notified_at     TEXT COLLATE \"C\",
+                 signed_up_at    TEXT COLLATE \"C\",
                  account_email   TEXT,
                  tenant_label    TEXT,
-                 first_paired_at TEXT,
+                 first_paired_at TEXT COLLATE \"C\",
                  analytics_id    TEXT NOT NULL UNIQUE
              );",
         )
@@ -2826,6 +2887,45 @@ SQUELCH_TEST_PG_URL is not set, and these tests run against a real Postgres.
         assert_eq!(normalize_name(""), None);
         assert_eq!(normalize_name("   \n\t "), None);
         assert_eq!(normalize_name("\u{202a}\u{202c}"), None);
+
+        // ...AND NEVER A STRING THAT RENDERS AS NOTHING, which is the same
+        // invariant and the harder half. Each of these is a name a browser's
+        // `required` accepts and a person cannot see.
+        for blank in [
+            "\u{200b}",         // zero-width space
+            "\u{feff}",         // byte-order mark
+            "\u{00ad}",         // soft hyphen
+            "\u{2060}",         // word joiner
+            "\u{200c}\u{200d}", // the joiners, alone
+            "\u{3164}",         // Hangul filler: a LETTER by category
+            "\u{2800}",         // an empty braille cell
+            "\u{201c}\u{201d}", // the page's own frame, nothing inside it
+        ] {
+            assert_eq!(normalize_name(blank), None, "{blank:?}");
+        }
+
+        // The invisibles go from the MIDDLE of a name too, so a soft hyphen
+        // cannot make one word read as another.
+        assert_eq!(normalize_name("ad\u{00ad}min"), Some("admin".into()));
+        // But the joiners stay where they belong — inside a name that has ink
+        // in it — because they are how some names are spelled.
+        assert_eq!(
+            normalize_name("Zar\u{200c}rin"),
+            Some("Zar\u{200c}rin".into())
+        );
+        // The quotes the board frames a name with cannot be part of one, which
+        // is what stops the frame from being forged.
+        assert_eq!(normalize_name("\u{201c}Ada\u{201d}"), Some("Ada".into()));
+
+        // THE CEILING APPLIES TO WHAT SURVIVES, not to what was posted. A name
+        // pasted behind a paragraph of leading whitespace is still a name.
+        let padded = format!("{}Ada Lovelace", " ".repeat(NAME_MAX_CHARS * 2));
+        assert_eq!(normalize_name(&padded), Some("Ada Lovelace".into()));
+        // And what is kept is bounded, with no space left hanging off the cut.
+        let long = "Ada ".repeat(NAME_MAX_CHARS);
+        let kept = normalize_name(&long).unwrap();
+        assert!(kept.chars().count() <= NAME_MAX_CHARS, "{kept:?}");
+        assert_eq!(kept.trim_end(), kept, "{kept:?}");
     }
 
     /// The name rides in on the INSERT and only on the insert: a later

@@ -299,6 +299,16 @@ td form {{ display: inline; }}
 button.quiet {{ background: none; color: inherit; border: 1px solid #cdc7bd;
   padding: 0.35rem 0.6rem; font-size: 0.85rem; font-weight: 400; }}
 .muted {{ color: #6b6b6b; font-size: 0.9rem; }}
+/* The name somebody typed into the public form, and it is deliberately NOT
+   `.muted`: it sits in the same cell as the one line on this page that claims
+   to come from Google, and the two must not be able to look alike. Italic and
+   quoted is the "as claimed" register. */
+.given {{ color: #6b6b6b; font-size: 0.9rem; font-style: italic; }}
+/* A name is free text from a public form and an address can run to 254
+   characters, so this is the one cell that a single unbroken token can push
+   past the table's width, taking the buttons off the right edge with it. The
+   same rule `code` already carries, for the same reason. */
+td.who {{ overflow-wrap: anywhere; }}
 .suffix {{ color: #6b6b6b; }}
 .stop {{ border-left: 3px solid #b3261e; padding: 0.1rem 0 0.1rem 0.85rem; }}
 .code {{ font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 1.5rem;
@@ -317,7 +327,7 @@ a.button {{ display: inline-block; margin: 0.25rem 0 1.25rem; padding: 0.65rem 1
 @media (prefers-color-scheme: dark) {{
   :root {{ --brand: #7cc8eb; }}
   body {{ background: #0f0f10; color: #f5f5f7; }}
-  .muted, .suffix, .hint, th {{ color: #a0a0a7; }}
+  .muted, .given, .suffix, .hint, th {{ color: #a0a0a7; }}
   code, .code {{ background: rgba(255, 255, 255, 0.07); }}
   input[type=text], input[type=password], input[type=email] {{ background: rgba(255, 255, 255, 0.04);
     border-color: rgba(255, 255, 255, 0.14); }}
@@ -983,16 +993,33 @@ approved, minted, or mailed.</p>"#,
 /// that read it cannot drift to two different spellings.
 pub const CONFIRM_FIELD: &str = "confirmed";
 
-/// The "who" cell: the address this person is known by, the name they gave when
-/// they joined, and — when the Google account that actually signed up is a
-/// DIFFERENT address — a muted line naming that too.
+/// The "who" cell: the address this person is known by, — when the Google
+/// account that actually signed up is a DIFFERENT address — a muted line naming
+/// that too, and last, the name they typed into the form.
 ///
 /// THE ADDRESS STAYS ON TOP even though the name is the more human of the two.
 /// Every button on this page acts on an address, every refusal names one, and
 /// the operator's own question before approving anybody ("is this account on
 /// the Google test-user list?") is asked about an address. The name is context
-/// for that decision and is rendered as context: muted, beneath, and absent
-/// entirely on the rows that have none rather than padded out with a dash.
+/// for that decision and is rendered as context: beneath, and absent entirely
+/// on the rows that have none rather than padded out with a dash.
+///
+/// THE LINES ARE ORDERED BY AUTHORITY, AND THE NAME IS QUOTED. Both of those
+/// are one fix for one hole. The name arrives here as free text on a public,
+/// unauthenticated form, and it used to render in the same muted line, with the
+/// same wrapper, as the `signed up as` provenance below — so a stranger who
+/// submitted the name `signed up as ada@example.com` produced a row that was
+/// byte-for-byte identical to a genuine Google-verified one. That inverts the
+/// trust ordering the whole page rests on: the provenance line is the ONE thing
+/// on it that claims to come from Google rather than from a form, and on the
+/// Waiting table it cannot legitimately appear at all, because `account_email`
+/// is only ever written beside `signed_up_at`.
+///
+/// So the page asserts first and quotes last. The curly quotes are the frame,
+/// and `store::normalize_name` strips both of those characters out of every
+/// stored name, which is what makes the frame something free text cannot spell:
+/// a quoted line is what somebody typed, an unquoted one is what this page
+/// knows.
 ///
 /// AN INVITE IS A BEARER CODE, so the two are not promised to match: a person
 /// can be invited at work and sign up with a personal mailbox, or forward the
@@ -1011,21 +1038,22 @@ pub const CONFIRM_FIELD: &str = "confirmed";
 /// source is believed to be.
 fn who_cell(r: &UserRow) -> String {
     let mut cell = escape_html(&r.email);
-    // Escaped like everything else here, and this one is the reason the rule
-    // exists: it is the only string on this page that a stranger typed into a
-    // public form.
-    if let Some(name) = r.name.as_deref() {
-        cell.push_str(&format!(
-            r#"<br><span class="muted">{}</span>"#,
-            escape_html(name)
-        ));
-    }
     if let Some(account) = r.account_email.as_deref()
         && account != r.email
     {
         cell.push_str(&format!(
             r#"<br><span class="muted">signed up as {}</span>"#,
             escape_html(account)
+        ));
+    }
+    // Escaped like everything else here, and this one is the reason the rule
+    // exists: it is the only string on this page that a stranger typed into a
+    // public form. The quotes are the page's own and cannot be part of the
+    // name; see above.
+    if let Some(name) = r.name.as_deref() {
+        cell.push_str(&format!(
+            "<br><span class=\"given\">\u{201c}{}\u{201d}</span>",
+            escape_html(name)
         ));
     }
     cell
@@ -1585,7 +1613,7 @@ mod tests {
         let html = document_of(admin_page(&[named], &[], None)).await;
         assert!(html.contains("ada@example.com"), "{html}");
         assert!(
-            html.contains(r#"<span class="muted">Ada Lovelace</span>"#),
+            html.contains("<span class=\"given\">\u{201c}Ada Lovelace\u{201d}</span>"),
             "{html}"
         );
         // The address is what every button here acts on, so it stays first.
@@ -1598,13 +1626,80 @@ mod tests {
             ..row(2, "eve@evil.test", true)
         };
         let html = document_of(admin_page(&[], &[hostile], None)).await;
-        assert!(!html.contains("<script>alert(1)"), "{html}");
         assert!(html.contains("&lt;script&gt;alert(1)"), "{html}");
 
-        // No name, no second line and no empty one.
+        // No name, no extra line and no empty one.
         let html = document_of(admin_page(&[], &[row(3, "grace@example.com", true)], None)).await;
-        assert!(!html.contains(r#"<span class="muted"></span>"#), "{html}");
+        assert!(!html.contains(r#"class="given""#), "{html}");
         assert!(html.contains("grace@example.com"), "{html}");
+    }
+
+    /// A NAME CANNOT SPELL THE ONE LINE ON THIS PAGE THAT COMES FROM GOOGLE.
+    ///
+    /// The provenance line is the page's most authoritative field and the name
+    /// beneath it is free text off a public form. They shared a wrapper once,
+    /// and a stranger submitting the name `signed up as ada@example.com`
+    /// rendered a row byte-for-byte identical to a genuine one — an operator
+    /// reading "this person already signed up as somebody I recognize" and
+    /// approving an invite for an address that had done no such thing.
+    ///
+    /// Two things stop it and this test holds both: the frame (curly quotes
+    /// that `normalize_name` strips out of every stored name, so nothing inside
+    /// one can be one) and the order (what the page knows first, what somebody
+    /// typed last).
+    #[tokio::test]
+    async fn a_name_cannot_forge_the_line_that_came_from_google() {
+        let forged = UserRow {
+            name: Some("signed up as ada@example.com".to_string()),
+            status: crate::store::USER_PENDING.to_string(),
+            approved_at: None,
+            invite_id: None,
+            notified_at: None,
+            ..row(1, "eve@evil.test", false)
+        };
+        let forged = document_of(admin_page(&[forged], &[], None)).await;
+        let genuine = UserRow {
+            account_email: Some("ada@example.com".to_string()),
+            ..accepted_row(1, "eve@evil.test", "eve")
+        };
+        let genuine = document_of(admin_page(&[], &[genuine], None)).await;
+
+        let cell = |html: &str| {
+            let start = html.find("eve@evil.test").unwrap();
+            html[start..start + 120].to_string()
+        };
+        assert_ne!(
+            cell(&forged),
+            cell(&genuine),
+            "the forgery is indistinguishable"
+        );
+        // The genuine line is unquoted and unmarked; the forged one is neither.
+        assert!(
+            genuine.contains(r#"<span class="muted">signed up as ada@example.com</span>"#),
+            "{genuine}"
+        );
+        assert!(
+            forged.contains(
+                "<span class=\"given\">\u{201c}signed up as ada@example.com\u{201d}</span>"
+            ),
+            "{forged}"
+        );
+        assert!(
+            !forged.contains(r#"<span class="muted">signed up as"#),
+            "{forged}"
+        );
+
+        // And on a row that carries both, the page's own line comes first.
+        let both = UserRow {
+            name: Some("signed up as ada@bigco.com".to_string()),
+            account_email: Some("eve-real@evil.test".to_string()),
+            ..accepted_row(1, "eve@evil.test", "eve")
+        };
+        let html = document_of(admin_page(&[], &[both], None)).await;
+        assert!(
+            html.find("eve-real@evil.test").unwrap() < html.find("ada@bigco.com").unwrap(),
+            "{html}"
+        );
     }
 
     /// AN INVITE IS A BEARER CODE, so the address that was invited and the

@@ -133,11 +133,40 @@ const styles = {
     gap: "1rem",
     textDecoration: "none",
   },
+  // THE SLOT THE BOTTOM OF THE PAGE IS DRAWN INSIDE, and it has a height for
+  // one reason: `content` is a vertically CENTRED column, so the masthead's
+  // position is a function of whatever sits under it. The button and the
+  // one-slot rig happened to differ by 0.2px, which is the only reason "nothing
+  // above it moves" was ever true. The two-slot rig is 46px taller, and half of
+  // that came straight off the top: the mark, the wordmark and the tagline all
+  // lurched upward on every press of "join the waitlist", which is the exact
+  // flicker the pushState-instead-of-navigate architecture below exists to
+  // prevent. Reserving the tallest state's height makes them constants again.
+  //
+  // The whole composition sits a little higher than it did because of it. That
+  // is the cost, it is uniform across every state, and it is the cheaper half
+  // of the trade.
+  slot: {
+    display: "flex",
+    flexDirection: "column",
+    alignItems: "center",
+    // The tallest state is the rig with a refusal under it, not the rig on its
+    // own, and reserving for anything less means the page still lurches on the
+    // one press that already went wrong.
+    minHeight: "9rem",
+  },
   // The one line that answers the press. Brighter than the detail under it and
   // quieter than the tagline above it, which stays the page's loudest line in
   // every state.
+  //
+  // BOUNDED LIKE THE LINE BENEATH IT now that it interpolates a name somebody
+  // typed. Unbounded it was fine at a fixed nineteen characters and ran off
+  // both edges of the screen the moment a person put an address in the name
+  // field, on a page whose `overflow: hidden` means you cannot scroll to it.
   confirm: {
     margin: "0.65rem 0 0",
+    maxWidth: "26rem",
+    overflowWrap: "anywhere",
     color: "#f5f5f7",
     fontSize: "1rem",
     textAlign: "center",
@@ -405,6 +434,33 @@ const CTA_CSS = `
 }
 .pb-rig-field::placeholder { color: #6b6b70; }
 .pb-rig-field:disabled { color: #a9a49a; }
+/* WHICH SLOT IS LIVE. The rig lights as one instrument on :focus-within,
+   which said everything worth saying while there was one opening in it and
+   nothing at all once there were two: tabbing between them changed no pixel
+   but the caret. A lit edge down the active slot is the smallest thing that
+   answers it in the instrument's own language, and it is :focus rather than
+   :focus-visible because the question ("which one am I typing into") is the
+   same however the slot was reached.
+
+   outline: none above is why this is a shadow: the outline is the affordance
+   this design gave up, and an inset edge is the one that belongs on a slot cut
+   into a face. */
+.pb-rig-field:focus { box-shadow: inset 2px 0 0 rgba(${BRASS}, 0.7); }
+/* Chrome recognises name beside email as an address profile and paints its
+   own opaque ground into both slots, which on a rig whose whole premise is that
+   the slots have no ground of their own is the one thing that breaks the
+   material. The inset shadow is the documented way to overrule it. */
+.pb-rig-field:-webkit-autofill,
+.pb-rig-field:-webkit-autofill:hover,
+.pb-rig-field:-webkit-autofill:focus {
+  -webkit-text-fill-color: #f5f5f7;
+  caret-color: #f5f5f7;
+  box-shadow: inset 0 0 0 100vw #17171a;
+  transition: background-color 9999s;
+}
+.pb-rig-field:-webkit-autofill:focus {
+  box-shadow: inset 0 0 0 100vw #17171a, inset 2px 0 0 rgba(${BRASS}, 0.7);
+}
 /* The name slot. Divided off from the row below by a hairline, so the two
    openings read as machined out of one face rather than as one box with two
    bits of text floating in it. Its own padding, because the address slot's
@@ -636,7 +692,15 @@ function useMeter() {
         hovered.current = true;
       },
       onPointerMove: (event: PointerEvent<HTMLElement>) => {
-        const box = event.currentTarget.getBoundingClientRect();
+        // THE CANVAS'S BOX, NOT THE HANDLER'S. They were the same element's
+        // box until the rig grew a second slot above the meter: the handlers
+        // stay on the whole instrument (so hovering anywhere tunes it, which is
+        // the design) while the canvas covers only the bottom row, and reading
+        // the outer box spent half the vertical travel over a slot with no
+        // meter behind it — the filter could never open fully anywhere you
+        // could actually see it. On the standalone button the two boxes are
+        // still the same rectangle, so nothing changes there.
+        const box = (canvasRef.current ?? event.currentTarget).getBoundingClientRect();
         const x = (event.clientX - box.left) / (box.width || 1);
         // Screen y grows downward and the hump grows upward, so invert: the
         // top of the button is the filter wide open.
@@ -811,7 +875,13 @@ function Waitlist() {
     // it did not before, and answering with it is what makes the field read as
     // having been asked rather than collected. First word only: a full name
     // read back at somebody is a receipt, not a greeting.
-    const first = name.trim().split(/\s+/)[0];
+    //
+    // AND ONLY WHEN IT IS THE SIZE OF A NAME. The field takes 128 characters
+    // and people put addresses in the wrong box; a greeting is not the place to
+    // find out. Anything longer falls back to the line that needs no name,
+    // which also keeps this state inside the slot above.
+    const word = name.trim().split(/\s+/)[0];
+    const first = word.length <= 20 ? word : "";
     return (
       <>
         <p style={styles.confirm}>
@@ -836,9 +906,10 @@ function Waitlist() {
           autoComplete="name"
           placeholder="your name"
           aria-label="your name"
-          // The same ceiling the control plane stores to, said here so a long
-          // name is stopped at the field rather than silently cut in half on
-          // the way in.
+          // The control plane's own ceiling is 128 CHARACTERS and this counts
+          // UTF-16 units, so the two agree on every name and the browser is
+          // the stricter of them on astral ones. Deliberately the stricter
+          // side: a name stopped at the field beats one cut on the way in.
           maxLength={128}
           // The button that opened this is gone from under the cursor, so the
           // first field takes the focus it left behind: press join, start
@@ -932,11 +1003,13 @@ export function App() {
           masthead
         )}
         <p style={styles.tagline}>fuck email. lets make it bearable</p>
-        {joining ? (
-          <Waitlist />
-        ) : (
-          <JoinButton onClick={go(WAITLIST_PATH, true)} />
-        )}
+        <div style={styles.slot}>
+          {joining ? (
+            <Waitlist />
+          ) : (
+            <JoinButton onClick={go(WAITLIST_PATH, true)} />
+          )}
+        </div>
       </div>
       <CornerLinks />
     </main>

@@ -19,12 +19,20 @@ table below; unset, none of it is mounted and both URLs are a 404):
 ```
 browser  ── GET  /  ──────────► "No invite code? Join the waitlist",
                                 linking to <WAITLIST_ORIGIN>/waitlist
-site     ── POST /waitlist ──► one users row per address, same 200 for a duplicate
+site     ── POST /waitlist ──► one users row per address (with the name it gave),
+                                same 200 for a duplicate
 operator ── GET  /admin ──────► token login, then the list
          ── POST /admin/approve ──► mint an invite, email it through Resend
          ── POST /admin/invite ───► the same, for an address that never joined
          ── POST /admin/send ─────► revoke that code, mint and mail a fresh one
 ```
+
+The form asks for a name as well as an address, and the name is stored beside it
+and shown under it on the board — context for the approve decision, never an
+identity: nothing is matched, joined, or mailed on it. It is written by the
+INSERT only, so a second submission of an address already on the list cannot
+rewrite the name the operator sees beside it, and a row that arrived before the
+field existed simply has none.
 
 A direct invite is recorded as a `users` row that starts out approved, so one
 table answers "have we invited them" however they arrived and the re-send button

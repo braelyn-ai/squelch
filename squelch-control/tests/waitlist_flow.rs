@@ -427,6 +427,24 @@ async fn a_name_arrives_with_the_address() {
     assert!(board.contains(APPLICANT), "{board}");
 }
 
+/// A name pasted in behind a paragraph of whitespace is still a name.
+///
+/// THE WIRE READ AND THE STORAGE CEILING ARE DIFFERENT NUMBERS, and this is
+/// the test that says why. When they were one, the route cut the value at 128
+/// characters BEFORE anything was trimmed, so a paste carrying leading spaces
+/// arrived as 128 spaces, normalized to nothing, and the person was recorded
+/// with no name at all.
+#[tokio::test]
+async fn a_name_behind_a_paste_full_of_whitespace_still_lands() {
+    let h = Harness::new().await;
+    let padded = format!("{}Ada Lovelace", " ".repeat(200));
+    let (status, _, body) = h.join_named(&padded, APPLICANT).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let rows = h.state.store().list_users().await.unwrap();
+    assert_eq!(rows[0].name.as_deref(), Some("Ada Lovelace"));
+}
+
 /// An address with no name at all is a submission like any other. THE CASE
 /// THAT MATTERS IS NOT THE EMPTY FIELD: the browser requires it. It is a
 /// browser running an older bundle of the site, which posts no `name` key, and
@@ -584,10 +602,39 @@ async fn the_dashboard_escapes_what_a_stranger_typed() {
     let (_, _, body) = h.get("/admin", Some(&cookie)).await;
     assert!(!body.contains(hostile), "{body}");
     assert!(body.contains("a&amp;&#39;b@evil.test"), "{body}");
-    assert!(!body.contains("<script>"), "{body}");
+    // The escaped form, and NOT a whole-page `!contains("<script>")`: this page
+    // has no script tag today, so that assertion would pass on a page that had
+    // stopped escaping and fail the day somebody added one, for a reason that
+    // has nothing to do with escaping.
     assert!(
         body.contains("&lt;script&gt;alert(1)&lt;/script&gt;"),
         "{body}"
+    );
+}
+
+/// The end-to-end half of `pages::a_name_cannot_forge_the_line_that_came_from`
+/// `_google`: the string really does survive the route, the normalizer and the
+/// store, and still cannot spell the page's own line by the time an operator
+/// reads it.
+#[tokio::test]
+async fn a_name_off_the_public_form_cannot_forge_the_google_line() {
+    let h = Harness::new().await;
+    let (status, _, _) = h
+        .join_named("signed up as ada@example.com", APPLICANT)
+        .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let cookie = h.sign_in().await;
+    let (_, _, board) = h.get("/admin", Some(&cookie)).await;
+    // Quoted, in the register that says somebody typed it...
+    assert!(
+        board.contains("<span class=\"given\">\u{201c}signed up as ada@example.com\u{201d}</span>"),
+        "{board}"
+    );
+    // ...and never in the one the page asserts with.
+    assert!(
+        !board.contains(r#"<span class="muted">signed up as"#),
+        "{board}"
     );
 }
 
