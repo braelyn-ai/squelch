@@ -49,7 +49,7 @@ Deeper search, gmail spam, and 2FA codes the moment they land.
 
 - Notifications arrive when the mail does
 - A fast lane decides buzz or no-buzz at ingest on Haiku 4.5. The deliberate lane still owns the rest of triage.
-- Sealed mail gets a body-free notification path, kind-derived phrase only. Ships off by default.
+- Sealed mail gets a body-free notification path, kind-derived phrase only
 - A re-ingest can no longer undo a seal you set by hand.
 - Provider spam exists locally now and is structurally excluded from every Passband triage feature
 - Empty bodies are no longer stored when a sender's plain-text part is blank beside a full HTML part. This leads to better triage

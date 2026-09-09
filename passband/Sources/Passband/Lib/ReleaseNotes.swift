@@ -152,8 +152,7 @@ enum ReleaseNotes {
                         + "deliberate lane still owns the rest of triage."),
                 ReleaseItem(
                     .daemon,
-                    "Sealed mail gets a body-free notification path, kind-derived phrase only. "
-                        + "Ships off by default."),
+                    "Sealed mail gets a body-free notification path, kind-derived phrase only"),
                 ReleaseItem(.daemon, "A re-ingest can no longer undo a seal you set by hand."),
                 ReleaseItem(
                     .daemon,

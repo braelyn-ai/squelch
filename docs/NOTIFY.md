@@ -593,7 +593,7 @@ Nothing else. No reason fields, no confidence, no category. `effort` from
 |---|---|---|
 | `rescue_window_secs: u64` | 3600 | §11.1 |
 | `fast_enabled: bool` | true | kill switch for the model path; sealed and suppressed still record |
-| `sealed_enabled: bool` | **false** for now | §11.6: flips once the paired app ships; off = sealed rows record nothing and emit nothing |
+| `sealed_enabled: bool` | **true** since daemon 0.0.6 | §11.6: shipped false for one release as an ordering guard; off = sealed rows record nothing and emit nothing |
 | `model: String` | `claude-haiku-4-5` | qualified for a gateway at call time |
 | `effort: Option<String>` | `None` | |
 | `max_body_chars: usize` | 1500 | |
@@ -666,10 +666,12 @@ signal for it, and the client must treat it as one:
   closed and `otp`/`login_alert`/`urgent`/`surfaced` are not in it.
 
 Until an app carrying that lands, a sealed event on an old Mac app is a second
-banner with a dead tap. So **`notify.sealed_enabled` defaults to `false` in
-the PR that builds this**, and flips to `true` in the release that pairs the
-daemon with that app. The daemon side is complete either way; the knob is an
-ordering guard, not a design hedge.
+banner with a dead tap. So **`notify.sealed_enabled` defaulted to `false` in
+the PR that built this**, and flipped to `true` in the release that pairs the
+daemon with that app: daemon 0.0.6, beside Mac 0.0.7 and iPhone 0.0.4. The
+daemon side was complete either way; the knob was an ordering guard, not a
+design hedge, and it stays a knob (`SQUELCH_NOTIFY_SEALED_ENABLED=false`) for
+a fleet whose clients have not caught up.
 
 ### 11.7 The deliberate lane's ledger writes
 
@@ -890,18 +892,16 @@ and only the first is automatic.
    gateway with the Stage-1 model only. A second probe on the notify model
    would catch step 3's drift before a tenant's ledger does.
 
-8. **App release, then flip the sealed switch.** The client half (2d2811b)
-   rides the next Mac and iOS releases after 0.0.6: `ReleaseNotes.swift`
-   is the only authored changelog, bump `passband/VERSION` + `project.yml`
-   + `xcodegen` for the Mac tag, `MARKETING_VERSION` + `xcodegen` for the
-   iOS tag (the two version lines are deliberately separate). Once those
-   are out (Sparkle carries the Mac update within a day; iOS waits on
-   TestFlight/App Store), flip `notify.sealed_enabled`: self-host by
-   `[notify] sealed_enabled = true` or `SQUELCH_NOTIFY_SEALED_ENABLED=true`,
-   hosted by changing the code default to `true` in the same commit as the
-   NEXT daemon tag (step 4 again), because of the closed env contract. Flip
-   it before the app ships and an un-updated Mac shows two banners with a
-   dead tap on the second.
+8. **App release, then flip the sealed switch. DONE in daemon 0.0.6.** The
+   client half (2d2811b) shipped as Mac 0.0.7 and iPhone 0.0.4, and the code
+   default flipped to `true` in the commit under the `daemon-0.0.6` tag,
+   because the closed env contract means hosted runs the default. The
+   ordering still matters at roll time: roll that daemon only once the Mac
+   release has had time to install (Sparkle carries it within a day; iOS
+   waits on TestFlight), because an un-updated Mac shows two banners with a
+   dead tap on the second. Self-host installs get it from the default; a
+   fleet that needs it off again sets `SQUELCH_NOTIFY_SEALED_ENABLED=false`
+   or `[notify] sealed_enabled = false`.
 
 9. **Docs that go stale on this PR:** `deploy/hosted/SETUP.md` §6b's model
    list (already stale; add Haiku), `PRODUCTION.md`'s gateway table

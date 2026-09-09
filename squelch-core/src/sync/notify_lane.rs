@@ -1894,9 +1894,14 @@ mod tests {
              Your one-time passcode is 483920. Enter this code to continue.\r\n",
             now.to_rfc2822()
         );
-        // Default config: `sealed_enabled` is FALSE until a client ships that
-        // routes the tap to the auth flow.
-        let (mid, c) = ingest(&store, acct, "g-otp", &eml, now, &cfg());
+        // The knob OFF, explicitly: the default has been on since 0.0.6, and
+        // this is the shape a fleet whose clients have not caught up runs
+        // (`SQUELCH_NOTIFY_SEALED_ENABLED=false`).
+        let off = NotifyConfig {
+            sealed_enabled: false,
+            ..cfg()
+        };
+        let (mid, c) = ingest(&store, acct, "g-otp", &eml, now, &off);
         assert!(c.is_none(), "off means no ping AND no ledger row");
         assert_eq!(
             store.sealed_messages(acct).unwrap().len(),
