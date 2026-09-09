@@ -383,6 +383,18 @@ impl SquelchServer {
             }
         }
 
+        // ISSUE #21: THE RULE RIDES WITH THE MAIL. An `Update` carries
+        // `matched_rule`, which is a bare row id — not text, and not even
+        // populated on the case the ask was written about (a bill; see
+        // `instruction_for`). One rules read for the whole batch, then a Rust
+        // glob per sender.
+        //
+        // READ BEFORE THE LEDGER IS STAMPED, deliberately. Everything that can
+        // fail this call now happens ahead of `mark_surfaced`, so a store error
+        // cannot leave a row marked as seen by an agent that was handed an error
+        // instead of the mail.
+        let rules = self.sender_rules()?;
+
         // SEEN-LEDGER: the agent door stamps too (surfaced_at=now if NULL,
         // new->open), so the ledger answers "did ANYONE see this" across both
         // doors. mark_surfaced re-guards sensitivity, so sealed is never stamped.
@@ -391,12 +403,6 @@ impl SquelchServer {
             .mark_surfaced(self.account_id, &ids)
             .map_err(Self::map_err)?;
 
-        // ISSUE #21: THE RULE RIDES WITH THE MAIL. An `Update` carries
-        // `matched_rule`, which is a bare row id — not text, and not even
-        // populated on the case the ask was written about (a bill; see
-        // `instruction_for`). One rules read for the whole batch, then a Rust
-        // glob per sender.
-        let rules = self.sender_rules()?;
         let out: Vec<InboxUpdate> = safe
             .into_iter()
             .map(|u| InboxUpdate {
