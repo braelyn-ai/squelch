@@ -19,7 +19,7 @@ use serde::Deserialize;
 use squelch_core::config::ShipmentListPolicy;
 use squelch_core::error::CoreError;
 use squelch_core::store::{NewAuditEntry, SearchSort, SqliteStore, Store};
-use squelch_core::types::{AccountId, Disposition, ThreadView, Update};
+use squelch_core::types::{AccountId, Disposition, SenderRule, ThreadView, Update};
 
 /// The squelch MCP server. Single-account: the account is resolved once at
 /// construction, though every row already carries `account_id`.
@@ -138,6 +138,69 @@ pub struct SetSenderRuleParams {
     pub disposition: String,
 }
 
+/// The account owner's standing instruction for a sender, delivered ALONGSIDE
+/// that sender's mail (issue #21).
+///
+/// This is a sender rule's `want_text`: the owner's own words, written through
+/// the client or through `set_sender_rule`, which is audited fail-closed. It is
+/// never text out of an email body. Stage-2 has read it since sender rules
+/// shipped — it is how a `filtered` rule decides surface-vs-squelch — but a rule
+/// that only steers triage is invisible to the agent doing the talking, so
+/// "tell me the total on the statement, not the minimum payment" had no way to
+/// reach the sentence the user actually reads.
+///
+/// DELIBERATELY NOT THE DISPOSITION. surface/squelch/filtered is a VERDICT, and
+/// the pipeline has already applied it: by the time the agent sees a row, the
+/// verdict is its `tier` and `importance`. Handing over the verdict too invites
+/// the agent to apply it a second time, and there is one case where doing so is
+/// actively wrong — a bill OUTRANKS a squelch rule on purpose (Rung 1 runs
+/// before Rung 2 in `triage::stage1`), so an agent re-reading "squelch" off a
+/// past-due notice would bury exactly the mail the ladder went out of its way to
+/// raise. What travels is the instruction, not the judgment.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct StandingInstruction {
+    /// The rule's sender pattern, so the agent can attribute what it is
+    /// following ("per your rule for `*@chase.com`") instead of asserting an
+    /// unsourced preference at the user.
+    pub match_pattern: String,
+    /// The owner's instruction, VERBATIM — the same bytes Stage-2 reads. Either
+    /// polarity: it may name what they want from this sender ("only the
+    /// statement total") or what they do not care about ("skip the promos").
+    pub want: String,
+}
+
+/// One `get_inbox_updates` result: the ranked update, plus the sender's standing
+/// instruction when they have one.
+///
+/// A WRAPPER RATHER THAN A FIELD ON [`Update`]: `Update` is the human door's row
+/// type as well, and the client reads rule text from its own rules list already.
+/// The flatten leaves every existing key exactly where it was, so this is an
+/// additive change to the agent door's wire shape.
+#[derive(Debug, serde::Serialize)]
+pub struct InboxUpdate {
+    #[serde(flatten)]
+    pub update: Update,
+    /// Absent (not null) when this sender has no rule, or has one that carries
+    /// no instruction text.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub standing_instruction: Option<StandingInstruction>,
+}
+
+/// A `get_thread` result: the sanitized thread, plus the standing instructions
+/// covering the people in it.
+///
+/// A LIST, because a thread can have several correspondents and a rule can match
+/// any of them. Deduplicated by pattern, so one rule matching four messages
+/// reads once rather than four times, and absent from the JSON entirely when
+/// nobody in the thread is ruled.
+#[derive(Debug, serde::Serialize)]
+pub struct ThreadWithInstructions {
+    #[serde(flatten)]
+    pub view: ThreadView,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub standing_instructions: Vec<StandingInstruction>,
+}
+
 impl SquelchServer {
     /// Build a server over an already-open store, resolving `account_email` to
     /// an account id (creating the account row if needed).
@@ -190,6 +253,96 @@ impl SquelchServer {
         self.tool_router.list_all().len()
     }
 
+    /// The account's sender rules, read in the order `squelch-core` itself reads
+    /// them (`list_sender_rules`, newest-updated first). Same list, same order,
+    /// so the rule this door names for an address is the rule Stage-1 would pick
+    /// for it — [`squelch_core::triage::rules::match_sender_rule`] takes the
+    /// FIRST match, which makes the order part of the answer whenever two
+    /// patterns overlap.
+    fn sender_rules(&self) -> Result<Vec<SenderRule>, ErrorData> {
+        self.store
+            .list_sender_rules(self.account_id)
+            .map_err(Self::map_err)
+    }
+
+    /// The standing instruction for one sender, resolved BY ADDRESS against the
+    /// rules as they stand NOW.
+    ///
+    /// NOT A JOIN ON `triage.matched_rule_id`, which is the obvious
+    /// implementation and the wrong one, for three separate reasons:
+    ///
+    /// 1. THE MOTIVATING EXAMPLE WOULD MISS. `matched_rule_id` records the rule
+    ///    that DECIDED the row, and Rung 1 (bill/payment) is evaluated BEFORE
+    ///    sender rules and returns `matched_rule: None` — it reads the rule only
+    ///    to decide whether to trust the sender's "past due". A credit-card
+    ///    statement is a bill, so "tell me the total on cc statements" is
+    ///    precisely the mail whose triage row carries no rule id at all.
+    /// 2. A RULE WRITTEN AFTER THE MAIL LANDED leaves no mark on rows already
+    ///    triaged — the same gap that made
+    ///    [`squelch_core::triage::events::current_rule`] necessary for the
+    ///    refine sites, and the common shape here: the user tells the agent what
+    ///    they want *because* of the mail they were just shown.
+    /// 3. The id answers "what decided this row". The question this door is
+    ///    asking is "what did the owner ask for about this sender", which is a
+    ///    property of the address, not of one verdict.
+    ///
+    /// IN RUST, NOT IN SQL. `match_sender_rule`'s globs are hand-rolled (`*`
+    /// only, case-insensitive, nothing else metacharacter) exactly so a
+    /// user-authored pattern cannot inject one. SQLite's `GLOB` is
+    /// case-SENSITIVE and gives `?` and `[` meaning; `LIKE` reads `%` and `_`.
+    /// Either re-expression would be a second spelling of a predicate that
+    /// already exists in Rust, free to drift from the one triage actually ran.
+    ///
+    /// A BLANK `want_text` IS NO INSTRUCTION. Only a `filtered` rule is required
+    /// to carry text (`validate_sender_rule`); a bare surface/squelch rule is a
+    /// verdict with nothing to say about how to present anything, and an empty
+    /// string on the wire reads as an instruction the agent has to interpret.
+    /// Gated on `trim`, sent unmodified: `want_text` is stored verbatim and
+    /// every other reader of it gets the owner's bytes.
+    fn instruction_for(from_addr: &str, rules: &[SenderRule]) -> Option<StandingInstruction> {
+        let rule = squelch_core::triage::rules::match_sender_rule(from_addr, rules)?;
+        if rule.want_text.trim().is_empty() {
+            return None;
+        }
+        Some(StandingInstruction {
+            match_pattern: rule.match_pattern.clone(),
+            want: rule.want_text.clone(),
+        })
+    }
+
+    /// Every standing instruction covering a thread's correspondents, in
+    /// first-appearance order, deduplicated by the pattern that produced it.
+    ///
+    /// Deduplicated by PATTERN rather than by address: two addresses under one
+    /// `*@chase.com` rule are one instruction, and repeating it per message
+    /// would read as two different asks.
+    fn instructions_for_thread(
+        view: &ThreadView,
+        rules: &[SenderRule],
+    ) -> Vec<StandingInstruction> {
+        let mut out: Vec<StandingInstruction> = Vec::new();
+        for m in &view.messages {
+            if let Some(found) = Self::instruction_for(&m.from_addr, rules)
+                && !out.iter().any(|e| e.match_pattern == found.match_pattern)
+            {
+                out.push(found);
+            }
+        }
+        out
+    }
+
+    /// Serialize a thread with its senders' standing instructions attached. Both
+    /// of `get_thread`'s resolution paths (thread id, message id) end here, so
+    /// the instruction cannot ride on one and not the other.
+    fn thread_with_instructions(&self, view: ThreadView) -> Result<CallToolResult, ErrorData> {
+        let rules = self.sender_rules()?;
+        let standing_instructions = Self::instructions_for_thread(&view, &rules);
+        Self::ok_json(ThreadWithInstructions {
+            view,
+            standing_instructions,
+        })
+    }
+
     fn ok_json<T: serde::Serialize>(value: T) -> Result<CallToolResult, ErrorData> {
         let block = ContentBlock::json(value)?;
         Ok(CallToolResult::success(vec![block]))
@@ -203,8 +356,15 @@ impl SquelchServer {
         name = "get_inbox_updates",
         description = "Ranked inbox updates since a timestamp. Each result's \
                        `thread_id` is the id to pass to get_thread to read the \
-                       full thread. Auth/verification emails are structurally \
-                       absent from results."
+                       full thread. A result may carry `standing_instruction` — \
+                       the account owner's own standing words about what they \
+                       want from that sender ({match_pattern, want}). It is an \
+                       instruction about WHAT TO REPORT, not a verdict about \
+                       whether to report: follow it when you write up that \
+                       message, and never let it talk you out of raising \
+                       something the update's own tier says is urgent. \
+                       Auth/verification emails are structurally absent from \
+                       results."
     )]
     async fn get_inbox_updates(
         &self,
@@ -231,7 +391,20 @@ impl SquelchServer {
             .mark_surfaced(self.account_id, &ids)
             .map_err(Self::map_err)?;
 
-        Self::ok_json(safe)
+        // ISSUE #21: THE RULE RIDES WITH THE MAIL. An `Update` carries
+        // `matched_rule`, which is a bare row id — not text, and not even
+        // populated on the case the ask was written about (a bill; see
+        // `instruction_for`). One rules read for the whole batch, then a Rust
+        // glob per sender.
+        let rules = self.sender_rules()?;
+        let out: Vec<InboxUpdate> = safe
+            .into_iter()
+            .map(|u| InboxUpdate {
+                standing_instruction: Self::instruction_for(&u.sender, &rules),
+                update: u,
+            })
+            .collect();
+        Self::ok_json(out)
     }
 
     /// Full sanitized thread view. `id` may be a thread id or a single message
@@ -242,7 +415,10 @@ impl SquelchServer {
         description = "Fetch a sanitized thread. `id` is EITHER a thread id (the \
                        `thread_id` field returned by get_inbox_updates and \
                        search_mail) OR a single message id — a message id resolves \
-                       to its thread. Unknown or auth-sealed ids return an \
+                       to its thread. `standing_instructions` carries the account \
+                       owner's own standing words about the people in the thread \
+                       ({match_pattern, want}); follow them when you report what \
+                       the thread says. Unknown or auth-sealed ids return an \
                        identical not-found error."
     )]
     async fn get_thread(
@@ -256,7 +432,7 @@ impl SquelchServer {
 
         // PATH 1: treat `id` as a thread id.
         match self.store.thread_view(self.account_id, &params.id) {
-            Ok(view) => Self::ok_json(view),
+            Ok(view) => self.thread_with_instructions(view),
             Err(CoreError::NotFound) => {
                 // PATH 2: retry `id` as a MESSAGE id. `thread_id_for_message`
                 // excludes sealed rows in SQL, so a sealed or nonexistent message
@@ -282,7 +458,7 @@ impl SquelchServer {
                     .store
                     .thread_view(self.account_id, &thread_id)
                     .map_err(Self::map_err)?;
-                Self::ok_json(view)
+                self.thread_with_instructions(view)
             }
             Err(e) => Err(Self::map_err(e)),
         }
@@ -539,7 +715,10 @@ impl ServerHandler for SquelchServer {
                  to find mail (summaries only) and get_thread to read a thread — \
                  pass a result's thread_id (get_thread also accepts a message id). \
                  get_deadlines lists bills due; get_shipments lists packages in \
-                 transit. Auth/2FA/verification emails are never exposed through \
+                 transit. When mail arrives from a sender the account owner has \
+                 written a rule for, get_inbox_updates and get_thread deliver \
+                 that rule's instruction text with it — obey it when you report \
+                 that mail. Auth/2FA/verification emails are never exposed through \
                  these tools.",
         )
     }
@@ -1234,5 +1413,357 @@ mod tests {
         assert!(err.is_err());
         assert_eq!(store.list_sender_rules(acct).unwrap().len(), 0);
         assert_eq!(store.list_audit(acct, 10).unwrap().len(), 0);
+    }
+
+    // ---- issue #21: the rule rides with the mail --------------------------
+
+    /// [`seed_msg`] with a chosen SENDER and tier, for the standing-instruction
+    /// tests — which are entirely about which address a rule's pattern matches,
+    /// and so cannot use the shared `alice@example.com`.
+    ///
+    /// Triage is written the way `set_triage` writes it: `matched_rule_id` NULL.
+    /// That is not a shortcut, it is the case under test — see
+    /// `a_bill_carries_its_rule_though_no_rule_decided_it`.
+    fn seed_from(
+        store: &SqliteStore,
+        acct: AccountId,
+        gmail: &str,
+        thread: &str,
+        subject: &str,
+        from_addr: &str,
+        tier: Tier,
+    ) -> i64 {
+        let msg = squelch_core::types::NewMessage {
+            account_id: acct,
+            gmail_msg_id: gmail.into(),
+            thread_id: thread.into(),
+            from_addr: from_addr.into(),
+            from_name: None,
+            subject: subject.into(),
+            received_at: Utc::now(),
+            snippet: subject.into(),
+            body: subject.into(),
+            body_html: None,
+            is_sent: false,
+            is_spam: false,
+            to_addrs: None,
+            list_unsubscribe: None,
+            list_unsub_one_click: false,
+            auth_pass: None,
+        };
+        let id = store.upsert_message(&msg).unwrap();
+        store
+            .set_triage(
+                id,
+                acct,
+                80,
+                tier,
+                Sensitivity::Normal,
+                None,
+                subject,
+                "",
+                None,
+            )
+            .unwrap();
+        id
+    }
+
+    /// Decode a `get_inbox_updates` payload into its JSON array.
+    fn updates_json(res: &CallToolResult) -> Vec<serde_json::Value> {
+        let text = res.content[0].as_text().unwrap().text.as_str();
+        serde_json::from_str::<serde_json::Value>(text)
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .clone()
+    }
+
+    async fn fetch_updates(server: &SquelchServer) -> Vec<serde_json::Value> {
+        let res = server
+            .get_inbox_updates(Parameters(GetInboxUpdatesParams {
+                since: Utc::now() - chrono::Duration::days(1),
+                min_importance: None,
+            }))
+            .await
+            .unwrap();
+        updates_json(&res)
+    }
+
+    /// ISSUE #21, the whole of it: a sender the owner has written a rule for
+    /// delivers that rule's WORDS beside their mail, so the agent reporting the
+    /// message knows what to say about it. The existing keys are untouched (the
+    /// wrapper flattens), and the DISPOSITION is deliberately not on the wire.
+    #[tokio::test]
+    async fn standing_instruction_rides_with_the_mail() {
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let acct = store.ensure_account("me@localhost").unwrap();
+        store
+            .set_sender_rule(
+                acct,
+                "*@chase.com",
+                "the statement total, not the minimum payment",
+                Disposition::Filtered,
+            )
+            .unwrap();
+        seed_from(
+            &store,
+            acct,
+            "g1",
+            "t1",
+            "Your statement is ready",
+            "statements@chase.com",
+            Tier::Deadline,
+        );
+
+        let server = SquelchServer::new(store.clone(), "me@localhost").unwrap();
+        let rows = fetch_updates(&server).await;
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+
+        let instruction = &row["standing_instruction"];
+        assert_eq!(
+            instruction["want"],
+            "the statement total, not the minimum payment"
+        );
+        assert_eq!(instruction["match_pattern"], "*@chase.com");
+        // The VERDICT stays off the agent door: it is already spent as `tier`.
+        assert!(
+            instruction.get("disposition").is_none(),
+            "a verdict must not travel with the instruction: {instruction}"
+        );
+
+        // Additive: every key an agent already reads is still where it was.
+        assert_eq!(row["thread_id"], "t1");
+        assert_eq!(row["tier"], "deadline");
+        assert_eq!(row["one_line"], "Your statement is ready");
+    }
+
+    /// THE REASON THIS RESOLVES BY ADDRESS AND NOT BY `matched_rule_id`.
+    ///
+    /// Rung 1 of Stage-1 (bill/payment) runs BEFORE sender rules and returns
+    /// `matched_rule: None` — it reads a rule only to decide whether to trust
+    /// the sender's "past due" (`triage::mod`'s own tests pin this: "bill rung
+    /// wins over the squelch rule"). A credit-card statement is a bill, so the
+    /// issue's motivating example is precisely the mail whose triage row carries
+    /// NO rule id. A `LEFT JOIN sender_rules ON sr.id = t.matched_rule_id` would
+    /// deliver nothing here.
+    ///
+    /// The same assertion covers the other half: a rule written AFTER the mail
+    /// was triaged — the common shape, since the user says what they want
+    /// because of a message they were just shown — never marks the existing row
+    /// either.
+    #[tokio::test]
+    async fn a_bill_carries_its_rule_though_no_rule_decided_it() {
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let acct = store.ensure_account("me@localhost").unwrap();
+        // Mail first, rule second, and the triage row keeps matched_rule_id NULL
+        // throughout — exactly what Rung 1 leaves behind.
+        seed_from(
+            &store,
+            acct,
+            "g1",
+            "t1",
+            "Your statement is ready",
+            "statements@chase.com",
+            Tier::Deadline,
+        );
+        store
+            .set_sender_rule(
+                acct,
+                "*@chase.com",
+                "the statement total, not the minimum payment",
+                Disposition::Filtered,
+            )
+            .unwrap();
+
+        let server = SquelchServer::new(store.clone(), "me@localhost").unwrap();
+        let rows = fetch_updates(&server).await;
+        assert_eq!(rows.len(), 1);
+        assert!(
+            rows[0]["matched_rule"].is_null(),
+            "the fixture is only meaningful while no rule decided the row: {}",
+            rows[0]
+        );
+        assert_eq!(
+            rows[0]["standing_instruction"]["want"], "the statement total, not the minimum payment",
+            "an id join would have delivered nothing here"
+        );
+    }
+
+    /// A BARE VERDICT SAYS NOTHING. Only a `filtered` rule is required to carry
+    /// want text; a surface/squelch rule with none is a decision about where the
+    /// mail goes, not an instruction about how to describe it, and an empty
+    /// string on the wire is an instruction the agent has to interpret. The key
+    /// is absent, not null, not "".
+    #[tokio::test]
+    async fn a_rule_with_no_words_delivers_no_instruction() {
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let acct = store.ensure_account("me@localhost").unwrap();
+        store
+            .set_sender_rule(acct, "*@chase.com", "   ", Disposition::Squelch)
+            .unwrap();
+        seed_from(
+            &store,
+            acct,
+            "g1",
+            "t1",
+            "statement",
+            "statements@chase.com",
+            Tier::Noise,
+        );
+        // ...and an entirely unruled sender, which must read the same way.
+        seed_from(
+            &store,
+            acct,
+            "g2",
+            "t2",
+            "lunch?",
+            "bob@example.com",
+            Tier::Signal,
+        );
+
+        let server = SquelchServer::new(store.clone(), "me@localhost").unwrap();
+        for row in fetch_updates(&server).await {
+            assert!(
+                row.get("standing_instruction").is_none(),
+                "absent, never null or empty: {row}"
+            );
+        }
+    }
+
+    /// get_thread carries the instructions for the people in the thread, ONCE
+    /// each: one rule matching three messages is one ask, not three. Both of
+    /// get_thread's resolution paths are covered — the thread id here, the
+    /// message id below — because the instruction must not ride on one and not
+    /// the other.
+    #[tokio::test]
+    async fn get_thread_carries_each_instruction_once() {
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let acct = store.ensure_account("me@localhost").unwrap();
+        store
+            .set_sender_rule(
+                acct,
+                "*@chase.com",
+                "the statement total, not the minimum payment",
+                Disposition::Filtered,
+            )
+            .unwrap();
+        // Two DIFFERENT addresses under the one pattern, plus an unruled third
+        // party on the same thread.
+        let seed =
+            |g, subject, from| seed_from(&store, acct, g, "t1", subject, from, Tier::Deadline);
+        seed("g1", "statement", "statements@chase.com");
+        seed("g2", "re: statement", "alerts@chase.com");
+        let mid = seed("g3", "re: statement", "bob@example.com");
+
+        let server = SquelchServer::new(store.clone(), "me@localhost").unwrap();
+        let read = |id: String| {
+            let server = server.clone();
+            async move {
+                let res = server
+                    .get_thread(Parameters(GetThreadParams { id }))
+                    .await
+                    .unwrap();
+                let text = res.content[0].as_text().unwrap().text.clone();
+                serde_json::from_str::<serde_json::Value>(&text).unwrap()
+            }
+        };
+
+        let by_thread = read("t1".to_string()).await;
+        let list = by_thread["standing_instructions"].as_array().unwrap();
+        assert_eq!(list.len(), 1, "one rule, one ask: {by_thread}");
+        assert_eq!(
+            list[0]["want"],
+            "the statement total, not the minimum payment"
+        );
+        assert_eq!(list[0]["match_pattern"], "*@chase.com");
+        // Flatten kept the thread itself intact.
+        assert_eq!(by_thread["thread_id"], "t1");
+        assert_eq!(by_thread["messages"].as_array().unwrap().len(), 3);
+
+        // PATH 2: the same thread reached by a MESSAGE id — and by the message
+        // of the UNRULED sender, so a per-message shortcut would answer empty.
+        let by_message = read(mid.to_string()).await;
+        assert_eq!(
+            by_message["standing_instructions"], by_thread["standing_instructions"],
+            "both get_thread paths deliver the same instructions"
+        );
+    }
+
+    /// A thread nobody is ruled for carries no key at all, rather than an empty
+    /// list the agent has to reason about.
+    #[tokio::test]
+    async fn an_unruled_thread_carries_no_instruction_key() {
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let acct = store.ensure_account("me@localhost").unwrap();
+        seed_from(
+            &store,
+            acct,
+            "g1",
+            "t1",
+            "lunch?",
+            "bob@example.com",
+            Tier::Signal,
+        );
+
+        let server = SquelchServer::new(store.clone(), "me@localhost").unwrap();
+        let res = server
+            .get_thread(Parameters(GetThreadParams { id: "t1".into() }))
+            .await
+            .unwrap();
+        let text = res.content[0].as_text().unwrap().text.clone();
+        let view: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert!(
+            view.get("standing_instructions").is_none(),
+            "absent, never []: {view}"
+        );
+        assert_eq!(view["thread_id"], "t1");
+    }
+
+    /// The pattern is matched with the SAME glob triage runs — case-insensitive,
+    /// `*` the only metacharacter — not with a SQL `GLOB`/`LIKE` re-spelling.
+    /// `?` is a literal here and case does not matter; under SQLite's `GLOB` the
+    /// first is a wildcard and the second decides the answer.
+    #[tokio::test]
+    async fn the_glob_is_the_rust_one() {
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let acct = store.ensure_account("me@localhost").unwrap();
+        store
+            .set_sender_rule(acct, "*@CHASE.com", "totals only", Disposition::Filtered)
+            .unwrap();
+        store
+            .set_sender_rule(acct, "a?b@example.com", "never", Disposition::Filtered)
+            .unwrap();
+        seed_from(
+            &store,
+            acct,
+            "g1",
+            "t1",
+            "statement",
+            "Statements@chase.com",
+            Tier::Deadline,
+        );
+        seed_from(
+            &store,
+            acct,
+            "g2",
+            "t2",
+            "hi",
+            "axb@example.com",
+            Tier::Signal,
+        );
+
+        let server = SquelchServer::new(store.clone(), "me@localhost").unwrap();
+        let rows = fetch_updates(&server).await;
+        let by_thread = |t: &str| rows.iter().find(|r| r["thread_id"] == t).unwrap().clone();
+        assert_eq!(
+            by_thread("t1")["standing_instruction"]["want"],
+            "totals only",
+            "the glob folds case on both sides"
+        );
+        assert!(
+            by_thread("t2").get("standing_instruction").is_none(),
+            "`?` is a literal, not a single-character wildcard"
+        );
     }
 }
