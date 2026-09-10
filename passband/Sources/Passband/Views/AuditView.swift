@@ -538,7 +538,11 @@ struct AuditSection: View {
 
     enum ActorKind { case agent, you, other }
 
-    static func actorKind(_ actor: String) -> ActorKind {
+    /// `nonisolated` because it reads nothing but its argument, and the filter
+    /// vocabulary below calls it from `WhoFilter.matches` — a plain enum method
+    /// with no actor of its own. Without this, MainActor is inferred from
+    /// `AuditSection`'s View conformance and every filter test is a warning.
+    nonisolated static func actorKind(_ actor: String) -> ActorKind {
         let lower = actor.lowercased()
         if ["agent", "mcp", "assistant", "ai"].contains(where: lower.hasPrefix) { return .agent }
         if ["client-api", "client", "app", "user"].contains(lower) { return .you }
