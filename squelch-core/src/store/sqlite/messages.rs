@@ -222,16 +222,18 @@ fn thread_guard_and_subject(
         return Err(CoreError::NotFound);
     }
     let subject: Option<String> = conn
-        .query_row(
-            "SELECT subject FROM messages
-             WHERE account_id=?1 AND thread_id=?2
-             ORDER BY received_at ASC LIMIT 1",
-            params![account_id, thread_id],
-            |r| r.get(0),
-        )
+        .query_row(THREAD_SUBJECT_SQL, params![account_id, thread_id], |r| {
+            r.get(0)
+        })
         .optional()?;
     subject.ok_or(CoreError::NotFound)
 }
+
+// Shared with the query-plan regression test: LIMIT 1 must seek the thread,
+// not walk the account's received_at index looking for its first message.
+pub(super) const THREAD_SUBJECT_SQL: &str = "SELECT subject FROM messages
+    WHERE account_id=?1 AND thread_id=?2
+    ORDER BY received_at ASC LIMIT 1";
 
 /// Replace this message's `deadlines` row, in the caller's transaction:
 /// DELETE-then-INSERT so a re-apply/re-ingest is idempotent, and `None` simply

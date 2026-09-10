@@ -5,6 +5,64 @@ use super::support::*;
 use crate::types::{SealedKind, Sensitivity, Tier};
 
 #[test]
+fn thread_subject_seeks_thread_in_date_order_after_reopening_old_store() {
+    let dir = std::env::temp_dir().join(format!("squelch-thread-index-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("mail.db");
+    let acct;
+    {
+        let store = SqliteStore::open(&path).unwrap();
+        acct = store.ensure_account("me@example.com").unwrap();
+        let now = Utc::now();
+        triaged(acct, "later", "thread")
+            .subject("Later subject")
+            .received_at(now)
+            .seed(&store);
+        triaged(acct, "earlier", "thread")
+            .subject("Original subject")
+            .received_at(now - chrono::Duration::days(1))
+            .seed(&store);
+        // Simulate the previous schema. Opening an existing mailbox must add
+        // the index too, without requiring a new database or a data backfill.
+        store
+            .lock()
+            .unwrap()
+            .execute_batch("DROP INDEX idx_messages_thread_received")
+            .unwrap();
+    }
+    let store = SqliteStore::open(&path).unwrap();
+    let view = store.thread_view_with_html(acct, "thread").unwrap();
+    assert_eq!(view.subject, "Original subject");
+    assert_eq!(view.messages.len(), 2);
+    assert_eq!(view.messages[0].subject, "Original subject");
+    assert_eq!(view.messages[1].subject, "Later subject");
+    let conn = store.lock().unwrap();
+    let sql = format!(
+        "EXPLAIN QUERY PLAN {}",
+        super::super::messages::THREAD_SUBJECT_SQL
+    );
+    let mut stmt = conn.prepare(&sql).unwrap();
+    let plan: Vec<String> = stmt
+        .query_map(params![acct, "thread"], |r| r.get(3))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    assert!(
+        plan.iter().any(|step| step.contains("SEARCH messages")
+            && step.contains("account_id=? AND thread_id=?")),
+        "thread lookup must not scan the account: {plan:?}"
+    );
+    assert!(
+        !plan.iter().any(|step| step.contains("TEMP B-TREE")),
+        "thread index must supply the date order: {plan:?}"
+    );
+    drop(stmt);
+    drop(conn);
+    drop(store);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
 fn ingest_message_persists_attachments_and_thread_view_carries_them() {
     use crate::config::Stage1Config;
     let (store, acct) = store();
