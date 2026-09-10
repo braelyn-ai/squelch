@@ -1072,6 +1072,70 @@ fn hybrid_snippet_is_the_match_window_and_falls_back_only_with_no_term() {
 }
 
 #[test]
+fn hybrid_snippet_range_counts_filtered_results_and_preserves_ranking() {
+    let embedder = Arc::new(StubEmbedder::new(VEC_DIMS));
+    let (store, acct) = store_with_embedder(embedder.clone());
+    for i in 0..8 {
+        let id = triaged(acct, &format!("g{i}"), &format!("t{i}"))
+            .from(if i % 2 == 0 {
+                "keep@example.com"
+            } else {
+                "drop@example.com"
+            })
+            .subject("digest")
+            .snippet("stored head")
+            .body(DEEP_BODY)
+            .seed(&store);
+        embed_and_store(&store, &*embedder, acct, id, "digest", DEEP_BODY);
+    }
+    let filter = SearchFilter {
+        from: Some("keep@example.com".into()),
+        ..Default::default()
+    };
+    let (all, full) = store
+        .hybrid_search_legs(
+            acct,
+            "pangolin",
+            &filter,
+            SearchSort::BestMatch,
+            false,
+            true,
+            8,
+        )
+        .unwrap();
+    assert_eq!(all.len(), 4);
+    assert!(full);
+    for range in [0..1, 1..3, 3..8, 0..0, 8..10] {
+        let (page, page_full) = store
+            .hybrid_search_legs_windowed(
+                acct,
+                "pangolin",
+                &filter,
+                SearchSort::BestMatch,
+                false,
+                range.clone(),
+                8,
+            )
+            .unwrap();
+        assert_eq!(page_full, full);
+        assert_eq!(page.len(), all.len());
+        for (i, (actual, expected)) in page.iter().zip(&all).enumerate() {
+            assert_eq!(actual.hit.id, expected.hit.id);
+            assert_eq!(
+                (actual.keyword, actual.vector),
+                (expected.keyword, expected.vector)
+            );
+            if range.contains(&i) {
+                assert_eq!(actual.hit.snippet, expected.hit.snippet);
+                assert!(actual.hit.snippet.contains("pangolin"));
+            } else {
+                assert_eq!(actual.hit.snippet, "stored head");
+            }
+        }
+    }
+}
+
+#[test]
 fn a_vector_hit_shows_the_sentence_that_carries_the_term() {
     // THE MOTIVATING FAILURE. The vector leg found the right mail and the panel
     // showed the head of the message, which said nothing about what was asked —

@@ -1026,8 +1026,18 @@ pub async fn search(
                 (page, window_full)
             }
             SearchMode::Hybrid => {
-                let (mut hits, window_full) =
-                    store.hybrid_search_legs(account_id, &term, &filter, sort, partial, true, k)?;
+                // The range is counted after filtering, exactly like the page
+                // below. Only rows the client receives need match snippets.
+                let start = offset as usize;
+                let (mut hits, window_full) = store.hybrid_search_legs_windowed(
+                    account_id,
+                    &term,
+                    &filter,
+                    sort,
+                    partial,
+                    start..start.saturating_add(limit as usize),
+                    k,
+                )?;
                 let page: Vec<SearchItem> = hits
                     .drain(..)
                     .skip(offset as usize)
