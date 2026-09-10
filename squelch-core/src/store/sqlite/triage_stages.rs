@@ -576,7 +576,15 @@ impl SqliteStore {
         };
         // Overwrite the seed values, stamp stage1_model_used (leaving the queue),
         // and set the escalation flag, leaving `model_used` (the Stage-2 marker)
-        // untouched. Guarded by sensitivity='normal'.
+        // untouched. Guarded by sensitivity='normal' AND by the queue predicate
+        // itself: a verdict lands only on a row that is still WAITING for one.
+        // The pass read the row and its body seconds ago and then held it
+        // across a model call; if something re-armed the row in between (the
+        // blank-body heal discarding a verdict and replacing the body, a hand
+        // re-triage), this verdict was reached over text the row no longer
+        // has, and a row that already carries a marker was ruled on by
+        // whoever wrote it. Matching nothing is the right outcome, and the
+        // caller already treats `false` as "no verdict landed".
         let n = tx.execute(
             "UPDATE triage SET
                  importance = ?3,
@@ -589,7 +597,8 @@ impl SqliteStore {
                  field_reasons = ?10,
                  category = COALESCE(?11, category),
                  escalation_reason = ?12
-             WHERE message_id = ?1 AND account_id = ?2 AND sensitivity = 'normal'",
+             WHERE message_id = ?1 AND account_id = ?2 AND sensitivity = 'normal'
+               AND stage1_model_used IS NULL",
             params![
                 applied.message_id,
                 applied.account_id,
@@ -1197,7 +1206,13 @@ impl SqliteStore {
         let mut conn = self.lock()?;
         let tx = conn.transaction()?;
         // Overwrite triage fields and stamp model_used, guarded by
-        // sensitivity='normal' so a mis-targeted sealed row is never mutated.
+        // sensitivity='normal' so a mis-targeted sealed row is never mutated,
+        // and by the Stage-2 queue predicate for the reason `stage1_apply`
+        // gives: a verdict held across a model call lands only on a row still
+        // waiting for exactly that verdict. (A row the heal re-armed straight
+        // back into this queue — a Filtered-rule sender — still matches; that
+        // residual window is one model call wide and needs the row to have
+        // been in flight at the very moment of the re-read.)
         let deadline_dt = applied.deadline.as_ref().map(|d| d.due_at.to_rfc3339());
         // Stage-2 owns all three properties on apply, so its reasons fully
         // replace any Stage-1 blob.
@@ -1216,7 +1231,9 @@ impl SqliteStore {
                  model_used = ?8,
                  field_reasons = ?9,
                  category = COALESCE(?10, category)
-             WHERE message_id = ?1 AND account_id = ?2 AND sensitivity = 'normal'",
+             WHERE message_id = ?1 AND account_id = ?2 AND sensitivity = 'normal'
+               AND stage1_model_used IS NOT NULL AND needs_stage2 = 1
+               AND model_used IS NULL",
             params![
                 applied.message_id,
                 applied.account_id,

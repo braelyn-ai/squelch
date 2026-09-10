@@ -1407,18 +1407,25 @@ impl SqliteStore {
     pub(super) fn banking_apply(&self, applied: &BankingApplied) -> Result<i64> {
         let mut conn = self.lock()?;
         let tx = conn.transaction()?;
-        let id = upsert_banking_conn(&tx, applied)?;
         // Stamp the extractor marker (leaving the extract queue) and, for a
         // RECORD (statement/alert), resolve the row to 'done' so it leaves the
         // attention bands. The sensitivity='normal' guard keeps a sealed row from
-        // ever being mutated here.
+        // ever being mutated here, and the queue predicate (`extractor_model_used
+        // IS NULL` with a category still routing here) keeps a record extracted
+        // over text the row no longer has from landing: the blank-body heal
+        // discards a verdict, clears the category and drops the record while the
+        // pass may be holding the row across a model call. THE STAMP RUNS FIRST
+        // so that when it matches nothing, no record is written either — the
+        // `banking` row is the verdict's product, and a verdict that did not
+        // land must not leave one behind. `0` says so; the caller ignores the id.
         let now_s = Utc::now().to_rfc3339();
-        tx.execute(
+        let n = tx.execute(
             "UPDATE triage SET
                  extractor_model_used = ?3,
                  status = CASE WHEN ?4 = 1 THEN 'done' ELSE status END,
                  resolved_at = CASE WHEN ?4 = 1 THEN ?5 ELSE resolved_at END
-             WHERE message_id = ?1 AND account_id = ?2 AND sensitivity = 'normal'",
+             WHERE message_id = ?1 AND account_id = ?2 AND sensitivity = 'normal'
+               AND extractor_model_used IS NULL AND category IS NOT NULL",
             params![
                 applied.message_id,
                 applied.account_id,
@@ -1427,6 +1434,10 @@ impl SqliteStore {
                 now_s,
             ],
         )?;
+        if n == 0 {
+            return Ok(0);
+        }
+        let id = upsert_banking_conn(&tx, applied)?;
         tx.commit()?;
         Ok(id)
     }
@@ -1434,6 +1445,22 @@ impl SqliteStore {
     pub(super) fn marketing_apply(&self, applied: &MarketingApplied) -> Result<()> {
         let mut conn = self.lock()?;
         let tx = conn.transaction()?;
+        // Marker first, guarded exactly as `banking_apply` is and for the same
+        // reason: an offer extracted over text the row no longer has must not
+        // land, and when the stamp matches nothing the offer is not written.
+        let n = tx.execute(
+            "UPDATE triage SET extractor_model_used = ?3
+             WHERE message_id = ?1 AND account_id = ?2 AND sensitivity = 'normal'
+               AND extractor_model_used IS NULL AND category IS NOT NULL",
+            params![
+                applied.message_id,
+                applied.account_id,
+                applied.extractor_model_used
+            ],
+        )?;
+        if n == 0 {
+            return Ok(());
+        }
         tx.execute(
             "INSERT INTO marketing(account_id, message_id, brand, offer, discount, code,
                                    expires_at, received_at)
@@ -1455,18 +1482,7 @@ impl SqliteStore {
                 applied.received_at.to_rfc3339(),
             ],
         )?;
-        // Stamp the extractor marker so the row leaves the queue. NO status
-        // change: marketing does not auto-resolve. The sensitivity='normal' guard
-        // keeps a sealed row from ever being mutated here.
-        tx.execute(
-            "UPDATE triage SET extractor_model_used = ?3
-             WHERE message_id = ?1 AND account_id = ?2 AND sensitivity = 'normal'",
-            params![
-                applied.message_id,
-                applied.account_id,
-                applied.extractor_model_used
-            ],
-        )?;
+        // NO status change: marketing does not auto-resolve.
         tx.commit()?;
         Ok(())
     }

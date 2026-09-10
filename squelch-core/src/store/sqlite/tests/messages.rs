@@ -1187,3 +1187,416 @@ fn inbox_unread_counts_round_trip_and_overwrite_one_row() {
     let other = store.ensure_account("other@example.com").unwrap();
     assert!(store.inbox_unread(other).unwrap().is_none());
 }
+
+// ---- blank-body heal: the fresh write and its queue -------------------------
+
+/// Stamp a row as fully classified — Stage-1, Stage-2 and every extractor
+/// wrote to it — with the verdict a subject-only read produced, plus every
+/// specialist row and stamp that verdict left behind.
+fn stamp_classified(store: &SqliteStore, acct: AccountId, id: i64, model_used: &str) {
+    let conn = store.lock().unwrap();
+    conn.execute(
+        "UPDATE triage SET stage1_model_used='claude-haiku-4-5', model_used=?2,
+                needs_stage2=1, extractor_model_used='claude-haiku-4-5',
+                ship_extract_model='claude-haiku-4-5',
+                category='invoice', escalation_reason='buried_bill',
+                notify_eligible_at='2026-09-04T20:41:01+00:00',
+                tier='deadline', importance=15, one_line='subject-only verdict'
+         WHERE message_id=?1",
+        params![id, model_used],
+    )
+    .unwrap();
+    for sql in [
+        "INSERT INTO banking(account_id, message_id, kind, received_at)
+         VALUES(?1, ?2, 'autopay', '2026-09-04T20:41:01+00:00')",
+        "INSERT INTO marketing(account_id, message_id, received_at)
+         VALUES(?1, ?2, '2026-09-04T20:41:01+00:00')",
+        "INSERT INTO receipts(account_id, message_id, from_addr, amount, received_at)
+         VALUES(?1, ?2, 'x@y', 9.99, '2026-09-04T20:41:01+00:00')",
+        "INSERT INTO calendar_updates(account_id, message_id, kind, received_at)
+         VALUES(?1, ?2, 'invite', '2026-09-04T20:41:01+00:00')",
+    ] {
+        conn.execute(sql, params![acct, id]).unwrap();
+    }
+    drop(conn);
+    store
+        .upsert_message_vector(acct, id, &[0.5f32; VEC_DIMS])
+        .unwrap();
+}
+
+/// (banking, marketing, receipts, calendar_updates, message_vecs) rows for `id`.
+fn derived_rows(store: &SqliteStore, id: i64) -> (i64, i64, i64, i64, i64) {
+    let conn = store.lock().unwrap();
+    let count = |table: &str| -> i64 {
+        conn.query_row(
+            &format!("SELECT COUNT(*) FROM {table} WHERE message_id=?1"),
+            params![id],
+            |r| r.get(0),
+        )
+        .unwrap()
+    };
+    (
+        count("banking"),
+        count("marketing"),
+        count("receipts"),
+        count("calendar_updates"),
+        count("message_vecs"),
+    )
+}
+
+fn stored_body(store: &SqliteStore, id: i64) -> String {
+    let conn = store.lock().unwrap();
+    conn.query_row("SELECT body FROM messages WHERE id=?1", params![id], |r| {
+        r.get(0)
+    })
+    .unwrap()
+}
+
+fn stamps(store: &SqliteStore, id: i64) -> (Option<String>, Option<String>) {
+    let conn = store.lock().unwrap();
+    conn.query_row(
+        "SELECT ship_extract_model, notify_eligible_at FROM triage WHERE message_id=?1",
+        params![id],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )
+    .unwrap()
+}
+
+#[test]
+fn ingest_message_fresh_discards_the_model_verdict_and_re_arms_the_queue() {
+    let (store, acct) = store();
+    let id = triaged(acct, "g-bill", "t-bill")
+        .from("garminservices@billing.garmin.com")
+        .subject("Your Garmin Services Bill")
+        .body("\r\n")
+        .ingest(&store);
+    stamp_classified(&store, acct, id, "claude-opus-5");
+    let before = store.triage_debug(acct, id).unwrap().unwrap();
+    assert_eq!(before.tier, "deadline");
+    assert_eq!(derived_rows(&store, id), (1, 1, 1, 1, 1));
+
+    // The same message, re-read with its body: a plain, confident seed.
+    let fresh = triaged(acct, "g-bill", "t-bill")
+        .from("garminservices@billing.garmin.com")
+        .subject("Your Garmin Services Bill")
+        .body("no action is required. Balance due: $14.99")
+        .importance(10)
+        .tier(Tier::Noise)
+        // The healed body carries a loose shipping signal: the fresh detection
+        // must be able to re-queue the shipments extractor past the processed
+        // marker the plain upsert would have preserved.
+        .ship_extract(true)
+        .build();
+    let same = store
+        .ingest_message_fresh(&fresh, HealScope::TextAndVerdict)
+        .unwrap();
+    assert_eq!(same, Some(id), "the upsert lands on the existing row");
+
+    assert!(stored_body(&store, id).contains("Balance due"));
+    let after = store.triage_debug(acct, id).unwrap().unwrap();
+    // The seed landed: the plain upsert would have kept 'deadline' / 15 here.
+    assert_eq!(after.tier, "noise");
+    assert_eq!(after.importance, 10);
+    // Every model marker back to "never looked"; no force stamp — the row
+    // queues as ordinary mail.
+    assert_eq!(after.stage1_model_used, None);
+    assert_eq!(after.model_used, None);
+    assert!(!after.needs_stage2);
+    assert_eq!(after.extractor_model_used, None);
+    assert_eq!(after.category, None);
+    assert_eq!(after.retriage_at, None);
+    // Every specialist row and the stale vector go with the verdict; the
+    // shipments extractor is re-pended (the fresh detection's answer, which
+    // the processed marker would otherwise have outlived); the notify stamp
+    // is cleared.
+    assert_eq!(derived_rows(&store, id), (0, 0, 0, 0, 0));
+    assert_eq!(stamps(&store, id), (Some("pending".into()), None));
+    // And the row is exactly what the Stage-1 queue hands out.
+    let queued = store.stage1_queue(acct, 10).unwrap();
+    assert_eq!(queued.len(), 1);
+    assert_eq!(queued[0].message_id, id);
+    assert!(queued[0].body.contains("Balance due"));
+    // With its receipts row gone it can reach the extractor again once
+    // Stage-1 gives it a category (the queue excludes rows with a receipt).
+    assert!(
+        store
+            .messages_missing_vectors(acct, 10)
+            .unwrap()
+            .iter()
+            .any(|m| m.message_id == id)
+    );
+}
+
+#[test]
+fn ingest_message_fresh_re_arms_a_filtered_rule_row_for_stage_two() {
+    let (store, acct) = store();
+    let rule = store
+        .set_sender_rule(
+            acct,
+            "*@billing.garmin.com",
+            "i dont care about account statements from garmin",
+            Disposition::Filtered,
+        )
+        .unwrap();
+    let id = triaged(acct, "g-bill", "t-bill")
+        .from("garminservices@billing.garmin.com")
+        .body("\r\n")
+        .matched_rule(Some(rule))
+        .confident(false)
+        .ingest(&store);
+    stamp_classified(&store, acct, id, "claude-opus-5");
+    assert!(
+        store.stage2_queue(acct, 10).unwrap().is_empty(),
+        "already ruled on"
+    );
+
+    let fresh = triaged(acct, "g-bill", "t-bill")
+        .from("garminservices@billing.garmin.com")
+        .body("Your payment will be processed on the due date.")
+        .matched_rule(Some(rule))
+        .confident(false)
+        .build();
+    store
+        .ingest_message_fresh(&fresh, HealScope::TextAndVerdict)
+        .unwrap();
+
+    // The Filtered rung's own markers — straight to Stage-2 with the want text,
+    // exactly as a first arrival — rather than `retriage_reset`'s refusal to
+    // touch a 'rule' row.
+    let after = store.triage_debug(acct, id).unwrap().unwrap();
+    assert_eq!(after.stage1_model_used.as_deref(), Some("rule"));
+    assert!(after.needs_stage2);
+    assert_eq!(after.model_used, None);
+    assert_eq!(after.matched_rule_id, Some(rule));
+    let queued = store.stage2_queue(acct, 10).unwrap();
+    assert_eq!(queued.len(), 1);
+    assert_eq!(queued[0].message_id, id);
+    assert_eq!(
+        queued[0].rule_want_text.as_deref(),
+        Some("i dont care about account statements from garmin")
+    );
+    assert!(queued[0].body.contains("processed on the due date"));
+    assert!(store.stage1_queue(acct, 10).unwrap().is_empty());
+}
+
+#[test]
+fn ingest_message_fresh_keeps_a_human_verdict_and_only_refreshes_the_text() {
+    let (store, acct) = store();
+    let id = triaged(acct, "g-bill", "t-bill")
+        .body("\r\n")
+        .ingest(&store);
+    // `correct_triage` stamps `model_used='human'`; the Stage-1 marker keeps
+    // whatever model wrote it, which is the shape a corrected row really has.
+    stamp_classified(&store, acct, id, "human");
+
+    let fresh = triaged(acct, "g-bill", "t-bill")
+        .body("the actual words")
+        .importance(90)
+        .tier(Tier::Signal)
+        .build();
+    store
+        .ingest_message_fresh(&fresh, HealScope::TextAndVerdict)
+        .unwrap();
+
+    assert_eq!(stored_body(&store, id), "the actual words");
+    let after = store.triage_debug(acct, id).unwrap().unwrap();
+    assert_eq!(after.tier, "deadline", "a person's verdict is not re-read");
+    assert_eq!(after.importance, 15);
+    assert_eq!(after.model_used.as_deref(), Some("human"));
+    assert_eq!(after.category.as_deref(), Some("invoice"));
+    // Specialist rows stay with the verdict; only the stale vector goes.
+    assert_eq!(derived_rows(&store, id), (1, 1, 1, 1, 0));
+    assert!(store.stage1_queue(acct, 10).unwrap().is_empty());
+    assert!(store.stage2_queue(acct, 10).unwrap().is_empty());
+}
+
+#[test]
+fn ingest_message_fresh_text_scope_keeps_the_verdict_and_drops_the_vector() {
+    // Mail past the passes' age cutoff: the words arrive for search and the
+    // agent door, the verdict stays (a discarded one would only be replaced
+    // by a stale-skip), and the vector is re-derived by the backfill.
+    let (store, acct) = store();
+    let id = triaged(acct, "g-old", "t-old").body("\r\n").ingest(&store);
+    stamp_classified(&store, acct, id, "claude-opus-5");
+
+    let fresh = triaged(acct, "g-old", "t-old")
+        .body("the actual words")
+        .importance(90)
+        .tier(Tier::Signal)
+        .build();
+    assert_eq!(
+        store.ingest_message_fresh(&fresh, HealScope::Text).unwrap(),
+        Some(id)
+    );
+    assert_eq!(stored_body(&store, id), "the actual words");
+    let after = store.triage_debug(acct, id).unwrap().unwrap();
+    assert_eq!(after.tier, "deadline");
+    assert_eq!(after.model_used.as_deref(), Some("claude-opus-5"));
+    assert_eq!(after.category.as_deref(), Some("invoice"));
+    assert_eq!(derived_rows(&store, id), (1, 1, 1, 1, 0));
+    assert_eq!(
+        stamps(&store, id).1.as_deref(),
+        Some("2026-09-04T20:41:01+00:00")
+    );
+    assert!(store.stage1_queue(acct, 10).unwrap().is_empty());
+}
+
+#[test]
+fn ingest_message_fresh_refuses_a_row_the_store_no_longer_holds_as_normal_inbound() {
+    // The sweep's candidate list is a snapshot; the live row rules. Spam
+    // (its `is_spam` is sticky-to-zero in the upsert, so a write here would
+    // flip a real verdict and queue a spam body for a model), sealed, and
+    // unknown are all refused with nothing written.
+    let (store, acct) = store();
+    let spam = triaged(acct, "g-spam", "t-spam")
+        .body("\r\n")
+        .is_spam(true)
+        .ingest(&store);
+    let sealed = triaged(acct, "g-otp", "t-otp")
+        .body("\r\n")
+        .sensitivity(Sensitivity::Sealed)
+        .sealed(SealedKind::Otp)
+        .ingest(&store);
+    for (gmail, id) in [("g-spam", spam), ("g-otp", sealed)] {
+        let fresh = triaged(acct, gmail, &format!("t-{gmail}"))
+            .body("words")
+            .build();
+        assert_eq!(
+            store
+                .ingest_message_fresh(&fresh, HealScope::TextAndVerdict)
+                .unwrap(),
+            None
+        );
+        assert_eq!(stored_body(&store, id), "\r\n", "nothing written");
+    }
+    let unknown = triaged(acct, "g-new", "t-new").body("words").build();
+    assert_eq!(
+        store
+            .ingest_message_fresh(&unknown, HealScope::TextAndVerdict)
+            .unwrap(),
+        None,
+        "a heal never inserts"
+    );
+    assert!(store.thread_view(acct, "t-new").is_err());
+}
+
+#[test]
+fn ingest_message_fresh_does_not_re_bump_the_unsubscribe_ledger() {
+    let (store, acct) = store();
+    store
+        .upsert_unsubscribe(
+            acct,
+            "news@list.example",
+            "header",
+            None,
+            Utc::now() - chrono::Duration::days(10),
+        )
+        .unwrap();
+    let id = triaged(acct, "g-news", "t-news")
+        .from("news@list.example")
+        .body("\r\n")
+        .ingest(&store);
+    let count = |store: &SqliteStore| -> i64 {
+        let conn = store.lock().unwrap();
+        conn.query_row(
+            "SELECT violation_count FROM unsubscribes WHERE account_id=?1",
+            params![acct],
+            |r| r.get(0),
+        )
+        .unwrap()
+    };
+    assert_eq!(count(&store), 1, "the arrival was counted");
+    let fresh = triaged(acct, "g-news", "t-news")
+        .from("news@list.example")
+        .body("the offer")
+        .build();
+    store
+        .ingest_message_fresh(&fresh, HealScope::TextAndVerdict)
+        .unwrap();
+    assert_eq!(count(&store), 1, "a re-read is not a second violation");
+    assert_eq!(stored_body(&store, id), "the offer");
+}
+
+#[test]
+fn blank_body_messages_judges_blankness_in_rust_over_inbound_html_mail_only() {
+    let (store, acct) = store();
+    let seed = |gmail: &str, body: &str| {
+        triaged(acct, gmail, &format!("t-{gmail}"))
+            .body(body)
+            .ingest(&store)
+    };
+    let set_html = |id: i64, html: Option<&str>| {
+        let conn = store.lock().unwrap();
+        conn.execute(
+            "UPDATE messages SET body_html=?2 WHERE id=?1",
+            params![id, html],
+        )
+        .unwrap();
+    };
+    // The three blank forms the wire actually produces — a bare CRLF, a
+    // space, a zero-width character — none of which SQLite's TRIM agrees on.
+    let crlf = seed("g-crlf", "\r\n");
+    set_html(crlf, Some("<p>real</p>"));
+    let space = seed("g-space", " ");
+    set_html(space, Some("<p>real</p>"));
+    let zw = seed("g-zw", "\u{FEFF}");
+    set_html(zw, Some("<p>real</p>"));
+    // Not candidates: text present; no HTML to heal from; spam; sealed; sent.
+    let text = seed("g-text", "hello");
+    set_html(text, Some("<p>hello</p>"));
+    let plain = seed("g-plain", "\r\n");
+    set_html(plain, None);
+    let spam = triaged(acct, "g-spam", "t-spam")
+        .body("\r\n")
+        .is_spam(true)
+        .ingest(&store);
+    set_html(spam, Some("<p>buy</p>"));
+    let sealed = triaged(acct, "g-otp", "t-otp")
+        .body("\r\n")
+        .sensitivity(Sensitivity::Sealed)
+        .sealed(SealedKind::Otp)
+        .ingest(&store);
+    set_html(sealed, Some("<p>483920</p>"));
+    let sent = triaged(acct, "g-sent", "t-sent")
+        .body("\r\n")
+        .is_sent(true)
+        .ingest(&store);
+    set_html(sent, Some("<p>mine</p>"));
+
+    let scan = store.blank_body_messages(acct, i64::MAX, 100).unwrap();
+    let mut got: Vec<i64> = scan.candidates.iter().map(|m| m.message_id).collect();
+    got.sort();
+    let mut want = vec![crlf, space, zw];
+    want.sort();
+    assert_eq!(got, want);
+    assert_eq!(scan.next_before_id, None, "a short chunk is the end");
+    let row = scan
+        .candidates
+        .iter()
+        .find(|m| m.message_id == crlf)
+        .unwrap();
+    assert_eq!(row.gmail_msg_id, "g-crlf");
+
+    // Chunking: the cursor walks newest (highest id) first, and a full chunk
+    // hands back where the next one starts, even when it held no blank row.
+    let first = store.blank_body_messages(acct, i64::MAX, 2).unwrap();
+    assert!(
+        first.next_before_id.is_some(),
+        "a full chunk says where the next one starts"
+    );
+    let mut walked = Vec::new();
+    let mut before = i64::MAX;
+    loop {
+        let chunk = store.blank_body_messages(acct, before, 2).unwrap();
+        walked.extend(chunk.candidates.iter().map(|m| m.message_id));
+        match chunk.next_before_id {
+            Some(next) => {
+                assert!(next < before);
+                before = next;
+            }
+            None => break,
+        }
+    }
+    walked.sort();
+    assert_eq!(walked, want, "chunked walk finds exactly the same rows");
+}
