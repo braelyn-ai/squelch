@@ -1799,8 +1799,13 @@ fn stage1_apply_reports_false_when_the_row_was_sealed_mid_pass() {
         "no deadline row"
     );
 
-    // Control: the same apply on a live row reports true.
-    let live = seed_triage_row(&store, acct, "g-live", "t2", Sensitivity::Normal);
+    // Control: the same apply on a live row — one the Stage-1 queue would
+    // actually hand out, i.e. still carrying its heuristic seed — reports true.
+    // (`seed_triage_row` writes a Stage-2-shaped marker, which the queue guard
+    // rightly refuses.)
+    let live = triaged_row(acct, "g-live", "t2", None, false, Sensitivity::Normal)
+        .received_at(Utc::now())
+        .ingest(&store);
     let mut ok = applied.clone();
     ok.message_id = live;
     assert!(
@@ -2469,4 +2474,76 @@ fn a_run_of_config_failures_leaves_the_cap_intact() {
         used < cap,
         "the fleet can still triage once the config is fixed"
     );
+}
+
+// ---- a verdict lands only on the row state it was read from ----------------
+
+#[test]
+fn stage1_apply_matches_nothing_once_the_row_already_carries_a_marker() {
+    // The pass read the row, held it across a model call, and meanwhile the
+    // row was ruled on (a re-armed heal, a hand re-triage, another writer).
+    // The late verdict must not land — it was reached over text the row may
+    // no longer have — and `false` is what the caller already treats as "no
+    // verdict landed".
+    let (store, acct) = store();
+    let now = Utc::now();
+    let id = triaged_row(acct, "g-1", "t-1", None, false, Sensitivity::Normal)
+        .received_at(now)
+        .ingest(&store);
+    let applied = |tier: Tier| crate::store::Stage1Applied {
+        message_id: id,
+        account_id: acct,
+        importance: 80,
+        tier,
+        one_line: "x".into(),
+        reason: "x".into(),
+        field_reasons: crate::types::FieldReasons::default(),
+        stage1_model_used: "claude-x".into(),
+        needs_stage2: false,
+        escalation_reason: None,
+        deadline: None,
+        category: Some("general".into()),
+    };
+    assert!(store.stage1_apply(&applied(Tier::Signal)).unwrap());
+    assert!(
+        !store.stage1_apply(&applied(Tier::Noise)).unwrap(),
+        "a second verdict on a ruled row matches nothing"
+    );
+    assert_eq!(
+        store.triage_debug(acct, id).unwrap().unwrap().tier,
+        "signal"
+    );
+}
+
+#[test]
+fn stage2_apply_matches_only_a_row_still_waiting_for_stage_two() {
+    let (store, acct) = store();
+    let now = Utc::now();
+    let id = triaged_row(acct, "g-1", "t-1", None, false, Sensitivity::Normal)
+        .received_at(now)
+        .ingest(&store);
+    let applied = crate::store::Stage2Applied {
+        message_id: id,
+        account_id: acct,
+        importance: 20,
+        tier: Tier::Noise,
+        one_line: "x".into(),
+        reason: "x".into(),
+        field_reasons: crate::types::FieldReasons::default(),
+        model_used: "claude-x".into(),
+        deadline: None,
+        category: None,
+    };
+    // Not escalated (needs_stage2 = 0): nothing to land on.
+    assert!(!store.stage2_apply(&applied).unwrap());
+    {
+        let conn = store.lock().unwrap();
+        conn.execute(
+            "UPDATE triage SET stage1_model_used='claude-x', needs_stage2=1 WHERE message_id=?1",
+            rusqlite::params![id],
+        )
+        .unwrap();
+    }
+    assert!(store.stage2_apply(&applied).unwrap());
+    assert!(!store.stage2_apply(&applied).unwrap(), "already ruled on");
 }

@@ -3225,3 +3225,42 @@ fn sealed_mail_gets_no_receipt_at_first_ingest() {
         "sealed mail writes no receipt"
     );
 }
+
+// ---- an extraction lands only on the row state it was read from ------------
+
+#[test]
+fn banking_apply_writes_no_record_for_a_row_that_left_the_extract_queue() {
+    // The pass held the row across a model call; meanwhile its verdict was
+    // discarded (category cleared, marker cleared, record dropped). A record
+    // extracted over the old text must not come back, and the stamp must not
+    // retire the row before Stage-1 has re-read it.
+    let (store, acct) = store();
+    let now = Utc::now();
+    let id = triaged_row(acct, "g-1", "t-1", None, false, Sensitivity::Normal)
+        .received_at(now)
+        .ingest(&store);
+    let applied = crate::store::BankingApplied {
+        message_id: id,
+        account_id: acct,
+        kind: "transaction_alert".into(),
+        institution: Some("Bank".into()),
+        amount: Some(1.0),
+        currency: Some("USD".into()),
+        account_hint: None,
+        received_at: now,
+        extractor_model_used: "claude-x".into(),
+        auto_resolve: true,
+    };
+    // No category yet: not in the extract queue, nothing lands.
+    assert_eq!(store.banking_apply(&applied).unwrap(), 0);
+    assert!(store.list_banking(acct).unwrap().is_empty());
+    assert_eq!(triage_extract_status(&store, id).2, None);
+
+    apply_category(&store, acct, id, "transaction_alert", false);
+    assert!(store.banking_apply(&applied).unwrap() > 0);
+    assert_eq!(store.list_banking(acct).unwrap().len(), 1);
+    assert_eq!(
+        triage_extract_status(&store, id).2.as_deref(),
+        Some("claude-x")
+    );
+}

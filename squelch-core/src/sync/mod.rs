@@ -71,6 +71,25 @@ const SENT_RECIPIENTS_KEY: &str = "sent_recipients";
 /// memory bound: the pass loops until the queue is empty.
 const SENT_RECIPIENTS_BATCH: u32 = 500;
 
+/// `sync_state` row key for the one-time blank-body heal's CURSOR. Unlike the
+/// two flags above this one records progress, not just completion:
+/// `uidvalidity = 1` means the sweep walked the whole mailbox and is done;
+/// otherwise `last_uid` is the message id the next start resumes BELOW (absent
+/// = start from the newest row). A sweep that stops early — the per-start fetch
+/// ceiling, a Gmail error — leaves the cursor where it got to.
+const BLANK_BODY_HEAL_KEY: &str = "blank_body_heal";
+
+/// How many rows one blank-body scan chunk reads under the store lock. A memory
+/// and lock-hold bound only; the sweep loops chunks until the ceiling or the end.
+const BLANK_BODY_SCAN_CHUNK: u32 = 500;
+
+/// The most raw fetches one daemon start spends on the blank-body heal. Each is
+/// a `format=raw` GET of a whole message, so this bounds the Gmail spend and the
+/// sweep's runtime per start; a mailbox with more converges over restarts, the
+/// cursor carrying it. Sized so an ordinary self-host mailbox (tens of such
+/// rows) finishes in one go.
+const BLANK_BODY_HEAL_MAX_FETCHES: usize = 400;
+
 /// `wake_budget.thread_id` sentinel for the per-account-per-day Stage-2 budget.
 /// Gmail thread ids are hex, so no real thread can collide with it.
 const GLOBAL_BUDGET_KEY: &str = "__global__";
@@ -1857,6 +1876,235 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
         Ok(())
     }
 
+    // ---- Blank-body heal ----------------------------------------------------
+
+    /// ONE-TIME sweep over mail stored with a body that is blank to a reader
+    /// beside a full HTML one — every message ingested before the body selection
+    /// learned to flatten the HTML alternative when the text/plain part is empty
+    /// (senders that build both alternatives from a template routinely ship an
+    /// empty text part). Each such message is re-fetched `format=raw` and put
+    /// back through the REAL ingest path, so the body it gets is exactly the one
+    /// a fresh arrival would, and written with [`Store::ingest_message_fresh`].
+    ///
+    /// THE VERDICT IS REDONE ONLY WHERE THE PASSES WOULD LOOK. A row still
+    /// inside the passes' own age cutoff has its verdict discarded and queues
+    /// as ordinary mail — no `retriage_at` stamp, so it queues BEHIND newer
+    /// arrivals, not ahead of them, and the LLM spend is bounded by the same
+    /// policy that bounds every pass. Older mail gets its text (search, the
+    /// agent door, the vector backfill) and keeps its verdict: discarding it
+    /// would only trade a wrong verdict for a stale-skip. That older tail is
+    /// exactly where a blank-bodied bill was judged on its subject line
+    /// ("Your Garmin Services Bill" read as an invoice with no date and sat in
+    /// For-your-eyes while the HTML said "no action is required, your payment
+    /// will be processed"), which is why the recent rows are worth the calls.
+    ///
+    /// A RE-READ THAT WOULD NEWLY SEAL A ROW IS NOT WRITTEN. The seal detector
+    /// is biased to recall on the premise that a false seal only hides benign
+    /// mail from the agent; with the shredder enabled a seal older than its
+    /// retention is a Gmail trash. Running that detector over the whole
+    /// archive at once, on precisely the HTML-template population the
+    /// marketing guards exist for, is not a decision a backfill gets to make.
+    /// Such rows are counted and left exactly as they were: their stored text
+    /// is blank, so nothing sealed was ever exposed.
+    ///
+    /// NO NOTIFICATION CAN COME OF THIS: the fresh write clears the row's
+    /// notify-eligibility stamp, the fast lane is never spawned here, and the
+    /// engine's own stamp is left unset (a backfill is not an arrival).
+    ///
+    /// PROGRESS IS A CURSOR, NOT A FLAG. The scan walks newest-first in chunks
+    /// (the store lock is held per chunk) and the cursor is written after each
+    /// chunk, so a start that stops early — the per-start fetch ceiling, a
+    /// Gmail error — resumes where it stopped instead of re-reading the
+    /// mailbox. A message Gmail no longer has, or whose HTML also flattens to
+    /// nothing, is passed over and counted; it does not hold the sweep open.
+    /// A transport or API error stops the sweep for this start (the error is
+    /// reported by kind, and grinding on through a quota refusal is how a
+    /// tenant deepens it); the chunk is re-read next start, and rows already
+    /// healed are no longer candidates. Best-effort and non-fatal, like the
+    /// sweeps it sits beside.
+    pub async fn heal_blank_bodies(&self) -> Result<()> {
+        let cursor = self
+            .store
+            .sync_state(self.account_id, BLANK_BODY_HEAL_KEY)?;
+        if cursor.as_ref().is_some_and(|c| c.uidvalidity >= 1) {
+            return Ok(());
+        }
+        let mut before_id: i64 = cursor
+            .map(|c| i64::try_from(c.last_uid).unwrap_or(i64::MAX))
+            .unwrap_or(i64::MAX);
+        eprintln!(
+            "squelch: blank-body heal starting (at most {BLANK_BODY_HEAL_MAX_FETCHES} raw fetches \
+             this start; rows in the triage window re-enter LLM triage)"
+        );
+        let started = std::time::Instant::now();
+        let rules = self.store.list_sender_rules(self.account_id)?;
+        let now = Utc::now();
+        let stale_cutoff = self.pass_stale_cutoff(now);
+
+        let mut fetched = 0usize;
+        let mut re_read = 0usize;
+        let mut text_only = 0usize;
+        let mut still_blank = 0usize;
+        let mut would_seal = 0usize;
+        let mut refused = 0usize;
+        let mut gone = 0usize;
+        let mut done = false;
+        let mut stopped: Option<String> = None;
+        'chunks: loop {
+            let scan = self.store.blank_body_messages(
+                self.account_id,
+                before_id,
+                BLANK_BODY_SCAN_CHUNK,
+            )?;
+            for row in &scan.candidates {
+                if fetched >= BLANK_BODY_HEAL_MAX_FETCHES {
+                    // The cursor stays above this row: it is re-read next start.
+                    before_id = row.message_id + 1;
+                    break 'chunks;
+                }
+                let url = format!("{}/messages/{}?format=raw", self.api_base, row.gmail_msg_id);
+                fetched += 1;
+                let msg: GmailMessage = match self.get_json(&url).await {
+                    Ok(msg) => msg,
+                    // Gone upstream: nothing to heal from, and nothing to retry.
+                    Err(CoreError::NotFound) => {
+                        gone += 1;
+                        continue;
+                    }
+                    Err(e) => {
+                        before_id = row.message_id + 1;
+                        stopped = Some(e.to_string());
+                        break 'chunks;
+                    }
+                };
+                let raw = match msg.raw.as_deref().map(decode_raw_b64url) {
+                    Some(Ok(bytes)) => bytes,
+                    // Undecodable is deterministic: retrying it every start
+                    // buys a raw GET for the same answer. Id only, never content.
+                    Some(Err(_)) => {
+                        eprintln!(
+                            "squelch: blank-body heal skipping message {} (decode error)",
+                            row.message_id
+                        );
+                        gone += 1;
+                        continue;
+                    }
+                    None => {
+                        gone += 1;
+                        continue;
+                    }
+                };
+                let fetched_msg = RawFetched {
+                    account_id: self.account_id,
+                    gmail_msg_id: row.gmail_msg_id.clone(),
+                    gmail_thread_id: msg.thread_id.clone(),
+                    raw,
+                    internal_date: parse_internal_date(msg.internal_date.as_deref()),
+                    // The candidate query is inbound, non-spam mail; the store
+                    // re-checks the live row before writing anything.
+                    is_sent: false,
+                    is_spam: false,
+                    account_addr: self.account_email.clone(),
+                };
+                // `notify_eligible_at` stays None: see the doc comment.
+                let triaged = ingest_with_rules(
+                    &fetched_msg,
+                    &self.config.stage1,
+                    Utc::now(),
+                    &rules,
+                    |addr| {
+                        self.store
+                            .is_known_contact(self.account_id, addr)
+                            .unwrap_or(false)
+                    },
+                );
+                if triaged.sensitivity != Sensitivity::Normal {
+                    would_seal += 1;
+                    continue;
+                }
+                // Judged by the same function ingest just used to pick the
+                // body: if the HTML flattened to nothing either, the row is
+                // what it was, and writing it would only buy a model call over
+                // an empty page.
+                if crate::triage::text::is_blank(&triaged.message.body) {
+                    still_blank += 1;
+                    continue;
+                }
+                let scope = if row.received_at >= stale_cutoff {
+                    crate::store::HealScope::TextAndVerdict
+                } else {
+                    crate::store::HealScope::Text
+                };
+                match self.store.ingest_message_fresh(&triaged, scope)? {
+                    Some(_) => {
+                        if scope == crate::store::HealScope::TextAndVerdict {
+                            re_read += 1;
+                        } else {
+                            text_only += 1;
+                        }
+                    }
+                    None => refused += 1,
+                }
+                if fetched.is_multiple_of(100) {
+                    eprintln!(
+                        "squelch: blank-body heal {fetched} fetched, {re_read} re-read, \
+                         {text_only} text-only, {}s",
+                        started.elapsed().as_secs()
+                    );
+                }
+            }
+            match scan.next_before_id {
+                Some(next) => {
+                    before_id = next;
+                    // Progress survives a stop between chunks.
+                    self.store.set_sync_state(
+                        self.account_id,
+                        BLANK_BODY_HEAL_KEY,
+                        &SyncState {
+                            uidvalidity: 0,
+                            last_uid: u64::try_from(before_id).unwrap_or(0),
+                        },
+                    )?;
+                }
+                None => {
+                    done = true;
+                    break;
+                }
+            }
+        }
+
+        self.store.set_sync_state(
+            self.account_id,
+            BLANK_BODY_HEAL_KEY,
+            &SyncState {
+                uidvalidity: done as u32,
+                last_uid: if done {
+                    0
+                } else {
+                    u64::try_from(before_id).unwrap_or(0)
+                },
+            },
+        )?;
+        let counts = format!(
+            "{re_read} re-read into triage, {text_only} text only, {still_blank} still blank, \
+             {would_seal} left unsealed, {refused} refused, {gone} gone from gmail, \
+             {fetched} fetched in {}s",
+            started.elapsed().as_secs()
+        );
+        match (stopped, done) {
+            (Some(err), _) => eprintln!(
+                "squelch: blank-body heal stopped on a gmail error ({err}); {counts}; \
+                 resuming next start"
+            ),
+            (None, true) => eprintln!("squelch: blank-body heal complete — {counts}"),
+            (None, false) => eprintln!(
+                "squelch: blank-body heal paused at the per-start ceiling — {counts}; \
+                 resuming next start"
+            ),
+        }
+        Ok(())
+    }
+
     // ---- Sent-recipients backfill -----------------------------------------
 
     /// ONE-TIME sweep filling `messages.to_addrs` on sent rows ingested before
@@ -2200,20 +2448,31 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
         //
         // The deliberate lane is unaffected: it never ran without an LLM anyway.
 
-        // STRUCTURAL EXCLUSION: sealed mail is never embedded. It is still a
-        // committed row the fast lane may ping about, so this narrows the embed
-        // text rather than dropping the whole outcome.
-        let embed_text = if triaged.sensitivity != Sensitivity::Normal {
-            None
-        } else if triaged.message.is_spam {
-            // NEITHER IS PROVIDER SPAM, for two reasons that point the same way.
-            // It would be the largest single consumer of embedder time in the
-            // daemon — spam outnumbers real mail — spent on the one category of
-            // message semantic recall must never return. And an embedding is a
-            // similarity claim: spam is written to imitate the mail it is
-            // impersonating, so a vector space containing it puts convincing
-            // forgeries next to the real thing in results the user reads as
-            // "your mail".
+        let embed_text = self.embed_text_for(&triaged);
+        Ok(Some(Ingested {
+            id,
+            embed_text,
+            triaged,
+        }))
+    }
+
+    /// The text a committed message is embedded from, or `None` for mail that
+    /// is never embedded. ONE predicate for every ingest path — the poll walk
+    /// and the blank-body heal — so the exclusions cannot drift between them.
+    ///
+    /// STRUCTURAL EXCLUSION: sealed mail is never embedded. It is still a
+    /// committed row the fast lane may ping about, so this narrows the embed
+    /// text rather than dropping the whole outcome.
+    ///
+    /// NEITHER IS PROVIDER SPAM, for two reasons that point the same way. It
+    /// would be the largest single consumer of embedder time in the daemon —
+    /// spam outnumbers real mail — spent on the one category of message
+    /// semantic recall must never return. And an embedding is a similarity
+    /// claim: spam is written to imitate the mail it is impersonating, so a
+    /// vector space containing it puts convincing forgeries next to the real
+    /// thing in results the user reads as "your mail".
+    fn embed_text_for(&self, triaged: &TriagedMessage) -> Option<String> {
+        if triaged.sensitivity != Sensitivity::Normal || triaged.message.is_spam {
             None
         } else {
             Some(crate::embed::message_embed_text(
@@ -2221,12 +2480,7 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
                 &triaged.message.body,
                 self.config.embed.max_chars,
             ))
-        };
-        Ok(Some(Ingested {
-            id,
-            embed_text,
-            triaged,
-        }))
+        }
     }
 
     /// The fast lane, built on first use. See the [`SyncEngine::notify_lane`]
@@ -2631,8 +2885,17 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
             url: &llm.url,
             caps,
             day: now.format("%Y-%m-%d").to_string(),
-            stale_cutoff: now - ChronoDuration::days(self.config.stage2.max_age_days as i64),
+            stale_cutoff: self.pass_stale_cutoff(now),
         })
+    }
+
+    /// The age past which the Stage-1 / Stage-2 / extract passes stop spending
+    /// a model call on a row (absent a hand re-triage). ONE definition, shared
+    /// with the blank-body heal, which uses it to decide whether a re-read
+    /// row's verdict is worth redoing: a discarded verdict on a row past this
+    /// line is replaced by nothing but a stale-skip.
+    fn pass_stale_cutoff(&self, now: DateTime<Utc>) -> DateTime<Utc> {
+        now - ChronoDuration::days(self.config.stage2.max_age_days as i64)
     }
 
     /// Unwrap a pass's queue read; a read error logs once and yields an empty
@@ -6643,6 +6906,438 @@ mod tests {
             "an interrupted sweep must retry on the next start"
         );
         assert_eq!(store.sent_missing_recipients(acct, 10).unwrap().len(), 1);
+    }
+
+    // ---- blank-body heal ---------------------------------------------------
+
+    /// The Garmin shape: a multipart/alternative whose text/plain part is a
+    /// bare CRLF and whose HTML carries the whole bill.
+    fn html_only_eml(at: DateTime<Utc>, html: &str) -> String {
+        format!(
+            "From: Garmin <garminservices@billing.garmin.com>\r\n\
+             To: me@example.com\r\n\
+             Subject: Your Garmin Services Bill\r\n\
+             Date: {}\r\n\
+             MIME-Version: 1.0\r\n\
+             Content-Type: multipart/alternative; boundary=\"alt\"\r\n\
+             \r\n\
+             --alt\r\n\
+             Content-Type: text/plain; charset=utf-8\r\n\
+             \r\n\
+             \r\n\
+             --alt\r\n\
+             Content-Type: text/html; charset=utf-8\r\n\
+             \r\n\
+             {html}\r\n\
+             --alt--\r\n",
+            at.to_rfc2822()
+        )
+    }
+
+    const GARMIN_HTML: &str = "<p>Your current Garmin Services bill is now available.</p>\
+        <p>If your saved payment method is up to date, no action is required. Your payment \
+        will be processed on the due date listed below.</p><p>Balance due: $14.99</p>";
+
+    /// A row as the pre-fix daemon stored it: blank text beside real HTML, and
+    /// a verdict the models reached over the subject line alone. `age` places
+    /// it relative to the passes' cutoff (`stage2.max_age_days`, 7 by default).
+    fn blank_bill_row(
+        store: &SqliteStore,
+        acct: AccountId,
+        gmail: &str,
+        age: ChronoDuration,
+    ) -> i64 {
+        let id = store
+            .upsert_message(&crate::types::NewMessage {
+                account_id: acct,
+                gmail_msg_id: gmail.to_string(),
+                thread_id: format!("t-{gmail}"),
+                from_addr: "garminservices@billing.garmin.com".to_string(),
+                from_name: Some("Garmin".to_string()),
+                subject: "Your Garmin Services Bill".to_string(),
+                received_at: Utc::now() - age,
+                snippet: String::new(),
+                body: "\r\n".to_string(),
+                body_html: Some("<table><tr><td>old html</td></tr></table>".to_string()),
+                is_sent: false,
+                is_spam: false,
+                to_addrs: None,
+                list_unsubscribe: None,
+                list_unsub_one_click: false,
+                auth_pass: None,
+            })
+            .unwrap();
+        store
+            .set_triage(
+                id,
+                acct,
+                15,
+                Tier::Deadline,
+                Sensitivity::Normal,
+                None,
+                "Garmin services bill notice; no amount or due date stated",
+                "stage-2: subject only",
+                None,
+            )
+            .unwrap();
+        // `set_triage` seeds the Stage-2 queue shape (marker 'rule', escalated);
+        // the real Stage-2 apply then lands the subject-only verdict on it.
+        let landed = store
+            .stage2_apply(&crate::store::Stage2Applied {
+                message_id: id,
+                account_id: acct,
+                importance: 15,
+                tier: Tier::Deadline,
+                one_line: "Garmin services bill notice; no amount or due date stated".into(),
+                reason: "stage-2: subject only".into(),
+                field_reasons: crate::types::FieldReasons::default(),
+                model_used: "claude-opus-5".into(),
+                deadline: None,
+                category: Some("invoice".into()),
+            })
+            .unwrap();
+        assert!(landed, "the seeded row is exactly what Stage-2 rules on");
+        id
+    }
+
+    fn heal_done(store: &SqliteStore, acct: AccountId) -> bool {
+        store
+            .sync_state(acct, BLANK_BODY_HEAL_KEY)
+            .unwrap()
+            .is_some_and(|s| s.uidvalidity >= 1)
+    }
+
+    #[tokio::test]
+    async fn the_blank_body_heal_re_reads_recent_mail_and_hands_it_back_to_triage() {
+        let (store, acct) = store_at_cursor(Some(100));
+        let rule = store
+            .set_sender_rule(
+                acct,
+                "*@billing.garmin.com",
+                "i dont care about account statements from garmin",
+                crate::types::Disposition::Filtered,
+            )
+            .unwrap();
+        let id = blank_bill_row(&store, acct, "g-garmin", ChronoDuration::days(2));
+        assert_eq!(
+            store
+                .blank_body_messages(acct, i64::MAX, 10)
+                .unwrap()
+                .candidates
+                .len(),
+            1
+        );
+        assert!(store.stage2_queue(acct, 10).unwrap().is_empty(), "ruled on");
+
+        let g = MockGmail::default();
+        g.body("g-garmin", html_only_eml(Utc::now(), GARMIN_HTML));
+        let base = serve_mock(g.clone()).await;
+        let eng = engine(store.clone(), acct, &base);
+        eng.heal_blank_bodies().await.unwrap();
+
+        // The text a fresh arrival would get, in the reader, FTS and the queue.
+        // (The mock serves no threadId, so the re-ingest re-derives the thread
+        // the way ingest does for any message without one; read it back rather
+        // than assuming the seeded value.)
+        let t = store.triage_debug(acct, id).unwrap().unwrap();
+        let view = store.thread_view(acct, &t.thread_id).unwrap();
+        assert!(view.messages[0].content.contains("Balance due: $14.99"));
+        assert!(
+            store
+                .search(acct, "balance", 10, 0)
+                .unwrap()
+                .iter()
+                .any(|h| h.id == id),
+            "the FTS row is rewritten with the healed body"
+        );
+        assert!(
+            store
+                .blank_body_messages(acct, i64::MAX, 10)
+                .unwrap()
+                .candidates
+                .is_empty()
+        );
+        // Its subject-only verdict is gone and the REAL ingest heuristic has
+        // re-seeded it from the body it can now read: the bill rung finds the
+        // amount, and that rung outranks a sender rule at ingest (the rule is
+        // re-read live by the Stage-1 pass), so the row re-enters the Stage-1
+        // queue rather than the Filtered rung's Stage-2 shortcut — with the
+        // body, as ordinary mail (no force stamp).
+        assert_eq!(t.model_used, None);
+        assert_eq!(t.category, None);
+        assert_eq!(t.stage1_model_used, None);
+        assert_eq!(t.retriage_at, None);
+        assert!(
+            t.one_line.contains("14.99"),
+            "seeded from the body, not the subject: {}",
+            t.one_line
+        );
+        let queued = store.stage1_queue(acct, 10).unwrap();
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].message_id, id);
+        assert!(queued[0].body.contains("no action is required"));
+        assert_eq!(
+            queued[0].notify_eligible_at, None,
+            "a re-read is not an arrival: nothing to notify from"
+        );
+        assert!(store.stage2_queue(acct, 10).unwrap().is_empty());
+        // The rule still stands for the live pass to read; only the seed's
+        // own rung ordering left the id off the row.
+        assert_eq!(
+            store
+                .list_sender_rules(acct)
+                .unwrap()
+                .iter()
+                .find(|r| r.id == rule)
+                .map(|r| r.disposition),
+            Some(crate::types::Disposition::Filtered)
+        );
+        // Not embedded inline: the vector backfill picks it up, batched.
+        assert!(
+            store
+                .messages_missing_vectors(acct, 10)
+                .unwrap()
+                .iter()
+                .any(|m| m.message_id == id)
+        );
+
+        // Once per install: the walk finished, so the cursor says done and a
+        // second start makes not one more Gmail call.
+        assert_eq!(g.calls("get:g-garmin"), 1);
+        assert!(heal_done(&store, acct));
+        eng.heal_blank_bodies().await.unwrap();
+        assert_eq!(g.calls("get:g-garmin"), 1);
+    }
+
+    #[tokio::test]
+    async fn the_blank_body_heal_gives_old_mail_its_text_and_keeps_its_verdict() {
+        // Past the passes' cutoff a discarded verdict would only be replaced by
+        // a stale-skip, so the words arrive and the verdict stays.
+        let (store, acct) = store_at_cursor(Some(100));
+        let id = blank_bill_row(&store, acct, "g-old", ChronoDuration::days(30));
+
+        let g = MockGmail::default();
+        g.body("g-old", html_only_eml(Utc::now(), GARMIN_HTML));
+        let base = serve_mock(g.clone()).await;
+        engine(store.clone(), acct, &base)
+            .heal_blank_bodies()
+            .await
+            .unwrap();
+
+        let t = store.triage_debug(acct, id).unwrap().unwrap();
+        let view = store.thread_view(acct, &t.thread_id).unwrap();
+        assert!(view.messages[0].content.contains("Balance due"));
+        assert_eq!(t.model_used.as_deref(), Some("claude-opus-5"));
+        assert_eq!(t.category.as_deref(), Some("invoice"));
+        assert_eq!(t.tier, "deadline");
+        assert!(store.stage1_queue(acct, 10).unwrap().is_empty());
+        assert!(store.stage2_queue(acct, 10).unwrap().is_empty());
+        assert!(heal_done(&store, acct));
+    }
+
+    #[tokio::test]
+    async fn the_blank_body_heal_leaves_a_human_verdict_standing() {
+        let (store, acct) = store_at_cursor(Some(100));
+        let id = blank_bill_row(&store, acct, "g-garmin", ChronoDuration::days(2));
+        store
+            .correct_triage(
+                acct,
+                id,
+                crate::types::TriageAxis::Tier,
+                "noise",
+                None,
+                Utc::now(),
+            )
+            .unwrap()
+            .expect("a correction is recorded");
+
+        let g = MockGmail::default();
+        g.body("g-garmin", html_only_eml(Utc::now(), GARMIN_HTML));
+        let base = serve_mock(g.clone()).await;
+        engine(store.clone(), acct, &base)
+            .heal_blank_bodies()
+            .await
+            .unwrap();
+
+        // The words arrive; the person's verdict does not move.
+        let t = store.triage_debug(acct, id).unwrap().unwrap();
+        let view = store.thread_view(acct, &t.thread_id).unwrap();
+        assert!(view.messages[0].content.contains("Balance due"));
+        assert_eq!(t.tier, "noise");
+        assert_eq!(t.model_used.as_deref(), Some("human"));
+        assert_eq!(t.category.as_deref(), Some("invoice"));
+        assert!(store.stage1_queue(acct, 10).unwrap().is_empty());
+        assert!(store.stage2_queue(acct, 10).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_blank_body_heal_does_not_write_a_row_the_re_read_would_seal() {
+        // The HTML carries a login code the blank text never showed. Sealing
+        // the archive is not a backfill's call (a false seal plus the shredder
+        // is a Gmail trash), so the row is left exactly as it was: blank text,
+        // old verdict, nothing exposed — and the sweep still finishes.
+        let (store, acct) = store_at_cursor(Some(100));
+        let id = blank_bill_row(&store, acct, "g-otp", ChronoDuration::days(2));
+
+        let g = MockGmail::default();
+        g.body(
+            "g-otp",
+            html_only_eml(
+                Utc::now(),
+                "<p>Your verification code is 483920. Enter this code to continue.</p>",
+            ),
+        );
+        let base = serve_mock(g.clone()).await;
+        engine(store.clone(), acct, &base)
+            .heal_blank_bodies()
+            .await
+            .unwrap();
+
+        let t = store.triage_debug(acct, id).unwrap().unwrap();
+        assert_eq!(
+            t.model_used.as_deref(),
+            Some("claude-opus-5"),
+            "verdict untouched"
+        );
+        let view = store.thread_view(acct, &t.thread_id).unwrap();
+        assert!(
+            !view.messages[0].content.contains("483920"),
+            "nothing written"
+        );
+        assert!(
+            store.sealed_messages(acct).unwrap().is_empty(),
+            "not sealed"
+        );
+        assert!(heal_done(&store, acct));
+    }
+
+    #[tokio::test]
+    async fn the_blank_body_heal_leaves_mail_whose_html_is_also_blank_alone() {
+        // An image-only message: the HTML flattens to nothing too. Nothing is
+        // written — a model call over an empty page is the guess the extractor
+        // already refuses — and the pass still converges.
+        let (store, acct) = store_at_cursor(Some(100));
+        let id = blank_bill_row(&store, acct, "g-pixel", ChronoDuration::days(2));
+
+        let g = MockGmail::default();
+        g.body(
+            "g-pixel",
+            html_only_eml(Utc::now(), "<p>&nbsp;</p><img src=\"https://x/y.png\">"),
+        );
+        let base = serve_mock(g.clone()).await;
+        let eng = engine(store.clone(), acct, &base);
+        eng.heal_blank_bodies().await.unwrap();
+
+        let t = store.triage_debug(acct, id).unwrap().unwrap();
+        assert_eq!(
+            t.model_used.as_deref(),
+            Some("claude-opus-5"),
+            "verdict untouched"
+        );
+        assert!(store.stage2_queue(acct, 10).unwrap().is_empty());
+        assert!(
+            heal_done(&store, acct),
+            "a message that cannot be healed does not hold the pass open"
+        );
+        eng.heal_blank_bodies().await.unwrap();
+        assert_eq!(g.calls("get:g-pixel"), 1);
+    }
+
+    #[tokio::test]
+    async fn the_blank_body_heal_passes_over_a_missing_message_and_heals_the_rest() {
+        // Two candidates, newest first: the newer heals, the older is gone
+        // from Gmail (404). A missing message is an answer, not a stop — it is
+        // passed over, counted, and the walk still finishes.
+        let (store, acct) = store_at_cursor(Some(100));
+        let older = blank_bill_row(&store, acct, "g-older", ChronoDuration::days(3));
+        let newer = blank_bill_row(&store, acct, "g-newer", ChronoDuration::days(2));
+
+        let g = MockGmail::default();
+        g.body("g-newer", html_only_eml(Utc::now(), GARMIN_HTML));
+        let base = serve_mock(g.clone()).await;
+        engine(store.clone(), acct, &base)
+            .heal_blank_bodies()
+            .await
+            .unwrap();
+
+        assert!(
+            store
+                .triage_debug(acct, newer)
+                .unwrap()
+                .unwrap()
+                .model_used
+                .is_none(),
+            "the newer row was re-read"
+        );
+        assert_eq!(
+            store
+                .triage_debug(acct, older)
+                .unwrap()
+                .unwrap()
+                .model_used
+                .as_deref(),
+            Some("claude-opus-5"),
+            "the missing one is left as it was"
+        );
+        assert!(heal_done(&store, acct));
+        assert_eq!(g.calls("get:g-older"), 1);
+    }
+
+    #[tokio::test]
+    async fn a_transport_error_leaves_the_blank_body_heal_resumable() {
+        let (store, acct) = store_at_cursor(Some(100));
+        let id = blank_bill_row(&store, acct, "g-garmin", ChronoDuration::days(2));
+
+        // No route at all: every fetch is a transport error, not a 404.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        let dead = format!("http://{addr}");
+
+        engine(store.clone(), acct, &dead)
+            .heal_blank_bodies()
+            .await
+            .unwrap();
+        assert!(!heal_done(&store, acct), "an interrupted sweep must retry");
+        let t = store.triage_debug(acct, id).unwrap().unwrap();
+        assert_eq!(
+            t.model_used.as_deref(),
+            Some("claude-opus-5"),
+            "nothing written"
+        );
+
+        // Next start, Gmail answering: the same row is re-read and the walk
+        // completes.
+        let g = MockGmail::default();
+        g.body("g-garmin", html_only_eml(Utc::now(), GARMIN_HTML));
+        let base = serve_mock(g.clone()).await;
+        engine(store.clone(), acct, &base)
+            .heal_blank_bodies()
+            .await
+            .unwrap();
+        assert!(heal_done(&store, acct));
+        assert!(
+            store
+                .triage_debug(acct, id)
+                .unwrap()
+                .unwrap()
+                .model_used
+                .is_none()
+        );
+        assert_eq!(g.calls("get:g-garmin"), 1);
+    }
+
+    #[tokio::test]
+    async fn the_blank_body_heal_treats_mail_gmail_no_longer_has_as_settled() {
+        // A 404 is an answer: nothing to heal from, nothing to retry.
+        let (store, acct) = store_at_cursor(Some(100));
+        blank_bill_row(&store, acct, "g-gone", ChronoDuration::days(2));
+        let base = serve_mock(MockGmail::default()).await;
+        engine(store.clone(), acct, &base)
+            .heal_blank_bodies()
+            .await
+            .unwrap();
+        assert!(heal_done(&store, acct));
     }
 
     #[tokio::test]

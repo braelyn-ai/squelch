@@ -602,11 +602,138 @@ impl SqliteStore {
     }
 
     pub(super) fn ingest_message(&self, triaged: &TriagedMessage) -> Result<i64> {
+        self.ingest_message_inner(triaged, None)
+            .map(|id| id.expect("a plain ingest never refuses"))
+    }
+
+    /// See [`crate::store::Store::ingest_message_fresh`].
+    pub(super) fn ingest_message_fresh(
+        &self,
+        triaged: &TriagedMessage,
+        scope: HealScope,
+    ) -> Result<Option<i64>> {
+        self.ingest_message_inner(triaged, Some(scope))
+    }
+
+    /// The one ingest write. `heal` is the blank-body heal's flavour: refuse
+    /// anything but a live, normal, non-spam row the store already holds; drop
+    /// the stale vector; and under [`HealScope::TextAndVerdict`] discard the
+    /// row's LLM verdict BEFORE the triage upsert so the `PROCESSED` guard
+    /// below lets the seed land, then re-arm the queue markers the way a first
+    /// insert would. A human's verdict is exempt either way.
+    fn ingest_message_inner(
+        &self,
+        triaged: &TriagedMessage,
+        heal: Option<HealScope>,
+    ) -> Result<Option<i64>> {
         let mut conn = self.lock()?;
         let tx = conn.transaction()?;
 
+        // 0. HEAL PRE-CHECK, on the LIVE row inside the transaction. The sweep
+        //    snapshotted its candidates minutes or hours ago; the on-demand spam
+        //    walk or a human seal may have ruled on the row since, and either
+        //    outranks a re-read. `is_spam` is sticky-to-zero in the upsert
+        //    below (a sighting outside SPAM clears it), so a fabricated
+        //    `is_spam: false` from the sweep would otherwise flip a real
+        //    verdict back — and put a spam body in front of a Stage-1 prompt.
+        if heal.is_some() {
+            let live: Option<(i64, i64, Option<String>)> = tx
+                .query_row(
+                    "SELECT m.id, m.is_spam, t.sensitivity
+                     FROM messages m
+                     LEFT JOIN triage t ON t.message_id = m.id
+                     WHERE m.account_id = ?1 AND m.gmail_msg_id = ?2",
+                    params![triaged.message.account_id, triaged.message.gmail_msg_id],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .optional()?;
+            match live {
+                Some((_, 0, Some(sens))) if sens == "normal" => {}
+                _ => return Ok(None),
+            }
+        }
+
         // 1. Upsert the message row (+ FTS).
         let id = upsert_message_conn(&tx, &triaged.message)?;
+
+        // 1a. HEAL: the vector was computed from the text the row had, which
+        //     was the subject alone; drop it so the vector backfill re-embeds
+        //     from the real text, batched and throttled, off this path.
+        if heal.is_some() {
+            tx.execute(
+                "DELETE FROM message_vecs WHERE message_id = ?1",
+                params![id],
+            )?;
+        }
+
+        // 1a'. HEAL, VERDICT SCOPE: forget the verdict, in the same
+        //      transaction as the text it was reached without. Every model
+        //      marker back to "never looked"; the category with them (the
+        //      extract queue routes on it, and a stale category would send the
+        //      healed body to a specialist before Stage-1 has re-read it); the
+        //      notify-eligibility stamp (a re-read is not an arrival, and the
+        //      upsert preserves whatever is stored, so NULL here is what makes
+        //      "no notification can come of this" true); and every specialist
+        //      row the old verdict produced — the set a human seal clears in
+        //      `correct_triage`, for the same reason: they hold content lifted
+        //      out of a read the verdict is being redone for. `receipts` in
+        //      particular: `extract_queue` excludes any row that has one, so a
+        //      receipt off a blank body would lock the healed row out of the
+        //      extractor for good. Shipments are handled as `retriage_reset`
+        //      does: staged orders go, the shipments extractor is re-pended,
+        //      and item names this message donated are scrubbed by
+        //      provenance while the identity-keyed `shipments` row survives.
+        //
+        //      'rule' is deliberately NOT in the exclusion list
+        //      `retriage_reset` uses: this write re-runs the ingest heuristic
+        //      that applies the rule, so the rule is re-honoured rather than
+        //      overruled. 'human' and 'n/a' are: a person outranks a re-read,
+        //      and sealed/sent mail re-enters no queue. `model_used = 'human'`
+        //      is the marker `correct_triage` actually stamps, so both
+        //      spellings are checked.
+        let verdict_discarded = if heal == Some(HealScope::TextAndVerdict) {
+            let n = tx.execute(
+                "UPDATE triage
+                    SET stage1_model_used = NULL, model_used = NULL, needs_stage2 = 0,
+                        extractor_model_used = NULL, category = NULL,
+                        escalation_reason = NULL, notify_eligible_at = NULL,
+                        ship_extract_model = CASE
+                            WHEN ship_extract_model IS NOT NULL THEN 'pending' ELSE NULL END
+                  WHERE account_id = ?1 AND message_id = ?2
+                    AND COALESCE(sensitivity, 'normal') = 'normal'
+                    AND COALESCE(stage1_model_used, '') NOT IN ('n/a', 'human')
+                    AND COALESCE(model_used, '') <> 'human'",
+                params![triaged.message.account_id, id],
+            )?;
+            if n > 0 {
+                for table in ["banking", "marketing", "receipts", "calendar_updates"] {
+                    tx.execute(
+                        &format!("DELETE FROM {table} WHERE account_id = ?1 AND message_id = ?2"),
+                        params![triaged.message.account_id, id],
+                    )?;
+                }
+                tx.execute(
+                    "DELETE FROM shipment_orders
+                     WHERE account_id = ?1 AND last_message_id = ?2",
+                    params![triaged.message.account_id, id],
+                )?;
+                for (table, source_reset) in [
+                    ("shipments", ", item_name_source = 'regex'"),
+                    ("shipment_orders", ""),
+                ] {
+                    tx.execute(
+                        &format!(
+                            "UPDATE {table} SET item_name = '', item_name_msg = NULL{source_reset}
+                             WHERE account_id = ?1 AND item_name_msg = ?2"
+                        ),
+                        params![triaged.message.account_id, id],
+                    )?;
+                }
+            }
+            n > 0
+        } else {
+            false
+        };
 
         // 1b. Contacts from Sent-mail To/Cc, in the SAME transaction.
         seed_contacts_conn(
@@ -636,7 +763,9 @@ impl SqliteStore {
         //     unsubscribed from, past the 72h grace, bumps that sender's
         //     violation_count — in the SAME transaction as the message insert, so
         //     the ledger cannot drift from the mail that drives it.
-        if !triaged.message.is_sent {
+        //     NOT on a heal: the message was counted when it arrived, and the
+        //     bump is a blind `+ 1` with no idempotency key.
+        if !triaged.message.is_sent && heal.is_none() {
             bump_unsub_violation_conn(
                 &tx,
                 triaged.message.account_id,
@@ -842,6 +971,25 @@ impl SqliteStore {
             ],
         )?;
 
+        // 2a. FRESH, second half: the upsert above never touches the queue
+        //     markers on conflict (that is what keeps a re-walk from discarding
+        //     paid classification), so the seed's own markers are written here,
+        //     exactly the pair a first insert would carry. Only when 1a actually
+        //     discarded a verdict — a human-corrected row keeps its markers with
+        //     the rest of its verdict.
+        if verdict_discarded {
+            tx.execute(
+                "UPDATE triage SET stage1_model_used = ?3, needs_stage2 = ?4
+                  WHERE account_id = ?1 AND message_id = ?2",
+                params![
+                    triaged.message.account_id,
+                    id,
+                    stage1_model_used,
+                    needs_stage2
+                ],
+            )?;
+        }
+
         // 2b. LOCAL DRAFT scrub, in the SAME transaction: a re-ingest can turn a
         //     row that was normal when the draft was saved into a sealed one, and
         //     `put_draft` would never accept a sealed parent. The reply
@@ -929,7 +1077,7 @@ impl SqliteStore {
         insert_attachments_conn(&tx, triaged.message.account_id, id, &triaged.attachments)?;
 
         tx.commit()?;
-        Ok(id)
+        Ok(Some(id))
     }
 
     pub(super) fn is_known_contact(&self, account_id: AccountId, addr: &str) -> Result<bool> {
@@ -1172,6 +1320,62 @@ impl SqliteStore {
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(out)
+    }
+
+    /// See [`crate::store::Store::blank_body_messages`].
+    pub(super) fn blank_body_messages(
+        &self,
+        account_id: AccountId,
+        before_id: i64,
+        limit: u32,
+    ) -> Result<crate::store::BlankBodyScan> {
+        let conn = self.lock()?;
+        // `body_html IS NOT NULL` is the only shape this heal can recover — a
+        // plain-text-only message with nothing in it has nothing to flatten —
+        // and it is a column test, so it bounds the read to HTML mail without
+        // re-expressing the blankness predicate. Bodies are streamed one row
+        // at a time and judged in Rust; only the blank ones are kept.
+        let mut stmt = conn.prepare(
+            "SELECT m.id, m.gmail_msg_id, m.received_at, m.body
+             FROM messages m
+             JOIN triage t ON t.message_id = m.id
+             WHERE m.account_id = ?1
+               AND m.id < ?2
+               AND m.body_html IS NOT NULL
+               AND m.is_sent = 0
+               AND m.is_spam = 0
+               AND t.sensitivity = 'normal'
+             ORDER BY m.id DESC
+             LIMIT ?3",
+        )?;
+        let rows = stmt.query_map(params![account_id, before_id, limit as i64], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                dt(r, 2)?,
+                r.get::<_, Option<String>>(3)?,
+            ))
+        })?;
+        let mut scan = crate::store::BlankBodyScan::default();
+        let mut seen = 0u32;
+        let mut last_id = None;
+        for row in rows {
+            let (message_id, gmail_msg_id, received_at, body) = row?;
+            seen += 1;
+            last_id = Some(message_id);
+            // A NULL body is nothing to read, the same as a blank one.
+            if crate::triage::text::is_blank(body.as_deref().unwrap_or("")) {
+                scan.candidates.push(crate::store::BlankBodyMessage {
+                    message_id,
+                    gmail_msg_id,
+                    received_at,
+                });
+            }
+        }
+        // A short chunk means the scan reached the oldest row; a full one may
+        // have more below it, and the next chunk starts under the last id seen.
+        scan.next_before_id = if seen < limit { None } else { last_id };
+        Ok(scan)
     }
 
     pub(super) fn set_message_to_addrs(

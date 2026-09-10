@@ -1025,6 +1025,41 @@ pub struct SentMissingRecipients {
     pub gmail_msg_id: String,
 }
 
+/// A stored message whose text body is BLANK TO A READER while a rendered HTML
+/// body sits beside it: the population the one-shot blank-body heal re-fetches.
+/// Carries only what the Gmail raw fetch and the re-ingest decision need. See
+/// [`Store::blank_body_messages`].
+#[derive(Debug, Clone)]
+pub struct BlankBodyMessage {
+    pub message_id: i64,
+    pub gmail_msg_id: String,
+    /// So the caller can decide, by the passes' own age cutoff, whether a
+    /// re-read is worth a verdict or only the text.
+    pub received_at: DateTime<Utc>,
+}
+
+/// One chunk of the blank-body scan: the blank rows found among the `limit`
+/// newest rows below the cursor, and where the next chunk starts.
+#[derive(Debug, Clone, Default)]
+pub struct BlankBodyScan {
+    pub candidates: Vec<BlankBodyMessage>,
+    /// The id to pass back as `before_id` for the next chunk; `None` when the
+    /// scan has walked past the oldest row and there is nothing left to read.
+    pub next_before_id: Option<i64>,
+}
+
+/// How much of a row [`Store::ingest_message_fresh`] may replace.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HealScope {
+    /// The message text (and the vector derived from it); the triage verdict
+    /// stays whatever it was. For mail past the passes' age cutoff, where a
+    /// discarded verdict would only be replaced by a stale-skip.
+    Text,
+    /// The text AND the verdict: the row re-enters whichever queue a first
+    /// arrival would, and every specialist row the old verdict produced goes.
+    TextAndVerdict,
+}
+
 /// The squelch local store. Implemented by [`SqliteStore`].
 ///
 /// SECURITY: every method that can feed the MCP surface (`ranked_updates`,
@@ -1492,6 +1527,45 @@ pub trait Store: Send + Sync {
     /// queryable as normal mail (docs/SECURITY.md §4).
     fn ingest_message(&self, triaged: &TriagedMessage) -> Result<i64>;
 
+    /// [`Store::ingest_message`] for a message the store ALREADY HOLDS, re-read
+    /// with a body it was first stored without. Never inserts: a message the
+    /// store does not hold, or holds as spam or sealed (a live re-check inside
+    /// the transaction, so a verdict landing mid-sweep wins), is REFUSED with
+    /// `Ok(None)` and nothing is written.
+    ///
+    /// Under either scope the stale vector is dropped so the vector backfill
+    /// re-embeds the row from its real text, and the unsubscribe-violation
+    /// ledger is NOT bumped again (the message was counted when it arrived).
+    ///
+    /// Under [`HealScope::TextAndVerdict`] the row's LLM verdict is discarded
+    /// first, so the fresh heuristic seed lands and the row re-enters whichever
+    /// queue a first arrival would (a Filtered-rule sender goes straight to
+    /// Stage-2 with its `want_text`, everything else to Stage-1). With the
+    /// verdict go the category, the notify-eligibility stamp (a re-read is not
+    /// an arrival), every specialist row it produced — `banking`, `marketing`,
+    /// `receipts`, `calendar_updates`, staged `shipment_orders`, and the item
+    /// names it donated to `shipments` — and the shipments-extractor marker is
+    /// re-pended, the same set `retriage_reset` and a human seal clear. The
+    /// receipts row matters most: `extract_queue` excludes any row that has
+    /// one, so a receipt lifted off a blank body would lock the healed row out
+    /// of the extractor for good.
+    ///
+    /// The plain upsert deliberately PRESERVES a classified row's verdict on a
+    /// re-ingest (a catch-up re-walk carries only seed values), which is right
+    /// for a re-walk and wrong for a heal: the verdict being discarded here was
+    /// reached over content the model never saw.
+    ///
+    /// A PERSON'S VERDICT SURVIVES under either scope: a row a human corrected
+    /// (`'human'` on either model marker) keeps every triage column and only
+    /// its text is refreshed. No `retriage_at` stamp is written — the caller
+    /// chooses the scope by the passes' own age cutoff instead, so a healed row
+    /// queues as ordinary mail rather than ahead of it.
+    fn ingest_message_fresh(
+        &self,
+        triaged: &TriagedMessage,
+        scope: HealScope,
+    ) -> Result<Option<i64>>;
+
     /// True if `addr` appears in this account's Sent-derived contacts (the
     /// "people I know" signal the sync engine feeds to Stage-1).
     fn is_known_contact(&self, account_id: AccountId, addr: &str) -> Result<bool>;
@@ -1720,6 +1794,27 @@ pub trait Store: Send + Sync {
         account_id: AccountId,
         limit: u32,
     ) -> Result<Vec<SentMissingRecipients>>;
+
+    /// One chunk of the blank-body heal's queue: among the `limit` newest
+    /// inbound, non-spam, non-sealed messages with `id < before_id` that carry
+    /// a `body_html`, the ones whose stored text body is blank to a reader —
+    /// mail ingested before the body selection learned to flatten the HTML
+    /// alternative when the text/plain one is empty. Chunked so the store lock
+    /// is held per chunk, not per mailbox, and cursor-driven so an interrupted
+    /// sweep resumes where it stopped instead of re-reading everything.
+    ///
+    /// Blankness is decided by [`crate::triage::text::is_blank`] in Rust — the
+    /// function ingest and the extractor use — never by a SQL re-expression of
+    /// it: SQLite's one-argument `TRIM` strips U+0020 and nothing else, and an
+    /// "empty" text/plain part on the wire is a bare CRLF. Sent mail is left
+    /// out: squelch's own composer always writes a text part, and a sent row
+    /// re-enters no queue, so a re-read would buy nothing but a raw fetch.
+    fn blank_body_messages(
+        &self,
+        account_id: AccountId,
+        before_id: i64,
+        limit: u32,
+    ) -> Result<BlankBodyScan>;
 
     /// Set one SENT message's display recipients; `false` when no such sent row
     /// exists. `""` is a legitimate value — it records that the headers were read

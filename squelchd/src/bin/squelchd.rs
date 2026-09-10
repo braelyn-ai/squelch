@@ -2147,14 +2147,16 @@ fn cmd_serve(
             })
         };
 
-        // One-time Sent-history sweeps, both headers-only on the read credential:
-        // the contacts harvest seeding recipient autocomplete, then the
-        // recipients backfill filling `to_addrs` on sent mail that predates the
-        // column. Staggered past the startup sync burst and run one after the
-        // other so they never contend for the same Gmail quota. Either failing
-        // just retries on the next daemon start — each done flag is only set on
-        // completion — and neither can block the sync loop, which runs in its own
-        // task.
+        // One-time history sweeps on the read credential: the contacts harvest
+        // seeding recipient autocomplete and the recipients backfill filling
+        // `to_addrs` on sent mail that predates the column (both headers-only),
+        // then the blank-body heal re-fetching mail stored with an empty text
+        // body beside a full HTML one (one raw GET per such message, and it
+        // hands each row back to triage). Staggered past the startup sync burst
+        // and run one after the other so they never contend for the same Gmail
+        // quota. Any of them failing just retries on the next daemon start —
+        // each done flag is only set on completion — and none can block the
+        // sync loop, which runs in its own task.
         //
         // The stagger is measured from when that burst can actually START, which
         // is why this waits on the SAME embedder gate the first backfill does: on
@@ -2168,11 +2170,15 @@ fn cmd_serve(
             let email = email.clone();
             let config = config.clone();
             let creds = sync_creds.clone();
+            let sweep_metrics = sync_metrics.clone();
             let mut embedder_gate = readiness.embedder_gate();
             tokio::spawn(async move {
                 wait_for_embedder_gate(&mut embedder_gate).await;
                 tokio::time::sleep(std::time::Duration::from_secs(180)).await;
-                let engine = SyncEngine::new(store, creds, account_id, email, config);
+                // The same metrics the sync loop reports into, so a Gmail
+                // refusal during a sweep lands on the same panel and alert.
+                let engine = SyncEngine::new(store, creds, account_id, email, config)
+                    .with_metrics(sweep_metrics);
                 if let Err(e) = engine.harvest_sent_contacts().await {
                     eprintln!(
                         "squelchd: sent-contacts harvest incomplete (retries next start): {e}"
@@ -2182,6 +2188,9 @@ fn cmd_serve(
                     eprintln!(
                         "squelchd: sent-recipients backfill incomplete (retries next start): {e}"
                     );
+                }
+                if let Err(e) = engine.heal_blank_bodies().await {
+                    eprintln!("squelchd: blank-body heal incomplete (retries next start): {e}");
                 }
             });
         }
