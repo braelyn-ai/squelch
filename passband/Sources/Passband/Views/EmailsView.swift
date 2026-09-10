@@ -613,7 +613,9 @@ struct EmailsView: View {
             },
             KeyBinding("a", "browse all") { store.openSide(.browse) },
             KeyBinding("T", "rules") { store.setView(.rules) },
-            KeyBinding("A", "audit log") { store.setView(.audit) },
+            // The audit log is a settings pane now, so `A` opens Settings ON
+            // it rather than a routed page of its own.
+            KeyBinding("A", "audit log") { store.openSettings(.audit) },
             KeyBinding("g", "auth messages") { store.setView(.auth) },
             // `u` (undo), `\` (theme) and `?` (help) are global bindings, not
             // listed here.

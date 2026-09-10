@@ -27,18 +27,20 @@ enum ShareOrigin: String, Sendable, Hashable {
 }
 
 enum MainView: String, Sendable, Hashable, CaseIterable {
-    case sitrep, emails, auth, rules, audit, groups, usage, settings, process
+    case sitrep, emails, auth, rules, groups, usage, settings, process
 
     /// The TOP rail group — also the 1..N number-key mapping, taken from
     /// POSITION in this array. Usage/Settings are excluded so that adding one
     /// never renumbers the rest. `process` is off the rail entirely: its one door
     /// is the all-mail header's peer-review chip.
     ///
-    /// `groups` is APPENDED rather than inserted, which is the whole reason it
-    /// sits below Audit: anywhere earlier and every digit above it shifts, and
-    /// the keys people have in their fingers are worth more than alphabetical
-    /// tidiness.
-    static let mainViews: [MainView] = [.sitrep, .emails, .auth, .rules, .audit, .groups]
+    /// `groups` is APPENDED rather than inserted: anywhere earlier and every
+    /// digit above it shifts, and the keys people have in their fingers are
+    /// worth more than alphabetical tidiness. Audit used to sit between the two,
+    /// and taking a destination OUT does renumber — it is the one edit that
+    /// cannot be made additively, and it was worth it once, to give the ledger
+    /// back the window it was spending (see Views/AuditView.swift).
+    static let mainViews: [MainView] = [.sitrep, .emails, .auth, .rules, .groups]
     /// The BOTTOM rail group, pinned below a divider.
     static let bottomViews: [MainView] = [.usage, .settings]
 
@@ -48,7 +50,6 @@ enum MainView: String, Sendable, Hashable, CaseIterable {
         case .emails: "Emails"
         case .auth: "Auth"
         case .rules: "Rules"
-        case .audit: "Audit"
         case .groups: "Groups"
         case .usage: "Usage"
         case .settings: "Settings"
@@ -62,7 +63,6 @@ enum MainView: String, Sendable, Hashable, CaseIterable {
         case .emails: "envelope"
         case .auth: "key"
         case .rules: "slider.horizontal.3"
-        case .audit: "scroll"
         case .groups: "person.2"
         case .usage: "waveform.path.ecg"
         case .settings: "gearshape"
@@ -1417,6 +1417,18 @@ final class AppStore {
         }
         route(to: view, viaPointer: viaPointer)
         pushHistory(HistoryEntry(view: view, selectedId: selectedId))
+    }
+
+    /// Settings, ON A NAMED PANE. The sub-nav's section is a PREFERENCE (where
+    /// you were last), so a caller that means one particular pane has to write
+    /// it before routing or it lands wherever the last visit left off — which
+    /// is why `A` for the audit log goes through here rather than setView.
+    ///
+    /// Writing the pref is also the honest half: the pane it opens is now the
+    /// pane Settings remembers, exactly as if the row had been clicked.
+    func openSettings(_ section: SettingsSection) {
+        Prefs.shared.settingsSection = section
+        setView(.settings)
     }
 
     /// Switch to the Emails view showing one PAGE — the header's noise count and

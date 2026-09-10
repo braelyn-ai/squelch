@@ -328,7 +328,6 @@ struct MainShell: View {
         case .emails: EmailsView()
         case .auth: RoutedHost(view: .auth) { AuthView() }
         case .rules: RoutedHost(view: .rules) { RulesView() }
-        case .audit: RoutedHost(view: .audit) { AuditView() }
         case .groups: RoutedHost(view: .groups) { GroupsView() }
         case .usage: UsageView()
         case .settings: SettingsView()
@@ -393,7 +392,7 @@ struct MainShell: View {
     }
 }
 
-/// Host for the full main views behind the rail: Auth / Rules / Audit.
+/// Host for the full main views behind the rail: Auth / Rules / Groups.
 ///
 /// These inner views register their list-style keys into the "modal" KeyContext
 /// and never push a context themselves, so this host pushes it while mounted.
@@ -414,7 +413,6 @@ struct RoutedHost<Content: View>: View {
     private var heading: (title: String, subtitle: String?) {
         switch view {
         case .rules: ("Rules", "sender rules")
-        case .audit: ("Audit", "agent & app actions")
         case .groups: ("Groups", "named audiences")
         default: (view.label, nil)
         }
