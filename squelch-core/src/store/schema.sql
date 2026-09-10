@@ -71,6 +71,11 @@ CREATE TABLE IF NOT EXISTS messages (
 );
 
 CREATE INDEX IF NOT EXISTS idx_messages_thread ON messages(account_id, thread_id);
+-- Thread reads need the earliest message as well as the ordered conversation.
+-- Without this index, ORDER BY received_at LIMIT 1 can choose the account's
+-- date index and walk unrelated messages while holding the shared store mutex.
+CREATE INDEX IF NOT EXISTS idx_messages_thread_received
+    ON messages(account_id, thread_id, received_at);
 CREATE INDEX IF NOT EXISTS idx_messages_received ON messages(account_id, received_at);
 -- Sender lookups: the escalation context assembles one sender's track record per
 -- queued row, inside a per-row loop that runs every sync tick. Unindexed, that is
