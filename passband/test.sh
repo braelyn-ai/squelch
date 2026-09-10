@@ -289,3 +289,11 @@ run_suite settings-search \
 run_suite from-operator \
   Sources/Passband/Lib/FromOperator.swift \
   Tests/FromOperatorTests.swift
+
+# The ring behind the search panel's empty state: what a submitted query does to
+# the remembered ones. Pure Foundation, one file — the fold is kept out of the
+# store precisely so the order, the dedupe and the cap can be asserted with no
+# app, no account and no UserDefaults behind them.
+run_suite recent-search-ring \
+  Sources/Passband/Lib/RecentSearchRing.swift \
+  Tests/RecentSearchRingTests.swift

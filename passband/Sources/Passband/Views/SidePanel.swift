@@ -93,6 +93,28 @@ struct SearchView: View {
         (store.search.fetchedQuery ?? "").split(separator: " ").map(String.init)
     }
 
+    /// The remembered queries, newest first. Read through the store rather than
+    /// copied into `@State`, so a search remembered while the panel is open
+    /// (opening a hit does exactly that) is on screen the moment the field is
+    /// cleared again.
+    private var recents: [String] { RecentSearchStore.shared.queries }
+
+    /// THE EMPTY STATE HAS SOMETHING TO SAY: nothing has been typed, and there
+    /// is history to offer. Keyed on the field being blank rather than on the
+    /// hits being empty — mid-edit the hits belong to the previous query, and a
+    /// list of old searches flashing over live results on every backspace is
+    /// exactly the flicker `answered` exists to prevent (docs/SEARCH.md §4.2).
+    private var showingRecents: Bool {
+        store.search.query.trimmed.isEmpty && !recents.isEmpty
+    }
+
+    /// How many rows the arrows have to walk. ONE index arms both lists,
+    /// because only one of them is ever on screen: hits need a query and
+    /// recents need the absence of one.
+    private var rowCount: Int {
+        showingRecents ? recents.count : store.search.hits.count
+    }
+
     /// THERE IS AN ANSWER ON SCREEN for the question on screen: the hits came
     /// back for exactly this query under exactly this order.
     ///
@@ -189,6 +211,22 @@ struct SearchView: View {
             // their place because they never leave theirs.
             if bandMounted && !expanded {
                 strippedBand
+            }
+            // WHERE THE HITS GO, and above the (empty) results scroller rather
+            // than inside it: `results` keeps its one call site in this tree,
+            // which is what stops SwiftUI re-identifying the ScrollView and
+            // throwing the scroll offset away (see the note above).
+            if showingRecents {
+                RecentSearches(
+                    queries: recents, armed: store.search.index,
+                    onRun: { run($0) }, onClear: { clearRecents() }
+                )
+                // The hits' own column, for the same reason they have one: the
+                // field can be cleared while the panel is still expanded, and a
+                // 1300pt-wide row holding four words is a treadmill for the eyes.
+                .frame(maxWidth: expanded ? 780 : .infinity)
+                .frame(maxWidth: .infinity)
+                .padding(.horizontal, expanded ? 24 : 14)
             }
             HStack(alignment: .top, spacing: 0) {
                 results(expanded: expanded)
@@ -311,17 +349,20 @@ struct SearchView: View {
         [
             KeyBinding("ArrowDown", "next hit", allowInInput: true) { move(1) },
             KeyBinding("ArrowUp", "prev hit", allowInInput: true) { move(-1) },
-            // Enter is two verbs: a row armed opens it, the bare bar expands
-            // the panel into fullscreen previews. Expanding is UNCONDITIONAL —
-            // gating it on results landing would make Enter-right-after-typing
-            // (inside the debounce window) silently do nothing.
-            KeyBinding(
-                "Enter", store.search.index >= 0 ? "open thread" : "expand previews",
-                allowInInput: true
-            ) {
-                if store.search.index >= 0 {
+            // Enter is three verbs, and which one it is follows what the row
+            // under the arm actually IS: a remembered query goes back into the
+            // field, a hit opens, and the bare bar expands the panel into
+            // fullscreen previews.
+            KeyBinding("Enter", enterDescription, allowInInput: true) {
+                if showingRecents, let query = recents[safe: store.search.index] {
+                    run(query)
+                } else if store.search.index >= 0 {
                     open()
-                } else {
+                } else if canExpand {
+                    // Expanding is acting on the results: the reader asked for
+                    // a bigger look at these hits, which is as much of an
+                    // answer as opening one of them.
+                    remember()
                     store.search.expanded = true
                 }
             },
@@ -331,17 +372,80 @@ struct SearchView: View {
         ]
     }
 
+    /// WHETHER THERE IS ANYTHING TO EXPAND INTO. Fullscreen is bigger previews
+    /// of the hits, so it wants hits — or at least the possibility of them: a
+    /// fetch still in flight expands, because gating on results LANDING is what
+    /// would make Enter-right-after-typing (inside the 220ms debounce) silently
+    /// do nothing.
+    ///
+    /// The two states it refuses are the ones where the panel KNOWS it has
+    /// nothing bigger to draw: the recents list is up, so no search has been
+    /// asked at all, and a query that came back with no matches. Both used to
+    /// throw the reader into a fullscreen empty panel that then took TWO Escs
+    /// to leave (the first only collapses it), which reads exactly like Esc
+    /// being broken — and the recents list is what made it easy to reach, since
+    /// Enter is the key that list is teaching.
+    private var canExpand: Bool {
+        if showingRecents { return false }
+        return !(answered && store.search.hits.isEmpty)
+    }
+
+    /// What Enter says it will do in the help overlay, which is also the check
+    /// that the branches above stay one decision: `recents[safe:]` returns nil
+    /// at -1, so an unarmed empty state falls through to the expand test.
+    private var enterDescription: String {
+        if store.search.index >= 0 { return showingRecents ? "search this" : "open thread" }
+        return canExpand ? "expand previews" : "nothing to open"
+    }
+
     /// Floor -1, not 0: ArrowUp from the top row disarms back to the bar.
     private func move(_ delta: Int) {
-        store.search.index = max(
-            -1, min(store.search.hits.count - 1, store.search.index + delta))
+        store.search.index = max(-1, min(rowCount - 1, store.search.index + delta))
     }
 
     private func open() {
         guard let hit = store.search.hits[safe: store.search.index] else { return }
+        // OPENING A HIT IS WHERE A QUERY STOPS BEING KEYSTROKES. Both callers
+        // land here — the arrow-and-Enter path and a plain click on a row — so
+        // the ring is written in one place.
+        remember()
         // openThread itself collapses `expanded` — every path into the reader
         // must, so the collapse lives there rather than here.
         store.openThread(hit.thread_id)
+    }
+
+    /// Put a submitted query in the ring. THE FETCHED TERM, never the live
+    /// field text: what earns a place here is a search that came back and was
+    /// acted on, and mid-edit those are two different strings (docs/SEARCH.md
+    /// §4.2). A nil fetched query — the fetch failed, or Enter beat it home —
+    /// is not a search anybody has seen the results of, so nothing is written.
+    private func remember() {
+        guard let term = store.search.fetchedQuery else { return }
+        RecentSearchStore.shared.record(term)
+    }
+
+    /// Forget the list, and let go of it as well: the armed row is one of the
+    /// rows that just went away, and an index left pointing into a list nobody
+    /// can see is a silent Enter. The field takes focus back for the same
+    /// reason `run` does — a button press must not leave the reader typing into
+    /// nothing.
+    private func clearRecents() {
+        RecentSearchStore.shared.clear()
+        store.search.index = -1
+        focused = true
+    }
+
+    /// Run a remembered query: it goes into the FIELD, the way accepting a
+    /// sender does, and the panel's own debounced task does the rest. Nothing
+    /// is opened — the reader may want to narrow it first.
+    private func run(_ query: String) {
+        store.search.query = query
+        // Disarm on the way: the armed row belonged to the recents list, and
+        // leaving the index at 2 would point at hit row 2 the moment results
+        // land — repurposing the next Enter into opening a stale stranger.
+        store.search.index = -1
+        // A click on a row moves the responder; typing has to keep working.
+        focused = true
     }
 
     private func runSearch() async {
@@ -360,6 +464,12 @@ struct SearchView: View {
             store.search.fetchedSort = nil
             store.search.diagnostics = nil
             store.search.nextCursor = nil
+            // AND NOTHING IS ARMED. The index outlives the hits it was counted
+            // against (it is parked in the store so `/` can resume a search),
+            // so a field cleared while row 7 was armed would hand row 7 of the
+            // recents list — a different list, a different length — to the very
+            // next Enter.
+            store.search.index = -1
             loading = false
             return
         }
