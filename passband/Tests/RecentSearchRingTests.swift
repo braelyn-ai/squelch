@@ -76,9 +76,12 @@ struct RecentSearchRingTests {
         adding("", to: ring, gives: ring)
         adding("   ", to: ring, gives: ring)
         adding("\n\t ", to: ring, gives: ring)
-        // A run of nothing but zero-width space survives trimming (it is not
-        // whitespace to Foundation) but has no tokens to search for.
+        // Foundation's whitespace set is wider than Swift's `isWhitespace`, and
+        // takes a zero-width space with it — so this trims to "" rather than
+        // reaching the fold. Asserted because it is the reader's clipboard that
+        // decides, not the rule anybody had in mind.
         adding("\u{200B}", to: ring, gives: ring)
+        adding(" \u{00A0}\u{2009} ", to: ring, gives: ring)
     }
 
     static func aLongQueryIsRefusedNotTruncated() {

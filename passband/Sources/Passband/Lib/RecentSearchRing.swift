@@ -40,22 +40,27 @@ enum RecentSearchRing {
             .joined(separator: " ")
     }
 
-    /// Fold a submitted query into the ring. Returns the ring UNCHANGED when
-    /// the query is not worth remembering, so a caller can compare and skip the
-    /// write.
+    /// Fold a submitted query into the ring. A query that is not worth
+    /// remembering leaves the ring as it was (give or take the fold's own
+    /// tidying), so the caller compares before it writes rather than trusting
+    /// this to say no.
     static func adding(_ query: String, to ring: [String]) -> [String] {
         let kept = query.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !kept.isEmpty, kept.count <= maxLength else { return ring }
-        // Blank-but-not-empty (a query of pure whitespace arrives trimmed to ""
-        // above, but a lone zero-width run does not) has no identity to match
-        // and nothing to search for either.
-        guard !identity(of: kept).isEmpty else { return ring }
+        // The ONE test that has to happen out here, because the fold below
+        // cannot make it: a query too long to keep is refused whole.
+        guard kept.count <= maxLength else { return ring }
         // ONE PASS OVER THE NEW QUERY AND THE OLD RING, first occurrence of
         // each identity wins. That is what makes the newest spelling the kept
         // one — and it re-folds the ENTIRE ring rather than only matching the
         // head against it, so a list left holding two spellings of one search
         // (by an older build, or a looser rule) gets shorter on the way past
         // instead of carrying the pair forever.
+        //
+        // AN ENTRY WITH NO TOKENS IS DROPPED HERE, and here ONLY. A blank query
+        // (whitespace trims to ""; Foundation's set is wide enough to take a
+        // zero-width space with it) has no identity, and so does a blank an
+        // older build left in the ring — one test covers both, and the guard
+        // this file used to carry above could never fire because of it.
         var seen = Set<String>()
         var next: [String] = []
         for candidate in [kept] + ring {

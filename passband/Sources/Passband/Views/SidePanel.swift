@@ -219,7 +219,7 @@ struct SearchView: View {
             if showingRecents {
                 RecentSearches(
                     queries: recents, armed: store.search.index,
-                    onRun: { run($0) }, onClear: { RecentSearchStore.shared.clear() }
+                    onRun: { run($0) }, onClear: { clearRecents() }
                 )
                 // The hits' own column, for the same reason they have one: the
                 // field can be cleared while the panel is still expanded, and a
@@ -422,6 +422,17 @@ struct SearchView: View {
     private func remember() {
         guard let term = store.search.fetchedQuery else { return }
         RecentSearchStore.shared.record(term)
+    }
+
+    /// Forget the list, and let go of it as well: the armed row is one of the
+    /// rows that just went away, and an index left pointing into a list nobody
+    /// can see is a silent Enter. The field takes focus back for the same
+    /// reason `run` does — a button press must not leave the reader typing into
+    /// nothing.
+    private func clearRecents() {
+        RecentSearchStore.shared.clear()
+        store.search.index = -1
+        focused = true
     }
 
     /// Run a remembered query: it goes into the FIELD, the way accepting a
