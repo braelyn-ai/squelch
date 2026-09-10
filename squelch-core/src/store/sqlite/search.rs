@@ -421,6 +421,33 @@ impl SqliteStore {
         want_windows: bool,
         k: usize,
     ) -> Result<(Vec<LeggedHit>, bool)> {
+        self.hybrid_search_legs_windowed(
+            account_id,
+            query_text,
+            filter,
+            sort,
+            partial,
+            if want_windows { 0..usize::MAX } else { 0..0 },
+            k,
+        )
+    }
+
+    /// Hybrid recall with match snippets only for the specified range of
+    /// filtered results. Ranking, filtering, provenance and window fullness are
+    /// identical to `hybrid_search_legs`; callers still paginate the returned
+    /// hits. Restricting snippet work avoids probing candidates outside the
+    /// page while keeping hydration and snippets under the same store lock.
+    #[allow(clippy::too_many_arguments)]
+    pub fn hybrid_search_legs_windowed(
+        &self,
+        account_id: AccountId,
+        query_text: &str,
+        filter: &SearchFilter,
+        sort: SearchSort,
+        partial: bool,
+        snippet_range: std::ops::Range<usize>,
+        k: usize,
+    ) -> Result<(Vec<LeggedHit>, bool)> {
         // ONE clock for both legs of one search.
         let now = Utc::now();
 
@@ -463,15 +490,15 @@ impl SqliteStore {
                 if !filter.matches(&hit) {
                     continue;
                 }
-                // EVERY hit is asked for a window, not just the ones the
-                // keyword leg produced. A vector hit surfaced by meaning may
-                // still carry one of the reader's words somewhere deep in its
+                // Every hit on the requested page is asked for a window, not
+                // just the ones the keyword leg produced. A vector hit surfaced
+                // by meaning may carry one of the reader's words deep in its
                 // body, and the sentence around that word is the reason to
                 // believe the result; the stored head is what a hit gets when
                 // the body holds no term at all. The ANY expression is what is
                 // asked, because a strict window would find nothing in exactly
                 // the mail this whole wave exists for.
-                if want_windows
+                if snippet_range.contains(&out.len())
                     && let Some(window) = self.fts_snippet(&conn, account_id, c.id, &fts.any)?
                 {
                     hit.snippet = window;

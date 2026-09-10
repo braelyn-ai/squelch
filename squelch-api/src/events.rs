@@ -186,9 +186,13 @@ pub async fn events_stream(
 
     let store = state.store.clone();
     let account_id = state.account_id;
-    let latest = {
+    let latest = if q.after.is_none() {
         let store = store.clone();
         blocking(move || store.latest_event_id(account_id)).await?
+    } else {
+        // An explicit replay cursor never uses the latest id. Avoid joining
+        // the store queue just to read a value start_cursor will discard.
+        0
     };
     let start = start_cursor(q.after, latest);
 
