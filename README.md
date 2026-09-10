@@ -190,8 +190,8 @@ Seven tools, no mailbox writes, sealed mail structurally absent:
 
 | Tool | What it returns |
 |---|---|
-| `get_inbox_updates` | ranked updates since a timestamp, with importance and a one-line "why" |
-| `get_thread` | a full thread by id |
+| `get_inbox_updates` | ranked updates since a timestamp, with importance, a one-line "why", and the sender's standing instruction |
+| `get_thread` | a full thread by id, with the standing instructions covering the people in it |
 | `search_mail` | full-text search over synced mail |
 | `get_deadlines` | upcoming deadlines extracted during triage |
 | `get_shipments` | package tracking status |
@@ -199,6 +199,8 @@ Seven tools, no mailbox writes, sealed mail structurally absent:
 | `list_sender_rules` | the current rule set |
 
 Sender rules are the one thing an agent can write, and they only shape triage inside squelch's own database. Nothing an agent does can touch your actual mailbox.
+
+A rule's `want_text` is a standing instruction in your own words — "the statement total, not the minimum payment" — and it is delivered **with the mail it applies to**, not just stored. Triage has read it since rules shipped; now the agent writing the sentence you read gets it too, resolved against the sender's address at the moment it answers, so a rule you write today applies to mail that arrived last week. The rule's verdict deliberately stays behind: surface/squelch/filtered has already been spent on the update's tier, and a bill outranks a squelch rule on purpose, so what crosses is the instruction and never the judgment.
 
 ## Passband, the client
 

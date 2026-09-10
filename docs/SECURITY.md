@@ -247,6 +247,30 @@ queryable as normal mail — not even for an instant.
   kind. It rides the SSE feed and `get_event`, both behind the same bearer; the
   agent door has zero references to `events`.
 
+**What the agent door gained with issue #21.** `get_inbox_updates` and
+`get_thread` now carry a matched sender rule's `want_text` beside the mail it
+applies to (`standing_instruction` / `standing_instructions`). Three things keep
+that inside the model above:
+
+- **It is not email content.** `want_text` is written by the account owner
+  through the client, or by an agent through `set_sender_rule`, whose write is
+  committed in the SAME transaction as its audit row (actor `agent`, action
+  `rule.set`) — fail-closed, so a rule cannot land untraced. Stage-2 has read the
+  same field, in its trusted-context block, since sender rules shipped.
+- **It is not a new read.** `list_sender_rules` already returns every rule,
+  `want_text` included, to any agent holding the door. What #21 adds is
+  *delivery* — the instruction arriving at the moment its sender's mail does,
+  instead of behind a correlation the agent has to think to perform.
+- **The verdict does not travel with it.** `disposition` is left off the wire on
+  purpose. It is a decision the pipeline has already applied, and re-applying it
+  agent-side is wrong in a case that matters: Rung 1 of Stage-1 (bill/payment)
+  runs *before* sender rules, so a past-due notice from a squelched sender is
+  surfaced deliberately, and an agent reading "squelch" off it would bury exactly
+  the mail the ladder raised.
+
+Sealed mail is untouched by all of this: a sealed row never reaches either tool,
+so no instruction is ever attached to one.
+
 **Human-door credentials.** Two kinds, checked in this order by
 `squelch-api/src/auth.rs`:
 
