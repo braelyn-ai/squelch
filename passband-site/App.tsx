@@ -133,11 +133,40 @@ const styles = {
     gap: "1rem",
     textDecoration: "none",
   },
+  // THE SLOT THE BOTTOM OF THE PAGE IS DRAWN INSIDE, and it has a height for
+  // one reason: `content` is a vertically CENTRED column, so the masthead's
+  // position is a function of whatever sits under it. The button and the
+  // one-slot rig happened to differ by 0.2px, which is the only reason "nothing
+  // above it moves" was ever true. The two-slot rig is 46px taller, and half of
+  // that came straight off the top: the mark, the wordmark and the tagline all
+  // lurched upward on every press of "join the waitlist", which is the exact
+  // flicker the pushState-instead-of-navigate architecture below exists to
+  // prevent. Reserving the tallest state's height makes them constants again.
+  //
+  // The whole composition sits a little higher than it did because of it. That
+  // is the cost, it is uniform across every state, and it is the cheaper half
+  // of the trade.
+  slot: {
+    display: "flex",
+    flexDirection: "column",
+    alignItems: "center",
+    // The tallest state is the rig with a refusal under it, not the rig on its
+    // own, and reserving for anything less means the page still lurches on the
+    // one press that already went wrong.
+    minHeight: "9rem",
+  },
   // The one line that answers the press. Brighter than the detail under it and
   // quieter than the tagline above it, which stays the page's loudest line in
   // every state.
+  //
+  // BOUNDED LIKE THE LINE BENEATH IT now that it interpolates a name somebody
+  // typed. Unbounded it was fine at a fixed nineteen characters and ran off
+  // both edges of the screen the moment a person put an address in the name
+  // field, on a page whose `overflow: hidden` means you cannot scroll to it.
   confirm: {
     margin: "0.65rem 0 0",
+    maxWidth: "26rem",
+    overflowWrap: "anywhere",
     color: "#f5f5f7",
     fontSize: "1rem",
     textAlign: "center",
@@ -335,8 +364,13 @@ const CTA_CSS = `
 .pb-rig {
   position: relative;
   isolation: isolate;
+  /* A COLUMN, because there are two things to give now and three controls will
+     not fit across 28rem: at that width the address slot ends up too narrow to
+     show a whole address, and on a phone it clips mid-domain. So the rig
+     grows downward instead of squeezing sideways, and stays ONE piece of
+     hardware with two slots cut in it rather than becoming two controls. */
   display: flex;
-  align-items: stretch;
+  flex-direction: column;
   width: min(28rem, 100%);
   margin-top: 0.65rem;
   border-radius: 0.9rem;
@@ -372,6 +406,15 @@ const CTA_CSS = `
 }
 .pb-rig:hover::before,
 .pb-rig:focus-within::before { opacity: 1; }
+/* The bottom slot's row. It carries the meter, so the instrument's floor stays
+   exactly the height it was rather than growing with the rig: the bars are
+   drawn behind the address and the button, which is the half where the action
+   is, and the name sits above the whole display. */
+.pb-rig-row {
+  position: relative;
+  display: flex;
+  align-items: stretch;
+}
 /* The slot. No border and no ground of its own: it is an opening in the rig,
    not a control sitting on one. Its padding matches the button's exactly, so
    the address and the label sit on the same optical line. */
@@ -391,6 +434,46 @@ const CTA_CSS = `
 }
 .pb-rig-field::placeholder { color: #6b6b70; }
 .pb-rig-field:disabled { color: #a9a49a; }
+/* WHICH SLOT IS LIVE. The rig lights as one instrument on :focus-within,
+   which said everything worth saying while there was one opening in it and
+   nothing at all once there were two: tabbing between them changed no pixel
+   but the caret. A lit edge down the active slot is the smallest thing that
+   answers it in the instrument's own language, and it is :focus rather than
+   :focus-visible because the question ("which one am I typing into") is the
+   same however the slot was reached.
+
+   outline: none above is why this is a shadow: the outline is the affordance
+   this design gave up, and an inset edge is the one that belongs on a slot cut
+   into a face. */
+.pb-rig-field:focus { box-shadow: inset 2px 0 0 rgba(${BRASS}, 0.7); }
+/* Chrome recognises name beside email as an address profile and paints its
+   own opaque ground into both slots, which on a rig whose whole premise is that
+   the slots have no ground of their own is the one thing that breaks the
+   material. The inset shadow is the documented way to overrule it. */
+.pb-rig-field:-webkit-autofill,
+.pb-rig-field:-webkit-autofill:hover,
+.pb-rig-field:-webkit-autofill:focus {
+  -webkit-text-fill-color: #f5f5f7;
+  caret-color: #f5f5f7;
+  box-shadow: inset 0 0 0 100vw #17171a;
+  transition: background-color 9999s;
+}
+.pb-rig-field:-webkit-autofill:focus {
+  box-shadow: inset 0 0 0 100vw #17171a, inset 2px 0 0 rgba(${BRASS}, 0.7);
+}
+/* The name slot. Divided off from the row below by a hairline, so the two
+   openings read as machined out of one face rather than as one box with two
+   bits of text floating in it. Its own padding, because the address slot's
+   asymmetric bottom is clearance for the meter and there is no meter behind
+   this one. */
+.pb-rig-name {
+  flex: none;
+  padding: 0.85rem 1.1rem 0.8rem;
+  /* Brighter than the button's own divider, and it has to be: that one runs
+     down the lit half of the instrument, with the meter's glow behind it,
+     while this one crosses dark ground where the same 0.18 vanishes. */
+  border-bottom: 1px solid rgba(${BRASS}, 0.3);
+}
 /* The button, once the rig owns the material: no ground, no shell, no lift.
    What is left of it is the half that lights up, divided off by one hairline.
    The lift is dropped deliberately, because a button that rises out of the bar
@@ -609,7 +692,15 @@ function useMeter() {
         hovered.current = true;
       },
       onPointerMove: (event: PointerEvent<HTMLElement>) => {
-        const box = event.currentTarget.getBoundingClientRect();
+        // THE CANVAS'S BOX, NOT THE HANDLER'S. They were the same element's
+        // box until the rig grew a second slot above the meter: the handlers
+        // stay on the whole instrument (so hovering anywhere tunes it, which is
+        // the design) while the canvas covers only the bottom row, and reading
+        // the outer box spent half the vertical travel over a slot with no
+        // meter behind it — the filter could never open fully anywhere you
+        // could actually see it. On the standalone button the two boxes are
+        // still the same rectangle, so nothing changes there.
+        const box = (canvasRef.current ?? event.currentTarget).getBoundingClientRect();
         const x = (event.clientX - box.left) / (box.width || 1);
         // Screen y grows downward and the hump grows upward, so invert: the
         // top of the button is the filter wide open.
@@ -752,6 +843,7 @@ const WAITLIST_PATH = "/waitlist";
 // perfectly still.
 function Waitlist() {
   const { chrome, handlers } = useMeter();
+  const [name, setName] = useState("");
   const [email, setEmail] = useState("");
   const [state, setState] = useState<"idle" | "busy" | "done" | "error">("idle");
 
@@ -764,7 +856,10 @@ function Waitlist() {
         method: "POST",
         // urlencoded keeps this a CORS simple request: no preflight round trip.
         headers: { "Content-Type": "application/x-www-form-urlencoded" },
-        body: new URLSearchParams({ email }),
+        // The name rides along beside the address. The control plane treats it
+        // as optional, so an older cached copy of this bundle posting an
+        // address alone still joins the list.
+        body: new URLSearchParams({ name, email }),
         credentials: "omit",
       });
       setState(res.ok ? "done" : "error");
@@ -776,9 +871,22 @@ function Waitlist() {
   // WHAT ARRIVES AND WHAT IS AT THE END OF IT, which is the only thing still
   // unanswered once somebody is on the list, and where the client lives now.
   if (state === "done") {
+    // BY NAME WHEN THERE IS ONE. It is the only thing the form now knows that
+    // it did not before, and answering with it is what makes the field read as
+    // having been asked rather than collected. First word only: a full name
+    // read back at somebody is a receipt, not a greeting.
+    //
+    // AND ONLY WHEN IT IS THE SIZE OF A NAME. The field takes 128 characters
+    // and people put addresses in the wrong box; a greeting is not the place to
+    // find out. Anything longer falls back to the line that needs no name,
+    // which also keeps this state inside the slot above.
+    const word = name.trim().split(/\s+/)[0];
+    const first = word.length <= 20 ? word : "";
     return (
       <>
-        <p style={styles.confirm}>you're on the list.</p>
+        <p style={styles.confirm}>
+          {first ? `you're on the list, ${first}.` : "you're on the list."}
+        </p>
         <p style={styles.status}>
           you will receive an email when a spot opens. it walks you through
           setup, and the app is waiting at the end of it.
@@ -790,23 +898,43 @@ function Waitlist() {
   return (
     <>
       <form className="pb-rig" onSubmit={submit} {...handlers}>
-        {chrome}
         <input
-          className="pb-rig-field"
-          type="email"
-          name="email"
+          className="pb-rig-field pb-rig-name"
+          type="text"
+          name="name"
           required
-          autoComplete="email"
-          placeholder="you@example.com"
-          aria-label="email address"
+          autoComplete="name"
+          placeholder="your name"
+          aria-label="your name"
+          // The control plane's own ceiling is 128 CHARACTERS and this counts
+          // UTF-16 units, so the two agree on every name and the browser is
+          // the stricter of them on astral ones. Deliberately the stricter
+          // side: a name stopped at the field beats one cut on the way in.
+          maxLength={128}
           // The button that opened this is gone from under the cursor, so the
-          // field takes the focus it left behind: press join, start typing.
+          // first field takes the focus it left behind: press join, start
+          // typing.
           autoFocus
-          value={email}
+          value={name}
           disabled={state === "busy"}
-          onChange={(event) => setEmail(event.target.value)}
+          onChange={(event) => setName(event.target.value)}
         />
-        <SubmitButton busy={state === "busy"} />
+        <div className="pb-rig-row">
+          {chrome}
+          <input
+            className="pb-rig-field"
+            type="email"
+            name="email"
+            required
+            autoComplete="email"
+            placeholder="you@example.com"
+            aria-label="email address"
+            value={email}
+            disabled={state === "busy"}
+            onChange={(event) => setEmail(event.target.value)}
+          />
+          <SubmitButton busy={state === "busy"} />
+        </div>
       </form>
       {state === "error" && (
         <p style={{ ...styles.status, color: "#d8a39a" }}>
@@ -875,11 +1003,13 @@ export function App() {
           masthead
         )}
         <p style={styles.tagline}>fuck email. lets make it bearable</p>
-        {joining ? (
-          <Waitlist />
-        ) : (
-          <JoinButton onClick={go(WAITLIST_PATH, true)} />
-        )}
+        <div style={styles.slot}>
+          {joining ? (
+            <Waitlist />
+          ) : (
+            <JoinButton onClick={go(WAITLIST_PATH, true)} />
+          )}
+        </div>
       </div>
       <CornerLinks />
     </main>

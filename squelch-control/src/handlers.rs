@@ -144,6 +144,18 @@ const MAX_CODE: usize = 512;
 /// constant on.
 pub(crate) const MAX_EMAIL: usize = 254;
 
+/// How much of a submitted name is READ off the wire, which is not how much is
+/// kept: the ceiling on what is STORED is
+/// [`crate::store::NAME_MAX_CHARS`], applied after the value is normalized.
+///
+/// THE TWO ARE DIFFERENT ON PURPOSE, and the difference is the bug they were
+/// one constant. Cutting the wire value at the storage ceiling spends the
+/// budget on whitespace: a name pasted out of a document behind two hundred
+/// leading spaces cuts to two hundred spaces, normalizes to nothing, and the
+/// person is stored nameless. So the wire read is generous — the body limit on
+/// this route is the real bound — and the ceiling is applied to what survives.
+const MAX_NAME_READ: usize = 1024;
+
 /// Entropy behind a session id and behind the CSRF `state`. 32 bytes is 43
 /// unpadded base64url characters.
 const RANDOM_BYTES: usize = 32;
@@ -507,7 +519,21 @@ pub async fn waitlist(State(state): State<ControlState>, body: Bytes) -> Respons
         return waitlist_answer(origin, StatusCode::BAD_REQUEST, INVALID_EMAIL);
     }
 
-    match state.store().add_user_waiting(&email).await {
+    // TRUNCATED RATHER THAN REFUSED, which is the opposite of the rule one line
+    // up, and the difference is what happens to a value that is too long. A
+    // truncated address is a well-formed address belonging to somebody else, so
+    // it has to be refused; a truncated name is the same person with their name
+    // cut short, and refusing a signup over it would lose somebody the list
+    // wanted for a field nothing is ever decided on. The truncation itself
+    // happens in the store, on the normalized value; this is only the read.
+    //
+    // MISSING IS FINE AND STAYS FINE. The field is required by the browser and
+    // by nothing else: an older cached bundle of the site posts an address
+    // alone, and that has to keep landing on the list rather than becoming the
+    // one shape of submission that silently fails.
+    let name = field_capped(&body, "name", MAX_NAME_READ);
+
+    match state.store().add_user_waiting(&email, Some(&name)).await {
         // PRIVACY: whether this submission created a row, and nothing else.
         // Never the address, on either branch.
         Ok(created) => {

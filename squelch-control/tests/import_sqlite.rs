@@ -454,7 +454,12 @@ async fn every_sequence_continues_where_the_file_left_off() {
         .insert_tenant("grace", "grace@example.com")
         .await
         .unwrap();
-    assert!(store.add_user_waiting("hopper@example.com").await.unwrap());
+    assert!(
+        store
+            .add_user_waiting("hopper@example.com", None)
+            .await
+            .unwrap()
+    );
 
     let client = common::raw_client(&url).await;
     let tenant_id: i64 = client
