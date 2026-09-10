@@ -269,6 +269,57 @@ then volume, then recency, then address. The menu's keys (arrows, Enter, Tab,
 Esc) mount only while it is showing, so they take those keys from the results
 list only for as long as there is a list to take them for.
 
+### 4.2 The empty state remembers
+
+Opening `/` on a cleared field gave a blank rectangle. It now gives the last ten
+queries, drawn where the hits go, arrowed into like hit rows, and Enter puts one
+back in the FIELD and runs it — the `from:` menu's verb, for the same reason: a
+remembered search is usually the first half of the next one, and the reader may
+want to narrow it before they are done. Esc is untouched and still closes the
+panel.
+
+- **Submitted means acted on, not typed.** A query lands in the ring when its
+  results came back AND the reader did something with them — opened a hit, or
+  expanded the panel for a bigger look. Every keystroke is a fetch (the debounce
+  is 220ms, not a submit button), so remembering what was fetched would fill the
+  list with `w`, `wi`, `wif`. What is recorded is `fetchedQuery`, the term the
+  hits on screen were actually fetched for, never the live field text: mid-edit
+  those are two different strings, and only one of them was answered.
+- **One entry per question the daemon would answer identically.** Search folds
+  case and splits on whitespace, so `Venmo` and `venmo`, `a  b` and `a b`, are
+  one search asked twice: the second asking moves it to the top rather than
+  growing the list, keeping the newest spelling. Ten entries, oldest evicted. An
+  over-long query (>200 chars) is refused rather than truncated — a truncated
+  query is a DIFFERENT search, and re-running one from a list would quietly
+  answer a question nobody asked. The rules are pure (`RecentSearchRing.swift`,
+  its own swiftc suite); the storage is not and does not decide anything.
+- **Device-local and per account**, the same shape as the thread-style ledger:
+  UserDefaults, keyed by the active account id, reloaded on every account
+  switch. Nothing goes to the daemon, and a query typed at the work account does
+  not surface under the personal one. The list's own header carries a `clear` —
+  these are the reader's words about their own mail, so forgetting them cannot
+  require deleting the app.
+- **Enter only expands when there is something to expand.** Bar-Enter has
+  always meant "fullscreen, bigger previews", and it fired unconditionally so
+  that Enter inside the 220ms debounce would not silently do nothing. The
+  recents list made the hole in that obvious: Enter is the key the list is
+  teaching, so an unarmed Enter over it threw the reader into a FULLSCREEN
+  EMPTY panel that then took two Escs to leave (the first only collapses it),
+  which reads exactly like Esc being broken. Expanding now refuses the two
+  states the panel knows are empty — the recents list is up (no search has been
+  asked), or the query came back with no matches — and still expands while a
+  fetch is in flight, which is the case the unconditional rule existed for.
+
+- **The keys are the panel's, not the list's.** The sender menu registers its
+  own arrows and wins by arriving later, which it can do because the reader has
+  to type `from:` first. This list mounts WITH the panel, in the same render,
+  where registration order is SwiftUI's business rather than ours — so the panel
+  keeps ONE keymap and ONE armed index across both lists it can draw, and only
+  one of them is ever on screen (hits need a query, recents need the absence of
+  one). The index is parked in the store to make `/` resumable, so clearing the
+  field also disarms: row 7 of a list of hits is not row 7 of a list of ten
+  searches.
+
 ## 5. Keyword or question: the classifier
 
 The iOS surface counts spaces (`MobileSearchView.swift`: four spaces, five
