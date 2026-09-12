@@ -70,6 +70,18 @@ run_suite staged-attachment \
   Sources/Passband/Lib/StagedAttachment.swift \
   Tests/StagedAttachmentTests.swift
 
+# The composer's attachment markers: how a picture is placed in the body and
+# taken back out, and the token the daemon's own alphabet accepts. Pure string
+# work over the wire type and the mime buckets — the send-side twin of
+# cid-images, and a stray edit to the marker grammar would silently make every
+# dropped picture a plain file.
+run_suite compose-attachments \
+  Sources/Passband/Model/SubjectText.swift \
+  Sources/Passband/Model/WireTypes.swift \
+  Sources/Passband/Lib/AttachmentKinds.swift \
+  Sources/Passband/Lib/ComposeAttachments.swift \
+  Tests/ComposeAttachmentsTests.swift
+
 # The blocking re-triage modal's state machine. Pure value logic, so it builds
 # with the wire type alone — no store, no daemon, no SwiftUI.
 run_suite retriage-run \

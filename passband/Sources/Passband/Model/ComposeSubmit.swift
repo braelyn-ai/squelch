@@ -71,7 +71,10 @@ enum ComposeSubmit {
                 // beside `reply_to_message_id` — the two are mutually exclusive
                 // server-side, and nothing in the client can produce both (a
                 // composer is opened as one or the other and never converts).
-                forwardOfMessageId: c.forwardOfMessageId)
+                forwardOfMessageId: c.forwardOfMessageId,
+                // Tray order. Every id must still resolve on the daemon or the
+                // send is refused — the tray is the promise.
+                attachmentIds: c.stagedAttachmentIds)
             capture(c, override, "sent")
             return .sent(result)
         } catch let apiError as APIError where apiError.kind == .guardBlocked {
@@ -102,6 +105,11 @@ enum ComposeSubmit {
             // string vocabulary).
             "copied": !c.cc.isEmpty,
             "blind": !c.bcc.isEmpty,
+            // Counts only: how many files, and how many the body placed
+            // inline. Nothing about what they are.
+            "attachments": c.attachments.count,
+            "inline_images": c.attachments.filter { ComposeMarkers.isInline($0, in: c.body) }
+                .count,
         ]
         if let mode = c.groupMode { props["group_mode"] = mode.rawValue }
         Analytics.capture("compose_send", props)
@@ -116,6 +124,28 @@ enum ComposeSubmit {
 enum ComposeCopy {
     /// 403: the read credential cannot send.
     static let noWriteCredential = "no write credential — run `squelchd auth --write`"
+
+    /// Why review cannot open yet, when the tray is not settled: an upload
+    /// still on its way, or one that failed. nil when every file is staged.
+    static func trayProblem(_ c: ComposeState) -> String? {
+        if c.attachments.contains(where: { $0.failed }) {
+            return "an attachment failed to upload — remove it or try again"
+        }
+        if c.uploadsPending { return "still uploading attachments…" }
+        return nil
+    }
+
+    /// The review summary's line about what rides along: "2 files · 1 inline"
+    /// — counts and placement, because the names are right below in the tray.
+    /// nil when there is nothing to say.
+    static func attachmentSummary(_ c: ComposeState) -> String? {
+        let total = c.attachments.count
+        guard total > 0 else { return nil }
+        let inline = c.attachments.filter { ComposeMarkers.isInline($0, in: c.body) }.count
+        var out = total == 1 ? "1 file" : "\(total) files"
+        if inline > 0 { out += " · \(inline) inline in the body" }
+        return out
+    }
 
     /// The review pane's line for an armed read-tracking pixel — the one thing
     /// about to go out that the body does not show.

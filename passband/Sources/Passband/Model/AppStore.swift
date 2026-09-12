@@ -449,6 +449,20 @@ struct ComposeState: Sendable, Equatable {
     /// actually goes out is the original as Gmail holds it, pixels and all.
     /// Nothing else drifts — same message, same id, same files.
     var forwardedMessage: ClientMessage?
+    /// THE TRAY: every file attached to this composition, in the order it was
+    /// attached. Uploaded the moment it is dropped (see `ComposeAttach`), so
+    /// an entry may still be waiting on its daemon id. Which of these go
+    /// INLINE is not recorded here — the body says, by carrying the file's
+    /// `cid:` marker or not (see `ComposeMarkers`).
+    var attachments: [ComposeAttachment] = []
+
+    /// The daemon ids of every file that has finished staging: what a draft
+    /// save and a send name.
+    var stagedAttachmentIds: [Int] { attachments.compactMap(\.id) }
+
+    /// Whether any file is still on its way up. A send must wait for it — the
+    /// tray is the promise of what the mail carries.
+    var uploadsPending: Bool { attachments.contains { $0.uploading } }
 
     /// The three recipient headers as one editable value. The strings stay the
     /// stored form — they are what goes on the wire, verbatim — and this is the
@@ -1362,6 +1376,7 @@ final class AppStore {
         ThreadPrefetch.shared.wipe()
         HeroCache.shared.wipe()
         AttachmentThumbs.shared.wipe()
+        ComposeAttach.wipe()
         // The staged preview files, for the same reason and with more teeth: a
         // survivor here is another account's attachment served from this
         // account's id, straight into a preview.
@@ -2558,6 +2573,8 @@ final class AppStore {
         next.bcc = draft.bcc ?? next.bcc
         next.subject = draft.subject
         next.body = draft.body
+        // The files the draft claimed, already staged — no upload to wait on.
+        next.attachments = (draft.attachments ?? []).map(ComposeAttachment.init)
         next.draftId = draft.id
         compose = next
         await resolveDraftGroup()
@@ -2642,6 +2659,7 @@ final class AppStore {
             next.to = draft.to.isEmpty ? next.to : draft.to
             next.recipientsStated = true
         }
+        next.attachments = (draft.attachments ?? []).map(ComposeAttachment.init)
         next.draftId = draft.id
         inlineReply = next
     }
@@ -2733,6 +2751,13 @@ final class AppStore {
     /// telling the sender it worked. A send has no undo, so the only safe read
     /// of "we do not know" is no.
     var forwardingAvailable: Bool { sitrep.stats?.forwarding == true }
+
+    /// Whether the composers may offer to attach files. Same shape and same
+    /// reason as `forwardingAvailable`: a daemon that does not know
+    /// `attachment_ids` ignores the key and mails the words without the
+    /// files, answering 200 — so the affordance is withheld rather than
+    /// offered as a lie. nil (no stats yet) counts as no.
+    var composeAttachmentsAvailable: Bool { sitrep.stats?.compose_attachments == true }
 
     // MARK: - read tracking
 

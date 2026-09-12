@@ -424,6 +424,20 @@ no-store`, like the reveal.
   triage row lands `sealed`) — `DELETE FROM drafts` for that message id in the same
   transaction as the seal. `list_drafts` additionally filters a sealed parent
   (`NOT EXISTS` on `triage`, the same shape as `deadlines`) as a belt.
+- **Staged attachments ride with the draft.** `outbound_attachments`
+  (`squelch-core/src/store/sqlite/outbound.rs`, served only by
+  `/client/compose/attachments`) holds the files a composer has attached, bytes and
+  all, from the moment they are dropped until a send names them by id (and consumes
+  them) or the draft that claimed them is deleted (which takes them with it, on
+  both seal paths above too). An upload nobody claims is swept a day later by the
+  next upload. Same door discipline as drafts: never on `/mcp`, never audited,
+  `no-store` on every read. The byte endpoint serves them under the SAME header
+  whitelist as inbound attachments (`safe_content_type`, `nosniff`,
+  `Content-Disposition: attachment`): the user's own screenshot and a renamed html
+  are indistinguishable to the byte door, so neither renders from our origin. At
+  the send, `text/*` and `message/*` attachments are scanned by the outbound guard
+  exactly as a forward's are; binary parts are not (the guard is a seatbelt, not
+  DLP).
 
 **The sent listing (human-door-only route).** `GET /client/sent`
 (`store::sent_listing`) is the **only** listing in the codebase that reads
@@ -713,9 +727,12 @@ raw fetch found the write credential dead — a 403 telling the user to re-run
 `squelchd auth --write`, never the 502 that would blame Gmail), `failed:target`,
 `rejected:no_recipient`, `rejected:too_large` (the original exceeds
 `MAX_FORWARD_RAW_BYTES` = 20 MiB decoded, refused with a 413 before the four-to-five-x
-re-encode allocates), `failed:fetch_original` (the forwarded original could not be
-read back, so nothing was sent), `rejected:compose`, `failed:gmail`, `ok`,
-`ok:forward`):
+re-encode allocates — or the send's own staged attachments total more than 25 MB),
+`rejected:attachment_missing` (an `attachment_ids` entry names no staged file — swept,
+deleted, or another account's — so the whole send is refused rather than going out
+with fewer files than the tray showed), `failed:fetch_original` (the forwarded
+original could not be read back, so nothing was sent), `rejected:compose`,
+`failed:gmail`, `ok`, `ok:forward`):
 
 | `send.echo` detail | meaning |
 | --- | --- |

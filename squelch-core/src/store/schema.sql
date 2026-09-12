@@ -1052,6 +1052,38 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_drafts_reply
 CREATE UNIQUE INDEX IF NOT EXISTS idx_drafts_new
     ON drafts(account_id) WHERE reply_to_message_id IS NULL;
 
+-- FILES STAGED FOR A SEND. The composer uploads each file the moment it is
+-- attached (POST /client/compose/attachments) and the row waits here, bytes
+-- and all, until a send names it by id or a draft claims it. HUMAN-DOOR DATA
+-- like `drafts`: never synced anywhere, never visible on /mcp.
+--
+-- LIFETIME is the draft's, or nothing's. `draft_id` is NULL from upload until
+-- the next draft save claims the row; a send consumes every row it names, a
+-- draft delete takes its rows with it, and an unclaimed row older than a day
+-- (a composer closed before its first autosave, a failed send, a crash) is
+-- swept on the next upload. The bytes are the whole point of the row, so
+-- unlike inbound `attachments` there is no metadata-only state: over the cap
+-- the upload is refused rather than recorded.
+--
+-- `content_id` is the `cid:` token an inline image is referenced by from the
+-- body. Minted client-side (a UUID) so the composer can write the reference
+-- into the markdown before the upload lands; validated, or minted here, when
+-- the client sent none.
+CREATE TABLE IF NOT EXISTS outbound_attachments (
+    id          INTEGER PRIMARY KEY,
+    account_id  INTEGER NOT NULL,
+    draft_id    INTEGER,              -- NULL until a draft save claims it
+    filename    TEXT NOT NULL,
+    mime        TEXT NOT NULL,
+    size_bytes  INTEGER NOT NULL,
+    content_id  TEXT NOT NULL,
+    data        BLOB NOT NULL,
+    created_at  TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_outbound_attachments_draft
+    ON outbound_attachments(account_id, draft_id);
+
 -- OUTBOUND READ TRACKING. One `send_trackers` row per tracked send: the minted
 -- token IS the pixel URL's path segment, so it is the only thing a recipient's
 -- mail client ever hands back. Tracking is opt-in per send AND requires

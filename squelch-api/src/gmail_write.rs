@@ -101,11 +101,17 @@ pub struct ReplyParts {
     /// `<img>` rides in the HTML part ONLY, so a plain-text reader fetches
     /// nothing and reads nothing back to us.
     pub pixel_url: Option<String>,
+    /// The files the composer attached, in the order it attached them. EMPTY
+    /// leaves the wire shape exactly what it always was (the tests pin those
+    /// bytes); anything here wraps the body in the structure
+    /// [`build_reply_rfc822`] describes. `is_inline` is decided by the caller
+    /// against `body_html` — see [`mark_inline`].
+    pub attachments: Vec<MailAttachment>,
 }
 
 /// Escape text for interpolation into HTML markup or a double-quoted attribute
 /// value. `&` first, or it would double-escape the entities emitted after it.
-fn escape_html(s: &str) -> String {
+pub(crate) fn escape_html(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
@@ -155,6 +161,9 @@ fn html_alternative(parts: &ReplyParts) -> Option<String> {
 /// let the inner level's delimiter close the outer one.
 const BOUNDARY_ALT: &str = "=_passband_alt_";
 const BOUNDARY_MIX: &str = "=_passband_mix_";
+/// The multipart/related level a composed message with inline images adds
+/// between the two above. Same rule: a third prefix, distinct from both.
+const BOUNDARY_REL: &str = "=_passband_rel_";
 
 /// How far the sequential bump below is allowed to walk. THE PROBED PARTS ARE
 /// ATTACKER-AUTHORED — a forward carries a stranger's message body and their
@@ -226,6 +235,25 @@ fn multipart_boundary(parts: &[&str]) -> String {
 /// text/plain first (the raw source, exactly as typed), text/html second. Body
 /// content stays structurally inert — the only string that delimits parts is
 /// the boundary, and [`multipart_boundary`] guarantees neither part contains it.
+///
+/// WITH ATTACHMENTS the body above becomes the root of a bigger tree, and
+/// which levels exist depends on what was attached:
+///
+/// ```text
+/// multipart/mixed                    (only when a FILE is attached)
+///   multipart/related                (only when an INLINE image is attached)
+///     multipart/alternative          (the body, exactly as above)
+///       text/plain
+///       text/html                    <img src="cid:…"> points at the siblings
+///     image/*  inline; Content-ID    one per inline image
+///   application/*  attachment        one per file
+/// ```
+///
+/// Inline parts sit in a multipart/related (RFC 2387) rather than beside the
+/// files in the mixed, because that is the one place every mail client resolves
+/// a `cid:` from; the forward builder gets away with mixed-only because it is
+/// replaying a message that already resolved somewhere. Empty `attachments`
+/// takes the old path and the old bytes.
 pub fn build_reply_rfc822(parts: &ReplyParts) -> Result<Vec<u8>, WriteError> {
     // No field that becomes a header line may contain CR or LF. The body may
     // (it lives after the blank line).
@@ -269,6 +297,15 @@ pub fn build_reply_rfc822(parts: &ReplyParts) -> Result<Vec<u8>, WriteError> {
     }
     // Bodies: normalize bare LFs to CRLF for RFC822 line endings.
     let text = parts.body.replace("\r\n", "\n").replace('\n', "\r\n");
+    if !parts.attachments.is_empty() {
+        let html = html_alternative(parts).map(|h| h.replace("\r\n", "\n").replace('\n', "\r\n"));
+        out.push_str(&body_with_attachments(
+            &text,
+            html.as_deref(),
+            &parts.attachments,
+        ));
+        return Ok(out.into_bytes());
+    }
     match html_alternative(parts).as_deref() {
         None => {
             out.push_str("Content-Type: text/plain; charset=\"UTF-8\"\r\n");
@@ -294,6 +331,109 @@ pub fn build_reply_rfc822(parts: &ReplyParts) -> Result<Vec<u8>, WriteError> {
         }
     }
     Ok(out.into_bytes())
+}
+
+/// Decide which attachments go out INLINE: exactly those the html references
+/// by `cid:`. A file the body never points at is emitted as an ordinary
+/// attachment whatever the composer called it — an inline part nothing
+/// references is one the recipient would simply never see — and a part with no
+/// `Content-ID` at all cannot be referenced, so it is never inline.
+///
+/// The test is the raw `cid:<token>` substring, which is what the renderer
+/// writes and what the recipient's client looks for; the token's own alphabet
+/// (see the upload handler) has no character that could make one token a
+/// prefix of another's reference inside a quoted attribute.
+pub fn mark_inline(attachments: &mut [MailAttachment], html: Option<&str>) {
+    for att in attachments.iter_mut() {
+        att.is_inline = match (&att.content_id, html) {
+            (Some(cid), Some(html)) => {
+                let token = content_id_token(cid);
+                !token.is_empty() && html.contains(&format!("cid:{token}"))
+            }
+            _ => false,
+        };
+    }
+}
+
+/// The body of a composed message that carries attachments — everything after
+/// the address headers, from the top-level `Content-Type:` line on. See
+/// [`build_reply_rfc822`] for the tree this builds. `text` and `html` arrive
+/// CRLF-normalized; the attachments are base64'd here, before the boundary
+/// probe, so the probe sees the bytes that go on the wire.
+fn body_with_attachments(text: &str, html: Option<&str>, attachments: &[MailAttachment]) -> String {
+    let encoded: Vec<String> = attachments.iter().map(|a| base64_body(&a.data)).collect();
+    let mut probe: Vec<&str> = vec![text];
+    if let Some(h) = html {
+        probe.push(h);
+    }
+    probe.extend(encoded.iter().map(String::as_str));
+    let alt = boundary_with_prefix(BOUNDARY_ALT, &probe);
+    let rel = boundary_with_prefix(BOUNDARY_REL, &probe);
+    let mix = boundary_with_prefix(BOUNDARY_MIX, &probe);
+
+    // The body: `(content-type value, content)`, as a nested part or the root.
+    let (body_ct, body) = match html {
+        Some(html) => (
+            format!("multipart/alternative; boundary=\"{alt}\""),
+            format!(
+                "--{alt}\r\nContent-Type: text/plain; charset=\"UTF-8\"\r\n\r\n{text}\r\n\
+                 --{alt}\r\nContent-Type: text/html; charset=\"UTF-8\"\r\n\r\n{html}\r\n\
+                 --{alt}--\r\n"
+            ),
+        ),
+        None => (
+            "text/plain; charset=\"UTF-8\"".to_string(),
+            format!("{text}\r\n"),
+        ),
+    };
+
+    let inline: Vec<(&MailAttachment, &String)> = attachments
+        .iter()
+        .zip(&encoded)
+        .filter(|(a, _)| a.is_inline)
+        .collect();
+    let files: Vec<(&MailAttachment, &String)> = attachments
+        .iter()
+        .zip(&encoded)
+        .filter(|(a, _)| !a.is_inline)
+        .collect();
+
+    // The related wrapper, when an inline image needs one. RFC 2387's `type`
+    // names the root part's type so a client knows which sibling is the body.
+    let (inner_ct, inner) = if inline.is_empty() {
+        (body_ct, body)
+    } else {
+        let root_type = body_ct.split(';').next().unwrap_or("").trim().to_string();
+        let mut content = format!("--{rel}\r\nContent-Type: {body_ct}\r\n\r\n{body}");
+        for (att, enc) in &inline {
+            content.push_str(&attachment_part(&rel, att, enc));
+        }
+        content.push_str(&format!("--{rel}--\r\n"));
+        (
+            format!("multipart/related; boundary=\"{rel}\"; type=\"{root_type}\""),
+            content,
+        )
+    };
+
+    let mut out = String::new();
+    if files.is_empty() {
+        out.push_str(&format!(
+            "Content-Type: {inner_ct}\r\nMIME-Version: 1.0\r\n\r\n"
+        ));
+        out.push_str(&inner);
+    } else {
+        out.push_str(&format!(
+            "Content-Type: multipart/mixed; boundary=\"{mix}\"\r\nMIME-Version: 1.0\r\n\r\n"
+        ));
+        out.push_str(&format!(
+            "--{mix}\r\nContent-Type: {inner_ct}\r\n\r\n{inner}"
+        ));
+        for (att, enc) in &files {
+            out.push_str(&attachment_part(&mix, att, enc));
+        }
+        out.push_str(&format!("--{mix}--\r\n"));
+    }
+    out
 }
 
 /// The `messages.send` JSON body: `raw` base64url-encoded WITHOUT padding as
@@ -861,15 +1001,17 @@ pub fn forward_subject(original: &str) -> String {
     }
 }
 
-/// One part of the original that rides along on the forward: a real attachment,
-/// or an inline part the html references by `cid:`.
+/// One file that rides along on a send: a real attachment, or an inline part
+/// the html references by `cid:`. Two sources build these — the parser, out of
+/// the original a forward carries, and the send handler, out of the files the
+/// composer staged — and the part writer treats them identically.
 ///
 /// `content_id` is the part's `Content-ID` token WITHOUT its angle brackets (the
 /// parser strips them; the builder writes them back), preserved otherwise
 /// VERBATIM — the html goes out unchanged, so every `cid:` reference in it
 /// resolves only if the token it names comes across untouched.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ForwardAttachment {
+pub struct MailAttachment {
     pub filename: String,
     pub mime: String,
     pub content_id: Option<String>,
@@ -907,7 +1049,7 @@ pub struct ForwardedOriginal {
     pub text: String,
     /// The decoded html body, if the original had one.
     pub html: Option<String>,
-    pub attachments: Vec<ForwardAttachment>,
+    pub attachments: Vec<MailAttachment>,
 }
 
 /// The characters that force a display name into an RFC 5322 quoted-string:
@@ -1025,7 +1167,7 @@ pub fn parse_forwarded_original(raw: &[u8]) -> Option<ForwardedOriginal> {
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .map(str::to_string);
-        attachments.push(ForwardAttachment {
+        attachments.push(MailAttachment {
             filename,
             mime,
             content_id,
@@ -1491,7 +1633,7 @@ fn rfc2231_encode(s: &str) -> String {
 /// names therefore go out as RFC 2231 (`filename*=utf-8''…`) beside an
 /// ASCII-projected `filename=` for clients that ignore 2231. An all-ASCII name
 /// is emitted exactly as it always was, byte for byte.
-fn attachment_part(boundary: &str, att: &ForwardAttachment, encoded: &str) -> String {
+fn attachment_part(boundary: &str, att: &MailAttachment, encoded: &str) -> String {
     let mime = mime_token(&att.mime);
     let filename = {
         let f = quoted_param(&att.filename);
@@ -1549,7 +1691,7 @@ fn attachment_part(boundary: &str, att: &ForwardAttachment, encoded: &str) -> St
     if mime.starts_with("text/") {
         out.push_str("; charset=\"utf-8\"");
     }
-    // `method` is structural for text/calendar (see [`ForwardAttachment::method`]).
+    // `method` is structural for text/calendar (see [`MailAttachment::method`]).
     if let Some(method) = att.method.as_deref().and_then(param_token) {
         out.push_str(&format!("; method={method}"));
     }
@@ -2268,6 +2410,7 @@ mod tests {
             references: Some("<root@x> <parent@x>".into()),
             body_html: None,
             pixel_url: None,
+            attachments: Vec::new(),
         };
         let raw = build_reply_rfc822(&parts).unwrap();
         let s = String::from_utf8(raw).unwrap();
@@ -2291,6 +2434,7 @@ mod tests {
             references: None,
             body_html: None,
             pixel_url: None,
+            attachments: Vec::new(),
         };
         assert!(matches!(
             build_reply_rfc822(&parts),
@@ -2310,6 +2454,7 @@ mod tests {
             references: None,
             body_html: Some("<div><strong>bold</strong> text</div>".into()),
             pixel_url: None,
+            attachments: Vec::new(),
         };
         let s = String::from_utf8(build_reply_rfc822(&parts).unwrap()).unwrap();
         assert!(
@@ -2336,6 +2481,7 @@ mod tests {
             references: None,
             body_html: None,
             pixel_url: None,
+            attachments: Vec::new(),
         }
     }
 
@@ -2479,6 +2625,7 @@ mod tests {
             references: None,
             body_html: Some("<p>x</p>".into()),
             pixel_url: None,
+            attachments: Vec::new(),
         };
         assert!(matches!(
             build_reply_rfc822(&parts),
@@ -2498,6 +2645,7 @@ mod tests {
             references: None,
             body_html: None,
             pixel_url: None,
+            attachments: Vec::new(),
         };
         assert!(matches!(
             build_reply_rfc822(&parts),
@@ -3688,5 +3836,251 @@ mod tests {
             }
             other => panic!("expected Api error, got {other:?}"),
         }
+    }
+
+    // ---- attachments on a COMPOSED message ---------------------------------
+
+    fn png(name: &str, cid: &str) -> MailAttachment {
+        MailAttachment {
+            filename: name.into(),
+            mime: "image/png".into(),
+            content_id: Some(cid.into()),
+            is_inline: false,
+            method: None,
+            data: b"hello png".to_vec(),
+        }
+    }
+
+    fn pdf(name: &str) -> MailAttachment {
+        MailAttachment {
+            filename: name.into(),
+            mime: "application/pdf".into(),
+            content_id: Some("pdf-cid".into()),
+            is_inline: false,
+            method: None,
+            data: b"%PDF-1.4 hello".to_vec(),
+        }
+    }
+
+    /// `bare_parts` with markdown html and the given files, `mark_inline`d the
+    /// way the handler does it.
+    fn composed(body: &str, html: &str, mut attachments: Vec<MailAttachment>) -> ReplyParts {
+        let mut parts = bare_parts(body);
+        parts.body_html = Some(html.to_string());
+        mark_inline(&mut attachments, parts.body_html.as_deref());
+        parts.attachments = attachments;
+        parts
+    }
+
+    #[test]
+    fn mark_inline_follows_the_html_and_nothing_else() {
+        let mut atts = vec![png("a.png", "cid-a"), png("b.png", "cid-b"), pdf("c.pdf")];
+        // Only `a` is referenced; `b` has a cid nobody points at; `c` is a file.
+        mark_inline(&mut atts, Some("<p>x</p><img src=\"cid:cid-a\" alt=\"a\">"));
+        assert!(atts[0].is_inline);
+        assert!(!atts[1].is_inline, "a cid nobody references is a file");
+        assert!(!atts[2].is_inline);
+        // No html at all: nothing can be inline, whatever the flags said.
+        atts[0].is_inline = true;
+        mark_inline(&mut atts, None);
+        assert!(atts.iter().all(|a| !a.is_inline));
+        // A part with no Content-ID cannot be referenced, so it is never inline.
+        let mut anon = vec![MailAttachment {
+            content_id: None,
+            ..png("x.png", "unused")
+        }];
+        mark_inline(&mut anon, Some("cid:x"));
+        assert!(!anon[0].is_inline);
+    }
+
+    #[test]
+    fn a_file_attachment_wraps_the_body_in_mixed() {
+        let parts = composed(
+            "see attached",
+            "<p>see attached</p>",
+            vec![pdf("notes.pdf")],
+        );
+        let s = String::from_utf8(build_reply_rfc822(&parts).unwrap()).unwrap();
+
+        // mixed[ alternative[text, html], pdf ] — no related level, because
+        // nothing is inline.
+        assert!(s.contains("Content-Type: multipart/mixed; boundary=\"=_passband_mix_0\"\r\n"));
+        assert!(s.contains(
+            "--=_passband_mix_0\r\nContent-Type: multipart/alternative; boundary=\"=_passband_alt_0\"\r\n\r\n"
+        ));
+        assert!(!s.contains("multipart/related"));
+        assert!(s.contains("--=_passband_alt_0--\r\n--=_passband_mix_0\r\n"));
+        assert!(s.ends_with("--=_passband_mix_0--\r\n"));
+
+        // The body parts are what a plain reply carries, verbatim.
+        assert!(s.contains("Content-Type: text/plain; charset=\"UTF-8\"\r\n\r\nsee attached\r\n"));
+        assert!(s.contains("<p>see attached</p>"));
+
+        // The file: a real attachment, base64, named.
+        assert!(s.contains("Content-Type: application/pdf; name=\"notes.pdf\"\r\n"));
+        assert!(s.contains("Content-Disposition: attachment; filename=\"notes.pdf\"\r\n"));
+        assert!(s.contains(&base64::engine::general_purpose::STANDARD.encode(b"%PDF-1.4 hello")));
+        // Threading headers survive the wrap.
+        assert!(s.starts_with("To: alice@example.com\r\nSubject: hi\r\n"));
+        assert!(s.contains("MIME-Version: 1.0\r\n"));
+    }
+
+    #[test]
+    fn an_inline_image_wraps_the_body_in_related_not_mixed() {
+        let parts = composed(
+            "look ![shot](cid:shot-1)",
+            "<p>look <img src=\"cid:shot-1\" alt=\"shot\"></p>",
+            vec![png("shot.png", "shot-1")],
+        );
+        let s = String::from_utf8(build_reply_rfc822(&parts).unwrap()).unwrap();
+
+        // related[ alternative[text, html], png ] and NO mixed: there is no
+        // file to mix in, and a mixed around one part is noise.
+        assert!(s.contains(
+            "Content-Type: multipart/related; boundary=\"=_passband_rel_0\"; type=\"multipart/alternative\"\r\nMIME-Version: 1.0\r\n\r\n"
+        ));
+        assert!(!s.contains("multipart/mixed"));
+        assert!(s.contains(
+            "--=_passband_rel_0\r\nContent-Type: multipart/alternative; boundary=\"=_passband_alt_0\"\r\n\r\n"
+        ));
+        assert!(s.contains("--=_passband_alt_0--\r\n--=_passband_rel_0\r\n"));
+        assert!(s.ends_with("--=_passband_rel_0--\r\n"));
+        assert!(s.contains("Content-Disposition: inline; filename=\"shot.png\"\r\n"));
+        assert!(s.contains("Content-ID: <shot-1>\r\n"));
+        // The html still points at it by the same token.
+        assert!(s.contains("<img src=\"cid:shot-1\""));
+    }
+
+    #[test]
+    fn inline_and_file_together_nest_all_three_levels() {
+        let parts = composed(
+            "![shot](cid:shot-1) and the deck",
+            "<p><img src=\"cid:shot-1\" alt=\"shot\"> and the deck</p>",
+            vec![pdf("deck.pdf"), png("shot.png", "shot-1")],
+        );
+        let s = String::from_utf8(build_reply_rfc822(&parts).unwrap()).unwrap();
+
+        // mixed[ related[ alternative, png ], pdf ]: three prefixes, three
+        // distinct delimiters, and the inline part is INSIDE the related while
+        // the file is outside it.
+        let mixed = s
+            .find("multipart/mixed; boundary=\"=_passband_mix_0\"")
+            .unwrap();
+        let related = s
+            .find("multipart/related; boundary=\"=_passband_rel_0\"")
+            .unwrap();
+        let alternative = s
+            .find("multipart/alternative; boundary=\"=_passband_alt_0\"")
+            .unwrap();
+        assert!(mixed < related && related < alternative);
+        let png_part = s.find("Content-ID: <shot-1>").unwrap();
+        let related_end = s.find("--=_passband_rel_0--").unwrap();
+        let pdf_part = s.find("filename=\"deck.pdf\"").unwrap();
+        assert!(
+            png_part < related_end,
+            "the inline image is inside the related"
+        );
+        assert!(
+            related_end < pdf_part,
+            "the file is outside it, in the mixed"
+        );
+        assert!(s.ends_with("--=_passband_mix_0--\r\n"));
+        // Tray order is part order among the files, and among the inline ones.
+        assert!(s.contains("Content-Disposition: attachment; filename=\"deck.pdf\""));
+        assert!(s.contains("Content-Disposition: inline; filename=\"shot.png\""));
+    }
+
+    #[test]
+    fn a_composed_message_with_files_parses_back_to_its_parts() {
+        // The proof that the nesting is legible, not merely intended: a real
+        // parser reads two attachments out of it, one inline by cid, and the
+        // two body views intact.
+        let parts = composed(
+            "![shot](cid:shot-1) and the deck",
+            "<p><img src=\"cid:shot-1\" alt=\"shot\"> and the deck</p>",
+            vec![pdf("deck.pdf"), png("shot.png", "shot-1")],
+        );
+        let raw = build_reply_rfc822(&parts).unwrap();
+        let original = parse_forwarded_original(&raw).expect("parses");
+        assert_eq!(original.text.trim(), "![shot](cid:shot-1) and the deck");
+        assert!(original.html.as_deref().unwrap().contains("cid:shot-1"));
+        let names: Vec<&str> = original
+            .attachments
+            .iter()
+            .map(|a| a.filename.as_str())
+            .collect();
+        assert!(names.contains(&"deck.pdf"));
+        assert!(names.contains(&"shot.png"));
+        let shot = original
+            .attachments
+            .iter()
+            .find(|a| a.filename == "shot.png")
+            .unwrap();
+        assert!(shot.is_inline);
+        assert_eq!(shot.content_id.as_deref(), Some("shot-1"));
+        assert_eq!(shot.data, b"hello png");
+        let deck = original
+            .attachments
+            .iter()
+            .find(|a| a.filename == "deck.pdf")
+            .unwrap();
+        assert!(!deck.is_inline);
+        assert_eq!(deck.data, b"%PDF-1.4 hello");
+    }
+
+    #[test]
+    fn a_plain_text_send_with_a_file_needs_no_alternative() {
+        // No html and no pixel: the body is a bare text/plain part inside the
+        // mixed rather than an alternative with one member.
+        let mut parts = bare_parts("plain words");
+        parts.attachments = vec![pdf("a.pdf")];
+        let s = String::from_utf8(build_reply_rfc822(&parts).unwrap()).unwrap();
+        assert!(s.contains("multipart/mixed"));
+        assert!(!s.contains("multipart/alternative"));
+        assert!(s.contains(
+            "--=_passband_mix_0\r\nContent-Type: text/plain; charset=\"UTF-8\"\r\n\r\nplain words\r\n--=_passband_mix_0\r\n"
+        ));
+    }
+
+    #[test]
+    fn no_part_of_a_composed_message_contains_its_delimiters() {
+        // A body that imitates every prefix at suffix 0 forces a bump on each
+        // level — and the three levels still never share a delimiter.
+        let body = "=_passband_alt_0 =_passband_rel_0 =_passband_mix_0";
+        let parts = composed(
+            body,
+            &format!("<p>{body} <img src=\"cid:shot-1\"></p>"),
+            vec![pdf("a.pdf"), png("s.png", "shot-1")],
+        );
+        let s = String::from_utf8(build_reply_rfc822(&parts).unwrap()).unwrap();
+        for prefix in [BOUNDARY_ALT, BOUNDARY_REL, BOUNDARY_MIX] {
+            assert!(
+                s.contains(&format!("boundary=\"{prefix}1\"")),
+                "{prefix} bumped past the imitation"
+            );
+        }
+        // And every delimiter line in the message is one of the three.
+        for line in s.lines().filter(|l| l.starts_with("--=_passband_")) {
+            assert!(
+                line.starts_with("--=_passband_alt_1")
+                    || line.starts_with("--=_passband_rel_1")
+                    || line.starts_with("--=_passband_mix_1"),
+                "unexpected delimiter {line}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_attachment_free_send_is_byte_identical_to_before() {
+        // The frozen wire shape: `attachments: []` takes the old path.
+        let a = build_reply_rfc822(&bare_parts("hi")).unwrap();
+        let mut with_html = bare_parts("hi");
+        with_html.body_html = Some("<p>hi</p>".into());
+        let b = build_reply_rfc822(&with_html).unwrap();
+        let sa = String::from_utf8(a).unwrap();
+        let sb = String::from_utf8(b).unwrap();
+        assert!(!sa.contains("multipart"));
+        assert!(sb.contains("multipart/alternative"));
+        assert!(!sb.contains("multipart/mixed") && !sb.contains("multipart/related"));
     }
 }

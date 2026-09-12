@@ -187,6 +187,7 @@ pub fn compose(to: &str, subject: &str, body: &str) -> ReplyParts {
         // be tracked by. Tracking is per-send and opt-in everywhere else in
         // this daemon; here it is simply not offered.
         pixel_url: None,
+        attachments: Vec::new(),
     }
 }
 
