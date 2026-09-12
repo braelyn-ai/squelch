@@ -9259,3 +9259,348 @@ async fn a_query_of_pure_punctuation_lists_nothing_in_any_mode() {
         "the from: half still lists that sender's mail"
     );
 }
+
+// ---- compose attachments ----------------------------------------------------
+
+/// An authed upload: the bytes as the body, the metadata in the query and the
+/// `Content-Type` header — the shape the composer sends.
+fn upload(filename: &str, mime: Option<&str>, cid: Option<&str>, bytes: &[u8]) -> Request<Body> {
+    let mut uri = format!("/client/compose/attachments?filename={filename}");
+    if let Some(cid) = cid {
+        uri.push_str(&format!("&content_id={cid}"));
+    }
+    let mut b = Request::builder()
+        .method("POST")
+        .uri(uri)
+        .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"));
+    if let Some(mime) = mime {
+        b = b.header(header::CONTENT_TYPE, mime);
+    }
+    b.body(Body::from(bytes.to_vec())).unwrap()
+}
+
+async fn stage(app: &axum::Router, filename: &str, mime: &str, cid: &str, bytes: &[u8]) -> Value {
+    let resp = app
+        .clone()
+        .oneshot(upload(filename, Some(mime), Some(cid), bytes))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    body_json(resp).await
+}
+
+#[tokio::test]
+async fn staging_a_file_answers_its_metadata_and_serves_it_back() {
+    let Harness { app, .. } = harness(|_, _| {});
+    let meta = stage(
+        &app,
+        "shot.png",
+        "image/png; charset=x",
+        "shot-1@passband",
+        b"PNGBYTES",
+    )
+    .await;
+    let id = meta["id"].as_i64().expect("an id");
+    assert_eq!(meta["filename"], "shot.png");
+    assert_eq!(meta["mime"], "image/png", "parameters are dropped");
+    assert_eq!(meta["size"], 8);
+    assert_eq!(meta["content_id"], "shot-1@passband");
+
+    // The bytes come back under the byte door's discipline.
+    let resp = app
+        .clone()
+        .oneshot(authed("GET", &format!("/client/compose/attachments/{id}")))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(resp.headers()[header::CONTENT_TYPE], "image/png");
+    assert_eq!(resp.headers()["x-content-type-options"], "nosniff");
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(&bytes[..], b"PNGBYTES");
+
+    // Removing it from the tray: gone, and a second delete is a 404.
+    let resp = app
+        .clone()
+        .oneshot(authed(
+            "DELETE",
+            &format!("/client/compose/attachments/{id}"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let resp = app
+        .clone()
+        .oneshot(authed(
+            "DELETE",
+            &format!("/client/compose/attachments/{id}"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    let resp = app
+        .oneshot(authed("GET", &format!("/client/compose/attachments/{id}")))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn staging_polices_what_it_stores() {
+    let Harness { app, .. } = harness(|_, _| {});
+
+    // No content type: a blob. A multipart claim: a blob. A bad token: 400.
+    let meta = body_json(
+        app.clone()
+            .oneshot(upload("x", None, None, b"1"))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(meta["mime"], "application/octet-stream");
+    assert!(
+        meta["content_id"].as_str().unwrap().ends_with("@passband"),
+        "minted when the client sent none: {}",
+        meta["content_id"]
+    );
+    let meta = body_json(
+        app.clone()
+            .oneshot(upload("x", Some("multipart/mixed; boundary=z"), None, b"1"))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(meta["mime"], "application/octet-stream");
+    let resp = app
+        .clone()
+        .oneshot(upload("x", Some("text/plain"), Some("a%20b"), b"1"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    // A filename is a name, never a path.
+    let meta = stage(&app, "..%2F..%2Fevil.txt", "text/plain", "t1", b"1").await;
+    assert_eq!(meta["filename"], "....evil.txt");
+
+    // Empty is refused; the bearer is required.
+    let resp = app
+        .clone()
+        .oneshot(upload("x", Some("text/plain"), None, b""))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/client/compose/attachments?filename=x")
+                .body(Body::from("1"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn a_draft_claims_exactly_the_files_it_names() {
+    let Harness { app, .. } = harness(|_, _| {});
+    let a = stage(&app, "a.pdf", "application/pdf", "a1", b"A").await["id"]
+        .as_i64()
+        .unwrap();
+    let b = stage(&app, "b.pdf", "application/pdf", "b1", b"B").await["id"]
+        .as_i64()
+        .unwrap();
+
+    let draft = put_draft(
+        &app,
+        serde_json::json!({ "to": "alice@example.com", "body": "files", "attachment_ids": [a, b] }),
+    )
+    .await;
+    let names: Vec<&str> = draft["attachments"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v["filename"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        names,
+        vec!["a.pdf", "b.pdf"],
+        "the PUT's answer already lists them"
+    );
+
+    // The listing restores them, metadata only.
+    let drafts = list_drafts(&app).await;
+    let d = &drafts.as_array().unwrap()[0];
+    assert_eq!(d["attachments"].as_array().unwrap().len(), 2);
+    assert!(d["attachments"][0]["data"].is_null());
+    assert_eq!(d["attachments"][0]["content_id"], "a1");
+
+    // Removing one from the tray: the next save names only the other.
+    let draft = put_draft(
+        &app,
+        serde_json::json!({ "to": "alice@example.com", "body": "files", "attachment_ids": [b] }),
+    )
+    .await;
+    assert_eq!(draft["attachments"].as_array().unwrap().len(), 1);
+    assert_eq!(draft["attachments"][0]["id"], b);
+
+    // A save that says nothing about files leaves the claims alone.
+    let draft = put_draft(
+        &app,
+        serde_json::json!({ "to": "alice@example.com", "body": "files, edited" }),
+    )
+    .await;
+    assert_eq!(draft["attachments"].as_array().unwrap().len(), 1);
+
+    // Deleting the draft takes its file with it; the released one survives
+    // (until the sweep).
+    let draft_id = draft["id"].as_i64().unwrap();
+    let resp = app
+        .clone()
+        .oneshot(authed("DELETE", &format!("/client/drafts/{draft_id}")))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let resp = app
+        .clone()
+        .oneshot(authed("GET", &format!("/client/compose/attachments/{b}")))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::NOT_FOUND,
+        "the draft's file went with it"
+    );
+    let resp = app
+        .oneshot(authed("GET", &format!("/client/compose/attachments/{a}")))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "released, not deleted");
+}
+
+#[tokio::test]
+async fn a_send_carries_its_files_inline_where_the_body_points_and_consumes_them() {
+    let (base, handle) = mock_gmail(1).await;
+    let Harness { app, store, acct } = app_with_writes(base, |_, _| {});
+    let shot = stage(&app, "shot.png", "image/png", "shot-1@passband", b"PNG").await["id"]
+        .as_i64()
+        .unwrap();
+    let deck = stage(
+        &app,
+        "deck.pdf",
+        "application/pdf",
+        "deck-1@passband",
+        b"PDF",
+    )
+    .await["id"]
+        .as_i64()
+        .unwrap();
+    let draft = put_draft(
+        &app,
+        serde_json::json!({ "to": "alice@example.com", "body": "x", "attachment_ids": [shot, deck] }),
+    )
+    .await;
+
+    let resp = app
+        .clone()
+        .oneshot(authed_json(
+            "POST",
+            "/client/actions/send",
+            serde_json::json!({
+                "to": "alice@example.com",
+                "subject": "Hi",
+                "body": "the shot ![shot](cid:shot-1@passband) and the deck",
+                "body_format": "markdown",
+                "confirm": true,
+                "draft_id": draft["id"],
+                "attachment_ids": [shot, deck]
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let reqs = handle.await.unwrap();
+    let mime = sent_mime(&reqs[0]);
+    // mixed[ related[ alternative, png inline ], pdf attachment ]
+    assert!(mime.contains("Content-Type: multipart/mixed;"));
+    assert!(mime.contains("Content-Type: multipart/related;"));
+    assert!(mime.contains("Content-Type: multipart/alternative;"));
+    assert!(mime.contains("Content-Disposition: inline; filename=\"shot.png\""));
+    assert!(mime.contains("Content-ID: <shot-1@passband>"));
+    assert!(mime.contains("<img src=\"cid:shot-1@passband\" alt=\"shot\""));
+    assert!(mime.contains("Content-Disposition: attachment; filename=\"deck.pdf\""));
+    use base64::Engine as _;
+    assert!(mime.contains(&base64::engine::general_purpose::STANDARD.encode(b"PDF")));
+
+    // Consumed: the draft, and both files.
+    assert_eq!(list_drafts(&app).await.as_array().map(Vec::len), Some(0));
+    assert!(store.outbound_attachment(acct, shot).unwrap().is_none());
+    assert!(store.outbound_attachment(acct, deck).unwrap().is_none());
+}
+
+#[tokio::test]
+async fn a_send_naming_a_file_that_is_gone_is_refused_before_gmail() {
+    let (base, handle) = mock_gmail(0).await;
+    let Harness { app, store, acct } = app_with_writes(base, |_, _| {});
+    let resp = app
+        .oneshot(authed_json(
+            "POST",
+            "/client/actions/send",
+            serde_json::json!({
+                "to": "alice@example.com",
+                "body": "see attached",
+                "confirm": true,
+                "attachment_ids": [4242]
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let err = body_json(resp).await["error"].as_str().unwrap().to_string();
+    assert!(err.contains("no longer staged"), "{err}");
+    assert_eq!(handle.await.unwrap().len(), 0, "nothing reached Gmail");
+    let audit = store.list_audit(acct, 10).unwrap();
+    assert!(
+        audit
+            .iter()
+            .any(|a| a.action == "send"
+                && a.detail.as_deref() == Some("rejected:attachment_missing"))
+    );
+}
+
+#[tokio::test]
+async fn the_guard_reads_a_staged_text_file() {
+    let (base, handle) = mock_gmail(0).await;
+    let Harness { app, .. } = app_with_writes(base, |_, _| {});
+    let key = "-----BEGIN RSA PRIVATE KEY-----\nMIIEow\n-----END RSA PRIVATE KEY-----\n";
+    let notes = stage(&app, "notes.txt", "text/plain", "n1", key.as_bytes()).await["id"]
+        .as_i64()
+        .unwrap();
+    let resp = app
+        .oneshot(authed_json(
+            "POST",
+            "/client/actions/send",
+            serde_json::json!({
+                "to": "alice@example.com",
+                "body": "the notes you asked for",
+                "confirm": true,
+                "attachment_ids": [notes]
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "a key inside an attached text file is the body's secret by another door"
+    );
+    assert_eq!(handle.await.unwrap().len(), 0);
+}
+
+#[tokio::test]
+async fn stats_advertise_compose_attachments() {
+    let Harness { app, .. } = harness(|_, _| {});
+    let resp = app.oneshot(authed("GET", "/client/stats")).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(body_json(resp).await["compose_attachments"], true);
+}

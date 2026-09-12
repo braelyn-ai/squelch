@@ -184,9 +184,13 @@ final class DraftSaver {
         // against empty, because a reply opens already holding the set the
         // daemon derived: testing "is `to` empty" would make every abandoned
         // `r` mint a draft of a message nobody wrote.
+        //
+        // AND SO IS A FILE: a draft holding nothing but an attachment is a
+        // draft of that attachment, and discarding it would let the sweep take
+        // the file with it.
         let blank =
             state.recipients == state.seededRecipients && state.subject.trimmed.isEmpty
-            && Prefs.shared.isBodyUntouched(state.body)
+            && Prefs.shared.isBodyUntouched(state.body) && state.attachments.isEmpty
         if blank {
             // EMPTIED, not composed: a draft cleared back to nothing is discarded
             // rather than saved as a blank row that would restore as one. With no
@@ -199,7 +203,11 @@ final class DraftSaver {
         do {
             let saved = try await APIClient.shared.putDraft(
                 replyToMessageId: state.replyToMessageId, to: state.to, cc: state.cc,
-                bcc: state.bcc, subject: state.subject, body: state.body)
+                bcc: state.bcc, subject: state.subject, body: state.body,
+                // The files that have finished staging: the draft's claim on
+                // them is what keeps them past the sweep. One still uploading
+                // is claimed by the save its landing arms.
+                attachmentIds: state.stagedAttachmentIds)
             adopt(saved.id, slot: slot, key: state.id)
         } catch {
             // Silent, always. A 404 here is a parent sealed since the composer

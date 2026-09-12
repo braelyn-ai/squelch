@@ -25,10 +25,19 @@ struct MarkdownTextView: NSViewRepresentable {
     /// editors this replaces: `r` must land the caret in the body.
     var autofocus = false
     var disabled = false
+    /// Files dropped ON THE EDITOR, with the UTF-16 offset of the drop point,
+    /// so a picture lands where it was let go rather than at the end. nil
+    /// leaves AppKit's own file-drop behaviour (which pastes the path).
+    var onDropFiles: (([URL], Int?) -> Void)? = nil
+    /// A picture pasted with ⌘V — a screenshot, a copied image — as PNG bytes
+    /// with the caret's offset. Text pastes are untouched.
+    var onPasteImage: ((Data, Int?) -> Void)? = nil
 
     func makeNSView(context: Context) -> NSScrollView {
         let view = HighlightingTextView()
         view.delegate = context.coordinator
+        view.onDropFiles = onDropFiles
+        view.onPasteImage = onPasteImage
         view.string = text
         view.allowsUndo = true
         view.isRichText = false  // attributes are OURS; no pasted fonts
@@ -65,6 +74,9 @@ struct MarkdownTextView: NSViewRepresentable {
         // not. Without this the delegate writes into the first render's binding.
         context.coordinator.parent = self
         view.isEditable = !disabled
+        // Fresh closures every render, like the binding.
+        view.onDropFiles = onDropFiles
+        view.onPasteImage = onPasteImage
         // Only external changes (a draft restore) land here — the coordinator
         // wrote user edits into the binding already, and re-setting the string
         // for those would throw away the selection.
@@ -95,6 +107,61 @@ struct MarkdownTextView: NSViewRepresentable {
 /// The NSTextView half: owns the re-style pass. Attribute changes never touch
 /// the characters, so the selection and undo stack survive every pass.
 final class HighlightingTextView: NSTextView {
+    var onDropFiles: (([URL], Int?) -> Void)?
+    var onPasteImage: ((Data, Int?) -> Void)?
+
+    // MARK: - files in
+
+    // THE EDITOR IS A DROP TARGET FOR FILES, and it has to be this view that
+    // says so: AppKit delivers a drag to the deepest view under the pointer,
+    // and NSTextView already accepts file URLs — by inserting their PATHS as
+    // text, which is never what dropping a photo on a mail means. So the drag
+    // is claimed here when there is a handler and a file, and handed up with
+    // the character the pointer is over; everything else falls through to
+    // AppKit (text drags still work).
+
+    private func hasFiles(_ info: NSDraggingInfo) -> Bool {
+        onDropFiles != nil && !ComposeDrop.fileURLs(on: info.draggingPasteboard).isEmpty
+    }
+
+    override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
+        hasFiles(sender) ? .copy : super.draggingEntered(sender)
+    }
+
+    override func draggingUpdated(_ sender: NSDraggingInfo) -> NSDragOperation {
+        hasFiles(sender) ? .copy : super.draggingUpdated(sender)
+    }
+
+    override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
+        guard let onDropFiles, hasFiles(sender) else {
+            return super.performDragOperation(sender)
+        }
+        let urls = ComposeDrop.fileURLs(on: sender.draggingPasteboard)
+        let point = convert(sender.draggingLocation, from: nil)
+        onDropFiles(urls, characterIndexForInsertion(at: point))
+        return true
+    }
+
+    /// ⌘V with a picture on the clipboard attaches it; ⌘V with a file copied
+    /// in the Finder attaches that. Anything with text in it is a text paste,
+    /// as ever — see `ComposeDrop.imagePNG`.
+    override func paste(_ sender: Any?) {
+        let pasteboard = NSPasteboard.general
+        let caret = selectedRange().location
+        if let onDropFiles {
+            let urls = ComposeDrop.fileURLs(on: pasteboard)
+            if !urls.isEmpty, pasteboard.string(forType: .string) == nil {
+                onDropFiles(urls, caret)
+                return
+            }
+        }
+        if let onPasteImage, let png = ComposeDrop.imagePNG(on: pasteboard) {
+            onPasteImage(png, caret)
+            return
+        }
+        super.paste(sender)
+    }
+
     func rehighlight() {
         guard let storage = textStorage else { return }
         let all = NSRange(location: 0, length: storage.length)

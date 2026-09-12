@@ -97,7 +97,10 @@ actor APIClient {
         method: Method,
         query: [String: String?],
         body: Data?,
-        timeout: TimeInterval
+        timeout: TimeInterval,
+        // JSON for every route but one: the attachment upload's body IS the
+        // file, and its type is the file's.
+        contentType: String = "application/json"
     ) throws -> URLRequest {
         let cfg = try requireConfig()
         guard var comps = URLComponents(string: cfg.baseURL + path) else {
@@ -116,7 +119,7 @@ actor APIClient {
         req.setValue("application/json", forHTTPHeaderField: "Accept")
         if let body {
             req.httpBody = body
-            req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            req.setValue(contentType, forHTTPHeaderField: "Content-Type")
         }
         return req
     }
@@ -646,7 +649,7 @@ actor APIClient {
         body: String, replyToMessageId: Int? = nil, to: String? = nil, cc: String? = nil,
         bcc: String? = nil, groupId: Int? = nil, subject: String? = nil,
         overrideGuard: Bool = false, draftId: Int? = nil, includeTracker: Bool = false,
-        replyAll: Bool = false, forwardOfMessageId: Int? = nil
+        replyAll: Bool = false, forwardOfMessageId: Int? = nil, attachmentIds: [Int] = []
     ) async throws -> SendResult {
         try await post(
             "/client/actions/send",
@@ -678,8 +681,50 @@ actor APIClient {
                 include_tracker: includeTracker ? true : nil,
                 // Same omission rule, and the daemon expands the set itself —
                 // this is a flag, never a recipient list.
-                reply_all: replyAll ? true : nil),
-            timeout: forwardOfMessageId == nil ? Self.requestTimeout : Self.forwardTimeout)
+                reply_all: replyAll ? true : nil,
+                // Omitted when empty, like everything else here.
+                attachment_ids: attachmentIds.isEmpty ? nil : attachmentIds),
+            // A send that re-reads and base64s megabytes of files, then
+            // hands them to Gmail, gets the forward's budget rather than a
+            // JSON round-trip's.
+            timeout: forwardOfMessageId == nil && attachmentIds.isEmpty
+                ? Self.requestTimeout : Self.forwardTimeout)
+    }
+
+    // MARK: - compose attachments
+
+    /// How long an upload may take. A 25 MB file over a hosted tenant's link
+    /// is minutes, not the 15 s a JSON round-trip gets.
+    static let uploadTimeout: TimeInterval = 300
+
+    /// Stage one file for a send: the bytes go up as the body, the name and
+    /// the client-minted `cid:` token in the query. What comes back is the
+    /// daemon's id for the file, which is what the draft and the send name.
+    func stageAttachment(filename: String, mime: String, contentId: String, data: Data)
+        async throws -> OutboundAttachment
+    {
+        let req = try buildRequest(
+            path: "/client/compose/attachments", method: .POST,
+            query: ["filename": filename, "content_id": contentId],
+            body: data, timeout: Self.uploadTimeout, contentType: mime)
+        let (bytes, _) = try await perform(req)
+        return try decode(OutboundAttachment.self, from: bytes)
+    }
+
+    /// A file taken out of the tray. Unknown and another account's are one 404,
+    /// and the caller ignores both: the row is gone either way.
+    func deleteComposeAttachment(_ id: Int) async throws {
+        try await deleteNoContent("/client/compose/attachments/\(id)")
+    }
+
+    /// A staged file's bytes, for the thumbnail of a file this session did not
+    /// upload (a restored draft). Authenticated like every other read.
+    func composeAttachmentBytes(_ id: Int) async throws -> Data {
+        let req = try buildRequest(
+            path: "/client/compose/attachments/\(id)", method: .GET, query: [:], body: nil,
+            timeout: Self.attachmentTimeout)
+        let (bytes, _) = try await perform(req)
+        return bytes
     }
 
     /// The recipients a reply to `messageId` would carry, derived server-side.
@@ -757,13 +802,13 @@ actor APIClient {
     @discardableResult
     func putDraft(
         replyToMessageId: Int?, to: String, cc: String = "", bcc: String = "", subject: String,
-        body: String
+        body: String, attachmentIds: [Int] = []
     ) async throws -> DraftView {
         try await put(
             "/client/drafts",
             body: DraftBody(
                 reply_to_message_id: replyToMessageId, to: to, cc: cc, bcc: bcc, subject: subject,
-                body: body))
+                body: body, attachment_ids: attachmentIds))
     }
 
     /// Discard one draft. Another account's id and an unknown id are the same 404.

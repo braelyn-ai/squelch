@@ -59,6 +59,8 @@ struct InlineReply: View {
     /// Whether the recipient fields are open. Per-composer by nature: it resets
     /// when the reply closes, because the next one is a different audience.
     @State private var editingRecipients = false
+    /// A file is being dragged over the composer: the editor's well says so.
+    @State private var dropTargeted = false
 
     /// The daemon's derived recipient set, TAGGED with the key it was fetched
     /// for. The tag is what makes a stale read impossible: this view is
@@ -115,6 +117,8 @@ struct InlineReply: View {
                         reviewPane(compose, parent: parent)
                     } else {
                         editor(compose)
+                        // The files, under the editor. Nothing when empty.
+                        AttachmentTray(slot: .inlineReply)
                     }
                     if let error = compose.error {
                         Text(error).font(Typo.micro).foregroundStyle(Palette.danger)
@@ -123,6 +127,9 @@ struct InlineReply: View {
                 .padding(.horizontal, Self.gutter)
                 .padding(.top, 12)
                 .padding(.bottom, 10)
+                // Anywhere on the composer, same as the pane: see
+                // `composeDropTarget`.
+                .composeDropTarget(.inlineReply, targeted: $dropTargeted)
 
                 #if os(macOS)
                     KeyHintBar(hints: hints)
@@ -264,7 +271,12 @@ struct InlineReply: View {
             // The account default still decides, and review still says so when
             // a pixel is armed.
             #if os(macOS)
-                if !inReview { TrackerToggle(on: bindFlag(\.includeTracker)) }
+                if !inReview {
+                    AttachButton(slot: .inlineReply)
+                    TrackerToggle(on: bindFlag(\.includeTracker))
+                }
+            #else
+                if !inReview { AttachButton(slot: .inlineReply) }
             #endif
             if compose.sending {
                 Text("sending…")
@@ -334,16 +346,31 @@ struct InlineReply: View {
         // not the bar: the editor also mounts on the way BACK from review (the
         // bar never left), so Esc out of review would otherwise drop the cursor
         // and hand every letter you typed next to the reader's verbs.
-        MarkdownTextView(text: bind(\.body), autofocus: true, disabled: compose.sending)
-            .frame(height: Self.editorHeight)
-            .padding(8)
-            .background(
-                RoundedRectangle(cornerRadius: 9, style: .continuous)
-                    .fill(Palette.canvas.opacity(0.65))
-            )
-            .overlay(
-                RoundedRectangle(cornerRadius: 9, style: .continuous)
-                    .strokeBorder(Palette.hairlineStrong, lineWidth: 0.75))
+        MarkdownTextView(
+            text: bind(\.body), autofocus: true, disabled: compose.sending,
+            // Same two doors the pane's editor has, gated the same way.
+            onDropFiles: store.composeAttachmentsAvailable
+                ? { urls, at in ComposeAttach.add(urls: urls, to: .inlineReply, at: at) }
+                : nil,
+            onPasteImage: store.composeAttachmentsAvailable
+                ? { png, at in
+                    ComposeAttach.add(
+                        data: png, filename: "pasted-image.png", mime: "image/png",
+                        to: .inlineReply, at: at)
+                } : nil
+        )
+        .frame(height: Self.editorHeight)
+        .padding(8)
+        .background(
+            RoundedRectangle(cornerRadius: 9, style: .continuous)
+                .fill(Palette.canvas.opacity(0.65))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 9, style: .continuous)
+                .strokeBorder(
+                    dropTargeted ? Palette.accent : Palette.hairlineStrong,
+                    lineWidth: dropTargeted ? 1.5 : 0.75))
+        .animation(.easeOut(duration: 0.12), value: dropTargeted)
     }
 
     /// Read-only, because review is for reading: the recipient and subject the
@@ -392,13 +419,19 @@ struct InlineReply: View {
             if compose.includeTracker && store.trackingAvailable {
                 ComposeSummaryRow("tracking", ComposeCopy.trackedSend)
             }
+            if let files = ComposeCopy.attachmentSummary(compose) {
+                ComposeSummaryRow("files", files)
+            }
 
             ScrollView {
-                // Same styling as the live editor, so review is the send's
-                // formatting, not a second interpretation of it.
-                Text(MarkdownStyle.attributed(compose.body))
-                    .textSelection(.enabled)
-                    .frame(maxWidth: .infinity, alignment: .leading)
+                VStack(alignment: .leading, spacing: 10) {
+                    // Same styling as the live editor, so review is the send's
+                    // formatting, not a second interpretation of it.
+                    Text(MarkdownStyle.attributed(compose.body))
+                        .textSelection(.enabled)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                    AttachmentTray(slot: .inlineReply, editable: false)
+                }
             }
             .frame(maxHeight: Self.editorHeight)
             .padding(10)
@@ -601,7 +634,13 @@ struct InlineReply: View {
         guard let compose = store.inlineReply else { return }
         // Same seed rule as the pane: an untouched signature is an empty body.
         guard !Prefs.shared.isBodyUntouched(compose.body) else {
-            patch { $0.error = "body is empty" }
+            // Same tray rule as the pane: a file still uploading or one that
+        // failed stops review here, in words.
+        if let problem = ComposeCopy.trayProblem(compose) {
+            patch { $0.error = problem }
+            return
+        }
+        patch { $0.error = "body is empty" }
             return
         }
         patch {

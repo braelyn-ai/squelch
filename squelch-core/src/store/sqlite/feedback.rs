@@ -246,6 +246,15 @@ impl SqliteStore {
             // refuses a sealed parent, so a draft keyed to one is a row the human
             // door would never have accepted, and it quotes mail the user has just
             // decided is auth. Discarding a composition is the cost of the seal.
+            // Its staged files first (the draft's lifetime is theirs — see
+            // `SqliteStore::delete_draft`).
+            tx.execute(
+                "DELETE FROM outbound_attachments
+                 WHERE account_id = ?1 AND draft_id IN (
+                     SELECT id FROM drafts
+                     WHERE account_id = ?1 AND reply_to_message_id = ?2)",
+                params![account_id, message_id],
+            )?;
             tx.execute(
                 "DELETE FROM drafts WHERE account_id = ?1 AND reply_to_message_id = ?2",
                 params![account_id, message_id],

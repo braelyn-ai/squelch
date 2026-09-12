@@ -36,6 +36,8 @@ struct ComposePane: View {
     private enum FocusTarget: Hashable { case recipient(RecipientSlot), subject }
 
     @State private var groupPickerOpen = false
+    /// A file is being dragged over the pane: the editor's well says so.
+    @State private var dropTargeted = false
     /// The picked group's size, for the fan-out pill's "· 12 ·". Held here rather
     /// than on ComposeState because it is a display detail the daemon re-reads
     /// from `groupId` anyway.
@@ -88,6 +90,10 @@ struct ComposePane: View {
             .keyContext(.modal)
             .keyBindings(.modal, bindings)
             .onAppear { if !inReview { focusedField = .recipient(.to) } }
+            // ANYWHERE ON THE PANE: a file let go over the subject line or
+            // the tray still lands. Edit phase only — review is for reading —
+            // and `ComposeAttach.add` is what refuses a drop during review.
+            .composeDropTarget(.compose, targeted: $dropTargeted)
         }
     }
 
@@ -274,6 +280,7 @@ struct ComposePane: View {
                     // What goes out is settled by the time review is up, and a
                     // switch beside the send button is a switch nobody meant to
                     // touch.
+                    AttachButton(slot: .compose)
                     TrackerToggle(on: bindFlag(\.includeTracker))
                     Button(ComposeLabels.cancel) { store.closeCompose() }
                         .buttonStyle(.glass)
@@ -308,16 +315,36 @@ struct ComposePane: View {
                         .lineLimit(1)
                         .minimumScaleFactor(0.85)
                 }
-                MarkdownTextView(text: bind(\.body))
-                    .frame(maxHeight: .infinity)
-                    .padding(8)
-                    .background(
-                        RoundedRectangle(cornerRadius: 9, style: .continuous)
-                            .fill(Palette.canvas.opacity(0.65))
-                    )
-                    .overlay(
-                        RoundedRectangle(cornerRadius: 9, style: .continuous)
-                            .strokeBorder(Palette.hairlineStrong, lineWidth: 0.75))
+                MarkdownTextView(
+                    text: bind(\.body),
+                    // Dropped ON THE EDITOR: at the drop point. Pasted: at
+                    // the caret. Both are the daemon-gated affordance, so a
+                    // daemon that cannot stage files gets AppKit's default.
+                    onDropFiles: store.composeAttachmentsAvailable
+                        ? { urls, at in ComposeAttach.add(urls: urls, to: .compose, at: at) }
+                        : nil,
+                    onPasteImage: store.composeAttachmentsAvailable
+                        ? { png, at in
+                            ComposeAttach.add(
+                                data: png, filename: "pasted-image.png", mime: "image/png",
+                                to: .compose, at: at)
+                        } : nil
+                )
+                .frame(maxHeight: .infinity)
+                .padding(8)
+                .background(
+                    RoundedRectangle(cornerRadius: 9, style: .continuous)
+                        .fill(Palette.canvas.opacity(0.65))
+                )
+                .overlay(
+                    RoundedRectangle(cornerRadius: 9, style: .continuous)
+                        .strokeBorder(
+                            dropTargeted ? Palette.accent : Palette.hairlineStrong,
+                            lineWidth: dropTargeted ? 1.5 : 0.75))
+                .animation(.easeOut(duration: 0.12), value: dropTargeted)
+                // The files, under the editor where a mail client puts them.
+                // Draws nothing when there are none.
+                AttachmentTray(slot: .compose)
             }
             .frame(maxHeight: .infinity)
 
@@ -536,6 +563,11 @@ struct ComposePane: View {
             if compose.includeTracker && store.trackingAvailable {
                 ComposeSummaryRow("tracking", ComposeCopy.trackedSend)
             }
+            // What rides along, said in the summary's own grammar — and then
+            // shown, below the note, as the tray it was reviewed in.
+            if let files = ComposeCopy.attachmentSummary(compose) {
+                ComposeSummaryRow("files", files)
+            }
 
             ScrollView {
                 VStack(alignment: .leading, spacing: 14) {
@@ -545,6 +577,7 @@ struct ComposePane: View {
                     Text(MarkdownStyle.attributed(compose.body))
                         .textSelection(.enabled)
                         .frame(maxWidth: .infinity, alignment: .leading)
+                    AttachmentTray(slot: .compose, editable: false)
                     // INSIDE this scroller rather than beside it, and under the
                     // note exactly as it will sit in the mail: on a forward the
                     // quote is most of what goes out, and review's whole job is
@@ -741,6 +774,13 @@ struct ComposePane: View {
         guard compose.forwardOfMessageId != nil || !Prefs.shared.isBodyUntouched(compose.body)
         else {
             patch { $0.error = "body is empty" }
+            return
+        }
+        // THE TRAY IS THE PROMISE. A file still uploading has no id for the
+        // send to name, and one that failed would go out missing; both stop
+        // the ceremony here, in words, rather than at the send.
+        if let problem = ComposeCopy.trayProblem(compose) {
+            patch { $0.error = problem }
             return
         }
         patch {

@@ -849,6 +849,15 @@ impl SqliteStore {
         //     `put_draft` would never accept a sealed parent. The reply
         //     composition goes with the seal.
         if triaged.sensitivity == Sensitivity::Sealed {
+            // Its staged files first (the draft's lifetime is theirs — see
+            // `SqliteStore::delete_draft`).
+            tx.execute(
+                "DELETE FROM outbound_attachments
+                 WHERE account_id = ?1 AND draft_id IN (
+                     SELECT id FROM drafts
+                     WHERE account_id = ?1 AND reply_to_message_id = ?2)",
+                params![triaged.message.account_id, id],
+            )?;
             tx.execute(
                 "DELETE FROM drafts WHERE account_id = ?1 AND reply_to_message_id = ?2",
                 params![triaged.message.account_id, id],
