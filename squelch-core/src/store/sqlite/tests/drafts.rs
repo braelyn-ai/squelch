@@ -389,6 +389,57 @@ fn reingest_that_seals_the_parent_deletes_its_draft() {
 }
 
 #[test]
+fn both_seal_paths_take_the_drafts_staged_files_with_it() {
+    // The draft's files live as long as the draft (see `delete_draft`), and
+    // a seal is a draft delete by another door — two of them.
+    let (store, acct) = store();
+    let normal = triaged(acct, "g1", "t1");
+    let parent = normal.ingest(&store);
+    let d = store
+        .upsert_draft(acct, Some(parent), DraftFields::default(), t(0))
+        .unwrap();
+    let file = store
+        .stage_outbound_attachment(acct, "a.pdf", "application/pdf", "cid-a", b"A", t(0))
+        .unwrap();
+    store
+        .claim_outbound_attachments(acct, d.id, &[file.id], t(0))
+        .unwrap();
+    normal.clone().sealed(SealedKind::Otp).ingest(&store);
+    assert!(
+        store.outbound_attachment(acct, file.id).unwrap().is_none(),
+        "the re-ingest seal took the file with the draft"
+    );
+
+    // The hand-correction path, on a second message.
+    let other = triaged(acct, "g2", "t2").ingest(&store);
+    let d2 = store
+        .upsert_draft(acct, Some(other), DraftFields::default(), t(1))
+        .unwrap();
+    let file2 = store
+        .stage_outbound_attachment(acct, "b.pdf", "application/pdf", "cid-b", b"B", t(1))
+        .unwrap();
+    store
+        .claim_outbound_attachments(acct, d2.id, &[file2.id], t(1))
+        .unwrap();
+    store
+        .correct_triage(
+            acct,
+            other,
+            crate::types::TriageAxis::Sensitivity,
+            "sealed",
+            None,
+            t(2),
+        )
+        .unwrap()
+        .unwrap();
+    assert!(store.list_drafts(acct).unwrap().is_empty());
+    assert!(
+        store.outbound_attachment(acct, file2.id).unwrap().is_none(),
+        "the hand seal took the file with the draft"
+    );
+}
+
+#[test]
 fn account_email_reads_the_row_and_404s_unknown() {
     let (store, acct) = store();
     assert_eq!(store.account_email(acct).unwrap(), "me@example.com");

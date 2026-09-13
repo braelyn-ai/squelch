@@ -553,6 +553,10 @@ pub struct Draft {
     pub bcc_addr: String,
     pub subject: String,
     pub body: String,
+    /// The files this draft has claimed, upload order. Metadata only — a
+    /// restore needs names and sizes to draw the tray, and the send re-reads
+    /// the bytes by id.
+    pub attachments: Vec<OutboundAttachmentMeta>,
     /// First save of this draft; an edit keeps it.
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -572,6 +576,30 @@ pub struct DraftFields<'a> {
     pub bcc_addr: &'a str,
     pub subject: &'a str,
     pub body: &'a str,
+}
+
+/// One file staged for a send, WITHOUT its bytes: what a draft listing and an
+/// upload's acknowledgement carry. The bytes are fetched only by the send
+/// itself and by the byte endpoint, through [`OutboundAttachment`].
+///
+/// HUMAN-DOOR ONLY, like [`Draft`]: produced for `/client/compose/attachments`
+/// and `/client/drafts`, and no agent-door read reaches the table.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutboundAttachmentMeta {
+    pub id: i64,
+    pub filename: String,
+    pub mime: String,
+    pub size_bytes: i64,
+    /// The `cid:` token a body may reference this file by. Angle brackets are
+    /// NOT part of it; the MIME builder writes them.
+    pub content_id: String,
+}
+
+/// [`OutboundAttachmentMeta`] plus the bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutboundAttachment {
+    pub meta: OutboundAttachmentMeta,
+    pub data: Vec<u8>,
 }
 
 /// One non-confident triage row queued for the Stage-2 LLM pass, with message

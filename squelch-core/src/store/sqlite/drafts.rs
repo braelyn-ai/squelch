@@ -13,6 +13,9 @@ fn map_draft(r: &rusqlite::Row<'_>) -> rusqlite::Result<Draft> {
         bcc_addr: r.get(5)?,
         subject: r.get(6)?,
         body: r.get(7)?,
+        // Filled by the caller, which still holds the connection: a row map
+        // cannot run a second query.
+        attachments: Vec::new(),
         created_at: dt(r, 8)?,
         updated_at: dt(r, 9)?,
     })
@@ -80,14 +83,35 @@ impl SqliteStore {
                 conn.last_insert_rowid()
             }
         };
-        let draft = conn.query_row(
+        let mut draft = conn.query_row(
             "SELECT id, account_id, reply_to_message_id, to_addr, cc_addr, bcc_addr,
                     subject, body, created_at, updated_at
              FROM drafts WHERE id = ?1",
             params![id],
             map_draft,
         )?;
+        draft.attachments = super::outbound::draft_attachments(&conn, account_id, id)?;
         Ok(draft)
+    }
+
+    /// One draft by id, files included. `None` for an unknown id and for
+    /// another account's.
+    pub fn draft_by_id(&self, account_id: AccountId, id: i64) -> Result<Option<Draft>> {
+        let conn = self.lock()?;
+        let row = conn
+            .query_row(
+                "SELECT id, account_id, reply_to_message_id, to_addr, cc_addr, bcc_addr,
+                        subject, body, created_at, updated_at
+                 FROM drafts WHERE account_id = ?1 AND id = ?2",
+                params![account_id, id],
+                map_draft,
+            )
+            .optional()?;
+        let Some(mut draft) = row else {
+            return Ok(None);
+        };
+        draft.attachments = super::outbound::draft_attachments(&conn, account_id, id)?;
+        Ok(Some(draft))
     }
 
     /// Every draft for an account, most recently touched first.
@@ -113,17 +137,29 @@ impl SqliteStore {
                )
              ORDER BY updated_at DESC",
         )?;
-        let out = stmt
+        let mut out = stmt
             .query_map(params![account_id], map_draft)?
             .collect::<std::result::Result<Vec<_>, _>>()?;
+        for draft in &mut out {
+            draft.attachments = super::outbound::draft_attachments(&conn, account_id, draft.id)?;
+        }
         Ok(out)
     }
 
     /// Discard one draft by id. `false` when nothing matched, so another
     /// account's id is indistinguishable from an unknown one (the handler turns
     /// both into 404).
+    ///
+    /// THE DRAFT'S FILES GO WITH IT. A staged upload lives as long as the draft
+    /// that claimed it (see `outbound_attachments` in schema.sql); a discarded
+    /// draft's files would otherwise sit unreachable until the sweep, holding
+    /// their bytes for nothing.
     pub fn delete_draft(&self, account_id: AccountId, id: i64) -> Result<bool> {
         let conn = self.lock()?;
+        conn.execute(
+            "DELETE FROM outbound_attachments WHERE account_id = ?1 AND draft_id = ?2",
+            params![account_id, id],
+        )?;
         let n = conn.execute(
             "DELETE FROM drafts WHERE account_id = ?1 AND id = ?2",
             params![account_id, id],

@@ -41,6 +41,12 @@ struct MarkdownTextView: UIViewRepresentable {
     /// caret in the body rather than being a box you have to go tap.
     var autofocus = false
     var disabled = false
+    /// The Mac editor's drop and paste hooks, accepted here so the composers
+    /// pass them without forking on platform. A phone has nothing to drop
+    /// with; its files come in through the paperclip's document picker.
+    var onDropFiles: (([URL], Int?) -> Void)? = nil
+    var onPasteImage: ((Data, Int?) -> Void)? = nil
+    var onDropHover: ((Bool) -> Void)? = nil
 
     func makeUIView(context: Context) -> HighlightingTextView {
         let view = HighlightingTextView()

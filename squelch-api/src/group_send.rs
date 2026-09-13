@@ -24,7 +24,7 @@ use squelch_core::store::sqlite::groups::{GroupSendRecipient, GroupSendStatus};
 use squelch_core::types::GroupMode;
 
 use crate::error::ApiError;
-use crate::gmail_write::{GmailWriteClient, ReplyParts, build_reply_rfc822};
+use crate::gmail_write::{GmailWriteClient, MailAttachment, ReplyParts, build_reply_rfc822};
 use crate::handlers::{audit_action, store_call};
 use crate::state::ApiState;
 
@@ -149,6 +149,9 @@ pub(crate) struct FanOut {
     /// surveilled ones is a different product decision than "attach a read
     /// receipt", and not one this feature gets to make on the user's behalf.
     pub pixel_url: Option<String>,
+    /// The composer's files, already `mark_inline`d against `body_html`. Every
+    /// member's copy carries the same parts.
+    pub attachments: Vec<MailAttachment>,
 }
 
 /// Start a fan-out: record the audience as pending, then settle it from a
@@ -284,6 +287,7 @@ async fn send_one(
         references: None,
         body_html: plan.body_html.clone(),
         pixel_url: plan.pixel_url.clone(),
+        attachments: plan.attachments.clone(),
     };
     let raw = build_reply_rfc822(&parts).map_err(|_| "could not compose".to_string())?;
     let sent = client

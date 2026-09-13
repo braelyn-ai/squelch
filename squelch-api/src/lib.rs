@@ -108,6 +108,21 @@ fn client_router(state: ApiState) -> Router {
             post(handlers::mark_thread_opened),
         )
         .route("/client/attachments/{id}", get(handlers::get_attachment))
+        // FILES ON THEIR WAY OUT (see the handlers' header). The upload carries
+        // its own body limit: the router's default is 2 MB, sized for JSON, and
+        // this is the one route whose body is a file. Sized for the cap plus a
+        // little, so the cap's own 413 message is what a too-large file gets
+        // rather than the framework's.
+        .route(
+            "/client/compose/attachments",
+            post(handlers::stage_compose_attachment).layer(axum::extract::DefaultBodyLimit::max(
+                handlers::MAX_OUTBOUND_ATTACHMENT_BYTES + 64 * 1024,
+            )),
+        )
+        .route(
+            "/client/compose/attachments/{id}",
+            get(handlers::get_compose_attachment).delete(handlers::delete_compose_attachment),
+        )
         .route("/client/shipments", get(handlers::get_shipments))
         // Force a carrier pass. HUMAN DOOR ONLY: the agent door reads the
         // shipments table and never gets to spend the operator's carrier quota.

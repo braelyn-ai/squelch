@@ -19,6 +19,7 @@ pub mod groups;
 mod messages;
 mod migrate;
 mod notify;
+mod outbound;
 mod rules;
 mod search;
 mod senders;

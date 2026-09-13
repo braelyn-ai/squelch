@@ -857,6 +857,12 @@ struct StoreStats: Codable, Sendable, Hashable {
     /// A mailbox catch-up in flight. ABSENT is the normal state; presence is
     /// the explanation for a triage queue that is not moving.
     var catch_up: CatchUpProgress?
+    /// Whether `attachment_ids` on a send and on a draft mean anything here.
+    /// ABSENT on a daemon too old to stage files, and absence reads as no —
+    /// the same silent-failure shape as `forwarding`: an old daemon ignores
+    /// the key and mails the words without the files. See
+    /// `AppStore.composeAttachmentsAvailable`.
+    var compose_attachments: Bool?
 }
 
 /// The 30-day re-walk the daemon falls back to when Gmail's history cursor
@@ -1207,6 +1213,10 @@ struct SendBody: Codable, Sendable {
     /// time — the client never enumerates it into `to`, so a stale or failed
     /// preview cannot change who the mail actually reaches.
     var reply_all: Bool?
+    /// The staged files this send carries, tray order. Omitted when there are
+    /// none. Which go inline is not said here: the daemon reads that off the
+    /// body's `cid:` references, the same rule the tray shows.
+    var attachment_ids: [Int]?
 }
 
 /// GET /client/messages/{id}/reply_recipients?all=true — the addresses a reply
@@ -1328,11 +1338,24 @@ struct DraftView: Codable, Sendable, Identifiable, Hashable {
     var body: String
     var created_at: String
     var updated_at: String
+    /// The files the draft holds. OPTIONAL for the reason `cc` is: an older
+    /// daemon sends no key, and a restore must not fail over it.
+    var attachments: [OutboundAttachment]?
 }
 
 /// PUT /client/drafts — upsert keyed on `reply_to_message_id`. Every text field
 /// is optional server-side (a half-composed draft is the normal case), but the
 /// composer always knows all three, so all three go.
+/// One file staged for a send, as the daemon describes it: everything but the
+/// bytes. `content_id` is the `cid:` token the body references it by.
+struct OutboundAttachment: Codable, Sendable, Identifiable, Hashable {
+    var id: Int
+    var filename: String
+    var mime: String
+    var size: Int
+    var content_id: String
+}
+
 struct DraftBody: Codable, Sendable {
     var reply_to_message_id: Int?
     var to: String
@@ -1343,6 +1366,9 @@ struct DraftBody: Codable, Sendable {
     var bcc: String
     var subject: String
     var body: String
+    /// The staged files this draft holds — EXACTLY these, so a file taken out
+    /// of the tray is released by the next save. Always sent, `[]` included.
+    var attachment_ids: [Int]
 }
 
 // MARK: - triage debug / shredder / feedback / marketing
